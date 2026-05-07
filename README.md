@@ -1,16 +1,16 @@
-# VibeServe
+# VibeServe: Can AI Agents Build Bespoke LLM Serving Systems?
 
 **An agentic loop that synthesizes bespoke LLM serving systems — one per (model, hardware, workload) target — instead of forcing every deployment through a single general-purpose runtime.**
-
-> Kamahori, Li, Peter, Kasikci. *VibeServe: Can AI Agents Build Bespoke LLM Serving Systems?* University of Washington, 2026.
 
 <p align="center">
   <img src="docs/figures/idea.png" width="85%" alt="Generic serving today vs. VibeServe's per-target bespoke systems">
 </p>
 
-General-purpose stacks (vLLM, SGLang, TensorRT-LLM) are tuned for the dense decoder-only Transformer running on data-center GPUs at the center of today's deployments. As model architectures (multimodal, hybrid SSM/attention), hardware (Apple Silicon, varied accelerators), and workloads (predicted-output code editing, long-prefix RAG, streaming ASR, constrained decoding) diverge from that center, the *portability tax* of a generic runtime grows. VibeServe takes the opposite bet: per-deployment specialization driven by long-horizon coding agents, where the engineering cost that once made bespoke systems impractical is now within reach.
+## Introduction
 
-In a standard setting (Llama-3.1-8B on H100), VibeServe reaches near-parity with vLLM. In six non-standard scenarios, generated systems achieve **5.95×** speedup for predicted-output code editing, **3.45×** throughput for hybrid prompt caching, **1.69×** lower TTFT for streaming ASR, **2.6×** for MacBook JSON decoding, **6.27×** for multimodal MacBook inference, and **21.4%** on H100 — by exploiting deployment-specific structure that generic abstractions hide.
+VibeServe explores a new approach to LLM serving: instead of relying on one general-purpose runtime to support every model, workload, and hardware target, we use AI agents to generate bespoke serving systems for each deployment scenario. The project asks whether long-horizon coding agents can synthesize complete LLM serving stacks end-to-end, including scheduling, caching, runtime logic, correctness checks, and performance optimizations tailored to a specific target.
+
+The system is organized as a multi-agent optimization loop. An outer loop plans the search over system designs using persistent state such as issues, memory, and git history, while an inner loop implements candidate systems, validates correctness against a reference implementation, and measures performance on the target benchmark. Across standard and non-standard serving scenarios, VibeServe matches highly optimized systems like vLLM in mainstream deployments and achieves substantial gains in specialized settings involving predicted-output decoding, hybrid prompt caching, streaming ASR, constrained JSON decoding, multimodal inference, and Apple Silicon deployment.
 
 ## Architecture
 
@@ -20,7 +20,7 @@ In a standard setting (Llama-3.1-8B on H100), VibeServe reaches near-parity with
 
 The framework factors the work along two axes:
 
-- **Outer loop** — a search policy operating over a *git-recorded* history of validated checkpoints. It picks the next optimization, dispatches one concrete task to the inner loop, and updates persistent planning state (issues, long-term memory file, commit graph). Three policies ship: an **issue-tracker** (used for the headline evaluation), an **evolutionary** population over git commits, and a **plain** queue-drain (Ralph-style).
+- **Outer loop** — a search policy operating over a git-recorded history of validated checkpoints. It picks the next optimization, dispatches one concrete task to the inner loop, and updates persistent planning state (issues, long-term memory file, commit graph). 
 - **Inner loop** — three role-specialized coding-agent invocations on a shared workspace:
   - *Implementer* writes/edits the candidate serving system.
   - *Accuracy Judge* runs the user-supplied checker against the reference and inspects diffs/runtime behavior for reward-hacking patterns; only correct candidates exit the inner loop.
@@ -55,13 +55,7 @@ vibe-serve \
   --modality speech_to_text
 ```
 
-`--outer-loop` selects the search policy (defaults to `agent`):
-
-| `--outer-loop` | Search policy | Planning state |
-|---|---|---|
-| `agent` (default) | LLM **Orchestrator** picks each round's task — the issue-tracker policy used in the paper | `roadmap.md` + `progress.md` (issue board) |
-| `plain` | Deterministic queue-drain (Ralph loop) | `IssueBoard` (`issues.json`) — `perf_eval` files issues, Implementer drains them |
-| `evolve` | Population-based mutation/selection | `population.json` — each offspring is a git commit |
+`--outer-loop` defaults to `agent`.  Pass `--outer-loop plain` or `--outer-loop evolve` to switch.  See `vibe-serve --outer-loop <kind> --help` for loop-specific flags.
 
 See `vibe-serve --outer-loop <kind> --help` for loop-specific flags.
 
@@ -170,11 +164,16 @@ examples/                         # six paper scenarios + nsys/torch profiler sk
 resources/skills/serving-systems/ # Agent Skills library
 ```
 
-Per-policy round algorithms:
-
-- **agent (issue-tracker)**: pre-round → Performance Evaluator → Orchestrator plan → Implementer/Judge retry up to `--max-retries-per-round` (default 3). Always exhausts `--max-rounds`; supports `revert_to_round` mid-loop.
-- **plain (Ralph)**: drain `IssueBoard` (one Implementer + one Judge per issue, BLOCK after `--max-attempts-per-issue`) → `perf_eval` (may file new issues). Early-exits when the queue is empty and `perf_eval` files nothing.
-- **evolve**: per generation × child: select parent (Pareto frontier with `--frontier-bias`, scalar softmax otherwise) + inspirations → `git checkout` parent tree → mutator → Judge → Performance Evaluator → commit. Runs the full `--max-generations × --children-per-generation`.
+- **agent**: pre-round → profiler → orchestrator plan → implementer/judge
+  retry up to `--max-retries-per-round` (default 3).  Always exhausts
+  `--max-rounds`; supports `revert_to_round` mid-loop.
+- **plain**: drain `IssueBoard` (one impl + one judge per issue, BLOCK
+  after `--max-attempts-per-issue`) → `perf_eval` (may file new issues).
+  Early-exits when queue is empty and `perf_eval` files nothing.
+- **evolve**: per generation × child: select parent (Pareto frontier with
+  `--frontier-bias`, scalar softmax otherwise) + inspirations →
+  `git checkout` parent tree → mutator → judge → profiler → commit.
+  No early stop; runs the full `--max-generations × --children-per-generation`.
 
 ## Development
 
@@ -182,15 +181,4 @@ Per-policy round algorithms:
 uv run pytest                                       # full suite
 uv run pytest tests/loops/plain/test_plain_loop.py  # one file
 uv run pytest -k orchestrator                       # by keyword
-```
-
-## Citation
-
-```bibtex
-@article{vibeserve2026,
-  title  = {VibeServe: Can AI Agents Build Bespoke LLM Serving Systems?},
-  author = {Kamahori, Keisuke and Li, Shihang and Peter, Simon and Kasikci, Baris},
-  year   = {2026},
-  institution = {University of Washington}
-}
 ```
