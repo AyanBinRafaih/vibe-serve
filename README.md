@@ -187,6 +187,8 @@ uv run pytest -k orchestrator                       # by keyword
 
 ## Citation
 
+If you use VibeServe in your research, please cite:
+
 ```bibtex
 @misc{kamahori2026vibeserveaiagentsbuild,
       title={VibeServe: Can AI Agents Build Bespoke LLM Serving Systems?},
