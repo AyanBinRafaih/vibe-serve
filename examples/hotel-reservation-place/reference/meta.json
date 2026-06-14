@@ -1,0 +1,74 @@
+{
+  "target": "DeathStarBench hotelReservation",
+  "repo": "https://github.com/delimitrou/DeathStarBench",
+  "subdir": "hotelReservation",
+  "frontend_port": 5000,
+  "deploy_cmd": "cd DeathStarBench/hotelReservation && docker compose up -d",
+  "teardown_cmd": "cd DeathStarBench/hotelReservation && docker compose down -v",
+
+  "api": {
+    "search": {
+      "method": "GET",
+      "path": "/hotels",
+      "params": ["inDate", "outDate", "lat", "lon"],
+      "response_shape": "GeoJSON FeatureCollection; features[].id is hotel ID (string), features[].properties.name, features[].geometry.coordinates"
+    },
+    "recommendations": {
+      "method": "GET",
+      "path": "/recommendations",
+      "params": ["lat", "lon", "require"],
+      "require_values": ["dis", "rate", "price"],
+      "response_shape": "Same GeoJSON FeatureCollection shape as /hotels"
+    },
+    "user": {
+      "method": "GET",
+      "path": "/user",
+      "params": ["username", "password"],
+      "response_success": {"message": "Login successfully!"},
+      "response_failure": {"message": "Failed. Please check your username and password. "}
+    },
+    "reservation": {
+      "method": "POST",
+      "path": "/reservation",
+      "params": ["hotelId", "inDate", "outDate", "customerName", "username", "password", "number"],
+      "response_success": {"message": "Reserve successfully!"},
+      "note": "customerName and username are both required as separate params, even if equal"
+    }
+  },
+
+  "credentials": {
+    "username_format": "Cornell_<hex(utf8(str(i)))>",
+    "password_format": "str(i) repeated 10 times, sent as plaintext",
+    "examples": {
+      "0":  {"username": "Cornell_30", "password": "0000000000"},
+      "1":  {"username": "Cornell_31", "password": "1111111111"},
+      "2":  {"username": "Cornell_32", "password": "2222222222"},
+      "3":  {"username": "Cornell_33", "password": "3333333333"}
+    },
+    "id_range": "0 to 500 inclusive (501 users)"
+  },
+
+  "search_params": {
+    "lat": 37.7749,
+    "lon": -122.4194,
+    "inDate": "2015-04-09",
+    "outDate": "2015-04-10"
+  },
+
+  "valid_date_range": {
+    "start": "2015-04-09",
+    "end": "2015-04-17",
+    "note": "Outside this range, rate plans may not exist and search may return empty results"
+  },
+
+  "hotel_capacity": {
+    "note": "Capacity is per-hotel total room count (the 'number' collection in reservation-db), NOT per-date. No per-date inventory beyond this cap.",
+    "hotel_1_to_6": 200,
+    "hotel_4_preexisting_reservation": {"customerName": "Alice", "inDate": "2015-04-09", "outDate": "2015-04-10", "number": 1},
+    "hotel_7_to_80_formula": "i % 3 == 1 -> 300; i % 3 == 2 -> 250; i % 3 == 0 -> 200",
+    "seeded_hotel_ids": "1 to 80 inclusive"
+  },
+
+  "no_reset_endpoint": true,
+  "state_persistence_note": "Reservations accumulate in MongoDB across runs. checker and benchmark must use partitioned hotel IDs / date pairs / user IDs to avoid interference, and must design overbooking checks to be idempotent across repeated runs."
+}
