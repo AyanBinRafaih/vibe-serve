@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -654,12 +655,100 @@ class _RunContext:
         gitignore = self.workspace / ".gitignore"
         gitignore.write_text("\n".join(sorted(self.EXCLUDED_WORKSPACE_DIRS)) + "\n")
 
-        self._git_run(["git", "add", "-A"])
+        self._git_add_all()
         self._git_run(["git", "commit", "-m", "initial: workspace setup"])
+
+    # -- snapshot resilience --------------------------------------------------
+    #
+    # On the Docker/Modal paths the sandbox runs as root and writes files into
+    # the bind-mounted workspace.  Most land mode-644 (host-readable), but a
+    # tool may emit a restrictive file the *host* user running `git add` cannot
+    # read (e.g. neuron-explorer's mode-600 ``system_profile.json``).  A single
+    # such file makes ``git add -A`` exit 128 and would otherwise abort the whole
+    # run.  These are always transient scratch artifacts we never want in a
+    # checkpoint, so we exclude them (local-only, via ``.git/info/exclude``)
+    # rather than fail.
+
+    def _collect_unreadable(self) -> list[str]:
+        """Workspace-relative paths the snapshotting user cannot read.
+
+        Walks the worktree (skipping ``.git``, never following symlinks) and
+        records files lacking ``R_OK`` and directories lacking ``R_OK|X_OK``
+        (an unsearchable dir hides its whole subtree from ``git add`` too).
+        """
+        unreadable: list[str] = []
+        root = str(self.workspace)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if ".git" in dirnames:
+                dirnames.remove(".git")
+            kept = []
+            for d in dirnames:
+                full = os.path.join(dirpath, d)
+                if os.access(full, os.R_OK | os.X_OK):
+                    kept.append(d)
+                else:
+                    unreadable.append(os.path.relpath(full, root))
+            dirnames[:] = kept  # prune unsearchable dirs from the walk
+            for f in filenames:
+                full = os.path.join(dirpath, f)
+                if not os.access(full, os.R_OK):
+                    unreadable.append(os.path.relpath(full, root))
+        return unreadable
+
+    @staticmethod
+    def _unreadable_from_stderr(stderr: str) -> list[str]:
+        """Parse paths git reported it could not index from *stderr*.
+
+        Git prints e.g. ``error: open("foo"): Permission denied`` and
+        ``error: unable to index file 'foo'``.
+        """
+        paths: list[str] = []
+        for m in re.finditer(r'(?:open\("|unable to index file \')([^"\']+)', stderr):
+            paths.append(m.group(1))
+        return paths
+
+    def _exclude_paths(self, rel_paths: list[str]) -> None:
+        """Append *rel_paths* to ``.git/info/exclude`` (local, untracked)."""
+        rel_paths = [p for p in dict.fromkeys(rel_paths) if p]
+        if not rel_paths:
+            return
+        exclude_file = self.workspace / ".git" / "info" / "exclude"
+        exclude_file.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude_file.read_text() if exclude_file.exists() else ""
+        have = set(existing.splitlines())
+        new = [p for p in rel_paths if p not in have]
+        if not new:
+            return
+        prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+        exclude_file.write_text(existing + prefix + "\n".join(new) + "\n")
+        shown = ", ".join(new[:5]) + ("…" if len(new) > 5 else "")
+        self.lprint(
+            f"[git-tracking] excluded {len(new)} unreadable path(s) from "
+            f"snapshot: {shown}"
+        )
+
+    def _git_add_all(self) -> None:
+        """``git add -A``, resilient to files the host user cannot read.
+
+        Excludes unreadable paths up front, then retries on any residual
+        permission failure (a file may appear between the scan and the add).
+        """
+        self._exclude_paths(self._collect_unreadable())
+        for _ in range(3):
+            result = self._git_run(["git", "add", "-A"], check=False)
+            if result.returncode == 0:
+                return
+            stderr = result.stderr.decode(errors="replace")
+            offenders = self._unreadable_from_stderr(stderr)
+            if not offenders:
+                break  # failure unrelated to unreadable files — surface it
+            self._exclude_paths(offenders)
+        # Final attempt: let _git_run raise with full diagnostics if it still fails.
+        self._git_run(["git", "add", "-A"])
 
     def _git_snapshot(self, label: str) -> None:
         """Commit current workspace state with *label* as the commit message."""
-        self._git_run(["git", "add", "-A"])
+        self._git_add_all()
         # git diff --cached --quiet exits 1 when there are staged changes
         has_changes = self._git_run(
             ["git", "diff", "--cached", "--quiet"], check=False,

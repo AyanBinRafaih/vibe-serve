@@ -49,7 +49,7 @@ def _explorer() -> str:
     return "neuron-explorer"
 
 
-def _run(cmd: list[str], *, timeout: int = 1800) -> int:
+def _run(cmd: list[str], *, timeout: int = 1800, cwd: str | None = None) -> int:
     """Run *cmd*, streaming combined output to stdout. Returns exit code."""
     print(f"$ {' '.join(cmd)}", flush=True)
     try:
@@ -59,6 +59,7 @@ def _run(cmd: list[str], *, timeout: int = 1800) -> int:
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
+            cwd=cwd,
         )
     except FileNotFoundError:
         print(
@@ -114,7 +115,12 @@ def cmd_capture(ns) -> None:
         "-o", str(out_dir),
         "bash", "-lc", workload,
     ]
-    rc = _run(cmd, timeout=ns.timeout)
+    # Run with cwd=out_dir: neuron-explorer drops stray artifacts
+    # (system_profile.json, ntrace.pb) into the *current directory* regardless
+    # of -o. If that's the git-tracked /workspace, those root-owned, mode-600
+    # files break the host-side per-round `git add -A`. Keeping cwd in the
+    # out-dir (under /tmp) contains them.
+    rc = _run(cmd, timeout=ns.timeout, cwd=str(out_dir))
     ntff = _find_one(out_dir, ".ntff")
     neff = _find_one(out_dir, ".neff")
     print("\n--- capture artifacts ---")
