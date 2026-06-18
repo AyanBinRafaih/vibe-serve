@@ -641,6 +641,21 @@ class _RunContext:
             result.check_returncode()
         return result
 
+    # Compiled-accelerator artifacts an agent may emit into the workspace.
+    # Large and never wanted in a per-round checkpoint. The Neuron compile cache
+    # is bind-mounted *outside* the workspace, but a stray trace/compile call
+    # pointed at the workspace (or a torch.compile dump) would otherwise be
+    # committed and bloat history across rounds.
+    _ARTIFACT_GITIGNORE_PATTERNS: tuple[str, ...] = (
+        "*.neff", "*.ntff", "*.neuron",
+        "neuroncc_compile_workdir/", "neuron-compile-cache/",
+    )
+
+    def _workspace_gitignore(self) -> str:
+        """Contents of the workspace ``.gitignore`` (excluded dirs + artifacts)."""
+        lines = sorted(self.EXCLUDED_WORKSPACE_DIRS) + list(self._ARTIFACT_GITIGNORE_PATTERNS)
+        return "\n".join(lines) + "\n"
+
     def _init_git_tracking(self, existing: bool) -> None:
         """Initialize or validate the git repo in the unified workspace."""
         if existing:
@@ -653,7 +668,7 @@ class _RunContext:
         self._git_run(["git", "init"])
 
         gitignore = self.workspace / ".gitignore"
-        gitignore.write_text("\n".join(sorted(self.EXCLUDED_WORKSPACE_DIRS)) + "\n")
+        gitignore.write_text(self._workspace_gitignore())
 
         self._git_add_all()
         self._git_run(["git", "commit", "-m", "initial: workspace setup"])
