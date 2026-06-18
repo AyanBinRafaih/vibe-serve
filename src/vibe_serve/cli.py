@@ -290,6 +290,8 @@ def load_config_and_skills(
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    backend: ComputeBackend = args.backend or config.backend.name
+
     if getattr(args, "no_skills", False):
         skills = None
     else:
@@ -298,7 +300,15 @@ def load_config_and_skills(
             if isinstance(args.skills_dir, list)
             else ([str(args.skills_dir)] if args.skills_dir else None)
         )
-    backend: ComputeBackend = args.backend or config.backend.name
+        # Trainium targets get the vendored AWS NKI skills automatically so the
+        # implementer can write NeuronCore kernels. Other backends are
+        # unaffected; --no-skills still disables everything.
+        if backend == ComputeBackend.TRAINIUM:
+            nki_skills = PROJECT_ROOT / "resources" / "skills" / "neuron-agentic-development" / "skills"
+            if nki_skills.is_dir():
+                skills = (skills or [])
+                if str(nki_skills) not in skills:
+                    skills.append(str(nki_skills))
     return config, skills, backend
 
 
