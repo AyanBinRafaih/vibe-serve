@@ -5,9 +5,14 @@ AutoModelForCausalLM reference.
 
 Both paths use greedy decoding (temperature=0) so outputs must match exactly.
 
+Device is auto-detected: cuda:0 if available, else cpu (AWS Trainium boxes
+have no CUDA, so the HF reference and the custom model both run on CPU in
+BF16 here — this checks correctness, not speed).
+
 Usage:
-    CUDA_VISIBLE_DEVICES=0 .venv/bin/python accuracy_checker.py
-    CUDA_VISIBLE_DEVICES=0 .venv/bin/python accuracy_checker.py --model-dir ../model
+    python checker.py                      # auto device
+    python checker.py --model-dir ../model
+    python checker.py --device cpu         # force
 """
 
 import argparse
@@ -17,6 +22,27 @@ from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def _resolve_device(requested: str | None) -> str:
+    """Pick a runnable device. Trainium boxes have no CUDA, so fall back to CPU.
+
+    The HF *reference* model has no Neuron build, so it runs on CPU here; the
+    custom implementation is also exercised on the same device for an
+    apples-to-apples greedy token-ID comparison (correctness, not speed —
+    throughput is measured separately by the benchmark).
+    """
+    if requested and requested.lower() != "auto":
+        return requested
+    if torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
+
+
+def _dtype_for(device: str) -> torch.dtype:
+    """BF16 on CPU/Neuron (matches the BF16 serving dtype and is well-supported
+    on CPU, unlike FP16); FP16 on CUDA for parity with GPU serving."""
+    return torch.float16 if device.startswith("cuda") else torch.bfloat16
 
 
 def _load_custom_model_class():
@@ -151,11 +177,17 @@ def main():
         "--model-dir", type=str, default="../model",
         help="Local path to model weights directory (default: ../model)",
     )
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--device", type=str, default="auto",
+        help="Device for both reference and custom model. 'auto' (default) "
+             "uses cuda:0 if available, else cpu (Trainium boxes have no CUDA).",
+    )
     args = parser.parse_args()
 
+    device = _resolve_device(args.device)
     model_dir = str(Path(args.model_dir).resolve())
-    dtype = torch.float16
+    dtype = _dtype_for(device)
+    print(f"Accuracy check device={device} dtype={dtype}")
 
     # --- Load tokenizer (from local path) ---
     print(f"Loading tokenizer from: {model_dir}")
@@ -175,30 +207,32 @@ def main():
         test_cases.append((prompt, max_tokens, f"[chat] {desc}"))
 
     # --- Generate reference outputs with HF model, then unload ---
-    print(f"\nLoading HF reference model on {args.device} ...")
+    # Load on CPU first, then move with .to(device) — avoids device_map, which
+    # requires `accelerate` and assumes CUDA.
+    print(f"\nLoading HF reference model on {device} ...")
     t0 = time.perf_counter()
     ref_model = AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=dtype, device_map=args.device,
-        attn_implementation="eager",
+        model_dir, torch_dtype=dtype, attn_implementation="eager",
     )
-    ref_model.eval()
+    ref_model.to(device).eval()
     print(f"  HF model loaded in {time.perf_counter() - t0:.1f}s")
 
     print("Generating reference outputs ...")
     ref_outputs: list[list[int]] = []
     for prompt, max_tokens, desc in test_cases:
-        ref_outputs.append(generate_reference(ref_model, tokenizer, prompt, max_tokens, args.device))
+        ref_outputs.append(generate_reference(ref_model, tokenizer, prompt, max_tokens, device))
 
-    # Unload HF model to free GPU memory
+    # Unload reference model to free memory.
     del ref_model
-    torch.cuda.empty_cache()
-    print("  HF model unloaded from GPU.\n")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("  HF reference model unloaded.\n")
 
     # --- Load custom model ---
-    print(f"Loading custom model (VibeServeModel from main.py) on {args.device} ...")
+    print(f"Loading custom model (VibeServeModel from main.py) on {device} ...")
     t0 = time.perf_counter()
     VibeServeModel = _load_custom_model_class()
-    custom_model = VibeServeModel.from_pretrained(model_dir, args.device, dtype)
+    custom_model = VibeServeModel.from_pretrained(model_dir, device, dtype)
     print(f"  Custom model loaded in {time.perf_counter() - t0:.1f}s\n")
 
     # --- Run all tests ---
@@ -218,7 +252,7 @@ def main():
         print(f"  Prompt: {prompt_preview!r}")
 
         ref_ids = ref_outputs[i - 1]
-        custom_ids = generate_custom(custom_model, tokenizer, prompt, max_tokens, args.device)
+        custom_ids = generate_custom(custom_model, tokenizer, prompt, max_tokens, device)
 
         match, detail = compare_outputs(ref_ids, custom_ids, tokenizer)
         if match:
