@@ -58,6 +58,9 @@ _DEFAULT_SHM_SIZE = "16g"
 # rounds.  Kept *outside* /workspace so the git-tracked workspace doesn't
 # balloon with multi-MB NEFFs.
 _CACHE_CONTAINER_PATH = "/opt/neuron-compile-cache"
+# neuronx-cc temp/workdir (TMPDIR), host-mounted so intermediates stay off the
+# container overlay.
+_TMP_CONTAINER_PATH = "/opt/neuron-tmp"
 
 
 def _discover_neuron_devices() -> list[str]:
@@ -152,6 +155,15 @@ class TrainiumBackend:
             bind_mounts.append((str(host_cache), _CACHE_CONTAINER_PATH, False))
             passthrough_paths.append(_CACHE_CONTAINER_PATH)
 
+            # neuronx-cc writes large intermediates to its temp/workdir (TMPDIR).
+            # Left on the container overlay these grow many GB per round and are
+            # only reclaimed when the container is removed.  Redirect them to a
+            # host-mounted dir so they live on the roomy host disk instead.
+            host_tmp = self.log_dir / "neuron-tmp"
+            host_tmp.mkdir(parents=True, exist_ok=True)
+            bind_mounts.append((str(host_tmp), _TMP_CONTAINER_PATH, False))
+            passthrough_paths.append(_TMP_CONTAINER_PATH)
+
             return DockerSandbox(
                 host_workspace=host_workspace,
                 image=self.image,
@@ -163,6 +175,9 @@ class TrainiumBackend:
                 entrypoint="",
                 # neuronx-cc needs far more than Docker's default 64 MB /dev/shm.
                 shm_size=_DEFAULT_SHM_SIZE,
+                # Reclaim the container's overlay (GBs of compiled artifacts)
+                # automatically when it goes away, even on a hard kill.
+                auto_remove=True,
                 bind_mounts=bind_mounts,
                 passthrough_paths=passthrough_paths,
                 env=env,
@@ -188,6 +203,9 @@ class TrainiumBackend:
         env: dict[str, str] = {
             # Persistent neuronx-cc cache so repeated compiles are cheap.
             "NEURON_COMPILE_CACHE_URL": _CACHE_CONTAINER_PATH,
+            # Keep neuronx-cc's large temp/workdir on the host mount, not the
+            # container overlay.
+            "TMPDIR": _TMP_CONTAINER_PATH,
         }
         env.update(extra)
         return env

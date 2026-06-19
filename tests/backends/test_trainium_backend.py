@@ -61,6 +61,10 @@ class TestTrainiumSandbox:
         )
         assert "/opt/neuron-compile-cache" in sb._passthrough_prefixes
         assert sb._env.get("NEURON_COMPILE_CACHE_URL") == "/opt/neuron-compile-cache"
+        # auto-remove container + host-mounted neuronx-cc temp (TMPDIR)
+        assert sb._auto_remove is True
+        assert sb._env.get("TMPDIR") == "/opt/neuron-tmp"
+        assert any(c == "/opt/neuron-tmp" for _h, c, _ro in sb._bind_mounts)
 
     def test_modal_raises(self, tmp_path):
         impl = _make_backend(tmp_path)

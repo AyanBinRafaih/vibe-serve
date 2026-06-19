@@ -88,6 +88,7 @@ class DockerSandbox(BaseSandbox):
         devices: list[str] | None = None,
         entrypoint: str | None = None,
         shm_size: str | None = None,
+        auto_remove: bool = False,
         default_timeout: int = 300,
         start_timeout: int = 120,
         max_output_bytes: int = 100_000,
@@ -142,6 +143,7 @@ class DockerSandbox(BaseSandbox):
         self._devices: list[str] = list(devices or [])
         self._entrypoint = entrypoint
         self._shm_size = shm_size
+        self._auto_remove = auto_remove
         self._default_timeout = default_timeout
         self._start_timeout = start_timeout
         self._max_output_bytes = max_output_bytes
@@ -291,6 +293,12 @@ class DockerSandbox(BaseSandbox):
             "--name", self._container_name,
             "-v", f"{self._host_workspace}:/workspace",
         ]
+        if self._auto_remove:
+            # Auto-remove the container (and its overlay, which can hold many GB
+            # of compiled artifacts) whenever it goes away — including when the
+            # framework process is killed and the container is later stopped,
+            # which the graceful stop()/rm path would miss.
+            cmd.append("--rm")
         if self._gpus is not None:
             gpu_spec = self._resolve_gpu_device(self._gpus)
             cmd.extend(["--gpus", gpu_spec])

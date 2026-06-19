@@ -676,3 +676,21 @@ class TestShmSize:
         mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="abc\n", stderr="")
         sandbox.start()
         assert "--shm-size" not in mock_run.call_args_list[0][0][0]
+
+
+class TestAutoRemove:
+    @patch("subprocess.run")
+    def test_auto_remove_emits_rm_flag(self, mock_run, tmp_path):
+        sandbox = DockerSandbox(
+            host_workspace=str(tmp_path / "workspace"), image="img", auto_remove=True
+        )
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="abc\n", stderr="")
+        sandbox.start()
+        assert "--rm" in mock_run.call_args_list[0][0][0]
+
+    @patch("subprocess.run")
+    def test_no_rm_by_default(self, mock_run, tmp_path):
+        sandbox = DockerSandbox(host_workspace=str(tmp_path / "workspace"), image="img")
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="abc\n", stderr="")
+        sandbox.start()
+        assert "--rm" not in mock_run.call_args_list[0][0][0]
