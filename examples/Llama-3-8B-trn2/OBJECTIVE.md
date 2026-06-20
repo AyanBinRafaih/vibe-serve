@@ -34,8 +34,11 @@ as `perf_metric` every round; do not substitute or invert it.
 - Text-generation, dense causal LM (Llama-3-8B: 32 layers, hidden 4096, GQA
   with 8 KV heads, vocab 128256, RoPE theta 5e5, 8192-token context, no
   rope-scaling).
-- The benchmark drives the server over HTTP with a fixed-length Poisson sweep
-  (input == output length of 128/256/512 tokens, rates up to 2.0 req/s) and
-  reports `aggregate_throughput` (tok/s) — the primary metric.
+- The benchmark drives the server over HTTP with fixed in/out token lengths
+  (128/256/512). It **warms up first** (compiles the buckets, untimed) and then
+  measures **closed-loop** at several concurrency levels — so the reported
+  `aggregate_throughput` (tok/s, the primary metric) is the peak *steady-state*
+  throughput, not dragged down by cold compiles or queueing. Higher concurrency
+  drives bigger decode batches: a server that keeps the NeuronCore fed wins.
 - Correctness is judged by the accuracy checker against the HuggingFace
   Transformers reference; match its tolerance before chasing throughput.

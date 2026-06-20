@@ -35,7 +35,7 @@ NeuronCores execute *compiled graphs* (NEFFs). You cannot profile work that neve
    ```
    python neuron_profiler/analyze_neuron.py capture \
      --out-dir /tmp/neuronprof \
-     --workload "uv run python {{ bench_path or 'bench' }}/benchmark.py --url http://localhost:8077 --lengths 256 --rates 1.0 --requests-per-scenario 8"
+     --workload "uv run python {{ bench_path or 'bench' }}/benchmark.py --url http://localhost:8077 --lengths 256 --concurrency 4 --duration 10 --warmup-requests 1"
    ```
    `capture` wraps `neuron-explorer inspect`, which runs the workload and writes a system + device profile (NTFF) plus the NEFF into the out-dir. If it reports **no NTFF/NEFF produced**, the model is not executing on the NeuronCore — record that as the headline finding.
 
