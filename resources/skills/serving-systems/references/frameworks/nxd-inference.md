@@ -16,18 +16,23 @@ distribution, compilation, and serving on Trainium/Inferentia.
 It is built on `torch-neuronx` (it compiles via `neuronx-cc` like everything
 else — see [`neuron-pytorch.md`](neuron-pytorch.md)).
 
-## When to use it — and when not to
+## When to use it
 
-- **Use it** when the goal is "serve model X on Trainium" with the least code and
-  you're allowed turnkey libraries.
-- **Do NOT import it** when the task is to build a **bespoke / from-scratch**
-  serving system (it *is* the turnkey path you're asked to replace). In that
-  case, treat NxD as a **reference for the techniques** — how it shards, batches,
-  caches KV, and samples on-device — and reimplement what you need over your own
-  static-shape graphs.
+- **Full turnkey** — "serve model X on Trainium" with the least code: let NxD own
+  the whole model.
+- **Building blocks in a bespoke server (recommended on Trainium)** — even when
+  you write your own model layers, lean on NxD's **infrastructure**: its
+  **`KVCacheManager`** for a **device-resident, in-place KV cache** and its
+  **`ModelBuilder`** for tracing + the input/output aliasing that keeps that
+  cache resident. This is the supported way to beat the host-bound decode trap;
+  a from-scratch KV cache on raw `torch_neuronx.trace` cannot stay device-
+  resident. **Start at [`nxd-kv-cache.md`](nxd-kv-cache.md).**
 
-For the actual implementation patterns (static shapes, compile cache, BF16,
-KV-cache buffers) read [`neuron-pytorch.md`](neuron-pytorch.md); for custom
-kernels, the `neuron-nki-*` skills.
+So you don't have to choose all-or-nothing: keep the architecture yours, borrow
+NxD's KV-cache / tracing plumbing.
+
+For the lower-level static-shape/compile-cache/BF16 mechanics read
+[`neuron-pytorch.md`](neuron-pytorch.md); for custom kernels, the `neuron-nki-*`
+skills.
 
 Source: [NxD Inference docs](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/libraries/nxd-inference/index.html).

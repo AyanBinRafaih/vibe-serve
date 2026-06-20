@@ -19,10 +19,17 @@ as `perf_metric` every round; do not substitute or invert it.
 
 ## Implementation rules
 
-- Build the model yourself in **PyTorch** — explicit layers (your own attention
-  / MLP / RMSNorm / RoPE), using `transformers` only as a utility for config /
-  tokenizer / weight loading. Do **not** import a turnkey serving library. The
-  point is a bespoke implementation.
+- Build the model in **PyTorch** with explicit layers (your own attention / MLP
+  / RMSNorm / RoPE), using `transformers` only as a utility for config /
+  tokenizer / weight loading. Keep the architecture yours — don't hide the whole
+  model behind a one-call turnkey `generate()`.
+- You **may** (and for performance, should) build on **NxD Inference**
+  (`neuronx_distributed` / `neuronx_distributed_inference`) for the
+  Neuron-specific serving plumbing — in particular its **`KVCacheManager`**
+  (device-resident, in-place KV cache) and **`ModelBuilder`** (tracing + the
+  input/output aliasing that keeps the cache resident across decode steps). A
+  from-scratch KV cache on raw `torch_neuronx.trace` cannot stay device-resident
+  — NxD is the supported way to get there. See the **`nxd-kv-cache`** skill.
 - Run it on the NeuronCore in **BF16**; do not run the hot path on CPU or in
   `float32` (a server that loads but silently falls back to CPU is incorrect for
   this target). See the Trainium skill for how PyTorch maps onto NeuronCores.

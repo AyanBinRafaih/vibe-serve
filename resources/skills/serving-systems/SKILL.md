@@ -31,7 +31,7 @@ Three techniques every production serving system on NVIDIA ships with — confir
 
 ### On AWS Trainium (Neuron) instead
 
-Trainium is not a GPU — the floor is different. Start from [`references/frameworks/neuron-pytorch.md`](references/frameworks/neuron-pytorch.md) and [`references/hardware/aws-trainium.md`](references/hardware/aws-trainium.md). The defaults there: **static-shape graphs** (bucket prompt/decode lengths; `neuronx-cc` recompiles on new shapes), a **persistent compile cache**, **BF16**, on-device sampling, and continuous batching over static buffers. For custom NeuronCore kernels use the bundled **`neuron-nki-*`** skills (the Trainium analog of FlashInfer/Triton kernels).
+Trainium is not a GPU — the floor is different. Start from [`references/frameworks/neuron-pytorch.md`](references/frameworks/neuron-pytorch.md) and [`references/hardware/aws-trainium.md`](references/hardware/aws-trainium.md). The defaults there: **static-shape graphs** (bucket prompt/decode lengths; `neuronx-cc` recompiles on new shapes), a **persistent compile cache**, **BF16**, on-device sampling, and continuous batching over static buffers. The decisive decode optimization is a **device-resident, in-place KV cache** — use NxD's `KVCacheManager` + `ModelBuilder` aliasing ([`references/frameworks/nxd-kv-cache.md`](references/frameworks/nxd-kv-cache.md)); a from-scratch `torch_neuronx.trace` decode that passes the KV cache through the graph boundary every token is host-bound and slow. For custom NeuronCore kernels use the bundled **`neuron-nki-*`** skills (the Trainium analog of FlashInfer/Triton kernels).
 
 ## Reference index
 
@@ -112,7 +112,9 @@ Each entry below is one file under [`references/`](references/). The bracketed p
 
 - [`references/frameworks/neuron-pytorch.md`](references/frameworks/neuron-pytorch.md) — PyTorch on AWS Trainium (Neuron) — torch-neuronx vs TorchNeuron Native, `neuronx-cc` compilation, static-shape bucketing, persistent compile cache, BF16, static KV cache, host-sync pitfalls, when to drop to NKI.
 
-- [`references/frameworks/nxd-inference.md`](references/frameworks/nxd-inference.md) — NxD Inference (NeuronX Distributed Inference) — AWS's turnkey Trainium inference library (NeuronConfig / ModelBuilder / generate); when to use it vs. reimplement its techniques in a bespoke build.
+- [`references/frameworks/nxd-inference.md`](references/frameworks/nxd-inference.md) — NxD Inference (NeuronX Distributed Inference) — AWS's Trainium inference library (NeuronConfig / ModelBuilder / generate); full-turnkey or as building blocks inside a bespoke server.
+
+- [`references/frameworks/nxd-kv-cache.md`](references/frameworks/nxd-kv-cache.md) — NxD `KVCacheManager` — the device-resident, in-place KV cache for Trainium (resident `nn.Parameter` buffers + `ModelBuilder` input/output aliasing). The key decode optimization; what raw `torch_neuronx.trace` can't do.
 
 - [`references/frameworks/triton.md`](references/frameworks/triton.md) — Triton as a framework-level decision — when a custom Triton kernel pays off in serving vs reusing FlashInfer / FlashAttention / CUTLASS / liger / sgl-kernel.
 
