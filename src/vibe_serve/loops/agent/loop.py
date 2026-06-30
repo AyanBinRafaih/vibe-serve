@@ -19,6 +19,11 @@ from vibe_serve.config import Config
 from vibe_serve.constants import ComputeBackend, DEFAULT_COMPUTE_BACKEND
 from vibe_serve.context import _RunContext
 from vibe_serve.loops.agent import issue_board
+from vibe_serve.loops.agent.domain import (
+    DEFAULT_DOMAIN,
+    render_domain_section,
+    resolve_domain,
+)
 from vibe_serve.schemas import (
     OrchestratorPlan,
     PreRoundDecision,
@@ -288,6 +293,25 @@ def _run_profiler(
     return summary
 
 
+def _domain_render_context(ctx: _RunContext, modality: str) -> dict[str, object]:
+    """The uniform variable set every domain ``## <role>`` section is rendered with.
+
+    One context contract for all roles: a pack author can branch (``{% if … %}``)
+    on any of these in any role section without memorizing which the loop happens
+    to pass to which role. Variables that don't apply to the current run are
+    falsy (``bench_path`` / ``accuracy_checker_path`` when nothing is attached),
+    so ``{% if bench_path %}`` works everywhere. See
+    ``templates/_domain/README.md``.
+    """
+    return {
+        "modality": modality,
+        "reference_path": ctx.ref_name,
+        "bench_path": ctx.judge_bench_path,
+        "accuracy_checker_path": ctx.judge_acc_checker_path,
+        "runtime_notes": ctx.run_environment_view.prompt_notes,
+    }
+
+
 def _run_orchestrator_plan(
     ctx: _RunContext,
     *,
@@ -298,7 +322,12 @@ def _run_orchestrator_plan(
     progress_path: Path,
     roadmap_text: str,
     plateau_warning: str | None,
+    modality: str,
+    domain_path: Path,
 ) -> OrchestratorPlan:
+    domain_orchestrator = render_domain_section(
+        domain_path, "orchestrator", **_domain_render_context(ctx, modality)
+    )
     system_prompt = render_template(
         "orchestrator_plan_prompt.j2",
         template_dir=_TEMPLATE_DIR,
@@ -308,6 +337,7 @@ def _run_orchestrator_plan(
         exhaustion_info=carry.exhaustion_info,
         roadmap_text=roadmap_text,
         plateau_warning=plateau_warning,
+        domain_orchestrator=domain_orchestrator,
         runtime_notes=ctx.run_environment_view.prompt_notes,
         env_kind=ctx.run_environment_view.env_kind,
     )
@@ -334,14 +364,19 @@ def _run_implementer(
     retry: int,
     plan: OrchestratorPlan,
     modality: str,
+    domain_path: Path,
     feedback: str | None,
     progress_path: Path,
 ) -> ImplementerResponse:
+    domain_implementer = render_domain_section(
+        domain_path, "implementer", **_domain_render_context(ctx, modality)
+    )
     system_prompt = render_template(
         "implementer_prompt.j2",
         template_dir=_TEMPLATE_DIR,
         reference_path=ctx.ref_name,
         modality=modality,
+        domain_implementer=domain_implementer,
         task=plan.task,
         pass_criteria=plan.pass_criteria,
         retry=retry,
@@ -375,9 +410,13 @@ def _run_judge(
     retry: int,
     plan: OrchestratorPlan,
     modality: str,
+    domain_path: Path,
     progress_path: Path,
     objective: str,
 ) -> JudgeResponse:
+    domain_judge = render_domain_section(
+        domain_path, "judge", **_domain_render_context(ctx, modality)
+    )
     system_prompt = render_template(
         "judge_prompt.j2",
         template_dir=_TEMPLATE_DIR,
@@ -385,6 +424,7 @@ def _run_judge(
         bench_path=ctx.judge_bench_path,
         pass_criteria=plan.pass_criteria,
         modality=modality,
+        domain_judge=domain_judge,
         retry=retry,
         runtime_notes=ctx.run_environment_view.prompt_notes,
         env_kind=ctx.run_environment_view.env_kind,
@@ -417,6 +457,7 @@ def _run_single_agent_round(
     retry: int,
     plan: OrchestratorPlan,
     modality: str,
+    domain_path: Path,
     feedback: str | None,
     progress_path: Path,
     objective: str,
@@ -428,11 +469,15 @@ def _run_single_agent_round(
     multi-agent loop hands to the implementer is used here — it has
     workspace write access plus shell access for benchmarks/profiling.
     """
+    domain_single_agent = render_domain_section(
+        domain_path, "single_agent", **_domain_render_context(ctx, modality)
+    )
     system_prompt = render_template(
         "single_agent_round_prompt.j2",
         template_dir=_TEMPLATE_DIR,
         reference_path=ctx.ref_name,
         modality=modality,
+        domain_single_agent=domain_single_agent,
         task=plan.task,
         pass_criteria=plan.pass_criteria,
         retry=retry,
@@ -512,6 +557,7 @@ def run_agent_loop(
     backend: ComputeBackend = DEFAULT_COMPUTE_BACKEND,
     modality: str = "text_generation",
     inner_loop: str = "multi-agent",
+    domain: str = DEFAULT_DOMAIN,
 ) -> bool:
     """Run the orchestrator-driven build loop.
 
@@ -532,6 +578,9 @@ def run_agent_loop(
         raise ValueError(
             f"Unknown inner_loop {inner_loop!r}; choose from {', '.join(_INNER_LOOPS)}"
         )
+    # Resolve the domain pack once (fail fast on an unknown name/path). The
+    # per-role sections are parsed and rendered into the prompts at each call site.
+    domain_path = resolve_domain(domain)
     run_environment = run_environment or make_run_environment_spec()
     ctx = _RunContext(
         config=config,
@@ -624,6 +673,8 @@ def run_agent_loop(
                 progress_path=progress_path,
                 roadmap_text=roadmap_text,
                 plateau_warning=plateau_warning,
+                modality=modality,
+                domain_path=domain_path,
             )
 
             # No early stop: the loop always consumes the full max_rounds
@@ -664,6 +715,7 @@ def run_agent_loop(
                         retry=retry,
                         plan=plan,
                         modality=modality,
+                        domain_path=domain_path,
                         feedback=feedback,
                         progress_path=progress_path,
                     )
@@ -674,6 +726,7 @@ def run_agent_loop(
                         retry=retry,
                         plan=plan,
                         modality=modality,
+                        domain_path=domain_path,
                         progress_path=progress_path,
                         objective=objective,
                     )
@@ -689,6 +742,7 @@ def run_agent_loop(
                         retry=retry,
                         plan=plan,
                         modality=modality,
+                        domain_path=domain_path,
                         feedback=feedback,
                         progress_path=progress_path,
                         objective=objective,

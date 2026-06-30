@@ -92,6 +92,17 @@ def render_template(
     return env.get_template(name).render(**kwargs)
 
 
+def render_string(source: str, **kwargs: object) -> str:
+    """Render a Jinja2 template from an in-memory string.
+
+    Used by call sites that hold the template text directly rather than a
+    file on disk (e.g. a domain pack's role section parsed out of a single
+    Markdown file). Shares the root environment's settings so ``{% if %}``
+    trimming matches file-based templates.
+    """
+    return _env.from_string(source).render(**kwargs)
+
+
 class ComputeBackendFragment(ABC):
     """Provides backend-specific Jinja fragments under
     ``vibe_serve/templates/_backend/<backend>/``.

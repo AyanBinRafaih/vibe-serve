@@ -72,6 +72,31 @@ A separate entry point exposes the issue MCP server used by the plain loop:
 vibe-serve-issue-mcp                         # serves issues.json over MCP
 ```
 
+## Domains — pointing vibeserve at your problem space
+
+A **domain** is the bundle of cross-cutting context the agents need for whatever
+you're building: the background knowledge the implementer must read, and the
+correctness/performance/integrity gates the judge enforces. It answers *"what
+kind of system is this, and what does 'good' mean here?"* — kept separate from
+the neutral prompt skeleton and from the per-task I/O contract (`--modality`).
+
+Select one with `--domain` (agent loop):
+
+```bash
+vibe-serve --outer-loop agent --domain llm-serving ...      # default
+vibe-serve --outer-loop agent --domain generic ...          # no domain context
+vibe-serve --outer-loop agent --domain ./my-domain.md ...   # your own (a path)
+```
+
+`--domain` takes a **built-in name** (`llm-serving`, `generic`) **or a path** to
+your own `.md` file anywhere on disk. A domain is just a single Markdown file:
+free-form description prose, then `## implementer`, `## judge`, and (optionally)
+`## single_agent` sections that drop into the prompts at one labelled point each.
+Omit `## single_agent` and it's derived from the other two. Author your own by
+copying `generic.md` — no code change required.
+
+Full authoring guide: [`src/vibe_serve/loops/agent/templates/_domain/README.md`](src/vibe_serve/loops/agent/templates/_domain/README.md).
+
 ## Per-target inputs
 
 Each evaluation target lives under `examples/<name>/`:
