@@ -16,6 +16,12 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
+[manifest]
+members = [
+    "vibe-serve",
+    "vs-feature-flags",
+]
+
 [[package]]
 name = "agentshim"
 version = "0.5.0"
@@ -4548,6 +4554,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "soundfile" },
+    { name = "vs-feature-flags" },
 ]
 
 [package.dev-dependencies]
@@ -4581,6 +4588,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "soundfile", specifier = ">=0.13.1" },
+    { name = "vs-feature-flags", editable = "libs/vs-feature-flags" },
 ]
 
 [package.metadata.requires-dev]
@@ -4596,6 +4604,11 @@ test = [
     { name = "pytest" },
     { name = "pytest-cov" },
 ]
+
+[[package]]
+name = "vs-feature-flags"
+version = "0.1.0"
+source = { editable = "libs/vs-feature-flags" }
 
 [[package]]
 name = "watchfiles"

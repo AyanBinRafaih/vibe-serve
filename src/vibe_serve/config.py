@@ -19,9 +19,11 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from vibe_serve.constants import DEFAULT_COMPUTE_BACKEND, PROJECT_ROOT, ComputeBackend
+from vibe_serve.features import FeatureFlag
+from vs_feature_flags import parse_feature_flag_overrides
 
 Provider = Literal["vertex-ai", "anthropic", "google-genai", "openai", "openai-compatible"]
 
@@ -216,6 +218,15 @@ class Config(_Strict):
         default_factory=PerfEvalCfg,
         description="[perf_eval] — performance-evaluation settings.",
     )
+    feature_flags: dict[FeatureFlag, bool] = Field(
+        default_factory=dict,
+        description="[feature_flags] — typed feature-flag overrides.",
+    )
+
+    @field_validator("feature_flags", mode="before")
+    @classmethod
+    def _parse_feature_flags(cls, value: object) -> dict[FeatureFlag, bool]:
+        return parse_feature_flag_overrides(value, FeatureFlag)
 
 
 def as_config(config: "Config | Mapping") -> "Config":
