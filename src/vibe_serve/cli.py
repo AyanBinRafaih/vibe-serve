@@ -649,7 +649,7 @@ def _run_evolve(args: argparse.Namespace) -> None:
     if success:
         print(
             f"\nEvolve loop completed {args.max_generations} generations "
-            f"× {args.children_per_generation} children."
+            f"× {args.children_per_generation} cands."
         )
     else:
         print("\nEvolve loop stopped early (exception or KeyboardInterrupt).")
@@ -726,7 +726,7 @@ def _run_openevolve(args: argparse.Namespace) -> None:
     )
 
     if success:
-        print(f"\nOpenEvolve loop completed {args.max_iterations} iterations.")
+        print(f"\nOpenEvolve loop completed {args.max_iterations} rounds.")
     else:
         print("\nOpenEvolve loop stopped early (exception or KeyboardInterrupt).")
         sys.exit(1)
@@ -788,7 +788,7 @@ def _run_plain(args: argparse.Namespace) -> None:
             resume_state = _load_state(log_dir)
             if resume_state is not None:
                 print(
-                    f"Auto-detected state: iteration {resume_state.round_idx + 1}, "
+                    f"Auto-detected state: round {resume_state.round_idx + 1}, "
                     f"phase '{resume_state.phase}'"
                     + (
                         f", current issue #{resume_state.current_issue_id}"
