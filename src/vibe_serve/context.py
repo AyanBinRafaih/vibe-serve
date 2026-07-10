@@ -22,6 +22,7 @@ from vibe_serve.constants import (
     PROJECT_ROOT,
     ComputeBackend,
 )
+from vibe_serve.example_manifest import ExampleManifest
 from vibe_serve.llm_client import _build_model
 from vibe_serve.sandbox.run_environment import (
     RunEnvironmentRequest,
@@ -207,17 +208,76 @@ class _RunContext:
         self.torch_profiler_path = self._coerce_dir_path(torch_profiler, "--torch-profiler")
         self.neuron_profiler_path = self._coerce_dir_path(neuron_profiler, "--neuron-profiler")
 
+        ref_path = Path(reference_path).expanduser()
+        if not ref_path.is_absolute():
+            ref_path = ref_path.resolve()
+
+        ref_dir: Path | None = None
+        ref_script: Path | None = None
+        self.example_manifest: ExampleManifest | None = None
+
+        if not ref_path.exists():
+            # Externally-managed targets (issue #76 Docker-in-Docker
+            # Alternative C, e.g. train-ticket) have no reference/ directory
+            # at all. Try treating ref_path's parent as the example dir
+            # before failing outright -- ref_path itself is the conventional
+            # "would-be reference dir" name even though nothing is materialized there.
+            fallback_manifest = ExampleManifest.detect_from_example_dir(ref_path.parent)
+            if fallback_manifest is not None and fallback_manifest.workspace.externally_managed:
+                self.example_manifest = fallback_manifest
+                self.ref_name = "reference/ (externally managed, no local copy)"
+            else:
+                raise ValueError(f"Reference path does not exist: {reference_path}")
+        elif ref_path.is_dir():
+            self.example_manifest = ExampleManifest.detect(ref_path)
+
+        if self.example_manifest is not None and ref_path.exists():
+            ref_dir = ref_path
+            self.ref_name = "reference/"
+        elif self.example_manifest is not None:
+            pass
+        elif ref_path.is_file():
+            ref_script = ref_path
+            self.ref_name = ref_script.name
+        elif ref_path.is_dir():
+            reference_py = sorted(ref_path.glob("*.py"))
+            if not reference_py:
+                raise ValueError(f"No reference Python script found in directory: {reference_path}")
+            if len(reference_py) != 1:
+                raise ValueError(
+                    f"Expected one reference Python script in {reference_path}, found {len(reference_py)}"
+                )
+            ref_script = reference_py[0]
+            ref_dir = ref_path
+            self.ref_name = f"reference/{ref_script.name}"
+        else:
+            raise ValueError(f"Reference path is invalid: {reference_path}")
+
+        self.target_check_instructions: str | None = (
+            self.example_manifest.render_check_instructions()
+            if self.example_manifest is not None
+            else None
+        )
+        self.target_bench_instructions: str | None = (
+            self.example_manifest.render_bench_instructions()
+            if self.example_manifest is not None
+            else None
+        )
+
         # Resolve profiler kind: 'auto' → the compute backend's own profiler
         # when it dictates one (e.g. Trainium → neuron-explorer), else the run
         # environment's default (modal → torch, otherwise nsys).
         resolved_profiler = profiler_kind
         if resolved_profiler == "auto":
-            backend_profiler = getattr(self.backend_impl, "profiler_kind", None)
-            if backend_profiler == "neuron":
-                resolved_profiler = "neuron"
+            if self.example_manifest is not None:
+                resolved_profiler = self.example_manifest.profiler.kind
             else:
-                resolved_profiler = self.run_environment.default_profiler_kind
-        if resolved_profiler not in ("nsys", "torch", "neuron"):
+                backend_profiler = getattr(self.backend_impl, "profiler_kind", None)
+                if backend_profiler == "neuron":
+                    resolved_profiler = "neuron"
+                else:
+                    resolved_profiler = self.run_environment.default_profiler_kind
+        if resolved_profiler not in ("nsys", "torch", "neuron", "none"):
             raise ValueError(f"Unknown profiler kind: {profiler_kind!r}")
         self.profiler_kind = resolved_profiler
 
@@ -236,28 +296,6 @@ class _RunContext:
 
         skill_source_paths = self._coerce_skills_dirs(skills_dirs)
         self._skill_source_paths: list[Path] = skill_source_paths
-
-        ref_path = Path(reference_path).expanduser().resolve()
-        if not ref_path.exists():
-            raise ValueError(f"Reference path does not exist: {reference_path}")
-
-        ref_dir: Path | None = None
-        if ref_path.is_file():
-            ref_script = ref_path
-            self.ref_name = ref_script.name
-        elif ref_path.is_dir():
-            reference_py = sorted(ref_path.glob("*.py"))
-            if not reference_py:
-                raise ValueError(f"No reference Python script found in directory: {reference_path}")
-            if len(reference_py) != 1:
-                raise ValueError(
-                    f"Expected one reference Python script in {reference_path}, found {len(reference_py)}"
-                )
-            ref_script = reference_py[0]
-            ref_dir = ref_path
-            self.ref_name = f"reference/{ref_script.name}"
-        else:
-            raise ValueError(f"Reference path is invalid: {reference_path}")
 
         self.workspace = self.exp_dir / "workspace"
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -306,15 +344,28 @@ class _RunContext:
                     shutil.rmtree(d)
 
             if ref_dir is not None:
+                needs_weights = (
+                    self.example_manifest is None
+                    or self.example_manifest.workspace.requires_model_weights
+                )
                 # Modal handles model weights via a remote Volume, so we
                 # skip the local HF download (saves ~30 GB of local cache).
                 # We still fall back to the local path if meta.json is absent.
-                if (
+                if needs_weights and (
                     self.run_environment.materialize_local_model_weights
                     or (ref_dir / "meta.json").exists() is False
                 ):
                     _ensure_model_weights(ref_dir)
                 self._copy_excluding_extras(ref_dir, self.workspace / "reference")
+
+                if self.example_manifest is not None:
+                    # Generic examples keep setup.sh/build.sh/check.sh/bench.sh/
+                    # teardown.sh at the example root (sibling to reference/),
+                    # not inside reference/ itself -- copy that root separately
+                    # so the lifecycle scripts actually land in the sandbox.
+                    self._copy_excluding_extras(
+                        self.example_manifest.example_dir, self.workspace / "example"
+                    )
             else:
                 if (self.workspace / ref_script.name).exists():
                     (self.workspace / ref_script.name).unlink()
@@ -377,6 +428,7 @@ class _RunContext:
                     neuron_profiler_path=self.neuron_profiler_path,
                     log=self.lprint,
                     project_root=PROJECT_ROOT,
+                    example_manifest=self.example_manifest,
                 )
             )
         )

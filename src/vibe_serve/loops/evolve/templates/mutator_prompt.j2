@@ -1,5 +1,17 @@
 {% if modality is not defined %}{% set modality = "text_generation" %}{% endif %}
+{% if is_generic_example %}
+## Target (generic example, issue #76)
+
+This is not an LLM/model-serving offspring — do not write a `main.py` with
+a `VibeServeModel` class or any Python serving interface.
+
+Your candidate lives under `reference/` in the workspace (check
+`reference/vibeserve.example.toml` for a designated writable subpath).
+
+{{ target_bench_instructions }}
+{% else %}
 {% include "_modality/" ~ modality ~ "/implementer.j2" %}
+{% endif %}
 
 {% if runtime_notes %}
 ## Runtime environment
@@ -34,13 +46,22 @@ The profiler reports every objective as a numeric value in `metrics`. An offspri
 {% if is_cold_start %}
 ## Cold start — no parent yet
 
-The population is empty. There is no parent to mutate. Your job this round is to write the **first working version** of the server from the reference at `{{ reference_path }}`. Aim for a minimal correct implementation that:
+The population is empty. There is no parent to mutate. Your job this round is to produce the **first working version** of the candidate.
+{% if is_generic_example %}
+Aim for a minimal correct change to the candidate at `reference/` (or its
+designated writable subpath) that passes `check.sh`. Skip aggressive
+optimization in this seed — later generations will mutate it. A clean,
+correct seed beats a clever-but-broken one: failed seeds give the search
+nothing to evolve from.
+{% else %}
+Work from the reference at `{{ reference_path }}`. Aim for a minimal correct implementation that:
 
 - Boots and exposes `/health`.
 - Implements the modality's accuracy-checker contract (e.g. `VibeServeModel.from_pretrained` + the modality's generate / transcribe method).
 - Passes the modality's pass criteria (covered in the modality block above).
 
 Skip aggressive optimization in this seed — later generations will mutate it. Producing a clean, correct seed beats producing a clever-but-broken seed: failed seeds give the search nothing to evolve from.
+{% endif %}
 
 {% else %}
 ## Parent (the implementation you are mutating)

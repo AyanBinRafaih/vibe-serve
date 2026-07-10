@@ -39,6 +39,7 @@ from deepagents.backends.sandbox import BaseSandbox
 from vibe_serve.backends import SandboxKind
 from vibe_serve.backends.base import ComputeBackendImpl, SetupFn
 from vibe_serve.constants import DEFAULT_AGENT_BACKEND, PROJECT_ROOT
+from vibe_serve.example_manifest import ExampleManifest
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ class RunEnvironmentRequest:
     neuron_profiler_path: str | None = None
     log: Callable[[str], None] | None = None
     project_root: Path = PROJECT_ROOT
+    example_manifest: ExampleManifest | None = None
 
 
 class RunEnvironmentSession(Protocol):
@@ -141,6 +143,7 @@ class _DefaultRunEnvironmentSession:
     sandbox: BaseSandbox
     view: RunEnvironmentView
     stop_on_close: bool = False
+    teardown_fn: Callable[[BaseSandbox], None] | None = None
     _closed: bool = False
 
     def __enter__(self) -> _DefaultRunEnvironmentSession:
@@ -153,6 +156,8 @@ class _DefaultRunEnvironmentSession:
         if self._closed:
             return
         self._closed = True
+        if self.teardown_fn is not None:
+            self.teardown_fn(self.sandbox)
         if self.stop_on_close and hasattr(self.sandbox, "stop"):
             self.sandbox.stop()
 
@@ -210,9 +215,33 @@ class DockerEnvironment:
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:
         bind_mounts, docker_symlinks, model_path = _container_mount_plan(request)
         extra_init_commands, cli_provider_env = _cli_container_setup(request)
+        log = request.log or (lambda _: None)
+
+        manifest = request.example_manifest
+        if manifest is not None and manifest.setup.needs_docker_socket:
+            log(
+                "[docker] WARNING: this example's vibeserve.example.toml sets "
+                "setup.needs_docker_socket=true. The sandboxed agent will be able "
+                "to start, stop, and inspect ANY container on this host's Docker "
+                "daemon, not only the ones this example's own scripts manage "
+                "(see issue #76 design notes on Docker-in-Docker)."
+            )
+            bind_mounts.append(("/var/run/docker.sock", "/var/run/docker.sock", False))
+
         bind_mounts = _dedupe_mounts(bind_mounts)
         passthrough = ["/model"] if model_path is not None else []
         setup_fns = _symlink_setup_fns(docker_symlinks)
+        teardown_fn = None
+        if manifest is not None:
+            example_env = _example_env(manifest)
+            cli_provider_env = {**cli_provider_env, **example_env}
+            for script_name in ("setup.sh", "build.sh"):
+                if manifest.has_script(script_name):
+                    setup_fns = setup_fns + [
+                        _example_script_fn(manifest, request, script_name, example_env)
+                    ]
+            if manifest.has_script("teardown.sh"):
+                teardown_fn = _example_teardown_fn(manifest, request, example_env)
 
         sandbox = request.backend.make_sandbox(
             SandboxKind.DOCKER,
@@ -224,7 +253,6 @@ class DockerEnvironment:
             extra_init_commands=extra_init_commands,
             setup_fns=setup_fns,
         )
-        log = request.log or (lambda _: None)
         label = getattr(request.backend, "image", self.config.image or "<backend-default>")
         log(f"[docker] starting container with image {label}")
         sandbox.start()
@@ -242,6 +270,7 @@ class DockerEnvironment:
                 env_kind="docker",
             ),
             stop_on_close=True,
+            teardown_fn=teardown_fn,
         )
 
     def repair_workspace(
@@ -335,6 +364,16 @@ class ModalEnvironment(_NoopWorkspaceRecovery):
         # Host-side: ensure Modal Volumes exist for the model + optional
         # draft.  These run before the Docker container starts and are
         # idempotent (skip-if-ready sentinel).
+        if (
+            request.example_manifest is not None
+            and request.example_manifest.setup.needs_docker_socket
+        ):
+            raise RuntimeError(
+                "This example's vibeserve.example.toml sets "
+                "setup.needs_docker_socket=true, but --modal runs the agent in a "
+                "Modal sandbox with no local Docker daemon to expose a socket "
+                "from. Re-run with --docker, or drop setup.needs_docker_socket."
+            )
         self._ensure_model_volume(request)
         self._ensure_draft_volume(request)
 
@@ -651,6 +690,61 @@ def _modal_runtime_notes(gpu: str, app_name: str) -> str:
         "`dtype` (whatever was loaded), and `wall_time_sec` to the "
         "dict before writing to disk."
     )
+
+
+def _example_env(manifest: ExampleManifest) -> dict[str, str]:
+    """Standard env vars every generic-example lifecycle script receives (issue #76)."""
+    return manifest.env(output_dir="/workspace/example_output", load_level="medium")
+
+
+def _example_script_fn(
+    manifest: ExampleManifest,
+    request: RunEnvironmentRequest,
+    script_name: str,
+    env: dict[str, str],
+) -> SetupFn:
+    """Run one lifecycle script (setup.sh/build.sh) once the container is up.
+
+    Mirrors _symlink_setup_fns' shape: a callable taking the started
+    BaseSandbox. Runs with the manifest's standard env vars and a generous
+    default timeout since compose-based or compile-heavy targets can take a
+    while.
+    """
+    env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+
+    def run_script(sb) -> None:
+        log = request.log or (lambda _: None)
+        cmd = f"cd /workspace/example && {env_prefix} bash {script_name}"
+        log(f"[docker] running example {script_name} (timeout={manifest.setup.timeout_sec}s)")
+        result = sb.execute(cmd, timeout=manifest.setup.timeout_sec)
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Example {script_name} failed (exit {result.exit_code}):\n{result.output}"
+            )
+
+    return run_script
+
+
+def _example_teardown_fn(
+    manifest: ExampleManifest,
+    request: RunEnvironmentRequest,
+    env: dict[str, str],
+) -> Callable[[BaseSandbox], None]:
+    """Best-effort teardown.sh run on session close; never raises (issue #76)."""
+    env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+
+    def run_teardown(sb) -> None:
+        log = request.log or (lambda _: None)
+        cmd = f"cd /workspace/example && {env_prefix} bash teardown.sh"
+        log(f"[docker] running example teardown.sh (timeout={manifest.setup.timeout_sec}s)")
+        try:
+            result = sb.execute(cmd, timeout=manifest.setup.timeout_sec)
+            if result.exit_code != 0:
+                log(f"[docker] teardown.sh exited {result.exit_code}:\n{result.output}")
+        except Exception as exc:
+            log(f"[docker] teardown.sh raised (ignored during cleanup): {exc}")
+
+    return run_teardown
 
 
 def _isolated_paths(request: RunEnvironmentRequest) -> AgentPaths:

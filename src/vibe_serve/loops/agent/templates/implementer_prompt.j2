@@ -1,5 +1,26 @@
 {% if modality is not defined %}{% set modality = "text_generation" %}{% endif %}
+{% if is_generic_example %}
+## Target (generic example, issue #76)
+
+This is not a Python/model-serving target. Do not write a `main.py` with a
+`VibeServeModel` class or any Python model-serving interface — none of that
+applies here.
+
+Your candidate lives under `reference/` in the workspace (the example's
+manifest may designate a specific writable subpath there; check
+`reference/vibeserve.example.toml` if present, or ask the orchestrator's
+task description, for which subpath you're expected to edit). The example
+root (sibling to `reference/`) has `setup.sh` / `build.sh` (if present) to
+bring the target up, and:
+
+{{ target_bench_instructions }}
+
+Test your changes by running `bash example/build.sh` (if present) then
+`bash example/setup.sh` (idempotent — safe to re-run) from the workspace
+root, before declaring the round done.
+{% else %}
 {% include "_modality/" ~ modality ~ "/implementer.j2" %}
+{% endif %}
 
 {% if runtime_notes %}
 ## Runtime environment

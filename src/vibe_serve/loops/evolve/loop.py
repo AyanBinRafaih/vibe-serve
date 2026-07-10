@@ -41,7 +41,7 @@ from vibe_serve.loops.evolve.population import (
     Objective,
     Population,
 )
-from vibe_serve.loops.profiler import invoke_profiler
+from vibe_serve.loops.profiler import invoke_profiler, run_example_benchmark
 from vibe_serve.sandbox.run_environment import (
     RunEnvironmentSpec,
     make_run_environment_spec,
@@ -143,6 +143,9 @@ def _run_mutator(
         objectives=objectives,
         runtime_notes=ctx.run_environment_view.prompt_notes,
         env_kind=ctx.run_environment_view.env_kind,
+        is_generic_example=ctx.example_manifest is not None,
+        target_check_instructions=ctx.target_check_instructions,
+        target_bench_instructions=ctx.target_bench_instructions,
     )
     return ctx.invoke(
         kind="implementer",  # mutator reuses the implementer sandbox
@@ -179,6 +182,9 @@ def _run_judge(
         runtime_notes=ctx.run_environment_view.prompt_notes,
         env_kind=ctx.run_environment_view.env_kind,
         objective=objective,
+        is_generic_example=ctx.example_manifest is not None,
+        target_check_instructions=ctx.target_check_instructions,
+        target_bench_instructions=ctx.target_bench_instructions,
     )
     return ctx.invoke(
         kind="judge",
@@ -223,6 +229,11 @@ def _run_profiler(
     objective: str,
     objectives: list[Objective] | None = None,
 ) -> ProfilerSummary | None:
+    if ctx.example_manifest is not None:
+        return run_example_benchmark(ctx, round_label=f"gen-{generation}-cand-{child_idx}")
+    if ctx.profiler_kind == "none":
+        ctx.lprint(f"[gen-{generation}-cand-{child_idx}] profiler_kind=none; skipping profiler.")
+        return None
     template = (
         "profiler_prompt_torch.j2" if ctx.profiler_kind == "torch" else "profiler_prompt_nsys.j2"
     )

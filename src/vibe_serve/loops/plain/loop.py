@@ -538,6 +538,9 @@ def run_plain_loop(
                             reference_path=ctx.ref_name,
                             runtime_notes=ctx.run_environment_view.prompt_notes,
                             issue=issue,
+                            is_generic_example=ctx.example_manifest is not None,
+                            target_check_instructions=ctx.target_check_instructions,
+                            target_bench_instructions=ctx.target_bench_instructions,
                         )
                         impl_prompt = prompt.render(
                             "implementer/user.j2",
@@ -606,6 +609,9 @@ def run_plain_loop(
                         accuracy_checker_path=ctx.judge_acc_checker_path,
                         bench_path=ctx.judge_bench_path,
                         issue=issue,
+                        is_generic_example=ctx.example_manifest is not None,
+                        target_check_instructions=ctx.target_check_instructions,
+                        target_bench_instructions=ctx.target_bench_instructions,
                     )
                     judge_prompt = prompt.render("judge/user.j2", issue=issue)
 
@@ -707,6 +713,13 @@ def run_plain_loop(
                 )
                 ctx.reselect_gpu()
 
+                is_generic_example = ctx.example_manifest is not None
+                metric_direction = (
+                    ctx.example_manifest.benchmark.direction if is_generic_example else None
+                )
+                primary_metric = (
+                    ctx.example_manifest.benchmark.primary_metric if is_generic_example else None
+                )
                 perf_system_prompt = prompt.render(
                     "perf_eval/system.j2",
                     load_levels=load_levels,
@@ -715,6 +728,10 @@ def run_plain_loop(
                     previous_evaluator_feedback=previous_evaluator_feedback,
                     issue_create_cap=max_issues_per_perf_eval,
                     runtime_notes=ctx.run_environment_view.prompt_notes,
+                    is_generic_example=is_generic_example,
+                    target_bench_instructions=ctx.target_bench_instructions,
+                    primary_metric=primary_metric,
+                    metric_direction=metric_direction,
                 )
                 perf_prompt = prompt.render("perf_eval/user.j2")
 

@@ -17,6 +17,38 @@ You are a senior code reviewer evaluating one offspring in an LLM-driven evoluti
 {{ runtime_notes }}
 {% endif %}
 
+{% if is_generic_example %}
+## Correctness checking (generic example, issue #76)
+
+This offspring is a change to a non-Python target — not an LLM/model-serving
+implementation. Do not expect `main.py`, `VibeServeModel`, `/health`,
+`/debug/metrics`, or any Python serving interface.
+
+{{ target_check_instructions }}
+
+## Always-on correctness check
+
+In addition to the pass criteria above, `check.sh`'s exit code is
+authoritative for a **pass** verdict: non-zero exit → **fail**, regardless
+of what the pass criteria say.
+
+## Reward-hack detection (proactive)
+
+Evolutionary search amplifies any local optimum it finds, including gaming
+`check.sh` or `bench.sh` rather than genuinely improving the target. Before
+passing an offspring, read its diff (`git diff <parent-sha>..HEAD` or
+equivalent) for patterns that make the benchmark's declared metric look
+better without the target actually doing the represented work — e.g. a
+change that special-cases the exact request shape `bench.sh` sends, a
+short-circuit that returns a cached/precomputed response instead of
+performing the real operation, or a change to `check.sh`/`bench.sh`
+themselves (these are read-only reference files; any diff touching them is
+an automatic **fail** and a strong reward-hacking signal).
+
+If you find such a pattern, **verdict is fail**. Name the specific
+function/branch/file in feedback and tell the mutator to remove the
+shortcut.
+{% else %}
 {% include "_modality/" ~ modality ~ "/judge.j2" %}
 
 ## Always-on correctness checks
@@ -46,6 +78,7 @@ Evolutionary search amplifies any local optimum it finds. The most dangerous one
 If **any** of (1)/(2)/(3) finds a default-enabled bypass for the benchmark's request shape, **verdict is fail**. Name the specific function / branch / flag in feedback and tell the implementer to remove the bypass and run a real forward pass.
 
 Legitimate "fast paths" (these are not reward hacks): CUDA-graph replay of the target model's decode, FlashAttention swap, KV-cache reuse, xgrammar grammar compile cache, xgrammar jump-forward at deterministic positions (model is still consulted for non-deterministic positions), EAGLE3 speculative decoding. All of these still invoke the model.
+{% endif %}
 
 ## Performance criteria use the objective's headline metric, end-to-end
 

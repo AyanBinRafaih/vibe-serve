@@ -31,6 +31,8 @@ def mcp_spec(profiler_kind: str):
         from vibe_serve._agent_cli import MCPServerSpec
     except Exception:
         return None
+    if profiler_kind == "none":
+        return None
     if profiler_kind == "torch":
         return MCPServerSpec(
             name="vibeserve-torch-profiler",
@@ -85,3 +87,58 @@ def invoke_profiler(
     except Exception as exc:
         ctx.lprint(f"[warn] profiler failed: {exc}")
         return None
+
+
+def run_example_benchmark(ctx, *, round_label: str) -> ProfilerSummary | None:
+    """Run a generic example's bench.sh and parse its JSONL metrics (issue #76).
+
+    Generic examples have no GPU profiler; the declared benchmark harness
+    (bench.sh) is the source of truth for the primary metric. This runs
+    bench.sh in the sandbox, parses ``{"metric","value"}`` JSONL from both
+    stdout and ``VIBESERVE_OUTPUT_DIR``, and returns a ProfilerSummary whose
+    ``perf_metric`` / ``metrics`` the evolve and agent loops already consume
+    for comparison (evolve ranks by ``metrics[primary_metric]`` with the
+    manifest's declared direction). Returns None when bench.sh fails or emits
+    no primary metric, so the caller treats the candidate as unmeasured.
+    """
+    manifest = ctx.example_manifest
+    if manifest is None:
+        return None
+    sandbox = ctx.implementer_backend
+    out_dir = "/workspace/example_output"
+    try:
+        sandbox.execute(f"mkdir -p {out_dir}")
+        result = sandbox.execute(
+            "cd /workspace/example && bash bench.sh",
+            timeout=manifest.setup.timeout_sec,
+        )
+    except Exception as exc:
+        ctx.lprint(f"[{round_label}] example bench.sh failed to run: {exc}")
+        return None
+    if getattr(result, "exit_code", 0) != 0:
+        ctx.lprint(f"[{round_label}] bench.sh exited {result.exit_code}; candidate unmeasured.")
+        return None
+    text = getattr(result, "output", "") or ""
+    try:
+        extra = sandbox.execute(f"cat {out_dir}/*.jsonl 2>/dev/null || true")
+        text = text + "\n" + (getattr(extra, "output", "") or "")
+    except Exception:
+        pass
+    metrics = manifest.parse_metrics(text)
+    primary_name = manifest.benchmark.primary_metric
+    primary = metrics.get(primary_name)
+    ctx.lprint(
+        f"[{round_label}] bench.sh metrics={metrics} "
+        f"primary({primary_name})={primary} ({manifest.benchmark.direction})"
+    )
+    if primary is None:
+        ctx.lprint(f"[{round_label}] bench.sh emitted no '{primary_name}' metric; unmeasured.")
+        return None
+    return ProfilerSummary(
+        analysis=f"Parsed {len(metrics)} metric(s) from bench.sh JSONL output.",
+        bottlenecks="n/a (generic example: no GPU profiler; bench.sh is the metric source)",
+        suggestions="n/a",
+        perf_metric=primary,
+        perf_unit=primary_name,
+        metrics=metrics,
+    )

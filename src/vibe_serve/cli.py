@@ -160,7 +160,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--profiler",
-        choices=["nsys", "torch", "neuron", "auto"],
+        choices=["nsys", "torch", "neuron", "none", "auto"],
         default="auto",
         help=(
             "Which profiler to use between rounds. "
@@ -577,7 +577,16 @@ def _load_objectives_toml(reference_path: str) -> list:
 def _resolve_objectives(args: argparse.Namespace) -> list:
     if args.objective:
         return list(args.objective)
-    return _load_objectives_toml(args.ref)
+    from_toml = _load_objectives_toml(args.ref)
+    if from_toml:
+        return from_toml
+    from vibe_serve.example_manifest import ExampleManifest
+
+    ref = Path(args.ref).expanduser().resolve()
+    manifest = ExampleManifest.detect(ref)
+    if manifest is not None:
+        return [manifest.to_objective()]
+    return []
 
 
 def _build_evolve_parser() -> argparse.ArgumentParser:
@@ -881,8 +890,33 @@ _RUNNERS = {
 }
 
 
+def _expand_example_flag(argv: list[str]) -> list[str]:
+    """Expand ``--example <dir>`` into --ref/--acc-checker/--bench (issue #76).
+
+    Pure sugar: fills in only the flags the user didn't already pass
+    explicitly, following the ``examples/<name>/{reference,accuracy_checker,
+    benchmark}`` convention. Detection of generic-vs-legacy example
+    behavior itself happens later, in _RunContext, based on whether
+    vibeserve.example.toml is present next to --ref -- not based on
+    whether --example was used to construct these paths.
+    """
+    example_dir, rest = _extract_flag(argv, "--example")
+    if example_dir is None:
+        return argv
+    example_path = Path(example_dir)
+    additions: list[str] = []
+    if "--ref" not in rest and not any(t.startswith("--ref=") for t in rest):
+        additions += ["--ref", str(example_path / "reference")]
+    if "--acc-checker" not in rest and not any(t.startswith("--acc-checker=") for t in rest):
+        additions += ["--acc-checker", str(example_path / "accuracy_checker")]
+    if "--bench" not in rest and not any(t.startswith("--bench=") for t in rest):
+        additions += ["--bench", str(example_path / "benchmark")]
+    return rest + additions
+
+
 def main() -> None:
-    loop_kind, remaining = _extract_loop_selection(sys.argv[1:])
+    argv = _expand_example_flag(sys.argv[1:])
+    loop_kind, remaining = _extract_loop_selection(argv)
     args = _PARSER_BUILDERS[loop_kind]().parse_args(remaining)
     # Resolve validator + runner via globals() so unittest.mock.patch on
     # ``vibe_serve.cli._{validate,run}_<kind>`` takes effect.

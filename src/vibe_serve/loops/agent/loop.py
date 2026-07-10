@@ -22,7 +22,7 @@ from vibe_serve.loops.agent.domain import (
     render_domain_section,
     resolve_domain,
 )
-from vibe_serve.loops.profiler import invoke_profiler
+from vibe_serve.loops.profiler import invoke_profiler, run_example_benchmark
 from vibe_serve.prompts import render_template
 from vibe_serve.sandbox.run_environment import (
     RunEnvironmentSpec,
@@ -259,6 +259,16 @@ def _run_profiler(
     progress_path: Path,
     objective: str,
 ) -> ProfilerSummary | None:
+    if ctx.example_manifest is not None:
+        summary = run_example_benchmark(ctx, round_label=f"round-{round_number}")
+        if summary is not None:
+            issue_board.append_profiler_summary(progress_path, round_number, summary)
+            ctx.snapshot_workspace(f"round-{round_number}-profiler")
+        return summary
+    if ctx.profiler_kind == "none":
+        ctx.lprint(f"[round-{round_number}] profiler_kind=none (no GPU profiler); skipping.")
+        return None
+
     template = {
         "torch": "profiler_prompt_torch.j2",
         "neuron": "profiler_prompt_neuron.j2",
@@ -272,6 +282,8 @@ def _run_profiler(
         runtime_notes=ctx.run_environment_view.prompt_notes,
         env_kind=ctx.run_environment_view.env_kind,
         objective=objective,
+        is_generic_example=ctx.example_manifest is not None,
+        target_bench_instructions=ctx.target_bench_instructions,
     )
     summary = invoke_profiler(
         ctx,
@@ -375,6 +387,9 @@ def _run_implementer(
         feedback=feedback,
         runtime_notes=ctx.run_environment_view.prompt_notes,
         env_kind=ctx.run_environment_view.env_kind,
+        is_generic_example=ctx.example_manifest is not None,
+        target_check_instructions=ctx.target_check_instructions,
+        target_bench_instructions=ctx.target_bench_instructions,
     )
     response = ctx.invoke(
         kind="implementer",
@@ -420,6 +435,9 @@ def _run_judge(
         runtime_notes=ctx.run_environment_view.prompt_notes,
         env_kind=ctx.run_environment_view.env_kind,
         objective=objective,
+        is_generic_example=ctx.example_manifest is not None,
+        target_check_instructions=ctx.target_check_instructions,
+        target_bench_instructions=ctx.target_bench_instructions,
     )
     response = ctx.invoke(
         kind="judge",

@@ -86,7 +86,13 @@ class ThroughputStats(BaseModel):
     """Throughput metrics at a given load level."""
 
     request_throughput: float = Field(description="Requests per second.")
-    token_throughput: float = Field(description="Output tokens per second.")
+    token_throughput: float | None = Field(
+        default=None,
+        description=(
+            "Output tokens per second. None for non-token workloads "
+            "(e.g. HTTP microservice benchmarks with no LLM inference)."
+        ),
+    )
 
 
 class LoadLevelMetrics(BaseModel):

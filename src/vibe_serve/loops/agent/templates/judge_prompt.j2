@@ -17,7 +17,21 @@ You are a senior code reviewer evaluating the candidate implementation.
 {{ runtime_notes }}
 {% endif %}
 
+{% if is_generic_example %}
+## Correctness checking (generic example, issue #76)
+
+This example is not a Python/model-serving target — it uses the generic
+example-directory contract instead of `main.py` / `VibeServeModel`.
+
+{{ target_check_instructions }}
+
+Do not look for or expect a `VibeServeModel` class, `main.py`, `/health`
+endpoint, or any Python model-serving interface. Judge correctness purely
+by `check.sh`'s exit code and output, and by whether the implementer's
+changes match the orchestrator's `pass_criteria` above.
+{% else %}
 {% include "_modality/" ~ modality ~ "/judge.j2" %}
+{% endif %}
 
 {% if domain_judge %}
 {{ domain_judge }}
