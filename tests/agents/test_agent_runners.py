@@ -181,6 +181,134 @@ class TestDeepAgentsRunner:
         assert "response_format" not in mock_create.call_args.kwargs
         assert mock_run.call_args.args[1] == "what happened?"
 
+    def test_deepagents_runner_reuses_agent_for_same_kind(self, tmp_path):
+        """Two invoke() calls with the same kind/prompt/tools share one agent."""
+        pass_response = JudgeResponse(
+            analysis="looks good",
+            feedback="",
+            verdict=Verdict.PASS,
+        )
+        with (
+            patch("vibesys.agents.deepagents_runner.create_deep_agent") as mock_create,
+            patch(
+                "vibesys.agents.deepagents_runner.run_typed_agent",
+                return_value=pass_response,
+            ),
+        ):
+            mock_create.return_value = MagicMock(name="deep_agent")
+
+            runner = DeepAgentsRunner(
+                model="m",
+                backends={"judge": MagicMock(name="judge-backend")},
+                skills=[],
+                model_name="m",
+                run_log_file=None,
+            )
+
+            for i in range(2):
+                runner.invoke(
+                    kind="judge",
+                    workspace=tmp_path,
+                    system_prompt="sys",
+                    user_prompt=f"usr {i}",
+                    response_cls=JudgeResponse,
+                    fallback_factory=_judge_fallback,
+                    round_label=f"judge #{i}",
+                )
+
+            assert mock_create.call_count == 1
+
+    def test_deepagents_runner_rebuilds_when_system_prompt_changes(self, tmp_path):
+        """A different system_prompt for the same kind triggers a rebuild."""
+        pass_response = JudgeResponse(
+            analysis="looks good",
+            feedback="",
+            verdict=Verdict.PASS,
+        )
+        with (
+            patch("vibesys.agents.deepagents_runner.create_deep_agent") as mock_create,
+            patch(
+                "vibesys.agents.deepagents_runner.run_typed_agent",
+                return_value=pass_response,
+            ),
+        ):
+            mock_create.return_value = MagicMock(name="deep_agent")
+
+            runner = DeepAgentsRunner(
+                model="m",
+                backends={"judge": MagicMock(name="judge-backend")},
+                skills=[],
+                model_name="m",
+                run_log_file=None,
+            )
+
+            runner.invoke(
+                kind="judge",
+                workspace=tmp_path,
+                system_prompt="sys v1",
+                user_prompt="usr",
+                response_cls=JudgeResponse,
+                fallback_factory=_judge_fallback,
+                round_label="judge #1",
+            )
+            runner.invoke(
+                kind="judge",
+                workspace=tmp_path,
+                system_prompt="sys v2",
+                user_prompt="usr",
+                response_cls=JudgeResponse,
+                fallback_factory=_judge_fallback,
+                round_label="judge #2",
+            )
+
+            assert mock_create.call_count == 2
+
+    def test_deepagents_runner_invoke_and_invoke_text_do_not_share_cache(self, tmp_path):
+        """invoke() (typed) and invoke_text() (untyped) never reuse each other's agent."""
+        with (
+            patch("vibesys.agents.deepagents_runner.create_deep_agent") as mock_create,
+            patch(
+                "vibesys.agents.deepagents_runner.run_typed_agent",
+                return_value=JudgeResponse(analysis="ok", feedback="", verdict=Verdict.PASS),
+            ),
+            patch(
+                "vibesys.agents.deepagents_runner.run_agent",
+                return_value="plain text",
+            ),
+        ):
+            mock_create.return_value = MagicMock(name="deep_agent")
+
+            runner = DeepAgentsRunner(
+                model="m",
+                backends={"judge": MagicMock(name="judge-backend")},
+                skills=[],
+                model_name="m",
+                run_log_file=None,
+            )
+
+            runner.invoke(
+                kind="judge",
+                workspace=tmp_path,
+                system_prompt="sys",
+                user_prompt="usr",
+                response_cls=JudgeResponse,
+                fallback_factory=_judge_fallback,
+                round_label="judge #1",
+            )
+            runner.invoke_text(
+                kind="judge",
+                workspace=tmp_path,
+                system_prompt="sys",
+                user_prompt="usr",
+                round_label="judge #2",
+            )
+
+            assert mock_create.call_count == 2
+            first_kwargs = mock_create.call_args_list[0].kwargs
+            second_kwargs = mock_create.call_args_list[1].kwargs
+            assert "response_format" in first_kwargs
+            assert "response_format" not in second_kwargs
+
 
 # ---------------------------------------------------------------------------
 # Helpers for CLI runner tests
