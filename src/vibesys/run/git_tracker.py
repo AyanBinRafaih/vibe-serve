@@ -330,15 +330,38 @@ class GitTracker:
         return paths
 
     def _exclude_paths(self, rel_paths: list[str]) -> None:
-        """Append *rel_paths* to ``.git/info/exclude`` (local, untracked)."""
+        """Append *rel_paths* to the repository's ``info/exclude`` (local, untracked).
+
+        The workspace may live below the repository root (experiment
+        directories are themselves the repo), so the exclude file must be the
+        resolved git dir's — writing to ``self.root/.git`` would create a
+        directory no repository reads. Incoming paths are relative to either
+        the workspace (``_collect_unreadable``) or the repo toplevel (git
+        stderr); both are rebased onto the toplevel and anchored.
+        """
         rel_paths = [p for p in dict.fromkeys(rel_paths) if p]
         if not rel_paths:
             return
-        exclude_file = self.root / ".git" / "info" / "exclude"
+        git_dir = Path(
+            self.run(["git", "rev-parse", "--absolute-git-dir"]).stdout.decode().strip()
+        )
+        toplevel = Path(
+            self.run(["git", "rev-parse", "--show-toplevel"]).stdout.decode().strip()
+        ).resolve()
+        entries: list[str] = []
+        for path in rel_paths:
+            candidates = (self.root / path, toplevel / path)
+            absolute = next((c for c in candidates if c.exists()), candidates[0])
+            try:
+                rebased = absolute.resolve().relative_to(toplevel)
+            except ValueError:
+                continue
+            entries.append("/" + rebased.as_posix())
+        exclude_file = git_dir / "info" / "exclude"
         exclude_file.parent.mkdir(parents=True, exist_ok=True)
         existing = exclude_file.read_text() if exclude_file.exists() else ""
         have = set(existing.splitlines())
-        new = [p for p in rel_paths if p not in have]
+        new = [entry for entry in entries if entry not in have]
         if not new:
             return
         prefix = "" if (not existing or existing.endswith("\n")) else "\n"

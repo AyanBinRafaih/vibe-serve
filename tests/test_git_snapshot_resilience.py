@@ -86,3 +86,40 @@ def test_git_add_all_excludes_unreadable_and_succeeds(tmp_path):
         assert "system_profile.json" in exclude
     finally:
         os.chmod(secret, 0o644)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read mode-000 files")
+def test_git_add_all_excludes_unreadable_when_workspace_below_repo_root(tmp_path):
+    """Experiment layout: the repo root is the experiment dir, the tracked
+    workspace lives below it. Exclusions must land in the *repository's*
+    info/exclude — not a fabricated ``workspace/.git`` that no repo reads."""
+    exp = tmp_path / "exp"
+    ws = exp / "workspace"
+    ws.mkdir(parents=True)
+    _git(exp, "init")
+    (ws / "code.py").write_text("print('hi')\n")
+    model = ws / "model"
+    model.mkdir()
+    secret = model / "model.safetensors"
+    secret.write_text("x")
+    os.chmod(secret, 0o000)
+
+    tracker = _make_tracker(ws)
+    try:
+        tracker._add_all()
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=exp,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert "workspace/code.py" in staged
+        assert "workspace/model/model.safetensors" not in staged
+        # Recorded in the real repo's exclude file, anchored to the toplevel.
+        exclude = (exp / ".git" / "info" / "exclude").read_text()
+        assert "/workspace/model/model.safetensors" in exclude
+        # No spurious git dir invented inside the workspace.
+        assert not (ws / ".git").exists()
+    finally:
+        os.chmod(secret, 0o644)
