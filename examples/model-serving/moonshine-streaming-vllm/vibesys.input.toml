@@ -1,0 +1,18 @@
+version = 1
+
+[agent]
+domain = "llm-serving"
+
+[accuracy]
+command = ["uv", "run", "python", "accuracy_checker/checker.py"]
+timeout_seconds = 120
+
+[benchmark]
+command = ["uv", "run", "python", "benchmark/benchmark.py"]
+timeout_seconds = 300
+
+[[workspace.sources]]
+name = "vllm"
+repo = "https://github.com/vllm-project/vllm"
+commit = "d7de043d55d1dd629554467e23874097e1c48993"
+dest = "vllm"
