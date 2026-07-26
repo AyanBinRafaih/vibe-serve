@@ -177,7 +177,11 @@ class Workspace:
                 steps.append(CopySpec(src=seed, dest=self.root, respect_gitignore=True))
             for source in workspace_sources:
                 steps.append(GitSourceSpec(source=source))
-            if seed is not None:
+            # When the workspace is pre-populated (seed and/or git sources),
+            # the input copy must not clear existing children: copy_dir wipes
+            # the destination unless collisions are rejected, which would
+            # silently delete the just-materialized sources.
+            if seed is not None or workspace_sources:
                 steps.append(
                     CopySpec(
                         src=input_dir,

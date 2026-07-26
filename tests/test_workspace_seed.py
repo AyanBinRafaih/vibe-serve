@@ -494,6 +494,46 @@ def test_fresh_workspace_materializes_git_source_and_strips_nested_git(tmp_path)
             assert "vllm/.git" not in tracked
 
 
+def test_fresh_workspace_materializes_git_source_without_seed(tmp_path):
+    """Sources must survive the input-bundle copy when no seed is declared."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _init_git_repo(project_root)
+
+    source_repo = tmp_path / "source-vllm"
+    source_repo.mkdir()
+    _init_git_repo(source_repo)
+    (source_repo / "vllm").mkdir()
+    (source_repo / "vllm" / "__init__.py").write_text("__version__ = 'test'\n")
+    commit = _commit_all(source_repo)
+
+    input_dir = project_root / "examples" / "model-serving" / "llama-vllm"
+    input_dir.mkdir(parents=True)
+    (input_dir / "OBJECTIVE.md").write_text("Optimize vLLM.\n")
+    (input_dir / "vibesys.input.toml").write_text("version = 1\n")
+
+    source = WorkspaceSource(
+        name="vllm",
+        repo=str(source_repo),
+        commit=commit,
+        dest="vllm",
+    )
+
+    with _patched_context_dependencies(project_root):
+        with _make_context(
+            input_dir,
+            seed=None,
+            workspace_sources=(source,),
+            git_tracking=True,
+        ) as ctx:
+            assert (ctx.workspace / "OBJECTIVE.md").is_file()
+            assert (ctx.workspace / "vllm" / "vllm" / "__init__.py").read_text() == (
+                "__version__ = 'test'\n"
+            )
+            metadata = (ctx.workspace / "_vibesys_sources.json").read_text()
+            assert commit in metadata
+
+
 def test_workspace_source_destination_collision_is_rejected(tmp_path):
     source_repo = tmp_path / "source"
     source_repo.mkdir()
