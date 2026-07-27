@@ -33,6 +33,13 @@ dependencies = [
     "openevolve==0.3.1",
 ]
 
+[project.optional-dependencies]
+# Opt-in backend behind the `omnigent_agent_backend` feature flag. Kept out of
+# the base dependencies because it is a fast-moving alpha with no stability
+# policy — see docs/omnigent-evaluation.md — so end users who never enable the
+# flag should not carry it. Install with `uv sync --extra omnigent`.
+omnigent = ["omnigent==0.6.0"]
+
 [project.scripts]
 vibesys-issue-mcp = "vs_issue_board.mcp:main"
 
@@ -53,6 +60,11 @@ dev = [
     "pytest",
     "pytest-cov",
     "ruff>=0.6",
+    # Optional for users, required for contributors: without it pyright cannot
+    # resolve the Omnigent backend and its tests silently skip. `uv sync --dev`
+    # (what CI runs) therefore installs it. Version comes from the extra, so
+    # there is one pin.
+    "vibesys[omnigent]",
 ]
 test = [
     "hypothesis",
@@ -114,7 +126,6 @@ exclude = ["exp_env/**"]
 members = ["libs/*"]
 
 [tool.uv.sources]
-agentshim = { git = "https://github.com/vic-lsh/agentshim.git", rev = "codex/executor-injection" }
 vs-feature-flags = { workspace = true }
 vs-github = { workspace = true }
 vs-issue-board = { workspace = true }
