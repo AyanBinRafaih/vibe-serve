@@ -123,3 +123,36 @@ def test_git_add_all_excludes_unreadable_when_workspace_below_repo_root(tmp_path
         assert not (ws / ".git").exists()
     finally:
         os.chmod(secret, 0o644)
+
+
+def test_agent_created_nested_repo_does_not_hijack_snapshots(tmp_path):
+    """An agent running `git init`/`uv init` inside the workspace mid-run must
+    not capture later snapshots (or fail them with dubious-ownership errors):
+    the tracker stays pinned to the repository resolved at init time."""
+    exp = tmp_path / "exp"
+    ws = exp / "workspace"
+    ws.mkdir(parents=True)
+    _git(exp, "init")
+    (ws / "code.py").write_text("v1\n")
+
+    tracker = _make_tracker(ws)
+    tracker.init(existing=False)
+
+    # Agent side effect: a nested repo appears inside the workspace.
+    _git(ws, "init")
+    (ws / "code.py").write_text("v2\n")
+    tracker.snapshot("round-1")
+
+    exp_log = subprocess.run(
+        ["git", "--git-dir", str(exp / ".git"), "log", "--oneline"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "round-1" in exp_log
+    nested_log = subprocess.run(
+        ["git", "--git-dir", str(ws / ".git"), "log", "--oneline"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "round-1" not in nested_log
