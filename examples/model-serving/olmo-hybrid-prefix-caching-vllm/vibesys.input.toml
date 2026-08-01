@@ -14,5 +14,5 @@ timeout_seconds = 300
 [[workspace.sources]]
 name = "vllm"
 repo = "https://github.com/vllm-project/vllm"
-commit = "132765e3560659ff63ebd236203672e991b70e08"
+commit = "568afb3a13806beb53bb2e6bd518269357b237c0"
 dest = "vllm"
