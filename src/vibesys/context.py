@@ -529,6 +529,7 @@ def _assemble_run_context(
         model_name=model_name,
         input_path=input_path_str,
         workspace_seed_path=workspace_seed_path,
+        workspace_sources=workspace_sources,
         evaluator_path=evaluator_source,
         accuracy_command=accuracy_command,
         benchmark_command=benchmark_command,
@@ -712,6 +713,7 @@ def _assemble_candidate_context(
         model_name=parent.model_name,
         input_path=parent.input_path,
         workspace_seed_path=None,
+        workspace_sources=parent.workspace_sources,
         evaluator_path=parent.evaluator_path,
         accuracy_command=parent.accuracy_command,
         benchmark_command=parent.benchmark_command,
@@ -767,6 +769,7 @@ class _RunContext:
         model_name: str,
         input_path: str | None,
         workspace_seed_path: Path | None,
+        workspace_sources: tuple[WorkspaceSource, ...],
         evaluator_path: Path | None,
         accuracy_command: str,
         benchmark_command: str,
@@ -799,6 +802,7 @@ class _RunContext:
         self.model_name = model_name
         self.input_path = input_path
         self.workspace_seed_path = workspace_seed_path
+        self.workspace_sources = workspace_sources
         self.evaluator_path = evaluator_path
         self.accuracy_command = accuracy_command
         self.benchmark_command = benchmark_command

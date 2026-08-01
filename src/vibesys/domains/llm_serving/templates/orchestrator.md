@@ -1,3 +1,12 @@
+{% if workspace_sources %}
+## Starting-point checkout (read before planning any round)
+
+The workspace was seeded with pinned source checkout(s) that the objective names as the starting point: {% for source in workspace_sources %}`{{ source.dest }}/` ({{ source.name }}, {{ source.repo }} @ {{ source.commit[:12] }}){% if not loop.last %}, {% endif %}{% endfor %}. Treat seeded checkouts as implementer-owned code — ordinary mutable workspace code the implementer builds on — not as framework directories or read-only vendored dependencies.
+
+- Plan rounds that **adapt, configure, or modify the seeded code** before rounds that hand-write a replacement. "Wire the seeded engine to the objective's serving contract" is the canonical first task — not "build a self-contained server from scratch".
+- Before scheduling an optimization-floor item below, check whether the seeded engine already ships it (mature engines have continuous batching, tuned attention kernels, and CUDA graphs built in). When it does, the round is "enable and verify it in the seeded engine", not "implement it from the skills references".
+- Only plan a from-scratch component when you can cite a concrete reason the seeded code cannot serve the objective (e.g. the target model architecture is not registered and porting it costs more than writing the component, or the required serving mode has no seeded path). Record that reason in `roadmap.md` so later rounds don't relitigate the decision.
+{% endif %}
 ## Optimization priority (read before choosing the next task)
 
 Serving systems have a well-established **optimization floor**: three techniques every production LLM server ships with, because each addresses a fundamental cost source the workload cannot avoid on NVIDIA hardware. Before proposing any workload-specific optimization (speculative decoding, prompt/prefix caching, grammar-constrained decoding fast paths, schema minimization, etc.), confirm all three are in place unless a specific one is **absolutely incompatible** with the objective:
@@ -19,11 +28,19 @@ If you skip a floor item, cite the specific incompatibility in your `reasoning`.
 ## LLM-serving task examples
 
 Good round-sized tasks for this domain include:
+{% if workspace_sources %}
+- "Stand up the seeded engine's server behind the objective's endpoint contract."
+- "Register the target model architecture with the seeded engine."
+- "Enable and verify continuous batching / CUDA graphs that the seeded engine already ships."
+- "Patch the seeded engine's scheduler to exploit the benchmark's fixed workload shape."
+- "Fix the 8 ms launch overhead shown in `linear_layer_N` (top kernel in the last profile)."
+{% else %}
 - "Build a self-contained FastAPI server for the reference model."
 - "Add continuous batching to the decode loop."
 - "Replace manual attention with FlashInfer batched decode."
 - "Add CUDA graph capture/replay for the decode path."
 - "Fix the 8 ms launch overhead shown in `linear_layer_N` (top kernel in the last profile)."
+{% endif %}
 
 ## Scoping API work
 
