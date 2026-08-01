@@ -278,6 +278,16 @@ class Workspace:
             raise ValueError(
                 f"workspace source destination already exists for {source.name!r}: {source.dest}"
             )
+        # Excluded names match at any depth (copy ignores, git info/exclude,
+        # Modal uploads), so a colliding dest would be silently dropped from
+        # snapshots and sandboxes even though the clone succeeds.
+        colliding = [part for part in Path(source.dest).parts if part in self.excluded_dirs]
+        if colliding:
+            raise ValueError(
+                f"workspace source {source.name!r} dest {source.dest!r} contains excluded "
+                f"path component(s) {colliding}: files under it would be invisible to "
+                "workspace copies, git tracking, and sandbox uploads. Pick another dest."
+            )
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         self._run_git(["clone", "--no-checkout", source.repo, str(dest)], cwd=self.root)
