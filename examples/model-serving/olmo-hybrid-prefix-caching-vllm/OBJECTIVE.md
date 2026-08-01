@@ -66,7 +66,7 @@ The shared prefix is **always 32 k tokens, always identical across all 20 reques
 
 ## Starting point
 
-The workspace contains a checkout of **vLLM v0.14.1** at `vllm/` (pinned via
+The workspace contains a checkout of **vLLM v0.20.1** at `vllm/` (pinned via
 `[[workspace.sources]]`; provenance in `_vibesys_sources.json`). Do not write
 the serving system from scratch: start from vLLM's OpenAI-compatible server,
 paged-KV prefix caching, and hybrid (attention + linear-attention/SSM) model

@@ -54,7 +54,7 @@ Minimize **TTFT** (time from a client pushing an audio chunk to the server retur
 
 ## Starting point
 
-The workspace contains a checkout of **vLLM v0.14.1** at `vllm/` (pinned via
+The workspace contains a checkout of **vLLM v0.20.1** at `vllm/` (pinned via
 `[[workspace.sources]]`; provenance in `_vibesys_sources.json`). Do not write
 the serving system from scratch: start from vLLM's engine, scheduler, paged-KV
 and encoder-decoder/ASR machinery, adapting it to the streaming WebSocket +
