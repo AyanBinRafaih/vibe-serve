@@ -17,6 +17,12 @@ The framework's always-on gates (pytest, benchmark sanity, accuracy checker) app
 {% endif %}
 
 Model weights are at `/model` (do NOT redownload).
+{% if workspace_sources %}
+
+## Required: build on the seeded checkout, not from scratch
+
+The workspace contains pinned starting-point checkout(s) named by the objective: {% for source in workspace_sources %}`{{ source.dest }}/` ({{ source.name }}){% if not loop.last %}, {% endif %}{% endfor %}. This code is yours — ordinary mutable workspace code — and the objective expects the serving system to be built from it, not re-implemented beside it. Adapt the seeded engine's entrypoints, scheduler, kernels, and server layer before hand-writing replacements; if some part of the objective genuinely cannot be served from the seeded code, say so in your `summary` with what you checked, and keep the from-scratch surface as small as that gap.
+{% endif %}
 
 ## Required: read the relevant skill BEFORE writing code
 

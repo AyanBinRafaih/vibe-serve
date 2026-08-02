@@ -340,6 +340,7 @@ def _domain_render_context(
         "benchmark_command": ctx.judge_benchmark_command,
         "accuracy_command": ctx.judge_accuracy_command,
         "runtime_notes": ctx.run_environment_view.prompt_notes,
+        "workspace_sources": ctx.workspace_sources,
     }
 
 

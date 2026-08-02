@@ -76,12 +76,76 @@ class GitTracker:
             "GIT_CONFIG_VALUE_0": str(self.root),
         }
 
+    # Marker file placed in the tracking repository's git dir so resumed runs
+    # re-pin the same repository even if an agent has since created a nested
+    # repo (e.g. `uv init` inside the workspace) that discovery would find
+    # first.
+    _TRACKER_MARKER = "vibesys-tracker"
+
+    def _resolve_repo_root(self) -> Path | None:
+        """Innermost ancestor (including ``self.root``) holding the tracking repo.
+
+        Prefers a git dir carrying the tracker marker; otherwise falls back to
+        the innermost ``.git`` owned by the current user. Agent processes in
+        Docker run as root, so their stray ``git init`` artifacts are skipped
+        by the ownership filter and can never shadow the tracking repository.
+        """
+        fallback: Path | None = None
+        for candidate in (self.root, *self.root.parents):
+            git_path = candidate / ".git"
+            try:
+                stat = git_path.stat()
+            except OSError:
+                continue
+            if git_path.is_dir() and (git_path / "info" / self._TRACKER_MARKER).is_file():
+                return candidate
+            if fallback is None and stat.st_uid == os.getuid():
+                fallback = candidate
+        return fallback
+
+    def _mark_tracking_repo(self) -> None:
+        """Stamp the resolved repository so later resolutions stay pinned."""
+        repo_root = self._resolve_repo_root()
+        if repo_root is None:
+            return
+        git_path = repo_root / ".git"
+        if not git_path.is_dir():
+            return  # linked worktree gitlink — admin area lives in the main repo
+        marker = git_path / "info" / self._TRACKER_MARKER
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            if not marker.is_file():
+                marker.write_text("")
+        except OSError as exc:
+            self._log(f"[git-tracking] could not stamp tracking repo: {exc}")
+
     def run(
         self, cmd: list[str], *, check: bool = True, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[bytes]:
-        """Run a git command in the workspace, logging stderr on failure."""
+        """Run a git command in the workspace, logging stderr on failure.
+
+        Commands address the pinned tracking repository via explicit
+        ``--git-dir``/``--work-tree`` (bypassing git's upward discovery and its
+        ownership checks) so a nested repository an agent creates inside the
+        workspace cannot capture snapshots or fail them with dubious-ownership
+        errors. ``git init`` and runs without a resolvable repo fall back to
+        plain discovery.
+        """
         if env is None:
             env = {**os.environ, **self._GIT_ENV}
+        repo_root = self._resolve_repo_root()
+        if (
+            cmd[:1] == ["git"]
+            and cmd[1:2] != ["init"]
+            and repo_root is not None
+            and (repo_root / ".git").is_dir()  # gitlink worktrees use discovery
+        ):
+            cmd = [
+                "git",
+                f"--git-dir={repo_root / '.git'}",
+                f"--work-tree={repo_root}",
+                *cmd[1:],
+            ]
         result = subprocess.run(cmd, cwd=self.root, capture_output=True, env=env)
         if check and result.returncode != 0:
             stderr = result.stderr.decode(errors="replace").strip()
@@ -103,6 +167,7 @@ class GitTracker:
                 raise ValueError(
                     f"--git-tracking with --resume but no git repository in {self.root}"
                 )
+            self._mark_tracking_repo()
             if trusted_input_baseline is not None:
                 self._trusted_input_baseline = self._resolve_trusted_input_baseline(
                     trusted_input_baseline
@@ -117,6 +182,7 @@ class GitTracker:
 
         if not self._inside_work_tree():
             self.run(["git", "init"])
+        self._mark_tracking_repo()
 
         gitignore = self.root / ".gitignore"
         existing_gitignore = gitignore.read_text() if gitignore.is_file() else ""
@@ -330,15 +396,36 @@ class GitTracker:
         return paths
 
     def _exclude_paths(self, rel_paths: list[str]) -> None:
-        """Append *rel_paths* to ``.git/info/exclude`` (local, untracked)."""
+        """Append *rel_paths* to the repository's ``info/exclude`` (local, untracked).
+
+        The workspace may live below the repository root (experiment
+        directories are themselves the repo), so the exclude file must be the
+        resolved git dir's — writing to ``self.root/.git`` would create a
+        directory no repository reads. Incoming paths are relative to either
+        the workspace (``_collect_unreadable``) or the repo toplevel (git
+        stderr); both are rebased onto the toplevel and anchored.
+        """
         rel_paths = [p for p in dict.fromkeys(rel_paths) if p]
         if not rel_paths:
             return
-        exclude_file = self.root / ".git" / "info" / "exclude"
+        git_dir = Path(self.run(["git", "rev-parse", "--absolute-git-dir"]).stdout.decode().strip())
+        toplevel = Path(
+            self.run(["git", "rev-parse", "--show-toplevel"]).stdout.decode().strip()
+        ).resolve()
+        entries: list[str] = []
+        for path in rel_paths:
+            candidates = (self.root / path, toplevel / path)
+            absolute = next((c for c in candidates if c.exists()), candidates[0])
+            try:
+                rebased = absolute.resolve().relative_to(toplevel)
+            except ValueError:
+                continue
+            entries.append("/" + rebased.as_posix())
+        exclude_file = git_dir / "info" / "exclude"
         exclude_file.parent.mkdir(parents=True, exist_ok=True)
         existing = exclude_file.read_text() if exclude_file.exists() else ""
         have = set(existing.splitlines())
-        new = [p for p in rel_paths if p not in have]
+        new = [entry for entry in entries if entry not in have]
         if not new:
             return
         prefix = "" if (not existing or existing.endswith("\n")) else "\n"

@@ -1,5 +1,14 @@
 Model weights are at `/model` — do NOT download models.
 
+{% if workspace_sources %}
+## Required: build on the seeded checkout, not from scratch
+
+The workspace contains pinned starting-point checkout(s) named by the objective: {% for source in workspace_sources %}`{{ source.dest }}/` ({{ source.name }}){% if not loop.last %}, {% endif %}{% endfor %}. This code is **yours** — ordinary mutable workspace code you may edit freely — and the objective expects the serving system to be built from it, not re-implemented beside it.
+
+- Before writing any new serving code, locate the relevant paths inside the checkout (engine entrypoints, scheduler, attention backends, model registry, server layer) and adapt them to the task.
+- Do not hand-write functionality the checkout already provides (batching, KV management, kernels, endpoint plumbing) — enable, configure, or patch the seeded implementation instead.
+- If some part of the objective genuinely cannot be served from the seeded code (e.g. unsupported model architecture), say so explicitly in your `summary`, cite what you checked inside the checkout, and keep the from-scratch surface as small as that gap.
+{% endif %}
 ## Python toolchain
 
 Use `uv` for Python package management. Run `uv init` if `pyproject.toml`

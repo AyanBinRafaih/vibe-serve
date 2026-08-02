@@ -267,6 +267,27 @@ def _assemble_run_context(
     repo_visibility: RepositoryVisibility,
 ) -> "_RunContext":
     config = as_config(config)
+    if git_tracking:
+        # A non-stripped nested ``.git`` makes ``git add -A`` record the
+        # checkout as a bare gitlink: round snapshots stop seeing edits inside
+        # it and deliverable repos end up with a broken pointer instead of the
+        # seeded code. Provenance is preserved in ``_vibesys_sources.json``.
+        for source in workspace_sources:
+            if not source.strip_git:
+                raise ConfigurationError(
+                    ConfigurationDiagnostic(
+                        code="workspace_source_untrackable",
+                        stage="workspace_setup",
+                        message=(
+                            f"workspace source {source.name!r} sets strip_git=false, but "
+                            "this run tracks the workspace with git: the nested .git at "
+                            f"{source.dest!r} would be recorded as an empty gitlink, so "
+                            "round snapshots and deliverable repos would silently lose "
+                            "the checkout's contents. Remove strip_git=false (upstream "
+                            "repo and commit stay recorded in _vibesys_sources.json)."
+                        ),
+                    )
+                )
     run_environment_spec = run_environment or make_run_environment_spec()
     environment = build_run_environment(run_environment_spec)
 
@@ -454,6 +475,7 @@ def _assemble_run_context(
             RunEnvironmentRequest(
                 log_dir=log_dir,
                 workspace=workspace_files.root,
+                workspace_sources=workspace_sources,
                 ref_dir=ref_dir,
                 backend=backend_impl,
                 agent_backend=resolved_backend,
@@ -528,6 +550,7 @@ def _assemble_run_context(
         model_name=model_name,
         input_path=input_path_str,
         workspace_seed_path=workspace_seed_path,
+        workspace_sources=workspace_sources,
         evaluator_path=evaluator_source,
         accuracy_command=accuracy_command,
         benchmark_command=benchmark_command,
@@ -648,6 +671,7 @@ def _assemble_candidate_context(
             RunEnvironmentRequest(
                 log_dir=log_dir,
                 workspace=workspace,
+                workspace_sources=parent.workspace_sources,
                 ref_dir=None,
                 backend=parent.backend_impl,
                 agent_backend=resolved_backend,
@@ -710,6 +734,7 @@ def _assemble_candidate_context(
         model_name=parent.model_name,
         input_path=parent.input_path,
         workspace_seed_path=None,
+        workspace_sources=parent.workspace_sources,
         evaluator_path=parent.evaluator_path,
         accuracy_command=parent.accuracy_command,
         benchmark_command=parent.benchmark_command,
@@ -765,6 +790,7 @@ class _RunContext:
         model_name: str,
         input_path: str | None,
         workspace_seed_path: Path | None,
+        workspace_sources: tuple[WorkspaceSource, ...],
         evaluator_path: Path | None,
         accuracy_command: str,
         benchmark_command: str,
@@ -797,6 +823,7 @@ class _RunContext:
         self.model_name = model_name
         self.input_path = input_path
         self.workspace_seed_path = workspace_seed_path
+        self.workspace_sources = workspace_sources
         self.evaluator_path = evaluator_path
         self.accuracy_command = accuracy_command
         self.benchmark_command = benchmark_command

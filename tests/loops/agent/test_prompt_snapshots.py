@@ -15,6 +15,7 @@ import pytest
 from vibesys.domains.base import DomainName
 from vibesys.domains.registry import resolve_domain
 from vibesys.domains.rendering import render_domain_section
+from vibesys.input_manifest import WorkspaceSource
 from vibesys.profilers import ProfilerKind, profiler_definition
 from vibesys.prompts import render_template
 
@@ -47,6 +48,20 @@ _CONTEXTS = {
         "accuracy_command": None,
         "runtime_notes": "",
     },
+    "seeded": _BASE_CONTEXT
+    | {
+        "benchmark_command": "uv run python benchmark/benchmark.py",
+        "accuracy_command": "uv run python accuracy_checker/checker.py",
+        "runtime_notes": "Runtime note: local Docker workspace with NVIDIA CUDA access.",
+        "workspace_sources": (
+            WorkspaceSource(
+                name="vllm",
+                repo="https://github.com/vllm-project/vllm",
+                commit="d7de043d55d1dd629554467e23874097e1c48993",
+                dest="vllm",
+            ),
+        ),
+    },
 }
 
 
@@ -57,6 +72,7 @@ def _domain_context(context: dict[str, object]) -> dict[str, object]:
         "benchmark_command": context["benchmark_command"],
         "accuracy_command": context["accuracy_command"],
         "runtime_notes": context["runtime_notes"],
+        "workspace_sources": context.get("workspace_sources", ()),
     }
 
 
