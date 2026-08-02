@@ -408,9 +408,7 @@ class GitTracker:
         rel_paths = [p for p in dict.fromkeys(rel_paths) if p]
         if not rel_paths:
             return
-        git_dir = Path(
-            self.run(["git", "rev-parse", "--absolute-git-dir"]).stdout.decode().strip()
-        )
+        git_dir = Path(self.run(["git", "rev-parse", "--absolute-git-dir"]).stdout.decode().strip())
         toplevel = Path(
             self.run(["git", "rev-parse", "--show-toplevel"]).stdout.decode().strip()
         ).resolve()
