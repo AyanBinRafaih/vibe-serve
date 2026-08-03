@@ -24,7 +24,6 @@ dependencies = [
     "mcp>=1.0",
     "datasets>=4.8.4",
     "soundfile>=0.13.1",
-    "librosa>=0.11.0",
     "modal>=1.4.2",
     "vs-feature-flags",
     "vs-github",
