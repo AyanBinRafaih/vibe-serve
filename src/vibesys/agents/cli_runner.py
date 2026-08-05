@@ -20,6 +20,7 @@ Docker command routing and per-invocation MCP install/uninstall. Each
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,7 +42,12 @@ from vibesys.agent_runner import (
     parse_typed_response_text,
 )
 from vibesys.agents.callbacks import AgentLogger
-from vibesys.agents.cli_common import agent_label, build_schema_hint, materialize_skills
+from vibesys.agents.cli_common import (
+    agent_label,
+    build_schema_hint,
+    materialize_native_output_schema,
+    materialize_skills,
+)
 from vibesys.agents.host_resource_declarations import declare_agent_host_resources
 from vibesys.agents.progress import AgentProgress
 from vs_sandbox import HostResource, build_host_sandbox
@@ -68,11 +74,33 @@ _PROVIDER_CLASSES: dict[str, _ProviderFactory] = {
     "opencode": OpencodeCodingAgent,
 }
 
+# Codex provider threads retain useful implementation context, but long
+# tool-heavy systems turns can approach the provider context limit even when
+# the durable workspace contains everything needed to continue.  Keep one
+# adjacent continuation, then start a fresh provider thread on the third turn.
+_MAX_CODEX_SESSION_TURNS = 2
+_MAX_CODEX_SESSION_INPUT_TOKENS = 10_000_000
+_MAX_CODEX_SESSION_DURATION_MS = 600_000
+
 
 def _is_missing_codex_rollout(exc: RuntimeError) -> bool:
     """Return whether Codex rejected a stale resumable thread."""
     message = str(exc)
     return "thread/resume failed" in message and "no rollout found" in message
+
+
+def _heavy_codex_turn_reason(agent: CodingAgent) -> str | None:
+    """Explain why the previous Codex turn is too heavy to resume efficiently."""
+    session = getattr(agent, "_last_session", None)
+    usage = getattr(session, "final_usage", None) or {}
+    input_tokens = int(usage.get("input_tokens", 0) or 0)
+    duration_ms = int(getattr(session, "duration_ms", 0) or 0)
+    reasons: list[str] = []
+    if input_tokens >= _MAX_CODEX_SESSION_INPUT_TOKENS:
+        reasons.append(f"{input_tokens} input tokens")
+    if duration_ms >= _MAX_CODEX_SESSION_DURATION_MS:
+        reasons.append(f"{duration_ms} ms duration")
+    return " and ".join(reasons) or None
 
 
 class CliAgentRunner:
@@ -92,6 +120,9 @@ class CliAgentRunner:
         docker_sandboxes: dict[str, Any] | None = None,
         host_resources: Iterable[HostResource] = (),
         log_dir: Path | None = None,
+        default_reasoning_effort: str | None = None,
+        role_models: dict[str, str] | None = None,
+        role_reasoning_efforts: dict[str, str] | None = None,
     ):
         if provider not in _PROVIDER_CLASSES:
             raise SystemExit(
@@ -100,6 +131,9 @@ class CliAgentRunner:
         self._provider = provider
         self._provider_cls = _PROVIDER_CLASSES[provider]
         self._model = model
+        self._default_reasoning_effort = default_reasoning_effort
+        self._role_models = dict(role_models or {})
+        self._role_reasoning_efforts = dict(role_reasoning_efforts or {})
         self._skills: list[Path] = list(skills or [])
         self._model_name = model_name
         self._timeout = timeout
@@ -118,6 +152,7 @@ class CliAgentRunner:
         # the exception: its history is carried explicitly in each prompt, so
         # it must not depend on provider-side session state.
         self._agents: dict[str, CodingAgent] = {}
+        self._session_turn_counts: dict[str, int] = {}
 
     def invoke(
         self,
@@ -134,8 +169,25 @@ class CliAgentRunner:
         progress: AgentProgress | None = None,
         mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,  # noqa: ARG002 — deepagents-only injection point; cli uses mcp_servers
+        reuse_session: bool | None = None,
+        session_key: str | None = None,
     ) -> T:
-        schema_hint = build_schema_hint(response_cls)
+        native_schema_path: str | None = None
+        native_schema_supported = bool(
+            getattr(self._provider_cls, "supports_native_output_schema", False)
+            and callable(getattr(self._provider_cls, "set_output_schema_path", None))
+        )
+        if native_schema_supported:
+            try:
+                native_schema_path = materialize_native_output_schema(workspace, response_cls)
+            except (OSError, TypeError, ValueError) as exc:
+                log_and_print(
+                    f"[structured-output] native schema unavailable for "
+                    f"{response_cls.__name__}; using prompt fallback: "
+                    f"{type(exc).__name__}: {exc}",
+                    self._run_log_file,
+                )
+        schema_hint = "" if native_schema_path else build_schema_hint(response_cls)
         combined_prompt = f"{system_prompt}\n\n{user_prompt}{schema_hint}"
         text = self._generate(
             kind=kind,
@@ -146,6 +198,9 @@ class CliAgentRunner:
             invocation_id=invocation_id,
             progress=progress,
             mcp_servers=mcp_servers,
+            reuse_session=reuse_session,
+            session_key=session_key,
+            output_schema_path=native_schema_path,
         )
         label = agent_label(kind)
         parsed = parse_typed_response_text(text, response_cls)
@@ -186,6 +241,8 @@ class CliAgentRunner:
         progress: AgentProgress | None = None,
         mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,  # noqa: ARG002 — deepagents-only
+        reuse_session: bool | None = None,
+        session_key: str | None = None,
     ) -> str:
         """Run a conversational CLI agent without requesting structured JSON."""
         text = self._generate(
@@ -197,6 +254,9 @@ class CliAgentRunner:
             invocation_id=invocation_id,
             progress=progress,
             mcp_servers=mcp_servers,
+            reuse_session=reuse_session,
+            session_key=session_key,
+            output_schema_path=None,
         )
         label = agent_label(kind)
         if text:
@@ -221,14 +281,24 @@ class CliAgentRunner:
         invocation_id: str | None,
         progress: AgentProgress | None,
         mcp_servers: list[MCPServerSpec] | None,
+        reuse_session: bool | None,
+        session_key: str | None,
+        output_schema_path: str | None,
     ) -> str:
         """Run one CLI generation with shared setup, logging, and cleanup."""
         label = agent_label(kind)
+        selected_model = self._role_models.get(kind, self._model)
+        configured_reasoning_effort = self._role_reasoning_efforts.get(
+            kind, self._default_reasoning_effort
+        )
+        selected_reasoning_effort = (
+            configured_reasoning_effort if self._provider == "codex" else None
+        )
         materialize_skills(workspace, self._skills, log_file=self._run_log_file)
 
         logger = AgentLogger(
             log_file=self._run_log_file,
-            model_name=self._model_name,
+            model_name=selected_model or self._model_name,
             agent_label=label,
             progress=progress,
             agent_kind=kind,
@@ -241,8 +311,10 @@ class CliAgentRunner:
         #    its multi-turn history in the prompt, and provider session IDs can
         #    become unavailable when a sandbox or process changes, so every
         #    chat turn deliberately starts a fresh CLI session.
-        reuse_agent = kind != "chat"
-        agent = self._agents.get(kind) if reuse_agent else None
+        reuse_agent = kind != "chat" and (reuse_session if reuse_session is not None else True)
+        role_key = f"{kind}:{selected_model}:{selected_reasoning_effort}"
+        cache_key = f"{role_key}:{session_key}" if session_key else role_key
+        agent = self._agents.get(cache_key) if reuse_agent else None
         if agent is not None:
             # Update the event handler for this invocation's logger.
             agent.event_handler = logger
@@ -260,14 +332,16 @@ class CliAgentRunner:
             sandbox = self._docker_sandboxes[kind]
             executor = DockerCommandExecutor(sandbox._container_id)
             agent = self._provider_cls(
-                model=self._model,
+                model=selected_model,
                 event_handler=logger,
                 executor=executor,
             )
+            self._configure_reasoning_effort(agent, selected_reasoning_effort)
             if reuse_agent:
-                self._agents[kind] = agent
+                self._agents[cache_key] = agent
         else:
-            agent = self._provider_cls(model=self._model, event_handler=logger)
+            agent = self._provider_cls(model=selected_model, event_handler=logger)
+            self._configure_reasoning_effort(agent, selected_reasoning_effort)
             # Host execution path: confine the agent to its workspace at the OS
             # level so it cannot read or modify sibling runs or unrelated host
             # files (issue #149). Container executors above are already
@@ -285,7 +359,33 @@ class CliAgentRunner:
                 log=lambda msg: log_and_print(msg, self._run_log_file),
             )
             if reuse_agent:
-                self._agents[kind] = agent
+                self._agents[cache_key] = agent
+
+        renewal_reason: str | None = None
+        if self._provider == "codex" and reuse_agent:
+            if self._session_turn_counts.get(cache_key, 0) >= _MAX_CODEX_SESSION_TURNS:
+                renewal_reason = f"{_MAX_CODEX_SESSION_TURNS} successful turns"
+            else:
+                renewal_reason = _heavy_codex_turn_reason(agent)
+        if renewal_reason is not None:
+            log_and_print(
+                f"[{label}] renewing Codex thread after {renewal_reason}; durable workspace "
+                "state remains authoritative.",
+                self._run_log_file,
+            )
+            cast(CodexCodingAgent, agent).session_id = None
+            self._session_turn_counts[cache_key] = 0
+
+        # Set this on every turn, including plain-text turns, so a reused
+        # provider session cannot retain the previous response contract.
+        schema_setter = getattr(agent, "set_output_schema_path", None)
+        if callable(schema_setter):
+            schema_setter(output_schema_path)
+        elif output_schema_path is not None:
+            raise RuntimeError(
+                f"{type(agent).__name__} advertised native output schemas "
+                "without implementing set_output_schema_path()"
+            )
 
         # Layer GPU env vars on top of the captured interactive env so the
         # spawned subprocess inherits CUDA_VISIBLE_DEVICES. Containerised
@@ -306,7 +406,9 @@ class CliAgentRunner:
             self._run_log_file,
         )
         log_and_print(
-            f"backend: cli, provider: {self._provider}, model: {self._model_name}, "
+            f"backend: cli, provider: {self._provider}, "
+            f"model: {selected_model or self._model_name}, "
+            f"reasoning_effort: {selected_reasoning_effort or 'provider_default'}, "
             f"cwd: {workspace}",
             self._run_log_file,
         )
@@ -345,11 +447,16 @@ class CliAgentRunner:
                     self._run_log_file,
                 )
                 cast(CodexCodingAgent, agent).session_id = None
+                self._session_turn_counts[cache_key] = 0
                 text = agent.generate(
                     combined_prompt,
                     cwd=workspace_arg,
                     timeout=self._timeout,
                     silent=True,
+                )
+            if reuse_agent:
+                self._session_turn_counts[cache_key] = (
+                    self._session_turn_counts.get(cache_key, 0) + 1
                 )
         except BaseException as exc:
             agent_error = exc
@@ -361,21 +468,61 @@ class CliAgentRunner:
                 log_and_print(f"{type(exc).__name__}: {exc}", self._run_log_file)
             raise
         finally:
+            cleanup_error: Exception | None = None
             if mcp_servers:
                 try:
                     agent.uninstall_mcp_servers(workspace, mcp_servers)
                 except Exception as cleanup_exc:
-                    if agent_error is None:
-                        raise
-                    log_and_print(
-                        f"[{label}] MCP config cleanup failed while preserving the "
-                        f"original agent error: {cleanup_exc}",
-                        self._run_log_file,
-                    )
-            self._write_usage_record(kind=kind, round_label=round_label, agent=agent)
+                    cleanup_error = cleanup_exc
+                    if agent_error is not None:
+                        log_and_print(
+                            f"[{label}] MCP config cleanup failed while preserving the "
+                            f"original agent error: {cleanup_exc}",
+                            self._run_log_file,
+                        )
+            if self._docker_sandboxes is not None:
+                try:
+                    executor = agent.executor
+                    executor.repair_workspace_ownership(uid=os.getuid(), gid=os.getgid())
+                except Exception as cleanup_exc:
+                    if cleanup_error is None:
+                        cleanup_error = cleanup_exc
+                    else:
+                        log_and_print(
+                            f"[{label}] workspace ownership repair also failed: {cleanup_exc}",
+                            self._run_log_file,
+                        )
+                    if agent_error is not None:
+                        log_and_print(
+                            f"[{label}] workspace ownership repair failed while preserving "
+                            f"the original agent error: {cleanup_exc}",
+                            self._run_log_file,
+                        )
+            self._write_usage_record(
+                kind=kind,
+                round_label=round_label,
+                agent=agent,
+                model_name=selected_model or self._model_name,
+                reasoning_effort=selected_reasoning_effort,
+            )
+            if agent_error is None and cleanup_error is not None:
+                raise cleanup_error
         return text
 
-    def _write_usage_record(self, *, kind: str, round_label: str, agent: Any) -> None:
+    def _configure_reasoning_effort(self, agent: CodingAgent, reasoning_effort: str | None) -> None:
+        """Apply provider-specific reasoning controls to a newly built CLI agent."""
+        if self._provider == "codex" and reasoning_effort is not None:
+            cast(CodexCodingAgent, agent).set_reasoning_effort(reasoning_effort)
+
+    def _write_usage_record(
+        self,
+        *,
+        kind: str,
+        round_label: str,
+        agent: Any,
+        model_name: str | None,
+        reasoning_effort: str | None,
+    ) -> None:
         """Append one JSONL record to ``<log_dir>/usage.jsonl`` for this call.
 
         Reads ``agent._last_session`` (stashed by
@@ -397,7 +544,8 @@ class CliAgentRunner:
             "kind": kind,
             "round_label": round_label,
             "provider": self._provider,
-            "model": self._model_name,
+            "model": model_name,
+            "reasoning_effort": reasoning_effort,
             "input_tokens": usage.get("input_tokens", 0),
             "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
             "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),

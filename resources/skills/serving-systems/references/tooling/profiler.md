@@ -35,6 +35,43 @@ Is the problem known to be inside a specific kernel?
 3. **Annotate with NVTX** so the timeline is self-describing: one range per iteration / forward / backward / dataloader / eval.
 4. **Diagnose before editing code.** Produce: bottleneck class + evidence + bounded change set + acceptance metric.
 5. **Verify every recommendation** by re-running the same benchmark and comparing the same metrics.
+6. **Measure observer overhead.** Compare the profiled run with an uninstrumented
+   control at the same shape. Never call `torch.cuda.synchronize()` at every
+   annotated scope boundary when diagnosing synchronization or overlap: that
+   creates the serialization being measured. CUDA events around asynchronous
+   host scopes are ordering markers, not exclusive attribution, unless a
+   timeline proves which queued device work lies between them. If the headline
+   metric changes by more than 10%, classify the profile as perturbed: use it
+   for activation, ordering, graph coverage, fallback, or presence evidence,
+   but not phase shares, removable milliseconds, Amdahl bounds, or hypothesis
+   ranking. If no comparable control exists, apply the same restriction and
+   call the capture uncalibrated.
+
+## When CUPTI or external profilers are unavailable
+
+Record one capability artifact, then stop retrying the same unavailable
+permission/runtime pair. `CUPTI_ERROR_NOT_INITIALIZED`, an `nsys` daemon/export
+failure, or missing container tracing privileges is a measurement blocker, not
+evidence about the serving bottleneck.
+
+For decode-forward device-time ranking, fall back to a shape-faithful isolated
+microdriver with CUDA events:
+
+1. Derive batch size and context lengths from an uninstrumented production row.
+2. Warm the exact model, KV layout, and kernels before timing.
+3. Bracket a small set of mutually exclusive forward buckets with CUDA event
+   pairs on the executing stream; do not synchronize at bucket boundaries.
+4. Record several iterations, synchronize once after the complete window, and
+   compute event elapsed times afterward.
+5. Compare total microdriver wall time with an uninstrumented control at the
+   same shape. Reject quantitative attribution above the 10% perturbation band.
+
+Use this fallback only for within-forward device-time ranking. It cannot reveal
+CPU launch gaps, API synchronization, kernel names, or end-to-end phase shares.
+For CUDA-graph serving, time whole graph replay separately and use an eager
+same-shape microdriver for sub-forward buckets; do not present eager bucket
+fractions as graph-era end-to-end shares. Keep event recording gated out of the
+production service path.
 
 ## Tool 1: PyTorch Profiler (`torch.profiler`)
 
@@ -317,6 +354,8 @@ Prefer machine-readable exports (`nsys stats`, SQLite) over screenshots:
 - Comparing different input shapes across runs.
 - Comparing a compiled run to an eager run without separating cold-start from steady-state.
 - Overly broad traces that are impossible to interpret.
+- Per-scope synchronization in a manual timer, then diagnosing the resulting
+  profiler-induced gaps as application host overhead.
 - Using ncu on every kernel before a systems-level diagnosis.
 - "Increase batch size" without bottleneck evidence.
 - Optimizing from screenshots instead of exported metrics.
