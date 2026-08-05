@@ -50,6 +50,7 @@ from vibesys.agents.cli_common import (
 )
 from vibesys.agents.host_resource_declarations import declare_agent_host_resources
 from vibesys.agents.progress import AgentProgress
+from vibesys.constants import ComputeBackend
 from vs_sandbox import HostResource, build_host_sandbox
 
 T = TypeVar("T", bound=BaseModel)
@@ -114,6 +115,7 @@ class CliAgentRunner:
         provider: str,
         model: str | None = None,
         skills: list[Path] | None = None,
+        compute_backend: ComputeBackend | None = None,
         model_name: str | None = None,
         timeout: int | None = None,
         run_log_file: TextIO | None = None,
@@ -135,6 +137,7 @@ class CliAgentRunner:
         self._role_models = dict(role_models or {})
         self._role_reasoning_efforts = dict(role_reasoning_efforts or {})
         self._skills: list[Path] = list(skills or [])
+        self._compute_backend = compute_backend
         self._model_name = model_name
         self._timeout = timeout
         self._run_log_file = run_log_file
@@ -294,7 +297,12 @@ class CliAgentRunner:
         selected_reasoning_effort = (
             configured_reasoning_effort if self._provider == "codex" else None
         )
-        materialize_skills(workspace, self._skills, log_file=self._run_log_file)
+        materialize_skills(
+            workspace,
+            self._skills,
+            compute_backend=self._compute_backend,
+            log_file=self._run_log_file,
+        )
 
         logger = AgentLogger(
             log_file=self._run_log_file,

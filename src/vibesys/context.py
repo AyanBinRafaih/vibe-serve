@@ -425,6 +425,7 @@ def _assemble_run_context(
         backend=backend_impl,
         log=logger.lprint,
         project_root=PROJECT_ROOT,
+        compute_backend=backend,
     )
     workspace_files.create()
 
@@ -539,6 +540,7 @@ def _assemble_run_context(
         },
         skills=[src.name for src in skill_source_paths],
         skill_source_dirs=skill_source_paths,
+        compute_backend=backend,
         model=model,
         model_name=model_name,
         run_log_file=logger.writer,
@@ -671,6 +673,7 @@ def _assemble_candidate_context(
         backend=parent.backend_impl,
         log=logger.lprint,
         project_root=PROJECT_ROOT,
+        compute_backend=parent.backend,
     )
 
     # Reuse adapter-owned resources provisioned when the parent environment was
@@ -718,6 +721,7 @@ def _assemble_candidate_context(
         },
         skills=[src.name for src in parent.skill_source_paths],
         skill_source_dirs=parent.skill_source_paths,
+        compute_backend=parent.backend,
         model=parent.model,
         model_name=parent.model_name,
         run_log_file=logger.writer,

@@ -18,12 +18,15 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
 from pydantic import BaseModel
 
 from vibesys.agent_runner import log_and_print
+from vibesys.constants import ComputeBackend
+from vibesys.skills import foreign_platform_names, is_platforms_parent
 
 # Per-provider CLI skill-discovery paths, matching upstream
 # vibesys-skills install.sh conventions. Each CLI tool auto-loads
@@ -170,8 +173,28 @@ def discover_skill_dirs(root: Path) -> list[Path]:
     return [p.parent for p in root.rglob("SKILL.md")]
 
 
+def _platform_prune_ignore(
+    compute_backend: ComputeBackend | None,
+) -> Callable[[str, list[str]], set[str]]:
+    """Build a ``copytree`` ignore callable that prunes foreign platforms."""
+    skip_names = {".git", "repos", "__pycache__"}
+    foreign = foreign_platform_names(compute_backend)
+
+    def _ignore(src_dir: str, names: list[str]) -> set[str]:
+        ignored = {name for name in names if name in skip_names}
+        if foreign and is_platforms_parent(src_dir):
+            ignored |= {name for name in names if name in foreign}
+        return ignored
+
+    return _ignore
+
+
 def materialize_skills(
-    workspace: Path, skill_dirs: list[Path], log_file: TextIO | None = None
+    workspace: Path,
+    skill_dirs: list[Path],
+    *,
+    compute_backend: ComputeBackend | None = None,
+    log_file: TextIO | None = None,
 ) -> None:
     """Copy each skill directory into the workspace and CLI discovery paths.
 
@@ -181,7 +204,9 @@ def materialize_skills(
     ``.agents/skills``, ``.gemini/skills``, ``.cursor/skills``,
     ``.opencode/skills``). The root copy preserves the documented
     ``<skill-name>/references/...`` paths used by prompts and agents, while the
-    hidden copies support native CLI discovery.
+    hidden copies support native CLI discovery. When a compute backend is set,
+    foreign ``references/platforms/<backend>/`` directories are omitted from
+    every materialized copy.
 
     Existing destinations are replaced on every invocation so skill edits are
     picked up across iterations and after candidate checkpoint rollback. Errors
@@ -202,8 +227,7 @@ def materialize_skills(
     if not discovered:
         return
 
-    skip_names = {".git", "repos", "__pycache__"}
-    skip_ignore = shutil.ignore_patterns(*skip_names)
+    skip_ignore = _platform_prune_ignore(compute_backend)
 
     for target_rel in (".", *CLI_SKILL_DIRS):
         target_root = workspace / target_rel

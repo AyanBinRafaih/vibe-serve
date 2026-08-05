@@ -19,6 +19,38 @@ SIDECAR_NAME = ".vibesys.toml"
 _FRONTMATTER_DELIMITER = "---"
 _MATERIALIZATION_EXCLUDED_NAMES = frozenset({".git", "repos", "__pycache__"})
 
+# Files every ``references/platforms/<backend>/`` directory must provide.
+# ``floor.md`` is the per-backend optimization floor, which is genuinely
+# different per platform and must never fall back to another's.
+PLATFORM_SKELETON: tuple[str, ...] = ("floor.md", "hardware.md", "profiler.md")
+
+# Parent path of the per-backend directories inside a skill.
+PLATFORMS_PARENT: tuple[str, str] = ("references", "platforms")
+
+
+def foreign_platform_names(compute_backend: ComputeBackend | None) -> frozenset[str]:
+    """Return the ``platforms/<backend>/`` directory names to prune.
+
+    Empty when no backend is selected (copy the tree intact). Otherwise every
+    known :class:`ComputeBackend` value except the selected one — the agent
+    must not be able to read another platform's guidance, because applying one
+    platform's optimization floor to another produces wrong work rather than
+    merely irrelevant reading.
+    """
+    if compute_backend is None:
+        return frozenset()
+    return frozenset(b.value for b in ComputeBackend if b is not compute_backend)
+
+
+def is_platforms_parent(directory: Path | str) -> bool:
+    """True when *directory* is the ``references/platforms`` dir of a skill.
+
+    Pruning keys on the parent path rather than on directory name so an
+    unrelated directory that happens to be called e.g. ``cpu`` is never
+    dropped.
+    """
+    return Path(directory).parts[-2:] == PLATFORMS_PARENT
+
 
 class SkillMetadataError(ValueError):
     """Raised when a skill or VibeSys sidecar metadata is malformed."""
@@ -450,7 +482,48 @@ def resolve_skill_source_dirs(
     return [str(path) for path in resolved]
 
 
+def validate_platform_layout(skill_dir: Path) -> None:
+    """Validate a skill's ``references/platforms/`` tree, if it has one.
+
+    Skills may carry per-backend guidance under
+    ``references/platforms/<backend>/``. Two rules keep that tree honest:
+
+    1. Every directory name must be a known :class:`ComputeBackend` value, so
+       materialization can prune foreign platforms by literal name match.
+    2. Every platform directory must contain the skeleton files. A missing
+       one is a real gap — without this check it silently resolves to
+       whichever platform happens to be most complete, which is how a
+       platform ends up documented by another platform's guidance.
+    """
+    platforms_dir = skill_dir / "references" / "platforms"
+    if not platforms_dir.is_dir():
+        return
+
+    known = {backend.value for backend in ComputeBackend}
+    present = sorted(p for p in platforms_dir.iterdir() if p.is_dir())
+
+    unknown = [p.name for p in present if p.name not in known]
+    if unknown:
+        raise _metadata_error(
+            platforms_dir,
+            f"unknown platform director{'y' if len(unknown) == 1 else 'ies'}: "
+            f"{', '.join(sorted(unknown))}. Allowed: {', '.join(sorted(known))}",
+        )
+
+    for platform_dir in present:
+        missing = sorted(n for n in PLATFORM_SKELETON if not (platform_dir / n).is_file())
+        if missing:
+            raise _metadata_error(
+                platform_dir,
+                f"platform directory is missing required file(s): {', '.join(missing)}",
+            )
+
+
 def validate_skill_tree(root: Path) -> list[SkillMetadata]:
     """Validate every skill and VibeSys sidecar under *root*."""
     rules = discover_sidecar_rules(root)
-    return [effective_skill_metadata(skill_dir, rules) for skill_dir in discover_skill_dirs(root)]
+    metadata = []
+    for skill_dir in discover_skill_dirs(root):
+        validate_platform_layout(skill_dir)
+        metadata.append(effective_skill_metadata(skill_dir, rules))
+    return metadata

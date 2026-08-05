@@ -105,6 +105,7 @@ class DockerSandbox(BaseSandbox):
         image: str,
         gpus: str | None = None,
         devices: list[str] | None = None,
+        group_add: list[str] | None = None,
         entrypoint: str | None = None,
         shm_size: str | None = None,
         auto_remove: bool = False,
@@ -129,6 +130,11 @@ class DockerSandbox(BaseSandbox):
             devices: Host device paths (e.g. ``["/dev/neuron0"]``) to forward
                 with ``--device``.  Used by non-CUDA accelerators (AWS Neuron)
                 that the NVIDIA container runtime's ``--gpus`` cannot expose.
+            group_add: Supplementary groups to add the container user to
+                (emits ``--group-add``).  Required by accelerators whose
+                device nodes are group-owned rather than world-accessible —
+                AMD ROCm needs ``video`` and ``render`` to open ``/dev/kfd``
+                and ``/dev/dri/*``.
             entrypoint: Override the image ``ENTRYPOINT`` (emits
                 ``--entrypoint``).  Pass ``""`` to *clear* a baked-in
                 entrypoint so the container runs ``sleep infinity`` directly
@@ -160,6 +166,7 @@ class DockerSandbox(BaseSandbox):
         self._image = image
         self._gpus = gpus
         self._devices: list[str] = list(devices or [])
+        self._group_add: list[str] = list(group_add or [])
         self._entrypoint = entrypoint
         self._shm_size = shm_size
         self._auto_remove = auto_remove
@@ -334,6 +341,9 @@ class DockerSandbox(BaseSandbox):
         for device in self._devices:
             cmd.extend(["--device", device])
 
+        for group in self._group_add:
+            cmd.extend(["--group-add", group])
+
         if self._entrypoint is not None:
             cmd.extend(["--entrypoint", self._entrypoint])
 
@@ -412,6 +422,7 @@ class DockerSandbox(BaseSandbox):
             "image": self._image,
             "gpus": self._gpus,
             "devices": list(self._devices),
+            "group_add": list(self._group_add),
             "entrypoint": self._entrypoint,
             "shm_size": self._shm_size,
             "bind_mounts": [[host, container, ro] for host, container, ro in self._bind_mounts],

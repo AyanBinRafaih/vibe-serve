@@ -373,4 +373,4 @@ measured saturation point as though it were the hardware roofline.
 - [`../../OVERVIEW.md`](../../OVERVIEW.md) — roofline and prefill/decode foundations.
 - [`profiler.md`](profiler.md) — collect system timelines and kernel roofline evidence.
 - [`serving-benchmark.md`](serving-benchmark.md) — measure comparable end-to-end serving metrics.
-- [`../hardware/nvidia.md`](../hardware/nvidia.md) — hardware specifications for NVIDIA targets.
+- [`../platforms/`](../platforms/) — select the platform hardware notes for the target backend.
