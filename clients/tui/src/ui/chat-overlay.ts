@@ -10,17 +10,21 @@ import {
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {ConversationView} from './conversation.js';
+import type {Theme} from './theme.js';
 
 export class ChatOverlayView {
   readonly output: BoxRenderable;
   readonly #transcript: ScrollBoxRenderable;
   readonly #conversation: ConversationView;
   readonly #input: InputRenderable;
+  readonly #inputBox: BoxRenderable;
+  readonly #hint: TextRenderable;
 
   constructor(
     renderer: CliRenderer,
     private readonly controller: SessionController,
     markdownStyle: SyntaxStyle,
+    theme: Theme,
   ) {
     this.output = new BoxRenderable(renderer, {
       id: 'chat-overlay',
@@ -34,8 +38,8 @@ export class ChatOverlayView {
       paddingRight: 1,
       border: true,
       borderStyle: 'rounded',
-      borderColor: '#a78bfa',
-      backgroundColor: '#020617',
+      borderColor: theme.conversation.analysis.label,
+      backgroundColor: theme.elevatedSurface,
       title: ' Experiment chat ',
       zIndex: 20,
       visible: false,
@@ -49,18 +53,18 @@ export class ChatOverlayView {
       viewportCulling: true,
       verticalScrollbarOptions: {showArrows: true},
     });
-    this.#conversation = new ConversationView(renderer, controller, markdownStyle, {
+    this.#conversation = new ConversationView(renderer, controller, markdownStyle, theme, {
       selectConversation: state => state.chatConversation,
       emptyContent: 'Ask a question about the current experiment, its progress, or a failure.',
       renderMarkdown: false,
     });
-    const inputBox = new BoxRenderable(renderer, {
+    this.#inputBox = new BoxRenderable(renderer, {
       id: 'chat-input-box',
       height: 3,
       width: '100%',
       border: true,
       borderStyle: 'rounded',
-      borderColor: '#8b5cf6',
+      borderColor: theme.conversation.analysis.label,
       title: ' Message ',
       paddingLeft: 1,
       paddingRight: 1,
@@ -69,22 +73,31 @@ export class ChatOverlayView {
       id: 'chat-input',
       width: '100%',
       placeholder: 'Ask about this experiment',
-      textColor: '#f8fafc',
-      focusedTextColor: '#f8fafc',
+      textColor: theme.textStrong,
+      focusedTextColor: theme.textStrong,
     });
     this.#input.on(InputRenderableEvents.ENTER, this.#submit);
-    inputBox.add(this.#input);
+    this.#inputBox.add(this.#input);
     this.#transcript.add(this.#conversation.output);
     this.output.add(this.#transcript);
-    this.output.add(inputBox);
-    this.output.add(
-      new TextRenderable(renderer, {
-        content: 'Enter to send · Esc to close',
-        fg: '#64748b',
-        height: 1,
-        width: '100%',
-      }),
-    );
+    this.output.add(this.#inputBox);
+    this.#hint = new TextRenderable(renderer, {
+      content: 'Enter to send · Esc to close',
+      fg: theme.textSubtle,
+      height: 1,
+      width: '100%',
+    });
+    this.output.add(this.#hint);
+  }
+
+  applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
+    this.output.borderColor = theme.conversation.analysis.label;
+    this.output.backgroundColor = theme.elevatedSurface;
+    this.#inputBox.borderColor = theme.conversation.analysis.label;
+    this.#input.textColor = theme.textStrong;
+    this.#input.focusedTextColor = theme.textStrong;
+    this.#hint.fg = theme.textSubtle;
+    this.#conversation.applyTheme(theme, markdownStyle);
   }
 
   render(state: SessionState): void {

@@ -1,5 +1,5 @@
 import type {EventSubscription} from './client.js';
-import {HELP_TEXT, parseInput} from './commands.js';
+import {HELP_TEXT, parseInput, themeListText} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import type {ProtocolResponse, RequestInput, ServerMessage} from './protocol.js';
 import {
@@ -20,10 +20,12 @@ import {
   selectPreviousAgent,
   selectPreviousRound,
   selectRound,
+  setTheme,
   showDetail,
   showLive,
   toggleTodos,
 } from './session-model.js';
+import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
 
 export interface SessionController {
   readonly state: SessionState;
@@ -39,6 +41,7 @@ export interface SessionController {
   selectPreviousRound(): void;
   selectRound(roundNumber: number): void;
   toggleTodos(): void;
+  setTheme(themeName: ThemeName): void;
   subscribe(listener: (state: SessionState) => void): () => void;
 }
 
@@ -53,14 +56,19 @@ export interface SupervisionTransport {
 }
 
 export class SocketSessionController implements SessionController {
-  #state = initialSessionState();
+  #state: SessionState;
   readonly #listeners = new Set<(state: SessionState) => void>();
   #eventSubscription: EventSubscription | null = null;
   #chatMessageId = 0;
   readonly #chatQueue: Array<{id: string; text: string}> = [];
   #chatDrain: Promise<void> | null = null;
 
-  constructor(private readonly client: SupervisionTransport) {}
+  constructor(
+    private readonly client: SupervisionTransport,
+    themeName: ThemeName = DEFAULT_THEME_NAME,
+  ) {
+    this.#state = initialSessionState(themeName);
+  }
 
   get state(): SessionState {
     return this.#state;
@@ -116,6 +124,10 @@ export class SocketSessionController implements SessionController {
 
   toggleTodos(): void {
     this.#setState(toggleTodos(this.#state));
+  }
+
+  setTheme(themeName: ThemeName): void {
+    this.#setState(setTheme(this.#state, themeName));
   }
 
   closeChat(): void {
@@ -208,6 +220,14 @@ export class SocketSessionController implements SessionController {
       this.#setState({...this.#state, overlay: null, chatOpen: true});
       if (parsed.chatMessage) await this.sendChat(parsed.chatMessage);
       return;
+    }
+    if (parsed.localView === 'theme') {
+      if (parsed.themeName === undefined) {
+        return this.#setState(
+          showDetail(this.#state, themeListText(this.#state.themeName), 'help'),
+        );
+      }
+      return this.setTheme(parsed.themeName);
     }
     if (!parsed.request) return;
     if (parsed.request.type === 'query.chat') {

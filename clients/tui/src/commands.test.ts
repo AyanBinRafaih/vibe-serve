@@ -36,6 +36,22 @@ describe('parseInput', () => {
     expect(parseInput('/chat')).toEqual({localView: 'chat'});
     expect(parseInput('/chat   ')).toEqual({localView: 'chat'});
   });
+
+  it('lists themes bare and selects a known theme by name', () => {
+    expect(parseInput('/theme')).toEqual({localView: 'theme'});
+    expect(parseInput('/theme   ')).toEqual({localView: 'theme'});
+    expect(parseInput('/theme solarized-light')).toEqual({
+      localView: 'theme',
+      themeName: 'solarized-light',
+    });
+  });
+
+  it('rejects an unknown theme name with the available list', () => {
+    const parsed = parseInput('/theme monokai');
+    expect(parsed.error).toContain('Unknown theme: monokai');
+    expect(parsed.error).toContain('catppuccin-mocha');
+    expect(parsed.localView).toBeUndefined();
+  });
 });
 
 describe('slash-command input helpers', () => {
@@ -45,6 +61,7 @@ describe('slash-command input helpers', () => {
       '/chat',
       '/history',
       '/perf',
+      '/theme',
     ]);
     expect(suggestSlashCommands('/hi').map(command => command.name)).toEqual(['/history']);
     expect(suggestSlashCommands('/history ')).toEqual([]);

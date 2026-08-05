@@ -9,6 +9,7 @@ import {
 } from '@opentui/core';
 import type {SetupDefaults, SetupSelection} from './setup-model.js';
 import {validateSetupSelection} from './setup-model.js';
+import {resolveTheme, type Theme} from './ui/theme.js';
 
 const rawDefaults = process.env['VIBESYS_SETUP_DEFAULTS'];
 const resultPath = process.env['VIBESYS_SETUP_RESULT'];
@@ -17,8 +18,9 @@ if (!rawDefaults || !resultPath) {
 }
 
 const defaults = JSON.parse(rawDefaults) as SetupDefaults;
+const theme = resolveTheme(process.env['VIBESYS_THEME']);
 const renderer = await createCliRenderer({exitOnCtrlC: false});
-const form = createSetupForm(renderer, defaults);
+const form = createSetupForm(renderer, defaults, theme);
 renderer.start();
 
 await new Promise<void>(resolve => renderer.once(CliRenderEvents.DESTROY, resolve));
@@ -32,7 +34,7 @@ interface SetupForm {
   destroy(): void;
 }
 
-function createSetupForm(renderer: CliRenderer, defaults: SetupDefaults): SetupForm {
+function createSetupForm(renderer: CliRenderer, defaults: SetupDefaults, theme: Theme): SetupForm {
   const root = new BoxRenderable(renderer, {
     id: 'setup',
     width: '100%',
@@ -41,37 +43,39 @@ function createSetupForm(renderer: CliRenderer, defaults: SetupDefaults): SetupF
     paddingLeft: 2,
     paddingRight: 2,
     paddingTop: 1,
+    backgroundColor: theme.canvas,
   });
   const title = new TextRenderable(renderer, {
     id: 'setup-title',
     height: 2,
-    fg: '#22d3ee',
+    fg: theme.accent,
     content: 'VibeSys · New experiment',
   });
   const instructions = new TextRenderable(renderer, {
     id: 'setup-instructions',
     height: 2,
-    fg: '#94a3b8',
+    fg: theme.textMuted,
     content: 'Tab / Shift-Tab: move · Enter: launch · Esc: cancel · Clear owner for local-only',
   });
   const error = new TextRenderable(renderer, {
     id: 'setup-error',
     height: 2,
-    fg: '#f87171',
+    fg: theme.error,
     content: '',
   });
 
   const entries = [
-    createField(renderer, 'Input bundle', defaults.input_path, 'examples/<input>'),
-    createField(renderer, 'Experiment name', defaults.experiment_name, 'experiment name'),
+    createField(renderer, 'Input bundle', defaults.input_path, 'examples/<input>', theme),
+    createField(renderer, 'Experiment name', defaults.experiment_name, 'experiment name', theme),
     createField(
       renderer,
       'Repository owner',
       defaults.repository_owner ?? '',
       'local-only if empty',
+      theme,
     ),
-    createField(renderer, 'Repository name', defaults.repository_name, 'repository name'),
-    createField(renderer, 'Visibility', defaults.visibility, 'private | public | internal'),
+    createField(renderer, 'Repository name', defaults.repository_name, 'repository name', theme),
+    createField(renderer, 'Visibility', defaults.visibility, 'private | public | internal', theme),
   ];
   root.add(title);
   root.add(instructions);
@@ -135,13 +139,14 @@ function createField(
   label: string,
   value: string,
   placeholder: string,
+  theme: Theme,
 ): {box: BoxRenderable; input: InputRenderable} {
   const box = new BoxRenderable(renderer, {
     height: 3,
     width: '100%',
     border: true,
     borderStyle: 'rounded',
-    borderColor: '#475569',
+    borderColor: theme.border,
     title: ` ${label} `,
     paddingLeft: 1,
     paddingRight: 1,
@@ -150,8 +155,8 @@ function createField(
     width: '100%',
     value,
     placeholder,
-    textColor: '#f8fafc',
-    focusedTextColor: '#f8fafc',
+    textColor: theme.textStrong,
+    focusedTextColor: theme.textStrong,
   });
   box.add(input);
   return {box, input};

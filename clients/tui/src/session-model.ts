@@ -7,6 +7,7 @@ import {
   visiblePhases as visibleRunMapPhases,
   visibleRoundNumber as visibleRunMapRoundNumber,
 } from './run-map.js';
+import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
 
 export interface SessionState {
   sequence: number;
@@ -28,6 +29,7 @@ export interface SessionState {
   todoPhases: PhaseTodos[];
   todosExpanded: boolean;
   usage: UsageMeter | null;
+  themeName: ThemeName;
   /**
    * Set once a typed tool_call/tool_result event is seen. From then on the
    * legacy tool-channel text chunks (still present in event files recorded
@@ -90,7 +92,7 @@ export interface ConversationEntry {
   toolCallId?: string;
 }
 
-export function initialSessionState(): SessionState {
+export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): SessionState {
   return {
     sequence: 0,
     status: 'connecting',
@@ -111,8 +113,14 @@ export function initialSessionState(): SessionState {
     todoPhases: [],
     todosExpanded: false,
     usage: null,
+    themeName,
     typedToolEvents: false,
   };
+}
+
+export function setTheme(state: SessionState, themeName: ThemeName): SessionState {
+  if (state.themeName === themeName) return state;
+  return {...state, themeName, overlay: null};
 }
 
 export function applySnapshot(state: SessionState, snapshot: RunSnapshot): SessionState {

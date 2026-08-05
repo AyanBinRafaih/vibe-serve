@@ -20,6 +20,7 @@ Several flags look independent, but they combine into one execution contract:
 | Skills | `--skills-dir`, `--no-skills` | Candidate skill roots and the ablation switch that disables skill loading. |
 | Target inputs | `--input` | Target bundle directory with manifest-declared correctness and benchmark commands. |
 | Experiment repository | `--repo`, `--repo-visibility`, `--resume` | Optionally create and synchronize a remote experiment, or resume from a local path/GitHub repository. |
+| Client theme | `--theme` | Presentation only. Which semantic theme the interactive client renders with. |
 
 Do not treat these as simple toggles. Some combinations imply a startup
 contract, profiler, or sandbox capability. Language and artifact requirements
@@ -222,6 +223,46 @@ environment setup/teardown hooks.
 speech-to-text. Domains and modalities may define language, toolchain, and
 artifact requirements. Interface-specific prose should describe only the
 direct-call or service boundary.
+
+## Client Theme
+
+`--theme` selects the semantic theme the interactive client renders with. It is
+presentation only: it never reaches the agents, the workspace, or the recorded
+run state, and it is ignored in headless mode.
+
+| Theme | Appearance | Use for |
+| --- | --- | --- |
+| `dark` | dark | Default. Reproduces the pre-theme appearance. |
+| `light` | light | The baseline palette inverted for light terminals. |
+| `solarized-dark` | dark | Low-glare Solarized palette. |
+| `solarized-light` | light | Low-glare Solarized palette. |
+| `catppuccin-mocha` | dark | Softer, more expressive palette. |
+| `catppuccin-latte` | light | Softer, more expressive palette. |
+| `high-contrast-dark` | dark | Accessibility-focused; every foreground clears a 7:1 contrast ratio. |
+| `high-contrast-light` | light | Accessibility-focused; every foreground clears a 7:1 contrast ratio. |
+
+Resolution order, highest first:
+
+1. `--theme <name>` on the command line.
+2. `[tui].theme` in `agent.toml`.
+3. `dark`.
+
+An unknown name is rejected before any process starts. Inside a running
+session, `/theme` lists the available themes and `/theme <name>` switches
+immediately; that switch applies to the session only and does not edit
+`agent.toml`.
+
+Themes define semantic roles — surfaces, text emphasis levels, borders,
+accents, status colors, conversation roles, and Markdown/code colors — rather
+than per-component colors, and every derived foreground is checked against its
+own background at build time. Status is never carried by color alone: agent
+phases show a marker glyph and the spelled-out status, todo items show a
+per-status marker, and the running round is the only one with an elapsed-time
+suffix.
+
+```bash
+./vs --input examples/model-serving/Llama-3-8B --theme solarized-light
+```
 
 ## Skills
 

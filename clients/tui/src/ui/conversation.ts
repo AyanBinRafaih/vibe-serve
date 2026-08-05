@@ -10,6 +10,7 @@ import type {ConversationEntry, SessionState} from '../session-model.js';
 import {visibleConversation} from '../session-model.js';
 import {promptPreview, toolOutputPreview} from './previews.js';
 import {entryPalette} from './styles.js';
+import type {Theme} from './theme.js';
 
 export interface ConversationViewOptions {
   selectConversation?: (state: SessionState) => ConversationEntry[];
@@ -19,6 +20,8 @@ export interface ConversationViewOptions {
 
 export class ConversationView {
   readonly output: BoxRenderable;
+  #theme: Theme;
+  #markdownStyle: SyntaxStyle;
   readonly #expandedPrompts = new Set<string>();
   readonly #selectConversation: (state: SessionState) => ConversationEntry[];
   readonly #emptyContent: string;
@@ -29,9 +32,12 @@ export class ConversationView {
   constructor(
     private readonly renderer: CliRenderer,
     private readonly controller: SessionController,
-    private readonly markdownStyle: SyntaxStyle,
+    markdownStyle: SyntaxStyle,
+    theme: Theme,
     options: ConversationViewOptions = {},
   ) {
+    this.#markdownStyle = markdownStyle;
+    this.#theme = theme;
     this.#selectConversation = options.selectConversation ?? visibleConversation;
     this.#emptyContent = options.emptyContent ?? 'Waiting for run events…';
     this.#renderMarkdown = options.renderMarkdown ?? true;
@@ -46,6 +52,13 @@ export class ConversationView {
 
   render(state: SessionState): void {
     this.#renderConversation(this.#selectConversation(state));
+  }
+
+  applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
+    this.#theme = theme;
+    this.#markdownStyle = markdownStyle;
+    this.#clear();
+    this.#renderedConversation = [];
   }
 
   toggleLatestPrompt(): void {
@@ -97,7 +110,7 @@ export class ConversationView {
     if (entries.length === 0) {
       const card = new TextRenderable(this.renderer, {
         content: this.#emptyContent,
-        fg: '#64748b',
+        fg: this.#theme.textSubtle,
       });
       this.output.add(card);
       return;
@@ -117,7 +130,7 @@ export class ConversationView {
   }
 
   #renderEntry(entry: ConversationEntry): BoxRenderable {
-    const palette = entryPalette(entry);
+    const palette = entryPalette(entry, this.#theme);
     const card = new BoxRenderable(this.renderer, {
       id: `event-${entry.id}`,
       width: '100%',
@@ -162,7 +175,7 @@ export class ConversationView {
             content: this.#expandedPrompts.has(entry.id)
               ? '▴ click to collapse'
               : `▾ ${prompt.hiddenLines} more lines · click to expand`,
-            fg: '#60a5fa',
+            fg: this.#theme.info,
             width: '100%',
           }),
         );
@@ -180,7 +193,7 @@ export class ConversationView {
     card.add(
       new MarkdownRenderable(this.renderer, {
         content: preview.content,
-        syntaxStyle: this.markdownStyle,
+        syntaxStyle: this.#markdownStyle,
         conceal: true,
         streaming: !this.controller.state.terminal,
         width: '100%',
@@ -192,7 +205,7 @@ export class ConversationView {
           content: expanded
             ? '▴ click or Ctrl+P to collapse'
             : `▾ ${preview.hiddenLines} more lines · click or Ctrl+P to expand`,
-          fg: '#60a5fa',
+          fg: this.#theme.info,
           width: '100%',
         }),
       );
@@ -203,8 +216,8 @@ export class ConversationView {
     card.add(
       new TextRenderable(this.renderer, {
         content: entry.toolCall?.trimEnd() ?? '',
-        fg: '#dbeafe',
-        bg: '#1e3a8a',
+        fg: this.#theme.toolCall.foreground,
+        bg: this.#theme.toolCall.background,
         width: '100%',
       }),
     );
@@ -212,8 +225,8 @@ export class ConversationView {
       card.add(
         new TextRenderable(this.renderer, {
           content: toolOutputPreview(entry.toolResponse),
-          fg: '#a1a1aa',
-          bg: '#18181b',
+          fg: this.#theme.toolResult.foreground,
+          bg: this.#theme.toolResult.background,
           width: '100%',
         }),
       );

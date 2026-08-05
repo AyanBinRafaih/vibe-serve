@@ -23,6 +23,7 @@ available slash commands are:
 | `/help` | Show commands and planned controls. |
 | `/history` | List rounds with agent-active elapsed time. |
 | `/perf` | Plot the recorded performance metric by round. |
+| `/theme` | List themes; `/theme <name>` switches immediately. |
 
 The footer shows keyboard navigation. `[` and `]` select rounds, Tab and
 Shift+Tab select agents, Page Up/Page Down scroll the transcript, Ctrl+T expands
@@ -35,6 +36,42 @@ fails to start, its log tail is printed before the temporary session directory
 is removed. Requests and subscription setup have bounded timeouts; malformed or
 incompatible protocol messages are shown as errors instead of crashing a socket
 callback.
+
+## Themes
+
+Four light/dark pairs ship: `dark` (default) / `light`, `solarized-dark` /
+`solarized-light`, `catppuccin-mocha` / `catppuccin-latte`, and
+`high-contrast-dark` / `high-contrast-light`. Selecting `dark` reproduces the
+appearance the client had before themes existed: conversation cards, the
+tool-call bands, and the Markdown palette are pinned to the original literals.
+Four near-duplicate status shades were deliberately folded into the role they
+belong to — a completed todo now uses the same green as an active agent phase,
+completed phases and prompt-disclosure hints use the same blue as the detail
+overlay, round labels use the same body-text color as card content, and the
+chat panel's inner border matches its outer one. `theme.test.ts` pins all of
+this so the baseline cannot drift.
+
+Pick one with `--theme <name>` or `[tui].theme` in `agent.toml`; the flag wins.
+The launcher resolves the name once and passes it to both the pre-launch setup
+screen and the main client through `VIBESYS_THEME`. Inside a session, `/theme`
+lists the themes and `/theme <name>` re-themes every view in place.
+
+`ui/theme.ts` is the only module holding color literals. A theme declares
+semantic roles — `canvas`, `surface`, `elevatedSurface`, `selectedSurface`;
+`textPrimary`, `textMuted`, `textSubtle`, `textStrong`; `border`,
+`borderStrong`, `borderFocus`; `accent`, `info`; `success`, `warning`, `error`;
+per-role conversation card colors; and Markdown/code colors. Views ask for a
+role and never for a color.
+
+Adding a theme means adding one `ThemeSpec`: a semantic core plus one accent
+per conversation role. Card fills, labels, body text, the tool-call band, and
+the Markdown palette are derived from that core, and each derived foreground is
+pushed toward the nearest extreme until it clears the theme's `minContrast`
+against the surface it actually sits on. The `dark` theme additionally pins its
+derived values to the original literals so the baseline is byte-identical.
+Status meaning never depends on color: agent phases carry a marker glyph and
+the spelled-out status, todos carry a per-status marker, and only the running
+round shows elapsed time.
 
 ## Architecture
 

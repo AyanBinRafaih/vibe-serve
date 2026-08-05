@@ -2,6 +2,7 @@ import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
 import type {AgentPhase} from '../run-map.js';
 import type {SessionState} from '../session-model.js';
 import {visiblePhases, visibleRoundNumber} from '../session-model.js';
+import type {Theme} from './theme.js';
 
 const STATUS_MARKER: Record<AgentPhase['status'], string> = {
   pending: '○',
@@ -10,18 +11,23 @@ const STATUS_MARKER: Record<AgentPhase['status'], string> = {
   failed: '×',
 };
 
-const STATUS_COLOR: Record<AgentPhase['status'], string> = {
-  pending: '#64748b',
-  active: '#22c55e',
-  completed: '#60a5fa',
-  failed: '#f87171',
-};
+function statusColor(theme: Theme, status: AgentPhase['status']): string {
+  if (status === 'active') return theme.success;
+  if (status === 'completed') return theme.info;
+  if (status === 'failed') return theme.error;
+  return theme.textSubtle;
+}
 
 export class AgentMapView {
   readonly output: BoxRenderable;
+  #theme: Theme;
   #renderedState: SessionState | null = null;
 
-  constructor(private readonly renderer: CliRenderer) {
+  constructor(
+    private readonly renderer: CliRenderer,
+    theme: Theme,
+  ) {
+    this.#theme = theme;
     this.output = new BoxRenderable(renderer, {
       id: 'agent-map',
       width: 30,
@@ -31,9 +37,15 @@ export class AgentMapView {
       paddingRight: 1,
       border: true,
       borderStyle: 'rounded',
-      borderColor: '#475569',
+      borderColor: theme.border,
       title: ' Agents ',
     });
+  }
+
+  applyTheme(theme: Theme): void {
+    this.#theme = theme;
+    this.output.borderColor = theme.border;
+    this.#renderedState = null;
   }
 
   render(state: SessionState): void {
@@ -45,7 +57,7 @@ export class AgentMapView {
       this.output.add(
         new TextRenderable(this.renderer, {
           content: 'Waiting for phases…',
-          fg: '#64748b',
+          fg: this.#theme.textSubtle,
           width: '100%',
         }),
       );
@@ -56,7 +68,7 @@ export class AgentMapView {
     this.output.add(
       new TextRenderable(this.renderer, {
         content: roundNumber === null ? 'Run flow' : `Round ${roundNumber} flow`,
-        fg: '#cbd5e1',
+        fg: this.#theme.textPrimary,
         width: '100%',
       }),
     );
@@ -66,7 +78,7 @@ export class AgentMapView {
         this.output.add(
           new TextRenderable(this.renderer, {
             content: '        ↓',
-            fg: '#64748b',
+            fg: this.#theme.textSubtle,
             width: '100%',
           }),
         );
@@ -91,21 +103,21 @@ export class AgentMapView {
       paddingRight: 1,
       border: selected,
       borderStyle: 'rounded',
-      borderColor: selected ? '#22d3ee' : '#475569',
-      ...(selected ? {backgroundColor: '#0f172a'} : {}),
+      borderColor: selected ? this.#theme.borderFocus : this.#theme.border,
+      ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
     });
-    const statusColor = STATUS_COLOR[phase.status];
+    const color = statusColor(this.#theme, phase.status);
     row.add(
       new TextRenderable(this.renderer, {
         content: `${STATUS_MARKER[phase.status]} ${phase.kind}`,
-        fg: selected ? '#f8fafc' : statusColor,
+        fg: selected ? this.#theme.textStrong : color,
         width: '100%',
       }),
     );
     row.add(
       new TextRenderable(this.renderer, {
         content: phase.status,
-        fg: statusColor,
+        fg: color,
         width: '100%',
       }),
     );
@@ -113,7 +125,7 @@ export class AgentMapView {
       row.add(
         new TextRenderable(this.renderer, {
           content: phase.roundLabel,
-          fg: '#94a3b8',
+          fg: this.#theme.textMuted,
           width: '100%',
         }),
       );

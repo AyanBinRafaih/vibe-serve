@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from vibesys.constants import DEFAULT_COMPUTE_BACKEND, PROJECT_ROOT, ComputeBackend
 from vibesys.features import FeatureFlag
 from vibesys.repository import REPOSITORY_COMPONENT, RepositoryVisibility
+from vibesys.tui import DEFAULT_TUI_THEME, TuiTheme
 from vs_feature_flags import parse_feature_flag_overrides
 
 Provider = Literal["vertex-ai", "anthropic", "google-genai", "openai", "openai-compatible"]
@@ -203,6 +204,17 @@ class RepositoryCfg(_Strict):
         return owner
 
 
+class TuiCfg(_Strict):
+    theme: TuiTheme = Field(
+        default=DEFAULT_TUI_THEME,
+        description=(
+            "Semantic theme for the interactive client. One of: dark, light, "
+            "solarized-dark, solarized-light, catppuccin-mocha, catppuccin-latte, "
+            "high-contrast-dark, high-contrast-light. The --theme flag overrides."
+        ),
+    )
+
+
 class LoadLevelCfg(_Strict):
     """One benchmark load level fed to the perf_eval prompt template.
 
@@ -245,6 +257,10 @@ class Config(_Strict):
     repository: RepositoryCfg = Field(
         default_factory=RepositoryCfg,
         description="[repository] — defaults for remote experiment repositories.",
+    )
+    tui: TuiCfg = Field(
+        default_factory=TuiCfg,
+        description="[tui] — interactive client presentation settings.",
     )
     perf_eval: PerfEvalCfg = Field(
         default_factory=PerfEvalCfg,

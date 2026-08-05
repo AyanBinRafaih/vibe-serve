@@ -49,6 +49,7 @@ from vibesys.sandbox.run_environment import (
     make_run_environment_spec,
 )
 from vibesys.skills import DEFAULT_SKILL_ROOTS, resolve_skill_source_dirs
+from vibesys.tui import KNOWN_TUI_THEMES, TuiTheme
 from vs_github import GitHubCLI, GitHubCLIError
 
 if TYPE_CHECKING:
@@ -352,6 +353,18 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Compute backend to target. Overrides [backend].name in "
             f"agent.toml. Defaults to 'cuda'. Supported: {', '.join(KNOWN_COMPUTE_BACKENDS)}."
+        ),
+    )
+    parser.add_argument(
+        "--theme",
+        type=TuiTheme,
+        choices=list(TuiTheme),
+        default=None,
+        metavar="NAME",
+        help=(
+            "Theme for the interactive client. Overrides [tui].theme in "
+            f"agent.toml. Defaults to 'dark'. Supported: {', '.join(KNOWN_TUI_THEMES)}. "
+            "Ignored in headless mode."
         ),
     )
 
@@ -663,6 +676,7 @@ def _build_tui_defaults_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "agent.toml")
     parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--exp-name", default=None)
+    parser.add_argument("--theme", type=TuiTheme, choices=list(TuiTheme), default=None)
     return parser
 
 
@@ -681,6 +695,7 @@ def _run_tui_defaults(argv: list[str]) -> None:
         repository_owner=config.repository.owner,
         repository_name=repository_name_from_experiment(experiment_name),
         visibility=config.repository.visibility,
+        theme=args.theme or config.tui.theme,
     )
     print(defaults.model_dump_json())
 

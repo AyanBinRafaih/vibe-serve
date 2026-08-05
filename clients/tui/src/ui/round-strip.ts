@@ -4,12 +4,11 @@ import {type RoundSummary, roundAgentElapsedMs} from '../run-map.js';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {visibleRoundNumber} from '../session-model.js';
-
-const ACTIVE_ROUND_COLOR = '#22c55e';
-const DEFAULT_ROUND_COLOR = '#cbd5e1';
+import type {Theme} from './theme.js';
 
 export class RoundStripView {
   readonly output: BoxRenderable;
+  #theme: Theme;
   #renderedState: SessionState | null = null;
   #elapsedTimer: ReturnType<typeof setInterval> | null = null;
   #runningRound: {
@@ -21,18 +20,26 @@ export class RoundStripView {
   constructor(
     private readonly renderer: CliRenderer,
     private readonly controller: SessionController,
+    theme: Theme,
   ) {
+    this.#theme = theme;
     this.output = new BoxRenderable(renderer, {
       id: 'round-strip',
       width: '100%',
       height: 3,
       border: true,
       borderStyle: 'rounded',
-      borderColor: '#334155',
+      borderColor: theme.borderStrong,
       paddingLeft: 1,
       paddingRight: 1,
       title: ' Rounds ',
     });
+  }
+
+  applyTheme(theme: Theme): void {
+    this.#theme = theme;
+    this.output.borderColor = theme.borderStrong;
+    this.#renderedState = null;
   }
 
   render(state: SessionState): void {
@@ -43,7 +50,7 @@ export class RoundStripView {
       this.output.add(
         new TextRenderable(this.renderer, {
           content: 'Waiting for rounds...',
-          fg: '#64748b',
+          fg: this.#theme.textSubtle,
           width: '100%',
         }),
       );
@@ -85,8 +92,8 @@ export class RoundStripView {
     const isRunning = round.number === runningRound;
     const text = new TextRenderable(this.renderer, {
       content: this.#roundLabel(round, selected),
-      fg: isRunning ? ACTIVE_ROUND_COLOR : DEFAULT_ROUND_COLOR,
-      ...(isSelected ? {bg: '#0f172a'} : {}),
+      fg: isRunning ? this.#theme.success : this.#theme.textPrimary,
+      ...(isSelected ? {bg: this.#theme.selectedSurface} : {}),
       onMouseUp: () => this.controller.selectRound(round.number),
     });
     if (isRunning && hasActiveAgentTiming(round)) this.#runningRound = {round, selected, text};

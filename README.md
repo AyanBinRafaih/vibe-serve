@@ -177,6 +177,9 @@ cli_provider = "codex"        # which coding-agent harness to drive
 owner = "vibesys-playground"  # any GitHub user/org; enables pre-launch repository setup
 visibility = "private"        # private, public, or internal
 
+[tui]
+theme = "dark"                # interactive client theme; --theme overrides
+
 # Optional: benchmark load levels handed to the perf evaluator.
 # [[perf_eval.load_levels]]
 # rate = 1
@@ -185,6 +188,12 @@ visibility = "private"        # private, public, or internal
 ```
 
 Provider credentials live in `.env` — see `.env.example`. The CLI flags `--agent-backend` / `--cli-provider` / `--backend` override these.
+
+The interactive client ships four light/dark theme pairs — `dark` (default) /
+`light`, `solarized-dark` / `solarized-light`, `catppuccin-mocha` /
+`catppuccin-latte`, and `high-contrast-dark` / `high-contrast-light`. Set one
+with `[tui].theme` or `--theme`, or switch mid-session with `/theme <name>`.
+See [`docs/cli-flags.md`](docs/cli-flags.md#client-theme).
 
 Optional `[feature_flags]` entries are documented in
 [`src/vibesys/FEATURE_FLAGS.md`](src/vibesys/FEATURE_FLAGS.md). All flags default

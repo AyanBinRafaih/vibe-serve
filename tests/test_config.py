@@ -7,6 +7,7 @@ import pytest
 
 from vibesys.config import _load_dotenv_file, load_config
 from vibesys.features import FeatureFlag
+from vibesys.tui import TuiTheme
 
 
 class TestLoadConfigValid:
@@ -377,6 +378,40 @@ visibility = "internal"
         cfg_file.write_text(f'[model]\nname = "gpt-5.5"\n\n[repository]\nowner = "{owner}"\n')
 
         with pytest.raises(ValueError, match="repository owner"):
+            load_config(cfg_file)
+
+
+class TestLoadConfigTui:
+    def test_theme_defaults_to_dark(self, tmp_path):
+        cfg_file = tmp_path / "agent.toml"
+        cfg_file.write_text('[model]\nname = "gpt-5.5"\n')
+
+        config = load_config(cfg_file)
+
+        assert config.tui.theme is TuiTheme.DARK
+
+    @pytest.mark.parametrize("theme", [theme.value for theme in TuiTheme])
+    def test_every_registered_theme_is_selectable(self, tmp_path, theme):
+        cfg_file = tmp_path / "agent.toml"
+        cfg_file.write_text(f'[model]\nname = "gpt-5.5"\n\n[tui]\ntheme = "{theme}"\n')
+
+        config = load_config(cfg_file)
+
+        assert config.tui.theme == theme
+
+    @pytest.mark.parametrize("theme", ["monokai", "Dark", "", "solarized"])
+    def test_unknown_theme_is_rejected(self, tmp_path, theme):
+        cfg_file = tmp_path / "agent.toml"
+        cfg_file.write_text(f'[model]\nname = "gpt-5.5"\n\n[tui]\ntheme = "{theme}"\n')
+
+        with pytest.raises(ValueError):
+            load_config(cfg_file)
+
+    def test_unknown_tui_key_is_rejected(self, tmp_path):
+        cfg_file = tmp_path / "agent.toml"
+        cfg_file.write_text('[model]\nname = "gpt-5.5"\n\n[tui]\nthme = "dark"\n')
+
+        with pytest.raises(ValueError):
             load_config(cfg_file)
 
 

@@ -7,18 +7,25 @@ import {
   TextRenderable,
 } from '@opentui/core';
 import {type SlashCommand, slashCommandRange, suggestSlashCommands} from '../commands.js';
+import type {Theme} from './theme.js';
 
 export interface InputPanel {
   box: BoxRenderable;
   suggestions: BoxRenderable;
   completeSuggestion(): boolean;
   focus(): void;
+  applyTheme(theme: Theme): void;
   destroy(): void;
+}
+
+function commandSyntaxStyle(theme: Theme): SyntaxStyle {
+  return SyntaxStyle.fromStyles({'slash-command': {fg: theme.accent, bold: true}});
 }
 
 export function createInputPanel(
   renderer: CliRenderer,
   onSubmit: (value: string) => void,
+  theme: Theme,
 ): InputPanel {
   const box = new BoxRenderable(renderer, {
     id: 'input-box',
@@ -26,21 +33,19 @@ export function createInputPanel(
     width: '100%',
     border: true,
     borderStyle: 'rounded',
-    borderColor: '#22c55e',
+    borderColor: theme.success,
     title: ' Ask or command ',
     paddingLeft: 1,
     paddingRight: 1,
   });
-  const syntaxStyle = SyntaxStyle.fromStyles({
-    'slash-command': {fg: '#22d3ee', bold: true},
-  });
-  const commandStyleId = syntaxStyle.getStyleId('slash-command');
+  let syntaxStyle = commandSyntaxStyle(theme);
+  let commandStyleId = syntaxStyle.getStyleId('slash-command');
   const input = new InputRenderable(renderer, {
     id: 'input',
     width: '100%',
     placeholder: 'Type a question or /help',
-    textColor: '#f8fafc',
-    focusedTextColor: '#f8fafc',
+    textColor: theme.textStrong,
+    focusedTextColor: theme.textStrong,
     syntaxStyle,
   });
   const suggestions = new BoxRenderable(renderer, {
@@ -54,8 +59,8 @@ export function createInputPanel(
     zIndex: 5,
     border: true,
     borderStyle: 'rounded',
-    borderColor: '#475569',
-    backgroundColor: '#0f172a',
+    borderColor: theme.border,
+    backgroundColor: theme.selectedSurface,
     paddingLeft: 1,
     paddingRight: 1,
   });
@@ -63,7 +68,7 @@ export function createInputPanel(
     id: 'input-suggestion-list',
     width: '100%',
     height: 1,
-    fg: '#94a3b8',
+    fg: theme.textMuted,
     wrapMode: 'none',
     truncate: true,
     content: '',
@@ -109,6 +114,20 @@ export function createInputPanel(
       return true;
     },
     focus: () => input.focus(),
+    applyTheme(next: Theme): void {
+      box.borderColor = next.success;
+      input.textColor = next.textStrong;
+      input.focusedTextColor = next.textStrong;
+      suggestions.borderColor = next.border;
+      suggestions.backgroundColor = next.selectedSurface;
+      suggestionList.fg = next.textMuted;
+      const previous = syntaxStyle;
+      syntaxStyle = commandSyntaxStyle(next);
+      commandStyleId = syntaxStyle.getStyleId('slash-command');
+      input.syntaxStyle = syntaxStyle;
+      previous.destroy();
+      updateDecorations(input.value);
+    },
     destroy(): void {
       input.off(InputRenderableEvents.INPUT, updateDecorations);
       input.off(InputRenderableEvents.ENTER, submit);
