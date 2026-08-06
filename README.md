@@ -109,11 +109,12 @@ domain = "llm-serving"
 ```
 
 The domain must be a registered name such as `llm-serving` or `generic`. A
-domain is an in-repo package: prompt templates plus optional environment
-setup/teardown hooks. The package's `templates/` directory contains role files
-such as `implementer.md`, `judge.md`, and optionally `single_agent.md`; those
-files drop into the prompts at labelled points. Omit `single_agent.md` and it's
-derived from `implementer.md` plus `judge.md`.
+domain is an in-repo package with optional environment setup/teardown hooks;
+its role prompt files live centrally under
+`src/vibesys/prompts/domains/<domain>/`. Those files include roles such as
+`implementer.md`, `judge.md`, and optionally `single_agent.md`; they drop into
+the prompts at labelled points. Omit `single_agent.md` and it is derived from
+`implementer.md` plus `judge.md`.
 
 Full authoring guide: [`src/vibesys/domains/README.md`](src/vibesys/domains/README.md).
 
@@ -276,7 +277,11 @@ src/vibesys/
 ├── __main__.py                   # Python backend entry point for TS launcher
 ├── context.py                    # _RunContext: lifecycle + ctx.invoke()
 ├── agent_runner.py               # invoke wrappers + structured-response extraction
-├── prompts.py                    # Jinja + backend-fragment renderer
+├── prompts/                      # renderer plus all framework prompt assets
+│   ├── renderer.py               # Jinja + backend-fragment renderer
+│   ├── loops/                    # agent / evolve / plain prompt families
+│   ├── domains/                  # domain-specific role context
+│   └── backend/                  # compute-backend fragments
 ├── schemas.py                    # Pydantic response schemas
 ├── llm_client.py                 # LLM client factory
 ├── config.py / constants.py

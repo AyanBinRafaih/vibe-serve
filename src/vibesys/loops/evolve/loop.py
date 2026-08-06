@@ -63,6 +63,7 @@ from vibesys.loops.evolve.search_policy import (
 from vibesys.loops.gates import run_accuracy_gate
 from vibesys.loops.profiler import invoke_profiler
 from vibesys.profilers import ProfilerKind, profiler_definition
+from vibesys.prompts import PROMPTS_DIR
 from vibesys.run import LoopContext, RepositoryVisibility
 from vibesys.sandbox.run_environment import (
     RunEnvironmentSpec,
@@ -70,8 +71,8 @@ from vibesys.sandbox.run_environment import (
 )
 from vibesys.schemas import JudgeResponse, MutatorResponse, ProfilerSummary, Verdict
 
-_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
-_AGENT_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "agent" / "templates"
+_TEMPLATE_DIR = PROMPTS_DIR / "loops" / "evolve"
+_AGENT_TEMPLATE_DIR = PROMPTS_DIR / "loops" / "agent"
 _INTERFACE = "inprocess"
 
 # Evolve owns its top-level mutator and judge prompts but reuses the agent
