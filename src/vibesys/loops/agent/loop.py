@@ -33,7 +33,7 @@ from vibesys.profilers import (
     profiler_definition,
     require_profiler_kind,
 )
-from vibesys.prompts import render_template
+from vibesys.prompts import PROMPTS_DIR, render_template
 from vibesys.run import LoopContext, RepositoryVisibility
 from vibesys.sandbox.run_environment import (
     RunEnvironmentSpec,
@@ -75,7 +75,7 @@ DEFAULT_INTERFACE = "inprocess"
 
 _INNER_LOOPS = ("multi-agent", "single-agent")
 
-_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+_TEMPLATE_DIR = PROMPTS_DIR / "loops" / "agent"
 
 
 # ---------------------------------------------------------------------------
