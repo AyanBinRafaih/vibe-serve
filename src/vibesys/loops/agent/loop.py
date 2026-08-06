@@ -2002,9 +2002,7 @@ def _run_framework_accuracy_gate(
     """Run the immutable manifest accuracy command after an agent reports PASS."""
     hidden_evaluator = vars(ctx).get("hidden_evaluator_path") is not None
     command = (
-        getattr(ctx, "accuracy_command", None)
-        if hidden_evaluator
-        else ctx.judge_accuracy_command
+        getattr(ctx, "accuracy_command", None) if hidden_evaluator else ctx.judge_accuracy_command
     )
     execution_command = None
     if command:
@@ -2070,9 +2068,7 @@ def _run_framework_benchmark(
 
     hidden_evaluator = vars(ctx).get("hidden_evaluator_path") is not None
     base_command = (
-        getattr(ctx, "benchmark_command", None)
-        if hidden_evaluator
-        else ctx.judge_benchmark_command
+        getattr(ctx, "benchmark_command", None) if hidden_evaluator else ctx.judge_benchmark_command
     )
     if not base_command:
         return "Benchmark result contract is configured without a benchmark command.", None

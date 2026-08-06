@@ -68,7 +68,9 @@ def _wait_for_health(base_url: str, timeout_secs: float = 900.0) -> None:
                 last_error = f"HTTP {response.status}"
         except (OSError, urllib.error.URLError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-        raise SystemExit(f"Timed out waiting for Modal service health at {health_url}: {last_error}")
+        raise SystemExit(
+            f"Timed out waiting for Modal service health at {health_url}: {last_error}"
+        )
 
     deadline = time.monotonic() + timeout_secs
     last_error = "not attempted"

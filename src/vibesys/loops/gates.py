@@ -30,9 +30,7 @@ def run_accuracy_gate(
     changed = ctx.trusted_input_changes()
     hidden_evaluator = vars(ctx).get("hidden_evaluator_path") is not None
     command = (
-        getattr(ctx, "accuracy_command", None)
-        if hidden_evaluator
-        else ctx.judge_accuracy_command
+        getattr(ctx, "accuracy_command", None) if hidden_evaluator else ctx.judge_accuracy_command
     )
     if changed:
         output = "Evaluator-owned files were modified: " + ", ".join(changed)

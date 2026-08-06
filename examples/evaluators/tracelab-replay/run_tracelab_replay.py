@@ -16,8 +16,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 TRACE_RELEASE_URL = (
-    "https://github.com/uw-syfi/TraceLab/releases/download/v0.0.1/"
-    "syfi_coding_trace.duckdb"
+    "https://github.com/uw-syfi/TraceLab/releases/download/v0.0.1/syfi_coding_trace.duckdb"
 )
 TRACE_DUCKDB_SHA256 = "97715265367cc72376475f5d444c8e1900b88cab1482aa7b9a742894d9f15619"
 DEFAULT_MODEL = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
@@ -64,14 +63,15 @@ def download(url: str, destination: Path) -> None:
 def ensure_trace_db(cache_dir: Path) -> Path:
     db = cache_dir / "syfi_coding_trace.duckdb"
     if not db.exists():
-        print(f"[tracelab] downloading pinned TraceLab DuckDB: {TRACE_RELEASE_URL}", file=sys.stderr)
+        print(
+            f"[tracelab] downloading pinned TraceLab DuckDB: {TRACE_RELEASE_URL}", file=sys.stderr
+        )
         download(TRACE_RELEASE_URL, db)
     actual = sha256(db)
     if actual != TRACE_DUCKDB_SHA256:
         db.unlink(missing_ok=True)
         raise SystemExit(
-            "TraceLab DuckDB checksum mismatch: "
-            f"expected {TRACE_DUCKDB_SHA256}, got {actual}"
+            f"TraceLab DuckDB checksum mismatch: expected {TRACE_DUCKDB_SHA256}, got {actual}"
         )
     return db
 

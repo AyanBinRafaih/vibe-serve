@@ -274,8 +274,7 @@ def _serving_floor_metadata(engine_args: Any | None = None) -> dict[str, Any]:
                 or VLLM_CUDAGRAPH_CAPTURE_SIZES
             ),
             "compile_sizes": list(
-                getattr(compilation, "compile_sizes", None)
-                or ["cudagraph_capture_sizes"]
+                getattr(compilation, "compile_sizes", None) or ["cudagraph_capture_sizes"]
             ),
             "enforce_eager": False,
         },
@@ -341,8 +340,10 @@ def _summarize(prof: Any, num_iters: int) -> dict[str, Any]:
         self_cuda = float(getattr(ev, "self_device_time_total", 0.0) or 0.0)
         self_cpu = float(getattr(ev, "self_cpu_time_total", 0.0) or 0.0)
         name = ev.key
-        if ev.device_type == DeviceType.CUDA or "cuda" in name.lower() or (
-            cuda_us > 0 and cpu_us < cuda_us / 4
+        if (
+            ev.device_type == DeviceType.CUDA
+            or "cuda" in name.lower()
+            or (cuda_us > 0 and cpu_us < cuda_us / 4)
         ):
             category = "kernel"
         elif name.startswith("aten::") or name.startswith("torch::"):
@@ -572,9 +573,7 @@ class Server:
             token_ids = _token_ids_for_emitted_text(self.tokenizer, text)
             delta_text = text[emitted_text_len:] if len(text) >= emitted_text_len else ""
             delta_token_ids = (
-                token_ids[emitted_token_len:]
-                if len(token_ids) >= emitted_token_len
-                else []
+                token_ids[emitted_token_len:] if len(token_ids) >= emitted_token_len else []
             )
             emitted_text_len = len(text)
             emitted_token_len = len(token_ids)
@@ -676,7 +675,9 @@ class Server:
         self._record_prompt_cache_prefixes(prompt_token_ids)
 
     @modal.method()
-    async def generate(self, prompt: str, max_tokens: int = 32, temperature: float = 0.0) -> dict[str, Any]:
+    async def generate(
+        self, prompt: str, max_tokens: int = 32, temperature: float = 0.0
+    ) -> dict[str, Any]:
         return await self._run_completion(
             {
                 "prompt": prompt,

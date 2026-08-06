@@ -148,11 +148,7 @@ def _coerce_dir_path(raw: str | None, label: str) -> str | None:
 
 
 def _hidden_copy_ignore(_directory: str, names: list[str]) -> list[str]:
-    return [
-        name
-        for name in names
-        if name in {"target", "__pycache__", ".pytest_cache", ".venv"}
-    ]
+    return [name for name in names if name in {"target", "__pycache__", ".pytest_cache", ".venv"}]
 
 
 def _materialize_hidden_evaluator(source: Path | None, exp_dir: Path) -> Path | None:
@@ -978,7 +974,9 @@ class _RunContext:
         self.judge_backend = run_environment_session.sandbox
         self.framework_judge_backend = framework_judge_backend
         agent_project_root = paths.exp_dir / "_agent_project_root"
-        self.agent_project_root = agent_project_root if agent_project_root.exists() else PROJECT_ROOT
+        self.agent_project_root = (
+            agent_project_root if agent_project_root.exists() else PROJECT_ROOT
+        )
         self.commands = commands
         self.device = device
         # Expose the picked device for legacy callers (gpu monitor tests etc).

@@ -118,6 +118,7 @@ def _wait_for_health(base_url: str, timeout_secs: float) -> None:
         time.sleep(5.0)
     raise SystemExit(f"Timed out waiting for Modal service health at {health_url}: {last_error}")
 
+
 # ---------------------------------------------------------------------------
 # HTTP helpers — stream SSE from the OpenAI-compatible endpoints
 # ---------------------------------------------------------------------------
