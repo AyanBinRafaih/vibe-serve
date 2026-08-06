@@ -9,6 +9,7 @@ declarative :class:`CopySpec` / :class:`InputProjectSpec` records first
 on the plan without materializing anything.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -17,10 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from vibesys.input_manifest import WorkspaceSource
 from vibesys.input_project import materialize_input_project
+from vibesys.skills import foreign_platform_names, is_platforms_parent
 
 if TYPE_CHECKING:
     from vibesys.backends.base import ComputeBackendImpl
+    from vibesys.constants import ComputeBackend
     from vibesys.sandbox.run_environment import RunEnvironment
 
 # Dirs excluded from workspace copy, git tracking, and the
@@ -75,6 +79,10 @@ class CopySpec:
     # ``_evaluator`` mount point reserved for the manifest-declared source.
     require_absent: Path | None = None
     require_absent_message: str = ""
+    # Skill copies prune ``references/platforms/<other-backend>/`` so the agent
+    # only ever sees its own platform's guidance.  See
+    # :func:`vibesys.skills.foreign_platform_names`.
+    prune_platforms: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,7 +92,14 @@ class InputProjectSpec:
     project_dir: Path
 
 
-WorkspaceStep = CopySpec | InputProjectSpec
+@dataclass(frozen=True)
+class GitSourceSpec:
+    """Materialize a pinned git source into the candidate workspace."""
+
+    source: WorkspaceSource
+
+
+WorkspaceStep = CopySpec | InputProjectSpec | GitSourceSpec
 
 
 class Workspace:
@@ -99,9 +114,11 @@ class Workspace:
         log: Callable[[str], None],
         project_root: Path,
         excluded_dirs: Iterable[str] = EXCLUDED_WORKSPACE_DIRS,
+        compute_backend: "ComputeBackend | None" = None,
     ) -> None:
         self.root = root
         self.excluded_dirs = set(excluded_dirs)
+        self._compute_backend = compute_backend
         self._run_environment = run_environment
         self._backend = backend
         self._log = log
@@ -135,6 +152,7 @@ class Workspace:
         input_project_dir: Path | None,
         profiler_support_path: str | None,
         profiler_support_name: str | None,
+        workspace_sources: tuple[WorkspaceSource, ...] = (),
         extra_input_excludes: frozenset[str] = frozenset(),
     ) -> tuple[WorkspaceStep, ...]:
         """Build the ordered copy plan for ``setup``.
@@ -156,15 +174,22 @@ class Workspace:
         for src in skill_sources:
             rel = src.name
             if (self.root / rel).exists():
-                steps.append(CopySpec(src=src, dest=self.root / rel))
+                steps.append(CopySpec(src=src, dest=self.root / rel, prune_platforms=True))
             for cli_rel in _CLI_SKILL_DIRS:
                 cli_target = self.root / cli_rel / rel
                 if cli_target.exists():
-                    steps.append(CopySpec(src=src, dest=cli_target))
+                    steps.append(CopySpec(src=src, dest=cli_target, prune_platforms=True))
 
         if not existing:
             if seed is not None:
                 steps.append(CopySpec(src=seed, dest=self.root, respect_gitignore=True))
+            for source in workspace_sources:
+                steps.append(GitSourceSpec(source=source))
+            # When the workspace is pre-populated (seed and/or git sources),
+            # the input copy must not clear existing children: copy_dir wipes
+            # the destination unless collisions are rejected, which would
+            # silently delete the just-materialized sources.
+            if seed is not None or workspace_sources:
                 steps.append(
                     CopySpec(
                         src=input_dir,
@@ -193,7 +218,7 @@ class Workspace:
                 )
 
             for src in skill_sources:
-                steps.append(CopySpec(src=src, dest=self.root / src.name))
+                steps.append(CopySpec(src=src, dest=self.root / src.name, prune_platforms=True))
 
             if input_project_dir is not None:
                 steps.append(InputProjectSpec(project_dir=input_project_dir))
@@ -232,6 +257,9 @@ class Workspace:
                     log=self._log,
                 )
                 continue
+            if isinstance(step, GitSourceSpec):
+                self.materialize_git_source(step.source)
+                continue
             if step.require_absent is not None and (
                 step.require_absent.exists() or step.require_absent.is_symlink()
             ):
@@ -242,7 +270,76 @@ class Workspace:
                 extra_excludes=step.extra_excludes,
                 respect_source_gitignore=step.respect_gitignore,
                 reject_collisions=step.reject_collisions,
+                prune_platforms=step.prune_platforms,
             )
+
+    def materialize_git_source(self, source: WorkspaceSource) -> None:
+        """Clone a pinned git source into the workspace and optionally strip ``.git``."""
+
+        dest = self.root / source.dest
+        try:
+            dest.resolve().relative_to(self.root.resolve())
+        except ValueError as exc:
+            raise ValueError(
+                f"workspace source {source.name!r} escapes workspace: {source.dest}"
+            ) from exc
+        if dest.exists() or dest.is_symlink():
+            raise ValueError(
+                f"workspace source destination already exists for {source.name!r}: {source.dest}"
+            )
+        # Excluded names match at any depth (copy ignores, git info/exclude,
+        # Modal uploads), so a colliding dest would be silently dropped from
+        # snapshots and sandboxes even though the clone succeeds.
+        colliding = [part for part in Path(source.dest).parts if part in self.excluded_dirs]
+        if colliding:
+            raise ValueError(
+                f"workspace source {source.name!r} dest {source.dest!r} contains excluded "
+                f"path component(s) {colliding}: files under it would be invisible to "
+                "workspace copies, git tracking, and sandbox uploads. Pick another dest."
+            )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        self._run_git(["clone", "--no-checkout", source.repo, str(dest)], cwd=self.root)
+        self._run_git(["checkout", "--detach", source.commit], cwd=dest)
+        actual = self._run_git(["rev-parse", "HEAD"], cwd=dest).strip().lower()
+        expected = source.commit.lower()
+        if actual != expected and not actual.startswith(expected):
+            raise RuntimeError(
+                f"workspace source {source.name!r} checked out {actual}, expected {expected}"
+            )
+
+        metadata_path = self.root / "_vibesys_sources.json"
+        metadata = []
+        if metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text())
+        metadata.append(
+            {
+                "name": source.name,
+                "repo": source.repo,
+                "commit": actual,
+                "requested_commit": source.commit,
+                "dest": source.dest,
+                "strip_git": source.strip_git,
+            }
+        )
+        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+
+        if source.strip_git:
+            shutil.rmtree(dest / ".git")
+
+    @staticmethod
+    def _run_git(args: list[str], *, cwd: Path) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+        return result.stdout
 
     # -- copy machinery -------------------------------------------------------
 
@@ -281,8 +378,12 @@ class Workspace:
         extra_excludes: frozenset[str] = frozenset(),
         respect_source_gitignore: bool = False,
         reject_collisions: bool = False,
+        prune_platforms: bool = False,
     ) -> None:
         skip = self.excluded_dirs | {"_mounts"} | set(extra_excludes)
+        foreign_platforms = (
+            foreign_platform_names(self._compute_backend) if prune_platforms else frozenset()
+        )
         ignored_paths = (
             self._source_gitignored_paths(src) if respect_source_gitignore else frozenset()
         )
@@ -299,7 +400,16 @@ class Workspace:
 
         def _ignore(directory: str, names: list[str]) -> list[str]:
             parent = Path(directory)
-            return [name for name in names if name in skip or _is_ignored(parent / name)]
+            pruned = (
+                foreign_platforms
+                if foreign_platforms and is_platforms_parent(directory)
+                else frozenset()
+            )
+            return [
+                name
+                for name in names
+                if name in skip or name in pruned or _is_ignored(parent / name)
+            ]
 
         children = [
             child for child in src.iterdir() if child.name not in skip and not _is_ignored(child)

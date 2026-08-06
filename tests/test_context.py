@@ -1,13 +1,21 @@
 import subprocess
 import sys
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vibesys.context import _RunContext, create_run_context, setup_exp_dir
+from vibesys.constants import ComputeBackend
+from vibesys.context import (
+    _close_after_construction_failure,
+    _RunContext,
+    create_candidate_context,
+    create_run_context,
+    setup_exp_dir,
+)
 from vibesys.domains.base import DomainName
-from vibesys.domains.environment import NoopEnvironmentHooks
+from vibesys.domains.environment import EnvironmentPatch, NoopEnvironmentHooks
 from vibesys.errors import ConfigurationError
 from vibesys.profilers import ACTIVE_PROFILER_KINDS, ProfilerKind, ProfilerPreflightResult
 from vibesys.run import GitTracker, RunLogger, RunPaths, Workspace
@@ -54,10 +62,13 @@ def test_log_switch_retargets_stderr_tee_and_restores_on_close(tmp_path):
         workspace=tmp_path / "workspace",
         run_log_path=ctx.logger.path,
     )
-    original_log = ctx.run_log_file
+    original_file = ctx.logger.file
+    ctx.agent_runner = SimpleNamespace(_run_log_file=ctx.run_log_file)
 
     ctx.switch_log_file("round001")
 
+    assert original_file.closed
+    assert ctx.agent_runner._run_log_file is ctx.run_log_file
     # The unconditional tee mirrors stderr into the *current* log file,
     # stripped of ANSI escapes, while writes still reach the real stderr.
     print("\033[31mcolored diagnostic\033[0m", file=sys.stderr)
@@ -67,7 +78,6 @@ def test_log_switch_retargets_stderr_tee_and_restores_on_close(tmp_path):
     assert sys.stderr is original_stderr
     assert "colored diagnostic" in ctx.run_log_path.read_text()
     assert "\033[31m" not in ctx.run_log_path.read_text()
-    original_log.close()
 
 
 def test_input_copy_respects_source_gitignore(tmp_path):
@@ -209,6 +219,7 @@ def _write_ref(tmp_path):
 def _write_support_dirs(project_root):
     dirs = {
         ProfilerKind.NSYS: "nsys_profiler",
+        ProfilerKind.OTEL: "otel_profiler",
         ProfilerKind.TORCH: "torch_profiler",
         ProfilerKind.NEURON: "neuron_profiler",
         ProfilerKind.MACOS_CPU: "macos_cpu_profiler",
@@ -222,13 +233,16 @@ def _write_support_dirs(project_root):
 
 
 @pytest.mark.parametrize(
-    ("profiler_kind", "workspace_name"),
+    ("profiler_kind", "workspace_name", "profiler_domain"),
     [
-        (ProfilerKind.TORCH, "torch_profiler"),
-        (ProfilerKind.NEURON, "neuron_profiler"),
+        (ProfilerKind.TORCH, "torch_profiler", DomainName.LLM_SERVING),
+        (ProfilerKind.NEURON, "neuron_profiler", DomainName.LLM_SERVING),
+        (ProfilerKind.OTEL, "otel_profiler", DomainName.MICROSERVICES),
     ],
 )
-def test_run_context_defaults_profiler_support_paths(tmp_path, profiler_kind, workspace_name):
+def test_run_context_defaults_profiler_support_paths(
+    tmp_path, profiler_kind, workspace_name, profiler_domain
+):
     project_root = tmp_path / "project"
     source_dir = project_root / "resources" / "profilers" / profiler_kind.value
     source_dir.mkdir(parents=True)
@@ -248,12 +262,42 @@ def test_run_context_defaults_profiler_support_paths(tmp_path, profiler_kind, wo
             accuracy_command="uv run python accuracy_checker/checker.py",
             benchmark_command="uv run python benchmark/benchmark.py",
             profiler_kind=profiler_kind,
+            profiler_domain=profiler_domain,
             skills_dirs=[],
             run_environment=RunEnvironmentSpec("local"),
         ) as ctx,
     ):
         assert ctx.profiler_support_path == str(source_dir)
         assert (ctx.workspace / workspace_name / "server.py").is_file()
+
+
+def test_cli_context_skips_unused_langchain_model_construction(tmp_path):
+    project_root = tmp_path / "project"
+    ref = _write_ref(tmp_path)
+
+    with (
+        patch("vibesys.context.PROJECT_ROOT", project_root),
+        patch("vibesys.context.build_model") as build_model,
+        patch("vibesys.context.build_agent_runner", return_value=MagicMock()),
+        patch("vibesys.context.backends.get", return_value=_FakeBackend()),
+        create_run_context(
+            config={
+                "model": {"name": "gpt-5.6-sol"},
+                "thinking": {"level": "xhigh"},
+                "agent": {"backend": "cli", "cli_provider": "codex"},
+            },
+            exp_name="cli-reasoning",
+            input_path=str(ref.parent),
+            accuracy_command="uv run python accuracy_checker/checker.py",
+            benchmark_command="uv run python benchmark/benchmark.py",
+            profiler_kind=ProfilerKind.NONE,
+            profiler_domain=DomainName.LLM_SERVING,
+            skills_dirs=[],
+            run_environment=RunEnvironmentSpec("local"),
+        ) as ctx,
+    ):
+        assert ctx.model is None
+        build_model.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -265,11 +309,12 @@ def test_run_context_copies_only_selected_profiler_support(tmp_path, selected):
     _write_support_dirs(project_root)
     ref = _write_ref(tmp_path)
 
-    domain = (
-        DomainName.GENERIC
-        if selected in {ProfilerKind.MACOS_CPU, ProfilerKind.LINUX_CPU}
-        else DomainName.LLM_SERVING
-    )
+    if selected in {ProfilerKind.MACOS_CPU, ProfilerKind.LINUX_CPU}:
+        domain = DomainName.GENERIC
+    elif selected is ProfilerKind.OTEL:
+        domain = DomainName.MICROSERVICES
+    else:
+        domain = DomainName.LLM_SERVING
     with (
         patch("vibesys.context.PROJECT_ROOT", project_root),
         patch("vibesys.context.build_model", return_value="mock-model"),
@@ -289,6 +334,7 @@ def test_run_context_copies_only_selected_profiler_support(tmp_path, selected):
     ):
         expected = {
             ProfilerKind.NSYS: selected is ProfilerKind.NSYS,
+            ProfilerKind.OTEL: selected is ProfilerKind.OTEL,
             ProfilerKind.TORCH: selected is ProfilerKind.TORCH,
             ProfilerKind.NEURON: selected is ProfilerKind.NEURON,
             ProfilerKind.MACOS_CPU: selected is ProfilerKind.MACOS_CPU,
@@ -296,6 +342,7 @@ def test_run_context_copies_only_selected_profiler_support(tmp_path, selected):
         }
         assert ctx.profiler_kind is selected
         assert (ctx.workspace / "nsys_profiler").exists() is expected[ProfilerKind.NSYS]
+        assert (ctx.workspace / "otel_profiler").exists() is expected[ProfilerKind.OTEL]
         assert (ctx.workspace / "torch_profiler").exists() is expected[ProfilerKind.TORCH]
         assert (ctx.workspace / "neuron_profiler").exists() is expected[ProfilerKind.NEURON]
         assert (ctx.workspace / "macos_cpu_profiler").exists() is expected[ProfilerKind.MACOS_CPU]
@@ -487,6 +534,149 @@ def test_run_context_noop_environment_hooks_do_not_require_model_artifacts(tmp_p
     ):
         assert (ctx.workspace / "reference" / "reference.py").is_file()
         assert not (ref_dir / "model").exists()
+
+
+def test_candidate_context_cleans_up_when_agent_runner_construction_fails(tmp_path):
+    workspace = tmp_path / "candidates" / f"{tmp_path.name}-g1c2" / "workspace"
+    parent = SimpleNamespace(
+        exp_dir=tmp_path,
+        git=MagicMock(),
+        run_environment=MagicMock(),
+        backend=ComputeBackend.CUDA,
+        backend_impl=_FakeBackend(),
+        EXCLUDED_WORKSPACE_DIRS={".git", "target"},
+        accuracy_command="check-accuracy",
+        benchmark_command="run-benchmark",
+        profiler_support_path=None,
+        profiler_support_name=None,
+        environment_patch=SimpleNamespace(bind_mounts=()),
+        skill_source_paths=[],
+        model="mock-model",
+        model_name="claude-sonnet-4-6",
+        workspace_sources=(),
+    )
+    parent.git.add_worktree.side_effect = lambda path, _commit: path.mkdir(parents=True)
+    session = MagicMock()
+    session.__enter__.return_value = session
+    session.view = SimpleNamespace(
+        paths=SimpleNamespace(
+            accuracy_command="check-accuracy",
+            benchmark_command="run-benchmark",
+            profiler_support=None,
+        ),
+        cli_sandboxed=False,
+    )
+    session.sandbox = MagicMock()
+    parent.run_environment.open.return_value = session
+
+    with (
+        patch("vibesys.context.build_agent_runner", side_effect=SystemExit("boom")),
+        pytest.raises(SystemExit, match="boom"),
+    ):
+        create_candidate_context(
+            parent,
+            config={"model": {"name": "claude-sonnet-4-6"}},
+            generation=1,
+            child_idx=2,
+            parent_commit="deadbeef",
+        )
+
+    session.__exit__.assert_called_once()
+    parent.git.remove_worktree.assert_called_once_with(workspace)
+
+
+def test_candidate_context_cleans_up_when_add_worktree_partially_fails(tmp_path):
+    workspace = tmp_path / "candidates" / f"{tmp_path.name}-g1c2" / "workspace"
+    parent = SimpleNamespace(exp_dir=tmp_path, git=MagicMock())
+
+    def partially_add(path, _commit):
+        path.mkdir(parents=True)
+        raise RuntimeError("git add failed")
+
+    parent.git.add_worktree.side_effect = partially_add
+
+    with pytest.raises(RuntimeError, match="git add failed"):
+        create_candidate_context(
+            parent,
+            config={"model": {"name": "claude-sonnet-4-6"}},
+            generation=1,
+            child_idx=2,
+            parent_commit="deadbeef",
+        )
+
+    parent.git.remove_worktree.assert_called_once_with(workspace)
+
+
+def test_run_context_cleans_up_when_agent_runner_construction_fails(tmp_path):
+    project_root = tmp_path / "project"
+    ref = _write_ref(tmp_path)
+    hooks = MagicMock()
+    hooks.prepare.return_value = EnvironmentPatch()
+    original_stderr = sys.stderr
+
+    with (
+        patch("vibesys.context.PROJECT_ROOT", project_root),
+        patch("vibesys.context.build_model", return_value="mock-model"),
+        patch("vibesys.context.build_agent_runner", side_effect=RuntimeError("boom")),
+        patch("vibesys.context.backends.get", return_value=_FakeBackend()),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        create_run_context(
+            config={"model": {"name": "claude-sonnet-4-6"}},
+            exp_name="failed-construction",
+            input_path=str(ref.parent),
+            accuracy_command="check-accuracy",
+            benchmark_command="run-benchmark",
+            skills_dirs=[],
+            run_environment=RunEnvironmentSpec("local"),
+            environment_hooks=hooks,
+        )
+
+    assert sys.stderr is original_stderr
+    hooks.teardown.assert_called_once()
+
+
+def test_run_context_tears_down_prepared_hooks_when_workspace_setup_fails(tmp_path):
+    project_root = tmp_path / "project"
+    ref = _write_ref(tmp_path)
+    hooks = MagicMock()
+    hooks.prepare.return_value = EnvironmentPatch()
+
+    with (
+        patch("vibesys.context.PROJECT_ROOT", project_root),
+        patch("vibesys.context.build_model", return_value="mock-model"),
+        patch("vibesys.context.backends.get", return_value=_FakeBackend()),
+        patch("vibesys.context.Workspace.setup", side_effect=RuntimeError("setup failed")),
+        pytest.raises(RuntimeError, match="setup failed"),
+    ):
+        create_run_context(
+            config={"model": {"name": "claude-sonnet-4-6"}},
+            exp_name="failed-workspace-setup",
+            input_path=str(ref.parent),
+            accuracy_command="check-accuracy",
+            benchmark_command="run-benchmark",
+            skills_dirs=[],
+            run_environment=RunEnvironmentSpec("local"),
+            environment_hooks=hooks,
+        )
+
+    hooks.teardown.assert_called_once()
+
+
+def test_partial_construction_cleanup_does_not_replace_original_error():
+    stack = ExitStack()
+
+    def fail_cleanup() -> None:
+        raise OSError("cleanup failed")
+
+    stack.callback(fail_cleanup)
+    construction_error = RuntimeError("construction failed")
+
+    _close_after_construction_failure(stack, construction_error)
+
+    assert construction_error.__notes__ == [
+        "Additional error while cleaning up partial context construction: OSError: cleanup failed"
+    ]
 
 
 def test_run_context_materializes_input_project_path_dependencies(tmp_path):

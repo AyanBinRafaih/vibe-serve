@@ -13,7 +13,8 @@ from vibesys.constants import DEFAULT_COMPUTE_BACKEND
 from vibesys.context import _RunContext, create_run_context
 from vibesys.domains.base import DomainName
 from vibesys.domains.environment import NoopEnvironmentHooks
-from vibesys.input_manifest import load_input_bundle
+from vibesys.errors import ConfigurationError
+from vibesys.input_manifest import WorkspaceSource, load_input_bundle
 from vibesys.main import main
 from vibesys.profilers import ProfilerKind
 from vibesys.run import Workspace
@@ -61,6 +62,31 @@ def _init_git_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q", str(path)], check=True)
 
 
+def _commit_all(path: Path, message: str = "init") -> str:
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=VibeSys Test",
+            "-c",
+            "user.email=vibesys@example.invalid",
+            "commit",
+            "-qm",
+            message,
+        ],
+        cwd=path,
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 @contextmanager
 def _patched_context_dependencies(project_root: Path):
     with (
@@ -80,6 +106,7 @@ def _make_context(input_dir: Path, seed: Path | None = None, **kwargs) -> _RunCo
         accuracy_command="accuracy-checker",
         benchmark_command="benchmark",
         workspace_seed=seed,
+        workspace_sources=kwargs.pop("workspace_sources", ()),
         profiler_kind=ProfilerKind.NONE,
         skills_dirs=[],
         run_environment=RunEnvironmentSpec("local"),
@@ -119,6 +146,98 @@ def test_manifest_resolves_seed_relative_to_bundle(tmp_path):
     loaded = load_input_bundle(bundle, project_root=project_root)
 
     assert loaded.workspace_seed_path == seed.resolve()
+
+
+def test_manifest_resolves_workspace_sources(tmp_path):
+    project_root = tmp_path / "project"
+    seed = project_root / "examples" / "starters" / "queue"
+    seed.mkdir(parents=True)
+    bundle = _write_bundle(
+        project_root,
+        """
+[workspace]
+seed = "../../starters/queue"
+
+[[workspace.sources]]
+name = "vllm"
+repo = "https://github.com/vllm-project/vllm.git"
+commit = "0123456789abcdef0123456789abcdef01234567"
+dest = "vllm"
+""",
+    )
+
+    loaded = load_input_bundle(bundle, project_root=project_root)
+
+    assert loaded.workspace_seed_path == seed.resolve()
+    assert loaded.workspace_sources == (
+        WorkspaceSource(
+            name="vllm",
+            repo="https://github.com/vllm-project/vllm.git",
+            commit="0123456789abcdef0123456789abcdef01234567",
+            dest="vllm",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_block", "error"),
+    [
+        (
+            'name = "vllm"\nrepo = "https://github.com/vllm-project/vllm.git"\n'
+            'commit = "main"\ndest = "vllm"',
+            "commit must be a 7-64 character hexadecimal hash",
+        ),
+        (
+            'name = "vllm"\nrepo = "https://github.com/vllm-project/vllm.git"\n'
+            'commit = "0123456"\ndest = "../vllm"',
+            "dest must not contain",
+        ),
+        (
+            'name = "vllm"\nrepo = "ftp://example.invalid/vllm.git"\n'
+            'commit = "0123456"\ndest = "vllm"',
+            "unsupported repo URL scheme",
+        ),
+    ],
+)
+def test_manifest_rejects_invalid_workspace_sources(tmp_path, source_block, error):
+    project_root = tmp_path / "project"
+    bundle = _write_bundle(
+        project_root,
+        f"""
+[workspace]
+
+[[workspace.sources]]
+{source_block}
+""",
+    )
+
+    with pytest.raises(ValueError, match=error):
+        load_input_bundle(bundle, project_root=project_root)
+
+
+def test_manifest_rejects_duplicate_workspace_source_destinations(tmp_path):
+    project_root = tmp_path / "project"
+    bundle = _write_bundle(
+        project_root,
+        """
+[workspace]
+
+[[workspace.sources]]
+name = "first"
+repo = "https://example.invalid/first.git"
+commit = "0123456"
+dest = "src"
+
+[[workspace.sources]]
+name = "second"
+repo = "https://example.invalid/second.git"
+commit = "abcdef0"
+dest = "src"
+""",
+    )
+
+    with pytest.raises(ValueError, match="duplicate workspace source destination"):
+        load_input_bundle(bundle, project_root=project_root)
 
 
 def test_manifest_resolves_evaluator_relative_to_bundle(tmp_path):
@@ -405,6 +524,147 @@ def test_hidden_evaluator_stays_out_of_workspace_and_agent_project_mount(tmp_pat
             ).exists()
 
 
+def test_fresh_workspace_materializes_git_source_and_strips_nested_git(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _init_git_repo(project_root)
+
+    source_repo = tmp_path / "source-vllm"
+    source_repo.mkdir()
+    _init_git_repo(source_repo)
+    (source_repo / "vllm").mkdir()
+    (source_repo / "vllm" / "__init__.py").write_text("__version__ = 'test'\n")
+    commit = _commit_all(source_repo)
+
+    seed = project_root / "examples" / "starters" / "vllm-h100"
+    seed.mkdir(parents=True)
+    (seed / "serve.py").write_text("print('serve')\n")
+
+    input_dir = project_root / "examples" / "model-serving" / "llama-vllm"
+    input_dir.mkdir(parents=True)
+    (input_dir / "OBJECTIVE.md").write_text("Optimize vLLM.\n")
+    (input_dir / "vibesys.input.toml").write_text("version = 1\n")
+
+    source = WorkspaceSource(
+        name="vllm",
+        repo=str(source_repo),
+        commit=commit,
+        dest="vllm",
+    )
+
+    with _patched_context_dependencies(project_root):
+        with _make_context(
+            input_dir,
+            seed,
+            workspace_sources=(source,),
+            git_tracking=True,
+        ) as ctx:
+            assert (ctx.workspace / "serve.py").is_file()
+            assert (ctx.workspace / "vllm" / "vllm" / "__init__.py").read_text() == (
+                "__version__ = 'test'\n"
+            )
+            assert not (ctx.workspace / "vllm" / ".git").exists()
+
+            metadata = (ctx.workspace / "_vibesys_sources.json").read_text()
+            assert str(source_repo) in metadata
+            assert commit in metadata
+
+            tracked = subprocess.run(
+                ["git", "ls-files"],
+                cwd=ctx.workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            assert "vllm/vllm/__init__.py" in tracked
+            assert "vllm/.git" not in tracked
+
+
+def test_fresh_workspace_materializes_git_source_without_seed(tmp_path):
+    """Sources must survive the input-bundle copy when no seed is declared."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _init_git_repo(project_root)
+
+    source_repo = tmp_path / "source-vllm"
+    source_repo.mkdir()
+    _init_git_repo(source_repo)
+    (source_repo / "vllm").mkdir()
+    (source_repo / "vllm" / "__init__.py").write_text("__version__ = 'test'\n")
+    commit = _commit_all(source_repo)
+
+    input_dir = project_root / "examples" / "model-serving" / "llama-vllm"
+    input_dir.mkdir(parents=True)
+    (input_dir / "OBJECTIVE.md").write_text("Optimize vLLM.\n")
+    (input_dir / "vibesys.input.toml").write_text("version = 1\n")
+
+    source = WorkspaceSource(
+        name="vllm",
+        repo=str(source_repo),
+        commit=commit,
+        dest="vllm",
+    )
+
+    with _patched_context_dependencies(project_root):
+        with _make_context(
+            input_dir,
+            seed=None,
+            workspace_sources=(source,),
+            git_tracking=True,
+        ) as ctx:
+            assert (ctx.workspace / "OBJECTIVE.md").is_file()
+            assert (ctx.workspace / "vllm" / "vllm" / "__init__.py").read_text() == (
+                "__version__ = 'test'\n"
+            )
+            metadata = (ctx.workspace / "_vibesys_sources.json").read_text()
+            assert commit in metadata
+
+
+def test_workspace_source_destination_collision_is_rejected(tmp_path):
+    source_repo = tmp_path / "source"
+    source_repo.mkdir()
+    _init_git_repo(source_repo)
+    (source_repo / "src.py").write_text("pass\n")
+    commit = _commit_all(source_repo)
+
+    seed = tmp_path / "seed"
+    input_dir = tmp_path / "input"
+    workspace = tmp_path / "workspace"
+    seed.mkdir()
+    _init_git_repo(seed)
+    input_dir.mkdir()
+    (seed / "vllm").mkdir()
+    (seed / "vllm" / "placeholder.txt").write_text("seed\n")
+    _commit_all(seed)
+    (input_dir / "OBJECTIVE.md").write_text("objective\n")
+
+    workspace_files = Workspace(
+        workspace,
+        run_environment=MagicMock(isolated=False),
+        backend=MagicMock(),
+        log=MagicMock(),
+        project_root=tmp_path,
+        excluded_dirs=set(),
+    )
+    workspace_files.create()
+    plan = workspace_files.plan_setup(
+        existing=False,
+        seed=seed,
+        input_dir=input_dir,
+        evaluator_source=None,
+        skill_sources=[],
+        input_project_dir=None,
+        profiler_support_path=None,
+        profiler_support_name=None,
+        workspace_sources=(
+            WorkspaceSource(name="vllm", repo=str(source_repo), commit=commit, dest="vllm"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="destination already exists"):
+        workspace_files.setup(plan, existing=False)
+
+
 def test_input_collision_is_rejected_before_overlay(tmp_path):
     seed = tmp_path / "seed"
     input_dir = tmp_path / "input"
@@ -499,6 +759,11 @@ def test_cli_forwards_workspace_sources_to_every_outer_loop(tmp_path, outer_loop
     bundle = _write_bundle(
         project_root,
         '[workspace]\nseed = "../../starters/queue"\n\n'
+        "[[workspace.sources]]\n"
+        'name = "vllm"\n'
+        'repo = "https://github.com/vllm-project/vllm.git"\n'
+        'commit = "0123456789abcdef0123456789abcdef01234567"\n'
+        'dest = "vllm"\n\n'
         '[evaluator]\nsource = "../../evaluators/queue"',
     )
     argv = ["vibesys", "--outer-loop", outer_loop, "--input", str(bundle)]
@@ -519,6 +784,69 @@ def test_cli_forwards_workspace_sources_to_every_outer_loop(tmp_path, outer_loop
         main()
 
     assert runner.call_args.kwargs["workspace_seed"] == seed.resolve()
+    assert runner.call_args.kwargs["workspace_sources"] == (
+        WorkspaceSource(
+            name="vllm",
+            repo="https://github.com/vllm-project/vllm.git",
+            commit="0123456789abcdef0123456789abcdef01234567",
+            dest="vllm",
+        ),
+    )
     assert runner.call_args.kwargs["evaluator_path"] == evaluator.resolve()
     if outer_loop in {"agent", "evolve"}:
         assert runner.call_args.kwargs["domain"] is DomainName.GENERIC
+
+
+def test_workspace_source_with_nested_git_is_rejected_when_tracking(tmp_path):
+    """strip_git=false under git tracking would snapshot a bare gitlink."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _init_git_repo(project_root)
+
+    source_repo = tmp_path / "source"
+    source_repo.mkdir()
+    _init_git_repo(source_repo)
+    (source_repo / "src.py").write_text("pass\n")
+    commit = _commit_all(source_repo)
+
+    input_dir = project_root / "examples" / "model-serving" / "seeded"
+    input_dir.mkdir(parents=True)
+    (input_dir / "OBJECTIVE.md").write_text("objective\n")
+    (input_dir / "vibesys.input.toml").write_text("version = 1\n")
+
+    source = WorkspaceSource(
+        name="vllm",
+        repo=str(source_repo),
+        commit=commit,
+        dest="vllm",
+        strip_git=False,
+    )
+
+    with _patched_context_dependencies(project_root):
+        with pytest.raises(ConfigurationError, match="strip_git=false"):
+            _make_context(input_dir, workspace_sources=(source,), git_tracking=True)
+
+
+def test_workspace_source_dest_colliding_with_excluded_dirs_is_rejected(tmp_path):
+    """A dest under an excluded name would be invisible to copies and tracking."""
+    source_repo = tmp_path / "source"
+    source_repo.mkdir()
+    _init_git_repo(source_repo)
+    (source_repo / "src.py").write_text("pass\n")
+    commit = _commit_all(source_repo)
+
+    workspace = tmp_path / "workspace"
+    workspace_files = Workspace(
+        workspace,
+        run_environment=MagicMock(isolated=False),
+        backend=MagicMock(),
+        log=MagicMock(),
+        project_root=tmp_path,
+        excluded_dirs={"repos", "target"},
+    )
+    workspace_files.create()
+
+    source = WorkspaceSource(name="vllm", repo=str(source_repo), commit=commit, dest="repos/vllm")
+    with pytest.raises(ValueError, match="excluded path component"):
+        workspace_files.materialize_git_source(source)
+    assert not (workspace / "repos").exists()

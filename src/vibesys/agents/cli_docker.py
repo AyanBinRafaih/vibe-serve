@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+from dataclasses import dataclass
 from pathlib import Path
 
 # Per-provider environment variables to set inside the container.  Used as
@@ -23,6 +25,17 @@ DOCKER_PROVIDER_ENV: dict[str, dict[str, str]] = {
     "codex": {"PYTHONPATH": "/opt/vibesys"},
     "opencode": {"PYTHONPATH": "/opt/vibesys"},
 }
+
+
+# Keep the editor container aligned with the verified host CLI feature set.
+# Luna and its Max reasoning level require a newer CLI than the old 0.125 pin.
+CODEX_DOCKER_CLI_VERSION = "0.144.4"
+
+# Native implementations are valid candidate designs across domains, so the
+# editor container must be able to build and test them before paid target work.
+# Pin the toolchain for reproducible local checks instead of letting each agent
+# independently bootstrap an arbitrary Rust release.
+RUST_DOCKER_TOOLCHAIN_VERSION = "1.92.0"
 
 
 # Bash one-liners run inside the container at start() time, per provider.
@@ -69,7 +82,22 @@ _NODE_TARBALL_INSTALL = (
 )
 
 
-_MCP_PYTHON_INSTALL = [
+_RUST_TOOLCHAIN_INSTALL = (
+    "command -v cargo >/dev/null || { set -e; "
+    "curl -fsSL --retry 5 --retry-delay 5 -o /tmp/rustup-init.sh "
+    "https://sh.rustup.rs && "
+    "sh /tmp/rustup-init.sh -y --profile minimal "
+    f"--default-toolchain {RUST_DOCKER_TOOLCHAIN_VERSION} "
+    "--component rustfmt --component clippy && "
+    "ln -sf /root/.cargo/bin/* /usr/local/bin/ && "
+    "rm -f /tmp/rustup-init.sh; }"
+)
+
+
+_COMMON_DOCKER_TOOLING_INSTALL = [
+    _apt_install("curl ca-certificates", check_bin="curl"),
+    _RUST_TOOLCHAIN_INSTALL,
+    _apt_install("ripgrep", check_bin="rg"),
     _apt_install("python3 python3-pip"),
     "python3 -m pip install --quiet 'mcp>=1.0'",
 ]
@@ -81,29 +109,28 @@ _DOCKER_INSTALL_COMMANDS: dict[str, list[str]] = {
         # Anthropic's installer drops the binary in /root/.local/bin —
         # symlink to /usr/local/bin so PATH doesn't need adjustment.
         "ln -sf /root/.local/bin/claude /usr/local/bin/claude",
-        *_MCP_PYTHON_INSTALL,
+        *_COMMON_DOCKER_TOOLING_INSTALL,
     ],
     "opencode": [
         _apt_install("curl ca-certificates", check_bin="curl"),
         "curl -fsSL https://opencode.ai/install | bash",
         "ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode 2>/dev/null || "
         "ln -sf /root/.local/bin/opencode /usr/local/bin/opencode",
-        *_MCP_PYTHON_INSTALL,
+        *_COMMON_DOCKER_TOOLING_INSTALL,
     ],
     "gemini": [
         _NODE_TARBALL_INSTALL,
         "npm install -g @google/gemini-cli",
-        *_MCP_PYTHON_INSTALL,
+        *_COMMON_DOCKER_TOOLING_INSTALL,
     ],
     "codex": [
         _NODE_TARBALL_INSTALL,
-        # Pin to >=0.125.0 so the gpt-5.5 family of models works (0.118
-        # rejects them with 'requires a newer version of Codex').
+        # Pin the verified Luna-capable CLI rather than floating editor images.
         # `--include=optional` because newer codex packages ship the
         # Linux-x64 native binary as an optional dependency that
         # `npm install -g` silently skips on some npm configurations.
-        "npm install -g --include=optional @openai/codex@0.125.0",
-        *_MCP_PYTHON_INSTALL,
+        f"npm install -g --include=optional @openai/codex@{CODEX_DOCKER_CLI_VERSION}",
+        *_COMMON_DOCKER_TOOLING_INSTALL,
     ],
 }
 
@@ -113,29 +140,120 @@ def docker_init_commands(provider: str) -> list[str]:
     return list(_DOCKER_INSTALL_COMMANDS.get(provider, []))
 
 
-# Host paths to bind-mount RW so the in-container CLI inherits the host's
-# login state.  Only entries that actually exist on the host are mounted.
-# Claude paths are well-tested; the other three are best-guesses that may
-# need adjustment after first real run.
-DOCKER_AUTH_PATHS: dict[str, list[Path]] = {
-    "claude": [Path.home() / ".claude", Path.home() / ".claude.json"],
-    "gemini": [Path.home() / ".gemini"],
-    "codex": [Path.home() / ".codex"],
+@dataclass(frozen=True)
+class DockerAuthPath:
+    """Host provider state and its writable location inside the container."""
+
+    host_path: Path
+    container_path: str
+
+
+# Authentication and user configuration are mounted read-only under
+# ``/opt/vibesys-auth`` and copied into the container's ephemeral writable
+# layer before the CLI starts. Keep this list to provider-owned leaf files:
+# provider homes also contain large caches, worktrees, session history, package
+# installations, and databases that are neither required for authentication
+# nor appropriate to duplicate for every sandbox.
+DOCKER_AUTH_PATHS: dict[str, list[DockerAuthPath]] = {
+    "claude": [
+        DockerAuthPath(
+            Path.home() / ".claude" / ".credentials.json",
+            "/root/.claude/.credentials.json",
+        ),
+        DockerAuthPath(
+            Path.home() / ".claude" / "settings.json",
+            "/root/.claude/settings.json",
+        ),
+        DockerAuthPath(
+            Path.home() / ".claude" / "settings.local.json",
+            "/root/.claude/settings.local.json",
+        ),
+        DockerAuthPath(Path.home() / ".claude.json", "/root/.claude.json"),
+    ],
+    "gemini": [
+        DockerAuthPath(
+            Path.home() / ".gemini" / "oauth_creds.json",
+            "/root/.gemini/oauth_creds.json",
+        ),
+        DockerAuthPath(
+            Path.home() / ".gemini" / "google_accounts.json",
+            "/root/.gemini/google_accounts.json",
+        ),
+        DockerAuthPath(
+            Path.home() / ".gemini" / "settings.json",
+            "/root/.gemini/settings.json",
+        ),
+        DockerAuthPath(Path.home() / ".gemini" / ".env", "/root/.gemini/.env"),
+    ],
+    "codex": [
+        DockerAuthPath(Path.home() / ".codex" / "auth.json", "/root/.codex/auth.json"),
+        DockerAuthPath(
+            Path.home() / ".codex" / "config.toml",
+            "/root/.codex/config.toml",
+        ),
+    ],
     "opencode": [
-        Path.home() / ".local" / "share" / "opencode",
-        Path.home() / ".config" / "opencode",
+        DockerAuthPath(
+            Path.home() / ".local" / "share" / "opencode" / "auth.json",
+            "/root/.local/share/opencode/auth.json",
+        ),
+        DockerAuthPath(
+            Path.home() / ".config" / "opencode" / "opencode.json",
+            "/root/.config/opencode/opencode.json",
+        ),
+        DockerAuthPath(
+            Path.home() / ".config" / "opencode" / "opencode.jsonc",
+            "/root/.config/opencode/opencode.jsonc",
+        ),
+        # Older OpenCode releases used config.json/config.jsonc.
+        DockerAuthPath(
+            Path.home() / ".config" / "opencode" / "config.json",
+            "/root/.config/opencode/config.json",
+        ),
+        DockerAuthPath(
+            Path.home() / ".config" / "opencode" / "config.jsonc",
+            "/root/.config/opencode/config.jsonc",
+        ),
+        DockerAuthPath(
+            Path.home() / ".config" / "opencode" / ".env",
+            "/root/.config/opencode/.env",
+        ),
     ],
 }
 
 
 def auth_bind_mounts(provider: str) -> list[tuple[str, str, bool]]:
-    """Return ``(host_path, container_path, readonly=False)`` for existing auth paths.
-
-    Auth dirs are mounted into ``/root`` since we run as root inside the
-    container.
-    """
+    """Return read-only staging mounts for existing provider state."""
     out: list[tuple[str, str, bool]] = []
-    for host in DOCKER_AUTH_PATHS.get(provider, []):
-        if host.exists():
-            out.append((str(host), "/root/" + host.name, False))
+    for index, spec in enumerate(DOCKER_AUTH_PATHS.get(provider, [])):
+        if spec.host_path.exists():
+            out.append(
+                (
+                    str(spec.host_path),
+                    f"/opt/vibesys-auth/{index}",
+                    True,
+                )
+            )
     return out
+
+
+def auth_copy_commands(provider: str) -> list[str]:
+    """Return commands that copy staged provider state into writable storage.
+
+    Directories contain runtime state such as sessions and history, so mounting
+    them read-only at their final locations can break otherwise valid CLI runs.
+    Copying from read-only staging keeps those writes inside the disposable
+    container layer.
+    """
+    commands: list[str] = []
+    for index, spec in enumerate(DOCKER_AUTH_PATHS.get(provider, [])):
+        if not spec.host_path.exists():
+            continue
+        source = shlex.quote(f"/opt/vibesys-auth/{index}")
+        destination = shlex.quote(spec.container_path)
+        parent = shlex.quote(str(Path(spec.container_path).parent))
+        if spec.host_path.is_dir():
+            commands.append(f"mkdir -p {destination} && cp -a {source}/. {destination}/")
+        else:
+            commands.append(f"mkdir -p {parent} && cp -a {source} {destination}")
+    return commands

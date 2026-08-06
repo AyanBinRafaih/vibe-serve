@@ -34,6 +34,7 @@ from vibesys.config import Config, as_config
 from vibesys.constants import DEFAULT_COMPUTE_BACKEND, ComputeBackend
 from vibesys.context import create_run_context
 from vibesys.domains.llm_serving.hooks import LLMServingEnvironmentHooks
+from vibesys.input_manifest import WorkspaceSource
 from vibesys.loops.plain.render import render_all
 from vibesys.loops.plain.runner_ext import PlainLoopAgentRunner
 from vibesys.profilers import ProfilerKind
@@ -348,6 +349,7 @@ def run_plain_loop(
     benchmark_command: str,
     *,
     workspace_seed: Path | None = None,
+    workspace_sources: tuple[WorkspaceSource, ...] = (),
     evaluator_path: Path | None = None,
     hidden_evaluator_path: Path | None = None,
     max_rounds: int = 5,
@@ -385,6 +387,7 @@ def run_plain_loop(
         accuracy_command=accuracy_command,
         benchmark_command=benchmark_command,
         workspace_seed=workspace_seed,
+        workspace_sources=workspace_sources,
         evaluator_path=evaluator_path,
         hidden_evaluator_path=hidden_evaluator_path,
         existing=existing,
@@ -488,8 +491,6 @@ def run_plain_loop(
             )
 
         load_levels = config.perf_eval.load_levels
-        previous_evaluator_feedback: list[str] | None = None
-
         while i < end_iteration:
             iter_label = i + 1
             round_progress = RoundProgress(iter_label, end_iteration)
@@ -729,7 +730,6 @@ def run_plain_loop(
                     load_levels=load_levels,
                     progress_path="progress.md",
                     perf_metrics_path="perf_metrics.json",
-                    previous_evaluator_feedback=previous_evaluator_feedback,
                     issue_create_cap=max_issues_per_perf_eval,
                     benchmark_command=ctx.judge_benchmark_command,
                     runtime_notes=ctx.run_environment_view.prompt_notes,
@@ -765,8 +765,6 @@ def run_plain_loop(
                 _update_progress_from_perf_eval(progress_path, iter_label, perf_response)
                 _save_perf_metrics(perf_metrics_path, iter_label, perf_response)
                 ctx.snapshot_workspace(f"iter-{iter_label}-perf_eval")
-                previous_evaluator_feedback = perf_response.evaluator_feedback or None
-
                 ctx.lprint(
                     f"\n>>> Perf trend: throughput={perf_response.throughput_trend.value.upper()}, "
                     f"latency={perf_response.latency_trend.value.upper()}"

@@ -35,6 +35,7 @@ from vibesys.domains.environment import (
     NoopEnvironmentHooks,
 )
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
+from vibesys.input_manifest import WorkspaceSource
 from vibesys.llm_client import build_model
 from vibesys.profilers import (
     ACTIVE_PROFILER_KINDS,
@@ -241,8 +242,10 @@ def create_run_context(
     accuracy_command: str,
     benchmark_command: str,
     workspace_seed: Path | None = None,
+    workspace_sources: tuple[WorkspaceSource, ...] = (),
     evaluator_path: Path | None = None,
     hidden_evaluator_path: Path | None = None,
+    objective: str | None = None,
     existing: bool = False,
     trusted_input_baseline: str | None = None,
     debug: bool = False,
@@ -266,7 +269,103 @@ def create_run_context(
     and agent-runner build.  ``_RunContext.__init__`` itself only assigns
     the assembled components.
     """
+    teardown_stack = ExitStack()
+    try:
+        return _assemble_run_context(
+            teardown_stack=teardown_stack,
+            config=config,
+            exp_name=exp_name,
+            input_path=input_path,
+            accuracy_command=accuracy_command,
+            benchmark_command=benchmark_command,
+            workspace_seed=workspace_seed,
+            workspace_sources=workspace_sources,
+            evaluator_path=evaluator_path,
+            hidden_evaluator_path=hidden_evaluator_path,
+            objective=objective,
+            existing=existing,
+            trusted_input_baseline=trusted_input_baseline,
+            debug=debug,
+            profiler_kind=profiler_kind,
+            profiler_domain=profiler_domain,
+            skills_dirs=skills_dirs,
+            run_environment=run_environment,
+            git_tracking=git_tracking,
+            agent_backend=agent_backend,
+            cli_provider=cli_provider,
+            backend=backend,
+            environment_hooks=environment_hooks,
+            remote_repo=remote_repo,
+            repo_visibility=repo_visibility,
+        )
+    except BaseException as construction_error:
+        _close_after_construction_failure(teardown_stack, construction_error)
+        raise
+
+
+def _close_after_construction_failure(
+    teardown_stack: ExitStack, construction_error: BaseException
+) -> None:
+    """Unwind partial construction without replacing its root-cause error."""
+    try:
+        teardown_stack.close()
+    except BaseException as cleanup_error:
+        construction_error.add_note(
+            "Additional error while cleaning up partial context construction: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+
+
+def _assemble_run_context(
+    *,
+    teardown_stack: ExitStack,
+    config: Config,
+    exp_name: str,
+    input_path: str,
+    accuracy_command: str,
+    benchmark_command: str,
+    workspace_seed: Path | None,
+    workspace_sources: tuple[WorkspaceSource, ...],
+    evaluator_path: Path | None,
+    hidden_evaluator_path: Path | None,
+    objective: str | None,
+    existing: bool,
+    trusted_input_baseline: str | None,
+    debug: bool,
+    profiler_kind: ProfilerKind,
+    profiler_domain: DomainName,
+    skills_dirs: list[str] | None,
+    run_environment: RunEnvironmentSpec | None,
+    git_tracking: bool,
+    agent_backend: str | None,
+    cli_provider: str | None,
+    backend: ComputeBackend,
+    environment_hooks: EnvironmentHooks | None,
+    remote_repo: str | None,
+    repo_visibility: RepositoryVisibility,
+) -> "_RunContext":
     config = as_config(config)
+    if git_tracking:
+        # A non-stripped nested ``.git`` makes ``git add -A`` record the
+        # checkout as a bare gitlink: round snapshots stop seeing edits inside
+        # it and deliverable repos end up with a broken pointer instead of the
+        # seeded code. Provenance is preserved in ``_vibesys_sources.json``.
+        for source in workspace_sources:
+            if not source.strip_git:
+                raise ConfigurationError(
+                    ConfigurationDiagnostic(
+                        code="workspace_source_untrackable",
+                        stage="workspace_setup",
+                        message=(
+                            f"workspace source {source.name!r} sets strip_git=false, but "
+                            "this run tracks the workspace with git: the nested .git at "
+                            f"{source.dest!r} would be recorded as an empty gitlink, so "
+                            "round snapshots and deliverable repos would silently lose "
+                            "the checkout's contents. Remove strip_git=false (upstream "
+                            "repo and commit stay recorded in _vibesys_sources.json)."
+                        ),
+                    )
+                )
     run_environment_spec = run_environment or make_run_environment_spec()
     environment = build_run_environment(run_environment_spec)
 
@@ -286,14 +385,12 @@ def create_run_context(
     # One teardown stack for the whole context: every component with
     # cleanup registers here, and close() unwinds it in reverse
     # construction order (device → environment hooks → session → logs).
-    teardown_stack = ExitStack()
     teardown_stack.callback(logger.close)
     experiment_repository = ExperimentRepository(exp_dir, logger.lprint)
     if remote_repo is not None:
         try:
             experiment_repository.create_remote(remote_repo, repo_visibility)
         except Exception as exc:
-            teardown_stack.close()
             raise ConfigurationError(
                 ConfigurationDiagnostic(
                     code="repository_setup_failed",
@@ -346,7 +443,10 @@ def create_run_context(
     resolved_backend = agent_backend or config.agent.backend or DEFAULT_AGENT_BACKEND
     resolved_cli_provider = cli_provider or config.agent.cli_provider or "codex"
 
-    model = build_model(config)
+    # CLI providers construct and configure their own agent process. Building
+    # the LangChain model here is both unused and incorrect for CLI-only knobs
+    # such as Codex reasoning effort, which the generic OpenAI adapter rejects.
+    model = None if resolved_backend == "cli" else build_model(config)
     model_name = config.model.name
 
     input_path_str = _coerce_dir_path(input_path, "--input")
@@ -364,6 +464,7 @@ def create_run_context(
         domain=profiler_domain,
         backend_profiler_kind=getattr(backend_impl, "profiler_kind", None),
         environment_default_profiler_kind=environment.default_profiler_kind,
+        environment_supported_profiler_kinds=environment.supported_profiler_kinds,
     )
     profiler_preflight = preflight_profiler_kind(resolved_profiler_kind)
     if not profiler_preflight.usable:
@@ -406,6 +507,7 @@ def create_run_context(
         backend=backend_impl,
         log=logger.lprint,
         project_root=PROJECT_ROOT,
+        compute_backend=backend,
     )
     workspace_files.create()
 
@@ -424,6 +526,14 @@ def create_run_context(
     )
     environment_patch = hooks.prepare(environment_context)
 
+    def _teardown_environment_hooks() -> None:
+        try:
+            hooks.teardown(environment_context)
+        except Exception as exc:
+            logger.lprint(f"[warn] environment hook teardown failed: {exc}")
+
+    teardown_stack.callback(_teardown_environment_hooks)
+
     # When resuming an existing run, the plan skips full workspace file
     # setup — the workspace already contains reference files, skills, etc.
     # from the previous run.  Only skills are refreshed and profiler
@@ -437,6 +547,7 @@ def create_run_context(
         input_project_dir=input_project_dir,
         profiler_support_path=profiler_support_path,
         profiler_support_name=profiler_support_name,
+        workspace_sources=workspace_sources,
         extra_input_excludes=environment_patch.copy_excludes,
     )
     workspace_files.setup(plan, existing=existing)
@@ -454,14 +565,17 @@ def create_run_context(
             RunEnvironmentRequest(
                 log_dir=log_dir,
                 workspace=workspace_files.root,
+                workspace_sources=workspace_sources,
                 ref_dir=ref_dir,
                 backend=backend_impl,
                 agent_backend=resolved_backend,
                 cli_provider=resolved_cli_provider,
+                objective=objective,
                 accuracy_command=accuracy_command,
                 benchmark_command=benchmark_command,
                 profiler_support_path=profiler_support_path,
                 profiler_support_name=profiler_support_name,
+                git_history_root=git.history_root,
                 environment_bind_mounts=environment_patch.bind_mounts,
                 log=logger.lprint,
                 project_root=agent_project_root,
@@ -477,18 +591,10 @@ def create_run_context(
         profiler_benchmark_command=session.view.paths.benchmark_command,
     )
 
-    def _teardown_environment_hooks() -> None:
-        try:
-            hooks.teardown(environment_context)
-        except Exception as exc:
-            logger.lprint(f"[warn] environment hook teardown failed: {exc}")
-
-    teardown_stack.callback(_teardown_environment_hooks)
-
     # Start backend-specific background monitoring (CUDA: nvidia-smi).
     device = DeviceLease(backend_impl, log_dir=log_dir, run_environment_view=session.view)
-    device.start_monitor()
     teardown_stack.callback(device.close)
+    device.start_monitor()
 
     # Build the backend-agnostic agent runner. Loops invoke this instead
     # of calling create_deep_agent / vibesys._agent_cli directly. The cli
@@ -516,11 +622,11 @@ def create_run_context(
         },
         skills=[src.name for src in skill_source_paths],
         skill_source_dirs=skill_source_paths,
+        compute_backend=backend,
         model=model,
         model_name=model_name,
-        run_log_file=logger.file,
-        use_docker=(session.view.cli_sandboxed and not session.view.cli_modal_sandboxed),
-        use_modal=session.view.cli_modal_sandboxed,
+        run_log_file=logger.writer,
+        use_docker=session.view.cli_sandboxed,
         log_dir=log_dir,
     )
 
@@ -532,7 +638,7 @@ def create_run_context(
             inherit_env=True,
             env=_framework_env(
                 hidden_evaluator_runtime,
-                modal_app_name=session.view.modal_app_name,
+                modal_app_name=session.view.deployment_namespace,
             ),
         )
 
@@ -549,9 +655,11 @@ def create_run_context(
         model_name=model_name,
         input_path=input_path_str,
         workspace_seed_path=workspace_seed_path,
+        workspace_sources=workspace_sources,
         evaluator_path=evaluator_source,
         hidden_evaluator_path=hidden_evaluator_runtime,
         framework_judge_backend=framework_judge_backend,
+        effective_objective=objective,
         accuracy_command=accuracy_command,
         benchmark_command=benchmark_command,
         profiler_kind=resolved_profiler_kind,
@@ -592,16 +700,43 @@ def create_candidate_context(
 
     - a **git worktree** checked out at ``parent_commit`` (isolated working
       tree / index / detached HEAD; edits never touch the shared tree);
-    - a fresh **run-environment session** (its own Modal editor container);
+    - a fresh **run-environment session** (its own isolated editor sandbox);
     - its own **agent runner** (the CLI runner is not thread-safe);
     - a **no-tee ``RunLogger``** writing only to the candidate's log file — only
       the top-level run logger may own the process ``sys.stderr``.
 
-    Only Modal mode is supported for parallel evaluation (host GPU reselection
-    is a no-op there); the caller is responsible for that gating. Close the
-    returned context (or use it as a context manager) to stop the container and
-    remove the worktree.
+    The caller gates this path on the selected environment's parallel-candidate
+    capability. Close the returned context (or use it as a context manager) to
+    stop environment-owned resources and remove the worktree.
     """
+    teardown_stack = ExitStack()
+    try:
+        return _assemble_candidate_context(
+            teardown_stack=teardown_stack,
+            parent=parent,
+            config=config,
+            generation=generation,
+            child_idx=child_idx,
+            parent_commit=parent_commit,
+            agent_backend=agent_backend,
+            cli_provider=cli_provider,
+        )
+    except BaseException as construction_error:
+        _close_after_construction_failure(teardown_stack, construction_error)
+        raise
+
+
+def _assemble_candidate_context(
+    *,
+    teardown_stack: ExitStack,
+    parent: "_RunContext",
+    config: Config,
+    generation: int,
+    child_idx: int,
+    parent_commit: str,
+    agent_backend: str | None,
+    cli_provider: str | None,
+) -> "_RunContext":
     config = as_config(config)
     cand_root = parent.exp_dir / "candidates" / f"{parent.exp_dir.name}-g{generation}c{child_idx}"
     workspace = cand_root / "workspace"
@@ -611,17 +746,17 @@ def create_candidate_context(
     # Materialize the parent's tree in an isolated worktree (shared object
     # store). `git worktree add` touches the main repo's admin area, so the
     # caller serializes this; the container/agent work afterward is isolated.
+    # Remove the worktree only after it has been materialized, including when
+    # git itself reports failure after partially materializing its admin state.
+    teardown_stack.callback(lambda: parent.git.remove_worktree(workspace))
     parent.git.add_worktree(workspace, parent_commit)
 
     logger = RunLogger(log_dir, tee_stderr=False)
-    teardown_stack = ExitStack()
     teardown_stack.callback(logger.close)
-    # Remove the worktree *after* the session's container is stopped: register
-    # the removal before entering the session so it unwinds afterward (LIFO).
-    teardown_stack.callback(lambda: parent.git.remove_worktree(workspace))
 
     resolved_backend = agent_backend or config.agent.backend or DEFAULT_AGENT_BACKEND
     resolved_cli_provider = cli_provider or config.agent.cli_provider or "codex"
+    effective_objective = getattr(parent, "effective_objective", None)
 
     git = GitTracker(
         workspace,
@@ -634,24 +769,27 @@ def create_candidate_context(
         backend=parent.backend_impl,
         log=logger.lprint,
         project_root=PROJECT_ROOT,
+        compute_backend=parent.backend,
     )
 
-    # Reuse the parent's already-provisioned Modal model volume: the shared
-    # run_environment has `model_volume` set from the parent's open(), so this
-    # open() skips re-upload and ref_dir is unneeded.
+    # Reuse adapter-owned resources provisioned when the parent environment was
+    # opened. Candidate sessions do not need to rematerialize reference inputs.
     session = teardown_stack.enter_context(
         parent.run_environment.open(
             RunEnvironmentRequest(
                 log_dir=log_dir,
                 workspace=workspace,
+                workspace_sources=parent.workspace_sources,
                 ref_dir=None,
                 backend=parent.backend_impl,
                 agent_backend=resolved_backend,
                 cli_provider=resolved_cli_provider,
+                objective=effective_objective,
                 accuracy_command=parent.accuracy_command,
                 benchmark_command=parent.benchmark_command,
                 profiler_support_path=parent.profiler_support_path,
                 profiler_support_name=parent.profiler_support_name,
+                git_history_root=parent.git.history_root,
                 environment_bind_mounts=parent.environment_patch.bind_mounts,
                 log=logger.lprint,
                 project_root=parent.agent_project_root,
@@ -679,11 +817,11 @@ def create_candidate_context(
         },
         skills=[src.name for src in parent.skill_source_paths],
         skill_source_dirs=parent.skill_source_paths,
+        compute_backend=parent.backend,
         model=parent.model,
         model_name=parent.model_name,
-        run_log_file=logger.file,
-        use_docker=(session.view.cli_sandboxed and not session.view.cli_modal_sandboxed),
-        use_modal=session.view.cli_modal_sandboxed,
+        run_log_file=logger.writer,
+        use_docker=session.view.cli_sandboxed,
         log_dir=log_dir,
     )
 
@@ -695,7 +833,7 @@ def create_candidate_context(
             inherit_env=True,
             env=_framework_env(
                 parent.hidden_evaluator_path,
-                modal_app_name=session.view.modal_app_name,
+                modal_app_name=session.view.deployment_namespace,
             ),
         )
 
@@ -719,9 +857,11 @@ def create_candidate_context(
         model_name=parent.model_name,
         input_path=parent.input_path,
         workspace_seed_path=None,
+        workspace_sources=parent.workspace_sources,
         evaluator_path=parent.evaluator_path,
         hidden_evaluator_path=parent.hidden_evaluator_path,
         framework_judge_backend=framework_judge_backend,
+        effective_objective=effective_objective,
         accuracy_command=parent.accuracy_command,
         benchmark_command=parent.benchmark_command,
         profiler_kind=parent.profiler_kind,
@@ -740,7 +880,7 @@ def create_candidate_context(
         teardown_stack=teardown_stack,
         run_environment_session=session,
         commands=commands,
-        device=parent.device,  # shared; Modal reselect is a no-op
+        device=parent.device,  # shared under the environment's parallel contract
         agent_runner=agent_runner,
     )
 
@@ -776,9 +916,11 @@ class _RunContext:
         model_name: str,
         input_path: str | None,
         workspace_seed_path: Path | None,
+        workspace_sources: tuple[WorkspaceSource, ...],
         evaluator_path: Path | None,
         hidden_evaluator_path: Path | None,
         framework_judge_backend: Any,
+        effective_objective: str | None,
         accuracy_command: str,
         benchmark_command: str,
         profiler_kind: ProfilerKind,
@@ -810,8 +952,10 @@ class _RunContext:
         self.model_name = model_name
         self.input_path = input_path
         self.workspace_seed_path = workspace_seed_path
+        self.workspace_sources = workspace_sources
         self.evaluator_path = evaluator_path
         self.hidden_evaluator_path = hidden_evaluator_path
+        self.effective_objective = effective_objective
         self.accuracy_command = accuracy_command
         self.benchmark_command = benchmark_command
         self.profiler_kind = profiler_kind
@@ -870,7 +1014,7 @@ class _RunContext:
     @property
     def run_log_file(self) -> TextIO:
         """The current open log file handle (owned by ``RunLogger``)."""
-        return self.logger.file
+        return self.logger.writer
 
     @property
     def skill_source_paths(self) -> list[Path]:
@@ -1052,20 +1196,6 @@ class _RunContext:
             input(f"\n[debug] {step}. Press Enter to continue...")
 
     def snapshot_workspace(self, label: str) -> None:
-        # Under --modal the implementer writes land in the ephemeral Modal
-        # workspace Volume, not the host workspace dir. Pull the latest
-        # state back to the host before snapshotting so git commits (or
-        # directory copies) actually capture the implementer's code and
-        # tests, not just ``progress.md``. The ModalSandbox's tar-and-
-        # stream download is idempotent and excludes ``.venv`` /
-        # ``__pycache__`` / mounted RO dirs — same set we already skip at
-        # run end — so this is safe to run on every snapshot.
-        if hasattr(self.implementer_backend, "_download_workspace"):
-            try:
-                self.implementer_backend._download_workspace()  # pyright: ignore[reportAttributeAccessIssue]
-            except Exception as exc:
-                self.lprint(f"[warn] modal workspace sync to host failed: {exc}")
-
         if self.git_tracking:
             self.git.snapshot(label)
         else:
@@ -1105,6 +1235,11 @@ class _RunContext:
     # sites working.
 
     @property
+    def objective_location(self) -> str:
+        """Return the framework-owned effective objective path seen by agents."""
+        return self.run_environment_view.paths.objective
+
+    @property
     def judge_accuracy_command(self) -> str | None:
         """Return the accuracy command as seen by the judge agent."""
         return self.commands.judge_accuracy_command
@@ -1129,12 +1264,12 @@ class _RunContext:
 
     def switch_log_file(self, label: int | str) -> None:
         """Switch to a per-phase log file — see :meth:`RunLogger.switch`."""
-        new_file = self.logger.switch(label)
+        self.logger.switch(label)
         self._paths = replace(self._paths, run_log_path=self.logger.path)
         # Update the agent runner's log file handle so subsequent
         # invoke() calls write to the new step log.
         if hasattr(self, "agent_runner") and hasattr(self.agent_runner, "_run_log_file"):
-            self.agent_runner._run_log_file = new_file  # pyright: ignore[reportAttributeAccessIssue]
+            self.agent_runner._run_log_file = self.logger.writer  # pyright: ignore[reportAttributeAccessIssue]
 
     def reselect_gpu(self) -> None:
         """Delegate mid-run device rebalance — see :meth:`DeviceLease.reselect`."""

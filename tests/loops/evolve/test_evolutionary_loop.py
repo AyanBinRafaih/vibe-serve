@@ -35,7 +35,7 @@ from vibesys.loops.evolve.loop import (
     _plan_candidate,
     _recent_failure_lessons,
     _run_generation_parallel,
-    _teardown_candidate_app,
+    _teardown_candidate_deployment,
     run_evolve_loop,
 )
 from vibesys.loops.evolve.population import (
@@ -51,7 +51,7 @@ from vibesys.loops.evolve.search_policy import (
 )
 from vibesys.profilers import ProfilerKind
 from vibesys.run import GitTracker
-from vibesys.sandbox.run_environment import RunEnvironmentSpec, candidate_modal_app_name
+from vibesys.sandbox.run_environment import CandidateRuntime, RunEnvironmentSpec
 from vibesys.schemas import JudgeResponse, MutatorResponse, ProfilerSummary, Verdict
 
 _LLM_SERVING_DOMAIN = resolve_domain(DomainName.LLM_SERVING)
@@ -155,6 +155,11 @@ def _make_runner(
 
 def _invoke_loop(tmp_path, ref_file, runner, **kwargs):
     """Shared plumbing — patch context globals, run the loop, return result."""
+    accuracy_gate_feedbacks = kwargs.pop("_accuracy_gate_feedbacks", None)
+    accuracy_gate = MagicMock(return_value=None)
+    if accuracy_gate_feedbacks is not None:
+        accuracy_gate.side_effect = list(accuracy_gate_feedbacks)
+    runner.accuracy_gate = accuracy_gate
     defaults = dict(
         config={"model": {"name": "claude-sonnet-4-6"}},
         exp_name="test-evolve",
@@ -173,6 +178,10 @@ def _invoke_loop(tmp_path, ref_file, runner, **kwargs):
         patch("vibesys.backends.cuda.LocalShellBackend"),
         patch("vibesys.context.build_agent_runner", return_value=runner),
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
+        patch(
+            "vibesys.loops.evolve.loop._run_framework_accuracy_gate",
+            accuracy_gate,
+        ),
     ):
         return run_evolve_loop(**defaults)
 
@@ -322,6 +331,40 @@ def test_bootstrap_succeeds_after_repair(tmp_path, ref_file):
     assert seed.commit and seed.commit != failed.commit
 
 
+def test_bootstrap_repairs_after_framework_accuracy_failure(tmp_path, ref_file):
+    """An LLM-approved seed still fails when the trusted oracle rejects it.
+
+    The failed seed is never profiled, its oracle feedback is retained for the
+    repair attempt, and the configured timeout reaches the framework gate.
+    """
+    failure = "Framework accuracy gate failed.\nstatus endpoint diverged"
+    runner = _make_runner(mutator_writes=True)
+    result = _invoke_loop(
+        tmp_path,
+        ref_file,
+        runner,
+        _accuracy_gate_feedbacks=[failure, None],
+        accuracy_timeout_seconds=37,
+        bootstrap_max_attempts=2,
+        max_generations=0,
+    )
+
+    assert result is True
+    assert runner.counters["judge"] == 2
+    assert runner.counters["profiler"] == 1
+    assert runner.accuracy_gate.call_count == 2
+    assert [call.kwargs["timeout_seconds"] for call in runner.accuracy_gate.call_args_list] == [
+        37,
+        37,
+    ]
+
+    failed, seed = _load_population(tmp_path).all
+    assert failed.passed is False
+    assert failed.feedback == failure
+    assert failed.commit
+    assert seed.passed is True
+
+
 def test_bootstrap_prompt_uses_cold_start_section(tmp_path, ref_file):
     """The bootstrap attempt sees the cold-start branch of the mutator prompt
     (no parent block)."""
@@ -337,7 +380,7 @@ def test_bootstrap_prompt_uses_cold_start_section(tmp_path, ref_file):
     prompt = captured[0]
     assert "Bootstrap the first passing seed" in prompt
     assert "## Parent" not in prompt
-    assert "Model weights are at `/model`" in prompt
+    assert "LLM-serving implementation invariants" in prompt
 
 
 def test_evolve_with_preexisting_passing_seed_skips_bootstrap(tmp_path, ref_file):
@@ -427,6 +470,33 @@ def test_failed_child_excluded_from_future_parent_pool(tmp_path, ref_file):
     # The gen-2 child must descend from the seed, NOT from the failed g1
     # (which has no commit and can't be selected).
     assert g2.parent_id == seed.id
+
+
+def test_accuracy_rejected_child_is_not_profiled_or_selected(tmp_path, ref_file):
+    """The framework oracle can overrule an LLM PASS for an offspring."""
+    failure = "Framework accuracy gate failed.\nbooking response diverged"
+    runner = _make_runner()
+    result = _invoke_loop(
+        tmp_path,
+        ref_file,
+        runner,
+        _accuracy_gate_feedbacks=[None, failure, None],
+        max_generations=2,
+        children_per_generation=1,
+    )
+
+    assert result is True
+    assert runner.counters["judge"] == 3
+    assert runner.counters["profiler"] == 2
+    assert runner.accuracy_gate.call_count == 3
+
+    seed, rejected, accepted = _load_population(tmp_path).all
+    assert rejected.passed is False
+    assert rejected.commit is None
+    assert rejected.perf_metric is None
+    assert rejected.feedback == failure
+    assert accepted.passed is True
+    assert accepted.parent_id == seed.id
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +803,7 @@ def test_programmatic_openevolve_config_rejects_vibesys_policy(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Helper units: failure lessons, WIP-seed lookup, per-candidate Modal app
+# Helper units: failure lessons, WIP-seed lookup, per-candidate deployment
 # ---------------------------------------------------------------------------
 
 
@@ -785,42 +855,38 @@ def test_latest_wip_seed_none_when_no_snapshotted_failure():
     assert _latest_wip_seed(pop) is None
 
 
-def test_candidate_runtime_notes_substitutes_per_candidate_app_name():
+def test_candidate_runtime_notes_delegates_deployment_naming_to_environment():
     base = "run-20260720-abcd1234-llama3"
     ctx = SimpleNamespace(
         run_environment_view=SimpleNamespace(
-            modal_app_name=base,
+            deployment_namespace=base,
             prompt_notes=f"Deploy to Modal app {base}; endpoint {base}-web.",
-        )
+        ),
+        run_environment=SimpleNamespace(
+            candidate_runtime=lambda view, generation, child_idx: CandidateRuntime(
+                prompt_notes="provider-owned candidate instructions",
+                deployment_name=f"candidate-{generation}-{child_idx}",
+            )
+        ),
     )
     notes, app = _candidate_runtime_notes(ctx, generation=3, child_idx=2)
-    expected_app = candidate_modal_app_name(base, 3, 2)
-    assert app == expected_app
-    # Every occurrence of the base name is swapped for the candidate app name
-    # (which itself starts with the base + suffix, so the base survives only as
-    # that prefix — there is no bare, un-suffixed occurrence left).
-    assert notes == f"Deploy to Modal app {expected_app}; endpoint {expected_app}-web."
-    assert notes.count(expected_app) == 2
+    assert app == "candidate-3-2"
+    assert notes == "provider-owned candidate instructions"
 
 
-def test_candidate_runtime_notes_noop_without_modal_app():
-    notes_in = "Local run; no Modal app."
+def test_candidate_runtime_notes_noop_without_named_deployment():
+    notes_in = "Local run; no named deployment."
     ctx = SimpleNamespace(
-        run_environment_view=SimpleNamespace(modal_app_name=None, prompt_notes=notes_in)
+        run_environment_view=SimpleNamespace(deployment_namespace=None, prompt_notes=notes_in),
+        run_environment=SimpleNamespace(
+            candidate_runtime=lambda view, generation, child_idx: CandidateRuntime(
+                prompt_notes=view.prompt_notes
+            )
+        ),
     )
     notes, app = _candidate_runtime_notes(ctx, generation=1, child_idx=1)
     assert app is None
     assert notes == notes_in
-
-
-def test_candidate_modal_app_name_suffix_and_length():
-    short = candidate_modal_app_name("run-abc", 2, 5)
-    assert short == "run-abc-g2c5"
-
-    long_base = "r" * 80
-    name = candidate_modal_app_name(long_base, 12, 7)
-    assert name.endswith("-g12c7")
-    assert len(name) <= 63
 
 
 # ---------------------------------------------------------------------------
@@ -828,25 +894,25 @@ def test_candidate_modal_app_name_suffix_and_length():
 # ---------------------------------------------------------------------------
 
 
-def test_teardown_candidate_app_delegates_to_run_environment():
-    """The loop stays backend-agnostic: it hands the app name to the run
+def test_teardown_candidate_deployment_delegates_to_run_environment():
+    """The loop stays backend-agnostic: it hands the deployment name to the run
     environment, which decides how to release it."""
     run_env = MagicMock()
     ctx = SimpleNamespace(run_environment=run_env, lprint=lambda _: None)
 
-    _teardown_candidate_app(ctx, "vibesys-run-g1c2", keep=False)
+    _teardown_candidate_deployment(ctx, "vibesys-run-g1c2", keep=False)
 
     run_env.teardown_deployment.assert_called_once_with("vibesys-run-g1c2", log=ctx.lprint)
 
 
-def test_teardown_candidate_app_noop_when_kept_or_no_app():
+def test_teardown_candidate_deployment_noop_when_kept_or_absent():
     run_env = MagicMock()
     ctx = SimpleNamespace(run_environment=run_env, lprint=lambda _: None)
 
     # Opt-out: keep the app for post-hoc inspection.
-    _teardown_candidate_app(ctx, "vibesys-run-g1c2", keep=True)
+    _teardown_candidate_deployment(ctx, "vibesys-run-g1c2", keep=True)
     # No per-candidate deployment (non-Modal env).
-    _teardown_candidate_app(ctx, None, keep=False)
+    _teardown_candidate_deployment(ctx, None, keep=False)
 
     run_env.teardown_deployment.assert_not_called()
 
@@ -960,7 +1026,7 @@ def test_run_generation_parallel_bounds_concurrency_and_records_all(tmp_path, mo
         modality="text_generation",
         domain_definition=_LLM_SERVING_DOMAIN,
         pass_criteria="crit",
-        keep_modal_apps=False,
+        keep_deployments=False,
         search_policy=VibeSysSearchPolicy(),
     )
 
@@ -1019,7 +1085,7 @@ def test_run_generation_parallel_skips_parent_without_commit(tmp_path, monkeypat
         modality="text_generation",
         domain_definition=_LLM_SERVING_DOMAIN,
         pass_criteria="crit",
-        keep_modal_apps=False,
+        keep_deployments=False,
         search_policy=VibeSysSearchPolicy(),
     )
 
@@ -1053,7 +1119,7 @@ def test_evaluate_in_subcontext_skips_parent_without_commit():
         modality="text_generation",
         domain_definition=_LLM_SERVING_DOMAIN,
         pass_criteria="crit",
-        keep_modal_apps=False,
+        keep_deployments=False,
         policy_parent_id=None,
         target_island=None,
         worktree_lock=threading.Lock(),
@@ -1075,6 +1141,7 @@ def test_evaluate_in_subcontext_builds_worktree_and_evaluates(tmp_path, ref_file
         patch("vibesys.backends.cuda.LocalShellBackend"),
         patch("vibesys.context.build_agent_runner", return_value=runner),
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
+        patch("vibesys.loops.evolve.loop._run_framework_accuracy_gate", return_value=None),
         create_run_context(
             config={"model": {"name": "claude-sonnet-4-6"}},
             exp_name="test-parallel-subctx",
@@ -1114,7 +1181,7 @@ def test_evaluate_in_subcontext_builds_worktree_and_evaluates(tmp_path, ref_file
             modality="text_generation",
             domain_definition=_LLM_SERVING_DOMAIN,
             pass_criteria="be faster",
-            keep_modal_apps=False,
+            keep_deployments=False,
             policy_parent_id=None,
             target_island=None,
             worktree_lock=threading.Lock(),
@@ -1134,9 +1201,8 @@ def test_evaluate_in_subcontext_builds_worktree_and_evaluates(tmp_path, ref_file
         assert not cand_ws.exists()
 
 
-def test_max_parallelism_ignored_on_non_modal_env(tmp_path, ref_file, monkeypatch):
-    """--max-parallelism > 1 on a non-Modal env logs a downgrade and runs the
-    serial path (parallel orchestrator is never entered)."""
+def test_max_parallelism_ignored_without_environment_capability(tmp_path, ref_file, monkeypatch):
+    """An environment without isolated evaluation support stays serial."""
     called = {"parallel": False}
     monkeypatch.setattr(
         evolve_loop,
@@ -1159,11 +1225,10 @@ def test_max_parallelism_ignored_on_non_modal_env(tmp_path, ref_file, monkeypatc
 
 def test_loop_tears_down_candidate_on_pass_and_fail_paths(tmp_path, ref_file):
     """Teardown fires exactly once per candidate on every exit path — the
-    bootstrap attempt plus each generation candidate, whether it passes or
     fails the judge."""
     # bootstrap passes (1 attempt), gen-1 candidate passes, gen-2 candidate fails.
     runner = _make_runner(judge_verdicts=["pass", "pass", "fail"])
-    with patch("vibesys.loops.evolve.loop._teardown_candidate_app") as teardown:
+    with patch("vibesys.loops.evolve.loop._teardown_candidate_deployment") as teardown:
         _invoke_loop(
             tmp_path,
             ref_file,

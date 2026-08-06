@@ -10,17 +10,18 @@ every offspring:
   4. Run the *Mutator* agent (an LLM acting as the mutation operator) to
      edit code in place.
   5. Run the *Judge* on the result.
-  6. If pass, profile to obtain ``perf_metric``. Commit the workspace and
+  6. If the judge passes, run the framework-owned accuracy command.
+  7. If both pass, profile to obtain ``perf_metric``. Commit the workspace and
      record an Individual. Else: discard the dirty tree, record a failed
-     Individual carrying the judge feedback so future mutators can learn.
+     Individual carrying failure feedback so future mutators can learn.
 
 Before the generation loop, a dedicated *bootstrap* phase
-(``_bootstrap_seed``) runs implementer → judge iterations until the first
-judge-passing implementation exists, recorded as a generation-0 seed. So
-the generation loop always starts from a passing parent and never
-cold-starts. The bootstrap phase owns the from-scratch / fix-forward
-repair logic; on ``--resume`` it is skipped when a passing individual is
-already present.
+(``_bootstrap_seed``) runs implementer → judge → accuracy iterations until
+the first framework-verified implementation exists, recorded as a
+generation-0 seed. So the generation loop always starts from a passing
+parent and never cold-starts. The bootstrap phase owns the from-scratch /
+fix-forward repair logic; on ``--resume`` it is skipped when a passing
+individual is already present.
 
 The loop intentionally does NOT have an early-stop signal — generations
 run for the full ``max_generations`` budget. Termination decisions are
@@ -45,6 +46,7 @@ from vibesys.context import create_candidate_context, create_run_context
 from vibesys.domains.base import DomainDefinition, DomainName, DomainRole
 from vibesys.domains.registry import resolve_domain
 from vibesys.domains.rendering import render_domain_section
+from vibesys.input_manifest import WorkspaceSource
 from vibesys.loops.evolve.population import (
     Individual,
     Objective,
@@ -58,12 +60,12 @@ from vibesys.loops.evolve.search_policy import (
     SearchSelection,
     VibeSysSearchPolicy,
 )
+from vibesys.loops.gates import run_accuracy_gate
 from vibesys.loops.profiler import invoke_profiler
 from vibesys.profilers import ProfilerKind, profiler_definition
 from vibesys.run import LoopContext, RepositoryVisibility
 from vibesys.sandbox.run_environment import (
     RunEnvironmentSpec,
-    candidate_modal_app_name,
     make_run_environment_spec,
 )
 from vibesys.schemas import JudgeResponse, MutatorResponse, ProfilerSummary, Verdict
@@ -100,6 +102,8 @@ def _domain_render_context(
         "runtime_notes": (
             runtime_notes if runtime_notes is not None else ctx.run_environment_view.prompt_notes
         ),
+        "profile_execution": ctx.run_environment_view.profile_execution,
+        "workspace_sources": ctx.workspace_sources,
     }
 
 
@@ -144,21 +148,20 @@ def _candidate_code(ctx: LoopContext, commit: str) -> str:
     ).stdout.decode(errors="replace")
 
 
-def _teardown_candidate_app(ctx: LoopContext, cand_app: str | None, *, keep: bool) -> None:
+def _teardown_candidate_deployment(ctx: LoopContext, deployment: str | None, *, keep: bool) -> None:
     """Release a candidate's per-evaluation deployment once its judge/profiler are done.
 
-    Every candidate deploys its GPU server to its own per-candidate deployment (so the judge
-    never reads a prior candidate's cumulative logs). Once evaluation is over that deployment
-    is dead weight — nothing reuses it — so hand it back to the run environment to release.
-    The environment decides *how* (e.g. Modal stops the app; local envs are a no-op), so the
-    loop stays agnostic to the backend.
+    An environment may isolate candidate runtime state in a named deployment so
+    the judge never reads a prior candidate's cumulative logs. Once evaluation
+    is over, hand that deployment back to the run environment. The adapter owns
+    the release mechanism; the loop remains backend-agnostic.
 
-    No-op when ``keep`` is set (the ``--keep-modal-apps`` opt-out, for post-hoc log
-    inspection) or when ``cand_app`` is None (no per-candidate deployment).
+    No-op when ``keep`` is set for post-hoc inspection or when ``deployment`` is
+    None (the selected environment has no per-candidate deployment).
     """
-    if keep or not cand_app:
+    if keep or not deployment:
         return
-    ctx.run_environment.teardown_deployment(cand_app, log=ctx.lprint)
+    ctx.run_environment.teardown_deployment(deployment, log=ctx.lprint)
 
 
 # ---------------------------------------------------------------------------
@@ -227,22 +230,14 @@ def _latest_wip_seed(population: Population) -> Individual | None:
 def _candidate_runtime_notes(
     ctx: LoopContext, generation: int, child_idx: int
 ) -> tuple[str, str | None]:
-    """Runtime notes for one candidate, with a per-candidate Modal app name.
+    """Return runtime notes scoped to one environment-owned deployment.
 
-    In Modal mode every candidate must deploy to its own app so the judge
-    never reads a prior (broken) candidate's cumulative app logs. We derive a
-    ``-g<gen>c<child>`` app name and substitute it for the per-run base name
-    throughout the notes (the base name is a unique token, so a plain replace
-    swaps every occurrence — App name, endpoint labels, aux-volume prefixes).
-    For non-Modal envs the notes are returned unchanged and the app name is
-    ``None``.
+    Environments with named deployment isolation derive the concrete candidate
+    name and encode it in their runtime notes. Environments without that
+    capability return their notes unchanged.
     """
-    base = getattr(ctx.run_environment_view, "modal_app_name", None)
-    notes = ctx.run_environment_view.prompt_notes
-    if not base:
-        return notes, None
-    cand_app = candidate_modal_app_name(base, generation, child_idx)
-    return notes.replace(base, cand_app), cand_app
+    runtime = ctx.run_environment.candidate_runtime(ctx.run_environment_view, generation, child_idx)
+    return runtime.prompt_notes, runtime.deployment_name
 
 
 def _run_mutator(
@@ -282,7 +277,7 @@ def _run_mutator(
         interface=_INTERFACE,
         domain_implementer=domain_implementer,
         runtime_notes=prompt_runtime_notes,
-        env_kind=ctx.run_environment_view.env_kind,
+        profile_execution=ctx.run_environment_view.profile_execution,
         accuracy_command=ctx.judge_accuracy_command,
         benchmark_command=ctx.judge_benchmark_command,
         failed_lessons=failed_lessons or [],
@@ -334,7 +329,7 @@ def _run_judge(
         interface=_INTERFACE,
         domain_judge=domain_judge,
         runtime_notes=prompt_runtime_notes,
-        env_kind=ctx.run_environment_view.env_kind,
+        profile_execution=ctx.run_environment_view.profile_execution,
         objective=objective,
     )
     return ctx.invoke(
@@ -401,7 +396,7 @@ def _run_profiler(
         interface=_INTERFACE,
         domain_profiler=domain_profiler,
         runtime_notes=prompt_runtime_notes,
-        env_kind=ctx.run_environment_view.env_kind,
+        profile_execution=ctx.run_environment_view.profile_execution,
         objective=objective,
         profile_focus="Measure the headline metric for this candidate; rank top kernel-level bottlenecks.",
         profiler_support_name=definition.support_name,
@@ -446,6 +441,22 @@ class _CandidateOutcome:
     target_island: int | None = None
 
 
+def _run_framework_accuracy_gate(
+    ctx: LoopContext,
+    *,
+    generation: int,
+    child_idx: int,
+    timeout_seconds: int | None = None,
+) -> str | None:
+    """Run the immutable accuracy command and return retry feedback on failure."""
+    result = run_accuracy_gate(
+        ctx,
+        process_id=f"evolve-accuracy-{generation}-{child_idx}",
+        timeout_seconds=timeout_seconds,
+    )
+    return result.feedback
+
+
 def _evaluate_candidate(
     ctx: LoopContext,
     *,
@@ -458,35 +469,35 @@ def _evaluate_candidate(
     modality: str | None,
     domain_definition: DomainDefinition,
     pass_criteria: str,
-    keep_modal_apps: bool,
+    keep_deployments: bool,
     policy_parent_id: str | None = None,
     target_island: int | None = None,
-    isolated_app: bool = False,
+    isolated_deployment: bool = False,
+    accuracy_timeout_seconds: int | None = None,
 ) -> _CandidateOutcome:
-    """Mutate → judge → (profile → commit) one candidate on ``ctx``.
+    """Mutate → judge → accuracy gate → (profile → commit) one candidate on ``ctx``.
 
     Assumes ``ctx``'s workspace is already materialized at the parent commit
     (serial: the caller checked the shared tree out; parallel: the candidate's
     worktree was created at the parent sha). Touches only ``ctx`` — never the
     shared ``Population`` — so distinct contexts can run this concurrently. The
-    per-candidate Modal app is always stopped on the way out.
+    per-candidate deployment is always stopped on the way out.
 
-    ``isolated_app`` selects how the candidate's Modal app is named. In serial
-    mode all candidates share one context/app, so we derive a per-candidate app
-    name by suffixing (``_candidate_runtime_notes``). In parallel mode each
-    candidate already has its own sub-context whose session opened a distinct
-    app, so we use that app/notes directly with no further suffixing.
+    ``isolated_deployment`` selects whether the candidate already owns a distinct
+    environment deployment. In serial mode the environment derives a
+    per-candidate name. In parallel mode each candidate's sub-context already
+    owns a distinct deployment, so no further suffixing is needed.
     """
-    if isolated_app:
+    if isolated_deployment:
         cand_notes = ctx.run_environment_view.prompt_notes
-        cand_app = getattr(ctx.run_environment_view, "modal_app_name", None)
+        cand_deployment = ctx.run_environment_view.deployment_namespace
     else:
-        # In Modal mode this gives the mutator/judge/profiler a candidate-unique
-        # app name so the judge never reads a prior candidate's stale app logs.
-        cand_notes, cand_app = _candidate_runtime_notes(ctx, generation, child_idx)
+        # Give the mutator/judge/profiler an environment-owned deployment name
+        # so a prior candidate's stale state cannot leak into this evaluation.
+        cand_notes, cand_deployment = _candidate_runtime_notes(ctx, generation, child_idx)
     ctx.lprint(
         f"parent=#{parent.id} (perf={parent.perf_metric})"
-        + (f" modal-app={cand_app}" if cand_app else "")
+        + (f" deployment={cand_deployment}" if cand_deployment else "")
         + f"; inspirations={[i.id for i in inspirations]}"
     )
 
@@ -532,7 +543,25 @@ def _evaluate_candidate(
                 target_island=target_island,
             )
 
-        # 3. Profile the offspring to get its fitness.
+        # 3. Framework-owned accuracy gate. The LLM judge cannot waive this.
+        accuracy_feedback = _run_framework_accuracy_gate(
+            ctx,
+            generation=generation,
+            child_idx=child_idx,
+            timeout_seconds=accuracy_timeout_seconds,
+        )
+        if accuracy_feedback is not None:
+            return _CandidateOutcome(
+                passed=False,
+                parent_id=parent.id,
+                inspiration_ids=inspiration_ids,
+                summary=mutator.summary,
+                feedback=accuracy_feedback,
+                policy_parent_id=policy_parent_id,
+                target_island=target_island,
+            )
+
+        # 4. Profile the offspring to get its fitness.
         ctx.reselect_gpu()
         summary = _run_profiler(
             ctx,
@@ -545,7 +574,7 @@ def _evaluate_candidate(
             runtime_notes=cand_notes,
         )
 
-        # 4. Commit the offspring's tree so it can serve as a future parent.
+        # 5. Commit the offspring's tree so it can serve as a future parent.
         ctx.snapshot_workspace(f"gen-{generation}-child-{child_idx}")
         return _CandidateOutcome(
             passed=True,
@@ -561,7 +590,7 @@ def _evaluate_candidate(
             target_island=target_island,
         )
     finally:
-        _teardown_candidate_app(ctx, cand_app, keep=keep_modal_apps)
+        _teardown_candidate_deployment(ctx, cand_deployment, keep=keep_deployments)
 
 
 def _record_outcome(
@@ -680,8 +709,9 @@ def _run_generation_serial(
     modality: str | None,
     domain_definition: DomainDefinition,
     pass_criteria: str,
-    keep_modal_apps: bool,
+    keep_deployments: bool,
     search_policy: SearchPolicy,
+    accuracy_timeout_seconds: int | None = None,
 ) -> None:
     """Evaluate a generation's candidates one at a time on the shared context."""
     for child_idx in range(1, children_per_generation + 1):
@@ -723,9 +753,10 @@ def _run_generation_serial(
                 modality=modality,
                 domain_definition=domain_definition,
                 pass_criteria=pass_criteria,
-                keep_modal_apps=keep_modal_apps,
+                keep_deployments=keep_deployments,
                 policy_parent_id=plan.policy_parent_id,
                 target_island=plan.target_island,
+                accuracy_timeout_seconds=accuracy_timeout_seconds,
             )
             _record_outcome(
                 ctx,
@@ -757,10 +788,11 @@ def _evaluate_in_subcontext(
     modality: str | None,
     domain_definition: DomainDefinition,
     pass_criteria: str,
-    keep_modal_apps: bool,
+    keep_deployments: bool,
     policy_parent_id: str | None,
     target_island: int | None,
     worktree_lock: threading.Lock,
+    accuracy_timeout_seconds: int | None = None,
 ) -> _CandidateOutcome:
     """Run one candidate in its own isolated sub-context (worker thread).
 
@@ -814,10 +846,11 @@ def _evaluate_in_subcontext(
             modality=modality,
             domain_definition=domain_definition,
             pass_criteria=pass_criteria,
-            keep_modal_apps=keep_modal_apps,
+            keep_deployments=keep_deployments,
             policy_parent_id=policy_parent_id,
             target_island=target_island,
-            isolated_app=True,
+            isolated_deployment=True,
+            accuracy_timeout_seconds=accuracy_timeout_seconds,
         )
     except Exception as exc:
         parent_ctx.lprint(f"[warn] candidate {label} evaluation raised: {exc}")
@@ -856,8 +889,9 @@ def _run_generation_parallel(
     modality: str | None,
     domain_definition: DomainDefinition,
     pass_criteria: str,
-    keep_modal_apps: bool,
+    keep_deployments: bool,
     search_policy: SearchPolicy,
+    accuracy_timeout_seconds: int | None = None,
 ) -> None:
     """Evaluate a generation's candidates concurrently in isolated sub-contexts.
 
@@ -919,10 +953,11 @@ def _run_generation_parallel(
                 modality=modality,
                 domain_definition=domain_definition,
                 pass_criteria=pass_criteria,
-                keep_modal_apps=keep_modal_apps,
+                keep_deployments=keep_deployments,
                 policy_parent_id=plan.policy_parent_id,
                 target_island=plan.target_island,
                 worktree_lock=worktree_lock,
+                accuracy_timeout_seconds=accuracy_timeout_seconds,
             ): child_idx
             for (child_idx, plan) in plans
         }
@@ -960,9 +995,10 @@ def _bootstrap_seed(
     population: Population,
     population_path: Path,
     search_policy: SearchPolicy,
-    keep_modal_apps: bool = False,
+    keep_deployments: bool = False,
+    accuracy_timeout_seconds: int | None = None,
 ) -> Individual | None:
-    """Iterate implementer → judge until a first *passing* seed exists.
+    """Iterate implementer → judge → accuracy until a first passing seed exists.
 
     Runs BEFORE the generation loop so the search never cold-starts. Attempt 1
     writes a server from scratch; later attempts repair-forward the most-recent
@@ -996,17 +1032,19 @@ def _bootstrap_seed(
                 )
                 wip_seed = None
 
-        # Per-candidate Modal app name so a failed attempt's cumulative app logs
-        # never poison the next attempt's judge (same isolation the generation
-        # loop uses).
-        cand_notes, cand_app = _candidate_runtime_notes(ctx, 0, attempt)
+        # Use an environment-owned candidate deployment so a failed attempt's
+        # cumulative state never poisons the next attempt's judge.
+        cand_notes, cand_deployment = _candidate_runtime_notes(ctx, 0, attempt)
         failed_lessons = _recent_failure_lessons(population)
         num_failed_attempts = sum(1 for i in population.all if not i.passed)
         base_desc = "reference" if wip_seed is None else f"repair-seed #{wip_seed.id}"
-        ctx.lprint(f"bootstrap base={base_desc}" + (f" modal-app={cand_app}" if cand_app else ""))
+        ctx.lprint(
+            f"bootstrap base={base_desc}"
+            + (f" deployment={cand_deployment}" if cand_deployment else "")
+        )
 
-        # The attempt deploys its per-candidate Modal app during mutate/judge/
-        # profile; stop it once we're done evaluating, on every exit path.
+        # Stop the attempt's deployment after mutate/judge/profile on every
+        # exit path.
         try:
             # 1. Implementer (the mutator in cold-start / from-scratch mode).
             ctx.reselect_gpu()
@@ -1040,7 +1078,17 @@ def _bootstrap_seed(
                 runtime_notes=cand_notes,
             )
 
-            if verdict.verdict != Verdict.PASS:
+            if verdict.verdict == Verdict.PASS:
+                failure_feedback = _run_framework_accuracy_gate(
+                    ctx,
+                    generation=0,
+                    child_idx=attempt,
+                    timeout_seconds=accuracy_timeout_seconds,
+                )
+            else:
+                failure_feedback = verdict.feedback
+
+            if failure_feedback is not None:
                 # Snapshot the failed tree so the next attempt repairs it in place.
                 # Only tag a WIP repair-seed when the snapshot actually committed new
                 # work (the tree changed); an unedited tree is nothing to fix-forward.
@@ -1063,17 +1111,17 @@ def _bootstrap_seed(
                     perf_unit=None,
                     passed=False,
                     summary=mutator.summary,
-                    feedback=verdict.feedback,
+                    feedback=failure_feedback,
                 )
                 population.add(failed)
                 population.save(population_path)
                 ctx.lprint(
                     f"[bootstrap {attempt}] FAILED — feedback: "
-                    f"{(verdict.feedback or '').splitlines()[0][:120] if verdict.feedback else ''}"
+                    f"{failure_feedback.splitlines()[0][:120] if failure_feedback else ''}"
                 )
                 continue
 
-            # 3. PASS → profile, snapshot, and record the generation-0 seed.
+            # 4. Both gates passed → profile and record the generation-0 seed.
             ctx.reselect_gpu()
             summary = _run_profiler(
                 ctx,
@@ -1117,7 +1165,7 @@ def _bootstrap_seed(
             )
             return seed
         finally:
-            _teardown_candidate_app(ctx, cand_app, keep=keep_modal_apps)
+            _teardown_candidate_deployment(ctx, cand_deployment, keep=keep_deployments)
 
     ctx.lprint(f"[bootstrap] exhausted {max_attempts} attempt(s) without a passing seed.")
     return None
@@ -1182,8 +1230,10 @@ def run_evolve_loop(
     objective: str,
     *,
     workspace_seed: Path | None = None,
+    workspace_sources: tuple[WorkspaceSource, ...] = (),
     evaluator_path: Path | None = None,
     hidden_evaluator_path: Path | None = None,
+    accuracy_timeout_seconds: int | None = None,
     max_generations: int = 8,
     children_per_generation: int = 2,
     k_top_inspirations: int = 2,
@@ -1208,7 +1258,7 @@ def run_evolve_loop(
     objectives: list[Objective] | None = None,
     frontier_bias: float = 0.7,
     bootstrap_max_attempts: int = 5,
-    keep_modal_apps: bool = False,
+    keep_deployments: bool = False,
     max_parallelism: int = 1,
     search_policy: SearchPolicyName | str | None = None,
     openevolve_config: OpenEvolveSearchConfig | None = None,
@@ -1241,6 +1291,7 @@ def run_evolve_loop(
         accuracy_command=accuracy_command,
         benchmark_command=benchmark_command,
         workspace_seed=workspace_seed,
+        workspace_sources=workspace_sources,
         evaluator_path=evaluator_path,
         hidden_evaluator_path=hidden_evaluator_path,
         existing=existing,
@@ -1306,7 +1357,8 @@ def run_evolve_loop(
                 population=population,
                 population_path=population_path,
                 search_policy=policy,
-                keep_modal_apps=keep_modal_apps,
+                keep_deployments=keep_deployments,
+                accuracy_timeout_seconds=accuracy_timeout_seconds,
             )
             if seed_individual is None:
                 ctx.lprint(
@@ -1316,17 +1368,17 @@ def run_evolve_loop(
                 )
                 return False
 
-        # Parallelism is Modal-only: host GPU reselection is a no-op there and
-        # each candidate deploys to its own Modal app, so isolated sub-contexts
-        # (worktree + editor container + agent runner) can run concurrently.
-        # Local/Docker backends contend on one physical GPU, so they stay
-        # serial regardless of --max-parallelism.
-        env_kind = getattr(ctx.run_environment_view, "env_kind", "local")
-        parallel = max_parallelism > 1 and env_kind == "modal"
+        # The selected run environment declares whether isolated candidate
+        # evaluations can execute concurrently. Local single-device backends
+        # normally leave this false; remote deployment adapters may enable it.
+        env_kind = ctx.run_environment_view.env_kind
+        supports_parallel = ctx.run_environment_view.supports_parallel_candidate_evaluation
+        parallel = max_parallelism > 1 and supports_parallel
         if max_parallelism > 1 and not parallel:
             ctx.lprint(
                 f"[parallel] --max-parallelism={max_parallelism} ignored: parallel "
-                f"candidate evaluation requires Modal (env_kind={env_kind}); running serially"
+                "candidate evaluation is unsupported by the selected environment "
+                f"(env_kind={env_kind}); running serially"
             )
 
         for generation in range(1, max_generations + 1):
@@ -1358,8 +1410,9 @@ def run_evolve_loop(
                     modality=modality,
                     domain_definition=domain_definition,
                     pass_criteria=pass_criteria,
-                    keep_modal_apps=keep_modal_apps,
+                    keep_deployments=keep_deployments,
                     search_policy=policy,
+                    accuracy_timeout_seconds=accuracy_timeout_seconds,
                 )
             else:
                 _run_generation_serial(
@@ -1379,8 +1432,9 @@ def run_evolve_loop(
                     modality=modality,
                     domain_definition=domain_definition,
                     pass_criteria=pass_criteria,
-                    keep_modal_apps=keep_modal_apps,
+                    keep_deployments=keep_deployments,
                     search_policy=policy,
+                    accuracy_timeout_seconds=accuracy_timeout_seconds,
                 )
 
             policy.finish_generation(generation)

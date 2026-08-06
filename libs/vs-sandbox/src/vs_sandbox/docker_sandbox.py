@@ -41,16 +41,20 @@ def _cleanup_containers() -> None:
                 check=False,
                 timeout=30,
             )
-            subprocess.run(
-                ["docker", "rm", container_id],
+        except Exception:
+            pass
+        try:
+            removed = subprocess.run(
+                ["docker", "rm", "-f", container_id],
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=10,
             )
         except Exception:
-            pass
-        _live_containers.pop(container_id, None)
+            continue
+        if removed.returncode == 0 or "No such container" in (removed.stderr or ""):
+            _live_containers.pop(container_id, None)
 
 
 atexit.register(_cleanup_containers)
@@ -61,11 +65,17 @@ _original_sigint = signal.getsignal(signal.SIGINT)
 
 
 def _sigint_handler(signum: int, frame: FrameType | None) -> None:
-    """Ensure cleanup runs then re-raise the interrupt."""
+    """Re-raise the interrupt and let normal unwinding precede cleanup.
+
+    Container cleanup is registered with ``atexit``. Removing the editor
+    container here races with caller ``finally`` blocks that still need to run
+    inside it, notably VibeSys' bind-mount ownership repair. Restoring the
+    prior handler and re-raising first lets those blocks finish; process exit
+    then invokes ``_cleanup_containers`` without leaking the container.
+    """
     # Restore original handler FIRST to prevent recursive re-entry
-    # if another SIGINT arrives during cleanup.
+    # while the interrupt unwinds through caller cleanup.
     signal.signal(signal.SIGINT, _original_sigint)
-    _cleanup_containers()
     if callable(_original_sigint):
         _original_sigint(signum, frame)
     else:
@@ -95,6 +105,7 @@ class DockerSandbox(BaseSandbox):
         image: str,
         gpus: str | None = None,
         devices: list[str] | None = None,
+        group_add: list[str] | None = None,
         entrypoint: str | None = None,
         shm_size: str | None = None,
         auto_remove: bool = False,
@@ -119,6 +130,11 @@ class DockerSandbox(BaseSandbox):
             devices: Host device paths (e.g. ``["/dev/neuron0"]``) to forward
                 with ``--device``.  Used by non-CUDA accelerators (AWS Neuron)
                 that the NVIDIA container runtime's ``--gpus`` cannot expose.
+            group_add: Supplementary groups to add the container user to
+                (emits ``--group-add``).  Required by accelerators whose
+                device nodes are group-owned rather than world-accessible —
+                AMD ROCm needs ``video`` and ``render`` to open ``/dev/kfd``
+                and ``/dev/dri/*``.
             entrypoint: Override the image ``ENTRYPOINT`` (emits
                 ``--entrypoint``).  Pass ``""`` to *clear* a baked-in
                 entrypoint so the container runs ``sleep infinity`` directly
@@ -150,6 +166,7 @@ class DockerSandbox(BaseSandbox):
         self._image = image
         self._gpus = gpus
         self._devices: list[str] = list(devices or [])
+        self._group_add: list[str] = list(group_add or [])
         self._entrypoint = entrypoint
         self._shm_size = shm_size
         self._auto_remove = auto_remove
@@ -324,6 +341,9 @@ class DockerSandbox(BaseSandbox):
         for device in self._devices:
             cmd.extend(["--device", device])
 
+        for group in self._group_add:
+            cmd.extend(["--group-add", group])
+
         if self._entrypoint is not None:
             cmd.extend(["--entrypoint", self._entrypoint])
 
@@ -373,14 +393,9 @@ class DockerSandbox(BaseSandbox):
         if result.returncode != 0:
             container_id = result.stdout.strip()
             if container_id:
-                rm_cmd = ["docker", "rm", container_id]
-                rm_result = subprocess.run(
-                    rm_cmd,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self._log_cmd(rm_cmd, rm_result)
+                self._container_id = container_id
+                _live_containers[container_id] = self._container_name
+                self._discard_started_container()
             raise RuntimeError(
                 f"Failed to start Docker container (exit {result.returncode}):\n"
                 f"  stdout: {result.stdout.strip()}\n"
@@ -390,11 +405,24 @@ class DockerSandbox(BaseSandbox):
         self._container_id = result.stdout.strip()
         _live_containers[self._container_id] = self._container_name
 
+        try:
+            self._initialize_started_container()
+        except BaseException:
+            self._discard_started_container()
+            raise
+
+    def _initialize_started_container(self) -> None:
+        """Finish startup after Docker has created and registered the container."""
+        container_id = self._container_id
+        if container_id is None:
+            raise RuntimeError("Container was not created before initialization")
+
         # Save metadata for vibesys-shell to reconstruct the environment
         self._metadata = {
             "image": self._image,
             "gpus": self._gpus,
             "devices": list(self._devices),
+            "group_add": list(self._group_add),
             "entrypoint": self._entrypoint,
             "shm_size": self._shm_size,
             "bind_mounts": [[host, container, ro] for host, container, ro in self._bind_mounts],
@@ -404,7 +432,7 @@ class DockerSandbox(BaseSandbox):
         self._save_metadata()
 
         # Install uv (with timeout to avoid hanging on network issues)
-        uv_cmd = ["docker", "exec", self._container_id, "bash", "-c", "pip install uv"]
+        uv_cmd = ["docker", "exec", container_id, "bash", "-c", "pip install uv"]
         try:
             uv_result = subprocess.run(
                 uv_cmd,
@@ -424,7 +452,7 @@ class DockerSandbox(BaseSandbox):
             init_cmd = [
                 "docker",
                 "exec",
-                self._container_id,
+                container_id,
                 "bash",
                 "-c",
                 init_cmd_str,
@@ -457,6 +485,61 @@ class DockerSandbox(BaseSandbox):
         for fn in self._setup_fns:
             fn(self)
 
+    def _discard_started_container(self) -> None:
+        """Best-effort rollback for a container whose startup did not finish."""
+        if self._container_id is None:
+            return
+
+        container_id = self._container_id
+        if self._stop_and_remove_container(container_id, suppress_errors=True):
+            self._container_id = None
+            _live_containers.pop(container_id, None)
+
+    def _stop_and_remove_container(self, container_id: str, *, suppress_errors: bool) -> bool:
+        """Stop and remove a container, retaining ownership until removal succeeds."""
+        cleanup_error: Exception | None = None
+        commands = (
+            (["docker", "stop", container_id], 30),
+            (["docker", "rm", "-f", container_id], 10),
+        )
+        removed = False
+        for cmd, timeout in commands:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout,
+                )
+                self._log_cmd(cmd, result)
+                if cmd[1] == "rm":
+                    stderr = result.stderr or ""
+                    removed = (
+                        result.returncode == 0
+                        or "No such container" in stderr
+                        or (
+                            "removal of container" in stderr
+                            and "is already in progress" in stderr
+                        )
+                    )
+                    if not removed:
+                        cleanup_error = RuntimeError(
+                            f"Failed to remove Docker container {container_id} "
+                            f"(exit {result.returncode}): {result.stderr.strip()}"
+                        )
+            except Exception as exc:
+                if cmd[1] == "rm":
+                    cleanup_error = exc
+                try:
+                    self._log_cmd(cmd, error=f"container cleanup failed: {exc}")
+                except Exception:
+                    pass
+
+        if not removed and cleanup_error is not None and not suppress_errors:
+            raise cleanup_error
+        return removed
+
     def _save_metadata(self) -> None:
         """Write metadata to the host workspace (best-effort)."""
         try:
@@ -476,25 +559,9 @@ class DockerSandbox(BaseSandbox):
             return
 
         container_id = self._container_id
-        self._container_id = None
-        _live_containers.pop(container_id, None)
-
-        stop_cmd = ["docker", "stop", container_id]
-        stop_result = subprocess.run(
-            stop_cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self._log_cmd(stop_cmd, stop_result)
-        rm_cmd = ["docker", "rm", container_id]
-        rm_result = subprocess.run(
-            rm_cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self._log_cmd(rm_cmd, rm_result)
+        if self._stop_and_remove_container(container_id, suppress_errors=False):
+            self._container_id = None
+            _live_containers.pop(container_id, None)
 
     @property
     def id(self) -> str:
