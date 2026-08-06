@@ -792,7 +792,7 @@ def _assemble_candidate_context(
                 git_history_root=parent.git.history_root,
                 environment_bind_mounts=parent.environment_patch.bind_mounts,
                 log=logger.lprint,
-                project_root=parent.agent_project_root,
+                project_root=getattr(parent, "agent_project_root", PROJECT_ROOT),
             )
         )
     )
@@ -826,7 +826,7 @@ def _assemble_candidate_context(
     )
 
     framework_judge_backend = session.sandbox
-    if parent.hidden_evaluator_path is not None:
+    if getattr(parent, "hidden_evaluator_path", None) is not None:
         framework_judge_backend = LocalShellBackend(
             root_dir=str(workspace),
             virtual_mode=True,
@@ -859,7 +859,7 @@ def _assemble_candidate_context(
         workspace_seed_path=None,
         workspace_sources=parent.workspace_sources,
         evaluator_path=parent.evaluator_path,
-        hidden_evaluator_path=parent.hidden_evaluator_path,
+        hidden_evaluator_path=getattr(parent, "hidden_evaluator_path", None),
         framework_judge_backend=framework_judge_backend,
         effective_objective=effective_objective,
         accuracy_command=parent.accuracy_command,

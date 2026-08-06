@@ -28,7 +28,7 @@ def run_accuracy_gate(
 ) -> AccuracyGateResult:
     """Run the trusted accuracy command without delegating acceptance to an agent."""
     changed = ctx.trusted_input_changes()
-    hidden_evaluator = getattr(ctx, "hidden_evaluator_path", None) is not None
+    hidden_evaluator = vars(ctx).get("hidden_evaluator_path") is not None
     command = (
         getattr(ctx, "accuracy_command", None)
         if hidden_evaluator
@@ -56,7 +56,10 @@ def run_accuracy_gate(
     ctx.lprint(f"[framework-accuracy] running: {command}")
     command_to_execute = execution_command or command
     try:
-        backend = getattr(ctx, "framework_judge_backend", ctx.judge_backend)
+        # ``framework_judge_backend`` is optional on legacy/test contexts. Use
+        # the instance dictionary so a permissive mock does not fabricate a
+        # backend attribute and bypass the normal judge backend.
+        backend = vars(ctx).get("framework_judge_backend") or ctx.judge_backend
         if timeout_seconds is None:
             result = backend.execute(command_to_execute)
         else:

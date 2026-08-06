@@ -1185,7 +1185,7 @@ def _domain_render_context(
         "reference_path": ctx.ref_name,
         "benchmark_command": ctx.judge_benchmark_command,
         "accuracy_command": ctx.judge_accuracy_command,
-        "hidden_evaluator_configured": bool(getattr(ctx, "hidden_evaluator_path", None)),
+        "hidden_evaluator_configured": bool(vars(ctx).get("hidden_evaluator_path")),
         "runtime_notes": ctx.run_environment_view.prompt_notes,
         "profile_execution": ctx.run_environment_view.profile_execution,
         "workspace_sources": ctx.workspace_sources,
@@ -2000,7 +2000,7 @@ def _run_framework_accuracy_gate(
     release_deployment_after: bool = False,
 ) -> str | None:
     """Run the immutable manifest accuracy command after an agent reports PASS."""
-    hidden_evaluator = getattr(ctx, "hidden_evaluator_path", None) is not None
+    hidden_evaluator = vars(ctx).get("hidden_evaluator_path") is not None
     command = (
         getattr(ctx, "accuracy_command", None)
         if hidden_evaluator
@@ -2068,7 +2068,7 @@ def _run_framework_benchmark(
     if result_spec is None:
         return None, None
 
-    hidden_evaluator = getattr(ctx, "hidden_evaluator_path", None) is not None
+    hidden_evaluator = vars(ctx).get("hidden_evaluator_path") is not None
     base_command = (
         getattr(ctx, "benchmark_command", None)
         if hidden_evaluator
@@ -2097,7 +2097,8 @@ def _run_framework_benchmark(
         passed = False
     else:
         try:
-            backend = getattr(ctx, "framework_judge_backend", ctx.judge_backend)
+            # ``framework_judge_backend`` is optional on legacy/test contexts.
+            backend = vars(ctx).get("framework_judge_backend") or ctx.judge_backend
             effective_timeout = _framework_command_timeout(ctx, timeout_seconds)
             if effective_timeout is None:
                 result = backend.execute(command)
