@@ -110,25 +110,25 @@ jobs:
 
       - name: Test TUI
         run: |
-          rm -f "$RUNNER_TEMP/tui-tests.json"
-          pnpm --dir clients/tui test --reporter=default --reporter=json \
-            --outputFile.json="$RUNNER_TEMP/tui-tests.json"
-          python3 - "$RUNNER_TEMP/tui-tests.json" <<'PY'
+          rm -f "$RUNNER_TEMP/tui-unit.json" "$RUNNER_TEMP/tui-renderer.json"
+          pnpm --dir clients/tui test:unit --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/tui-unit.json"
+          pnpm --dir clients/tui test:renderer --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/tui-renderer.json"
+          python3 - "$RUNNER_TEMP/tui-unit.json" "$RUNNER_TEMP/tui-renderer.json" <<'PY'
           import json, os, sys
 
-          path = sys.argv[1]
-          # A runtime that cannot host the pool writes no report at all, so a
-          # missing file is itself the failure signal.
-          if not os.path.exists(path):
-              sys.exit("No TUI test report was written; the suite did not execute.")
-          report = json.load(open(path))
-          passed = report.get("numPassedTests", 0)
-          failed = report.get("numFailedTests", 0)
-          print(f"TUI tests: {passed} passed, {failed} failed")
-          # A runtime that cannot host the pool collects the files, runs nothing,
-          # and still exits 0. Treat an empty run as a failure.
-          if passed == 0:
-              sys.exit("No TUI tests ran; the suite did not execute.")
+          # A runtime that cannot host the pool writes no report, or reports zero
+          # tests, and still exits 0. Both are failures, not passes.
+          for label, path in zip(("unit", "renderer"), sys.argv[1:]):
+              if not os.path.exists(path):
+                  sys.exit(f"No TUI {label} report was written; that suite did not execute.")
+              report = json.load(open(path))
+              passed = report.get("numPassedTests", 0)
+              failed = report.get("numFailedTests", 0)
+              print(f"TUI {label} tests: {passed} passed, {failed} failed")
+              if passed == 0:
+                  sys.exit(f"No TUI {label} tests ran; that suite did not execute.")
           PY
 
       - name: Build TUI

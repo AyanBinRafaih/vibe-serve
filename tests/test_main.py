@@ -881,7 +881,11 @@ visibility = "private"
 def _write_theme_config(tmp_path, theme: str | None) -> Path:
     config_path = tmp_path / "agent.toml"
     tui_section = f'\n[tui]\ntheme = "{theme}"\n' if theme is not None else ""
-    config_path.write_text(f'[model]\nname = "gpt-5.5"\n{tui_section}')
+    # An explicit owner keeps the theme assertions off the `gh auth` fallback
+    # that an omitted owner now resolves through.
+    config_path.write_text(
+        f'[model]\nname = "gpt-5.5"\n\n[repository]\nowner = "vibesys-playground"\n{tui_section}'
+    )
     return config_path
 
 
