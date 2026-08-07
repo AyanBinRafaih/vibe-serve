@@ -109,7 +109,27 @@ jobs:
         run: pnpm --dir clients/tui check
 
       - name: Test TUI
-        run: pnpm --dir clients/tui test
+        run: |
+          rm -f "$RUNNER_TEMP/tui-tests.json"
+          pnpm --dir clients/tui test --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/tui-tests.json"
+          python3 - "$RUNNER_TEMP/tui-tests.json" <<'PY'
+          import json, os, sys
+
+          path = sys.argv[1]
+          # A runtime that cannot host the pool writes no report at all, so a
+          # missing file is itself the failure signal.
+          if not os.path.exists(path):
+              sys.exit("No TUI test report was written; the suite did not execute.")
+          report = json.load(open(path))
+          passed = report.get("numPassedTests", 0)
+          failed = report.get("numFailedTests", 0)
+          print(f"TUI tests: {passed} passed, {failed} failed")
+          # A runtime that cannot host the pool collects the files, runs nothing,
+          # and still exits 0. Treat an empty run as a failure.
+          if passed == 0:
+              sys.exit("No TUI tests ran; the suite did not execute.")
+          PY
 
       - name: Build TUI
         run: pnpm --dir clients/tui build
