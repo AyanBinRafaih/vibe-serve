@@ -20,9 +20,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.check.json",
     "prepack": "pnpm run build",
-    "test": "pnpm run test:unit && pnpm run test:renderer",
-    "test:unit": "vitest run --config vitest.config.ts",
-    "test:renderer": "bun --bun vitest run --config vitest.renderer.config.ts"
+    "test": "bun --bun vitest run --config vitest.config.ts"
   },
   "dependencies": {
     "@opentui/core": "^0.4.3"
