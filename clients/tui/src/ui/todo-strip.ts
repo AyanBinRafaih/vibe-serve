@@ -2,6 +2,7 @@ import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState, TodoItem} from '../session-model.js';
 import {visibleTodos} from '../session-model.js';
+import type {Theme} from './theme.js';
 
 const STATUS_MARKER: Record<string, string> = {
   pending: '○',
@@ -9,16 +10,9 @@ const STATUS_MARKER: Record<string, string> = {
   completed: '✓',
 };
 
-const STATUS_COLOR: Record<string, string> = {
-  pending: '#64748b',
-  in_progress: '#facc15',
-  completed: '#4ade80',
-};
-
 // The todo status field is an open string on the wire; unknown statuses
 // must degrade to a neutral marker, never break rendering.
 const UNKNOWN_MARKER = '?';
-const UNKNOWN_COLOR = '#94a3b8';
 
 const MAX_EXPANDED_ITEMS = 10;
 
@@ -26,8 +20,11 @@ export function todoMarker(status: string): string {
   return STATUS_MARKER[status] ?? UNKNOWN_MARKER;
 }
 
-export function todoColor(status: string): string {
-  return STATUS_COLOR[status] ?? UNKNOWN_COLOR;
+export function todoColor(status: string, theme: Theme): string {
+  if (status === 'pending') return theme.textSubtle;
+  if (status === 'in_progress') return theme.warning;
+  if (status === 'completed') return theme.success;
+  return theme.textMuted;
 }
 
 export function todoTitle(todos: TodoItem[]): string {
@@ -61,13 +58,16 @@ function truncate(line: string, maxWidth: number): string {
  */
 export class TodoStripView {
   readonly output: BoxRenderable;
+  #theme: Theme;
   #renderedTodos: TodoItem[] | null = null;
   #renderedExpanded = false;
 
   constructor(
     private readonly renderer: CliRenderer,
     controller: SessionController,
+    theme: Theme,
   ) {
+    this.#theme = theme;
     this.output = new BoxRenderable(renderer, {
       id: 'todo-strip',
       width: '100%',
@@ -76,11 +76,17 @@ export class TodoStripView {
       paddingLeft: 1,
       paddingRight: 1,
       borderStyle: 'rounded',
-      borderColor: '#334155',
+      borderColor: theme.borderStrong,
       border: false,
       visible: false,
       onMouseUp: () => controller.toggleTodos(),
     });
+  }
+
+  applyTheme(theme: Theme): void {
+    this.#theme = theme;
+    this.output.borderColor = theme.borderStrong;
+    this.#renderedTodos = null;
   }
 
   render(state: SessionState): void {
@@ -105,7 +111,7 @@ export class TodoStripView {
     this.output.add(
       new TextRenderable(this.renderer, {
         content: todoSummaryLine(todos, this.#contentWidth()),
-        fg: '#cbd5e1',
+        fg: this.#theme.textPrimary,
         height: 1,
         width: '100%',
       }),
@@ -122,7 +128,7 @@ export class TodoStripView {
       this.output.add(
         new TextRenderable(this.renderer, {
           content: todoItemLine(todo, this.#contentWidth()),
-          fg: todoColor(todo.status),
+          fg: todoColor(todo.status, this.#theme),
           height: 1,
           width: '100%',
         }),
@@ -132,7 +138,7 @@ export class TodoStripView {
       this.output.add(
         new TextRenderable(this.renderer, {
           content: `… +${hidden} more`,
-          fg: '#64748b',
+          fg: this.#theme.textSubtle,
           height: 1,
           width: '100%',
         }),

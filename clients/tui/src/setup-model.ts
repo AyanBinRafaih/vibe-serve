@@ -1,3 +1,5 @@
+import {isThemeName, type ThemeName} from './ui/theme.js';
+
 export const REPOSITORY_VISIBILITIES = ['private', 'public', 'internal'] as const;
 
 export type RepositoryVisibility = (typeof REPOSITORY_VISIBILITIES)[number];
@@ -8,6 +10,7 @@ export interface SetupDefaults {
   repository_owner: string | null;
   repository_name: string;
   visibility: RepositoryVisibility;
+  theme: ThemeName;
 }
 
 export interface SetupSelection {
@@ -27,7 +30,8 @@ export function parseSetupDefaults(text: string): SetupDefaults {
     typeof value.experiment_name !== 'string' ||
     (value.repository_owner !== null && typeof value.repository_owner !== 'string') ||
     typeof value.repository_name !== 'string' ||
-    !REPOSITORY_VISIBILITIES.includes(value.visibility as RepositoryVisibility)
+    !REPOSITORY_VISIBILITIES.includes(value.visibility as RepositoryVisibility) ||
+    !isThemeName(value.theme)
   ) {
     throw new Error('backend returned invalid interactive setup defaults');
   }

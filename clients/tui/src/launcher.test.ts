@@ -26,6 +26,8 @@ afterEach(async () => {
   else process.env['VIBESYS_FAKE_BACKEND_TERM_FILE'] = savedTermFile;
   if (savedArgsFile === undefined) delete process.env['VIBESYS_FAKE_BACKEND_ARGS_FILE'];
   else process.env['VIBESYS_FAKE_BACKEND_ARGS_FILE'] = savedArgsFile;
+  delete process.env['VIBESYS_FAKE_SETUP_THEME_FILE'];
+  delete process.env['VIBESYS_FAKE_FRONTEND_THEME_FILE'];
   if (tempDir) await rm(tempDir, {recursive: true, force: true});
   tempDir = undefined;
 });
@@ -127,6 +129,7 @@ if (process.argv.includes('tui-defaults')) {
     repository_owner: 'vibesys-playground',
     repository_name: 'queue-spsc-generated',
     visibility: 'private',
+    theme: 'solarized-dark',
   }));
   process.exit(0);
 }
@@ -156,6 +159,7 @@ process.on('SIGTERM', () => {
       `
 import {writeFileSync} from 'node:fs';
 const defaults = JSON.parse(process.env.VIBESYS_SETUP_DEFAULTS);
+writeFileSync(process.env.VIBESYS_FAKE_SETUP_THEME_FILE, process.env.VIBESYS_THEME ?? '');
 writeFileSync(process.env.VIBESYS_SETUP_RESULT, JSON.stringify({
   inputPath: defaults.input_path,
   experimentName: defaults.experiment_name,
@@ -165,7 +169,14 @@ writeFileSync(process.env.VIBESYS_SETUP_RESULT, JSON.stringify({
 }));
 `,
     );
-    const frontend = await writeExecutable('setup-frontend.mjs', 'process.exit(0);');
+    const frontend = await writeExecutable(
+      'setup-frontend.mjs',
+      `
+import {writeFileSync} from 'node:fs';
+writeFileSync(process.env.VIBESYS_FAKE_FRONTEND_THEME_FILE, process.env.VIBESYS_THEME ?? '');
+process.exit(0);
+`,
+    );
 
     process.env['VIBESYS_PYTHON'] = backend;
     process.env['VIBESYS_TUI_RUNTIME'] = process.execPath;
@@ -173,12 +184,29 @@ writeFileSync(process.env.VIBESYS_SETUP_RESULT, JSON.stringify({
     process.env['VIBESYS_SETUP_ENTRYPOINT'] = setup;
     process.env['VIBESYS_FAKE_BACKEND_TERM_FILE'] = backendTerminated;
     process.env['VIBESYS_FAKE_BACKEND_ARGS_FILE'] = backendArgs;
+    const setupTheme = join(tempDir, 'setup-theme');
+    const frontendTheme = join(tempDir, 'frontend-theme');
+    process.env['VIBESYS_FAKE_SETUP_THEME_FILE'] = setupTheme;
+    process.env['VIBESYS_FAKE_FRONTEND_THEME_FILE'] = frontendTheme;
 
     await expect(launch(['--input', 'examples/queue-spsc'])).resolves.toBe(0);
     const args = JSON.parse(await readFile(backendArgs, 'utf8')) as string[];
     expect(args).toContain('vibesys-playground/queue-spsc-generated');
     expect(args).toContain('queue-spsc-generated');
+    expect(await readFile(setupTheme, 'utf8')).toBe('solarized-dark');
+    expect(await readFile(frontendTheme, 'utf8')).toBe('solarized-dark');
     await access(backendTerminated);
+  });
+
+  it('rejects an unknown --theme before starting any process', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'vibesys-launcher-'));
+    const backend = await writeExecutable('unused-backend.mjs', 'process.exit(0);');
+    const frontend = await writeExecutable('unused-frontend.mjs', 'process.exit(0);');
+    process.env['VIBESYS_PYTHON'] = backend;
+    process.env['VIBESYS_TUI_RUNTIME'] = process.execPath;
+    process.env['VIBESYS_TUI_ENTRYPOINT'] = frontend;
+
+    await expect(launch(['--theme', 'monokai'])).resolves.toBe(2);
   });
 });
 

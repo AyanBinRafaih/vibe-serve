@@ -36,6 +36,17 @@ name = "gpt-5.4"
 # owner = "your-github-user"
 visibility = "private"       # private, public, or internal
 
+# [tui]
+# Theme for the interactive client, as light/dark pairs:
+#   "dark" (default) / "light"                            — the baseline palette
+#   "solarized-dark" / "solarized-light"                  — low-glare terminal palette
+#   "catppuccin-mocha" / "catppuccin-latte"               — softer, more expressive
+#   "high-contrast-dark" / "high-contrast-light"          — accessibility-focused
+#
+# The --theme flag overrides this value, and /theme switches for the current
+# session without changing the file. Ignored in headless mode.
+# theme = "dark"
+
 # [feature_flags]
 # VibeSys feature flags are declared in src/vibesys/features.py.
 

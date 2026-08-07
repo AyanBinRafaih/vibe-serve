@@ -1,9 +1,10 @@
-import {InputRenderable} from '@opentui/core';
-import {createTestRenderer} from '@opentui/core/testing';
+import {InputRenderable, rgbToHex} from '@opentui/core';
+import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
 import {afterEach, describe, expect, it} from 'vitest';
 import type {SessionController} from '../session-controller.js';
 import {initialSessionState, type SessionState} from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
+import {resolveTheme, type ThemeName} from './theme.js';
 
 const cleanup: Array<() => void> = [];
 
@@ -485,6 +486,144 @@ describe('OpenTUI presentation', () => {
   });
 });
 
+describe('theming', () => {
+  const assistantEntry = {
+    id: 'themed',
+    kind: 'assistant' as const,
+    label: 'implementer',
+    agentKind: 'implementer',
+    content: 'themed body text',
+  };
+
+  it('paints the whole surface from the selected theme', async () => {
+    const light = resolveTheme('light');
+    const testRenderer = await createTestRenderer({width: 90, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState('light'),
+      status: 'running',
+      conversation: [assistantEntry],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('themed body text'));
+
+    expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(light.accent);
+    const body = spanColors(testRenderer, 'themed body text');
+    expect(body?.fg).toBe(light.conversation.assistant.content);
+    expect(body?.bg).toBe(light.conversation.assistant.background);
+    expect(spanColors(testRenderer, 'implementer')?.fg).toBe(light.conversation.assistant.label);
+  });
+
+  it('keeps the dark baseline identical to the pre-theme palette', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      status: 'running',
+      conversation: [assistantEntry],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('themed body text'));
+
+    expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe('#22d3ee');
+    const body = spanColors(testRenderer, 'themed body text');
+    expect(body?.fg).toBe('#e2e8f0');
+    expect(body?.bg).toBe('#0f1b24');
+    expect(spanColors(testRenderer, 'implementer')?.fg).toBe('#67e8f9');
+  });
+
+  it('repaints live when the selected theme changes', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      status: 'running',
+      conversation: [assistantEntry],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('themed body text'));
+    expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(resolveTheme('dark').accent);
+
+    controller.setTheme('solarized-light');
+    await testRenderer.waitForVisualIdle();
+
+    const solarized = resolveTheme('solarized-light');
+    expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(solarized.accent);
+    const body = spanColors(testRenderer, 'themed body text');
+    expect(body?.fg).toBe(solarized.conversation.assistant.content);
+    expect(body?.bg).toBe(solarized.conversation.assistant.background);
+  });
+
+  it('themes the overlay and the chat panel from the same theme', async () => {
+    const latte = resolveTheme('catppuccin-latte');
+    const testRenderer = await createTestRenderer({width: 90, height: 30});
+    const controller = new FakeController(initialSessionState('catppuccin-latte'));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    controller.publish({
+      ...controller.state,
+      overlay: {kind: 'error', content: 'configuration failed'},
+    });
+    await testRenderer.waitForFrame(value => value.includes('configuration failed'));
+    expect(spanColors(testRenderer, 'configuration failed')?.fg).toBe(
+      latte.conversation.failure.content,
+    );
+    expect(spanColors(testRenderer, 'Esc to close')?.fg).toBe(latte.textSubtle);
+
+    controller.publish({...controller.state, overlay: null, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('Ask a question about'));
+    expect(spanColors(testRenderer, 'Ask a question about')?.fg).toBe(latte.textSubtle);
+  });
+
+  it('conveys agent and todo status with glyphs and words, not color alone', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 36});
+    const controller = new FakeController({
+      ...initialSessionState('high-contrast-light'),
+      rounds: [{number: 1, status: 'active'}],
+      phases: [
+        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
+        {kind: 'judge', status: 'failed', roundNumber: 1, roundLabel: 'round-1'},
+      ],
+      todoPhases: [
+        {
+          agentKind: null,
+          roundNumber: null,
+          items: [
+            {content: 'write the kernel', status: 'completed'},
+            {content: 'benchmark it', status: 'in_progress'},
+          ],
+        },
+      ],
+      todosExpanded: true,
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    const frame = await testRenderer.waitForFrame(value => value.includes('benchmark it'));
+
+    expect(frame).toContain('✓ implementer');
+    expect(frame).toContain('× judge');
+    expect(frame).toContain('completed');
+    expect(frame).toContain('failed');
+    expect(frame).toContain('✓ write the kernel');
+    expect(frame).toContain('▶ benchmark it');
+  });
+});
+
+function spanColors(
+  testRenderer: TestRendererSetup,
+  needle: string,
+): {fg: string; bg: string} | undefined {
+  for (const line of testRenderer.captureSpans().lines) {
+    for (const span of line.spans) {
+      if (span.text.includes(needle)) {
+        return {fg: rgbToHex(span.fg).toLowerCase(), bg: rgbToHex(span.bg).toLowerCase()};
+      }
+    }
+  }
+  return undefined;
+}
+
 function registerCleanup(
   renderer: Awaited<ReturnType<typeof createTestRenderer>>['renderer'],
   app: OpenTuiApp,
@@ -524,6 +663,10 @@ class FakeController implements SessionController {
   }
   closeChat(): void {
     this.state = {...this.state, chatOpen: false};
+    this.#notify();
+  }
+  setTheme(themeName: ThemeName): void {
+    this.state = {...this.state, themeName};
     this.#notify();
   }
   sendChat(value: string): Promise<void> {

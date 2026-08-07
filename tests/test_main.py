@@ -875,6 +875,68 @@ visibility = "private"
     assert defaults["visibility"] == "private"
     assert defaults["experiment_name"].startswith("queue-mpsc-")
     assert defaults["repository_name"] == defaults["experiment_name"]
+    assert defaults["theme"] == "dark"
+
+
+def _write_theme_config(tmp_path, theme: str | None) -> Path:
+    config_path = tmp_path / "agent.toml"
+    tui_section = f'\n[tui]\ntheme = "{theme}"\n' if theme is not None else ""
+    # An explicit owner keeps the theme assertions off the `gh auth` fallback
+    # that an omitted owner now resolves through.
+    config_path.write_text(
+        f'[model]\nname = "gpt-5.5"\n\n[repository]\nowner = "vibesys-playground"\n{tui_section}'
+    )
+    return config_path
+
+
+def test_tui_defaults_reports_the_configured_theme(tmp_path, capsys):
+    import json
+
+    argv = [
+        "vibesys",
+        "tui-defaults",
+        "--config",
+        str(_write_theme_config(tmp_path, "catppuccin-latte")),
+    ]
+
+    with patch.object(sys, "argv", argv):
+        main()
+
+    assert json.loads(capsys.readouterr().out)["theme"] == "catppuccin-latte"
+
+
+def test_tui_defaults_theme_flag_overrides_the_configured_theme(tmp_path, capsys):
+    import json
+
+    argv = [
+        "vibesys",
+        "tui-defaults",
+        "--config",
+        str(_write_theme_config(tmp_path, "catppuccin-latte")),
+        "--theme",
+        "high-contrast-dark",
+    ]
+
+    with patch.object(sys, "argv", argv):
+        main()
+
+    assert json.loads(capsys.readouterr().out)["theme"] == "high-contrast-dark"
+
+
+def test_tui_defaults_rejects_an_unknown_theme(tmp_path):
+    argv = [
+        "vibesys",
+        "tui-defaults",
+        "--config",
+        str(_write_theme_config(tmp_path, None)),
+        "--theme",
+        "monokai",
+    ]
+
+    with patch.object(sys, "argv", argv), pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
 
 
 def test_validate_command_defaults_to_current_input_bundle(monkeypatch, tmp_path, capsys):

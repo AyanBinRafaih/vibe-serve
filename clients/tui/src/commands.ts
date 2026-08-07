@@ -1,8 +1,10 @@
 import type {RequestInput} from './protocol.js';
+import {isThemeName, listThemes, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export type ParsedInput = {
-  localView?: 'chat' | 'help';
+  localView?: 'chat' | 'help' | 'theme';
   chatMessage?: string;
+  themeName?: ThemeName;
   request?: RequestInput;
   responseView?: 'history' | 'perf';
   error?: string;
@@ -18,7 +20,21 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   {name: '/chat', description: 'Open experiment chat'},
   {name: '/history', description: 'List rounds and their elapsed time'},
   {name: '/perf', description: 'Plot performance by round'},
+  {name: '/theme', description: 'List themes, or switch with /theme <name>'},
 ];
+
+export function themeListText(current: ThemeName): string {
+  return [
+    'Themes',
+    ...listThemes().map(
+      theme =>
+        `  ${theme.name === current ? '›' : ' '} ${theme.name.padEnd(20)} ${theme.label} (${theme.appearance})`,
+    ),
+    '',
+    'Switch with /theme <name>. This applies to the current session only;',
+    'set [tui].theme in agent.toml or pass --theme to change the default.',
+  ].join('\n');
+}
 
 export const HELP_TEXT = [
   'Available',
@@ -49,6 +65,15 @@ export function parseInput(text: string): ParsedInput {
   if (chat) {
     const message = chat[1]?.trim();
     return {localView: 'chat', ...(message ? {chatMessage: message} : {})};
+  }
+  const theme = text.match(/^\/theme(?:\s+(.*))?$/);
+  if (theme) {
+    const requested = theme[1]?.trim();
+    if (!requested) return {localView: 'theme'};
+    if (!isThemeName(requested)) {
+      return {error: `Unknown theme: ${requested}. Available: ${THEME_NAMES.join(', ')}.`};
+    }
+    return {localView: 'theme', themeName: requested};
   }
   if (text === '/history') return {request: {type: 'query.history'}, responseView: 'history'};
   if (text === '/perf') return {request: {type: 'query.performance'}, responseView: 'perf'};

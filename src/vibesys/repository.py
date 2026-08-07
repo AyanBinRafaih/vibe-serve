@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
+from vibesys.tui import TuiTheme
+
 
 class RepositoryVisibility(StrEnum):
     """Supported GitHub repository visibility values."""
@@ -32,6 +34,7 @@ class InteractiveSetupDefaults(BaseModel):
     repository_owner: str | None
     repository_name: str
     visibility: RepositoryVisibility
+    theme: TuiTheme
 
 
 def generate_experiment_name(

@@ -9,6 +9,7 @@ import {bindKeybindings} from './keybindings.js';
 import {OverlayView} from './overlay.js';
 import {RoundStripView} from './round-strip.js';
 import {createMarkdownStyle} from './styles.js';
+import {resolveTheme, type ThemeName} from './theme.js';
 import {TodoStripView} from './todo-strip.js';
 
 export interface OpenTuiApp {
@@ -16,16 +17,19 @@ export interface OpenTuiApp {
 }
 
 export function createOpenTuiApp(renderer: CliRenderer, controller: SessionController): OpenTuiApp {
+  let themeName: ThemeName = controller.state.themeName;
+  let theme = resolveTheme(themeName);
   const root = new BoxRenderable(renderer, {
     id: 'app',
     width: '100%',
     height: '100%',
     flexDirection: 'column',
+    backgroundColor: theme.canvas,
   });
   const header = new TextRenderable(renderer, {
     id: 'header',
     height: 1,
-    fg: '#22d3ee',
+    fg: theme.accent,
     content: 'VibeSys · connecting',
   });
   const viewport = new ScrollBoxRenderable(renderer, {
@@ -34,7 +38,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     flexGrow: 1,
     border: true,
     borderStyle: 'rounded',
-    borderColor: '#475569',
+    borderColor: theme.border,
     stickyScroll: true,
     stickyStart: 'bottom',
     viewportCulling: true,
@@ -49,17 +53,17 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   const help = new TextRenderable(renderer, {
     id: 'key-help',
     height: 1,
-    fg: '#64748b',
+    fg: theme.textSubtle,
     content: '[/]: round · Tab: agent · PgUp/PgDn · Ctrl+T: todos · Ctrl+P: prompt · Ctrl+L: live',
   });
-  const markdownStyle = createMarkdownStyle();
-  const roundStrip = new RoundStripView(renderer, controller);
-  const todoStrip = new TodoStripView(renderer, controller);
-  const agentMap = new AgentMapView(renderer);
-  const overlay = new OverlayView(renderer);
-  const conversation = new ConversationView(renderer, controller, markdownStyle);
-  const chat = new ChatOverlayView(renderer, controller, markdownStyle);
-  const input = createInputPanel(renderer, value => void controller.submit(value));
+  let markdownStyle = createMarkdownStyle(theme);
+  const roundStrip = new RoundStripView(renderer, controller, theme);
+  const todoStrip = new TodoStripView(renderer, controller, theme);
+  const agentMap = new AgentMapView(renderer, theme);
+  const overlay = new OverlayView(renderer, theme);
+  const conversation = new ConversationView(renderer, controller, markdownStyle, theme);
+  const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme);
+  const input = createInputPanel(renderer, value => void controller.submit(value), theme);
 
   viewport.add(conversation.output);
   main.add(agentMap.output);
@@ -76,8 +80,29 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   renderer.root.add(root);
   input.focus();
 
+  const applyTheme = (next: ThemeName): (() => void) => {
+    themeName = next;
+    theme = resolveTheme(next);
+    const previousMarkdownStyle = markdownStyle;
+    markdownStyle = createMarkdownStyle(theme);
+    root.backgroundColor = theme.canvas;
+    header.fg = theme.accent;
+    viewport.borderColor = theme.border;
+    help.fg = theme.textSubtle;
+    roundStrip.applyTheme(theme);
+    todoStrip.applyTheme(theme);
+    agentMap.applyTheme(theme);
+    overlay.applyTheme(theme);
+    conversation.applyTheme(theme, markdownStyle);
+    chat.applyTheme(theme, markdownStyle);
+    input.applyTheme(theme);
+    return () => previousMarkdownStyle.destroy();
+  };
+
   let chatWasOpen = false;
   const render = (state: SessionState): void => {
+    const releasePreviousStyle =
+      state.themeName === themeName ? undefined : applyTheme(state.themeName);
     const returnHint = state.chatOpen || state.overlay !== null ? ' · Esc: close dialog' : '';
     const selection = state.selectedAgentKind ? ` · selected ${state.selectedAgentKind}` : '';
     header.content = `VibeSys · ${statusText(state)}${selection}${returnHint}`;
@@ -90,6 +115,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     if (state.chatOpen && !chatWasOpen) chat.focus();
     if (!state.chatOpen && chatWasOpen) input.focus();
     chatWasOpen = state.chatOpen;
+    releasePreviousStyle?.();
   };
   const unbindKeys = bindKeybindings(renderer, controller, viewport, {
     completeInput: () => input.completeSuggestion(),

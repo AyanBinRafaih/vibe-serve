@@ -292,6 +292,50 @@ describe('session controller', () => {
       content: 'Error: Codex exited with code 1',
     });
   });
+
+  it('starts on the requested theme and defaults to dark', () => {
+    expect(new SocketSessionController(new FakeTransport()).state.themeName).toBe('dark');
+    expect(
+      new SocketSessionController(new FakeTransport(), 'catppuccin-latte').state.themeName,
+    ).toBe('catppuccin-latte');
+  });
+
+  it('lists themes locally and marks the active one', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport, 'solarized-dark');
+
+    await controller.submit('/theme');
+
+    expect(controller.state.overlay?.kind).toBe('help');
+    expect(controller.state.overlay?.content).toContain('› solarized-dark');
+    expect(controller.state.overlay?.content).toContain('high-contrast-light');
+    expect(controller.state.themeName).toBe('solarized-dark');
+    expect(transport.requests).toEqual([]);
+  });
+
+  it('switches theme locally and closes the listing overlay', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submit('/theme');
+    await controller.submit('/theme high-contrast-dark');
+
+    expect(controller.state.themeName).toBe('high-contrast-dark');
+    expect(controller.state.overlay).toBeNull();
+    expect(transport.requests).toEqual([]);
+  });
+
+  it('reports an unknown theme as an error without switching', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submit('/theme monokai');
+
+    expect(controller.state.overlay?.kind).toBe('error');
+    expect(controller.state.overlay?.content).toContain('Unknown theme: monokai');
+    expect(controller.state.themeName).toBe('dark');
+    expect(transport.requests).toEqual([]);
+  });
 });
 
 class FakeTransport implements SupervisionTransport {

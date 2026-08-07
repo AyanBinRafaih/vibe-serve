@@ -24,9 +24,29 @@ describe('interactive setup model', () => {
           repository_owner: selection.repositoryOwner,
           repository_name: selection.repositoryName,
           visibility: selection.visibility,
+          theme: 'solarized-dark',
         }),
       ),
-    ).toMatchObject({repository_owner: 'vibesys-playground', visibility: 'private'});
+    ).toMatchObject({
+      repository_owner: 'vibesys-playground',
+      visibility: 'private',
+      theme: 'solarized-dark',
+    });
+  });
+
+  it('rejects backend defaults carrying an unknown theme', () => {
+    expect(() =>
+      parseSetupDefaults(
+        JSON.stringify({
+          input_path: selection.inputPath,
+          experiment_name: selection.experimentName,
+          repository_owner: selection.repositoryOwner,
+          repository_name: selection.repositoryName,
+          visibility: selection.visibility,
+          theme: 'monokai',
+        }),
+      ),
+    ).toThrow(/invalid interactive setup defaults/);
   });
 
   it('replaces launch values with the confirmed form values', () => {

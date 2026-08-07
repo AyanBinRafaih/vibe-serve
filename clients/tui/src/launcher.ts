@@ -15,6 +15,7 @@ import {
   type SetupSelection,
   shouldOfferInteractiveSetup,
 } from './setup-model.js';
+import {DEFAULT_THEME_NAME, isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 const READY_TIMEOUT_MS = 30_000;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -49,6 +50,7 @@ export async function launch(argv: string[]): Promise<number> {
   const prepared = await prepareInteractiveArgs(backend, runtime, entrypoint, argv);
   if ('exitCode' in prepared) return prepared.exitCode;
   const runArgv = prepared.argv;
+  const theme = prepared.theme;
 
   const sessionDir = await mkdtemp(join(tmpdir(), 'vibesys-session-'));
   const socketPath = join(sessionDir, 'control.sock');
@@ -89,7 +91,7 @@ export async function launch(argv: string[]): Promise<number> {
       return backendProcess.exitCode ?? 1;
     }
     frontend = spawn(runtime, [entrypoint], {
-      env: {...process.env, VIBESYS_CONTROL_SOCKET: socketPath},
+      env: {...process.env, VIBESYS_CONTROL_SOCKET: socketPath, VIBESYS_THEME: theme},
       stdio: 'inherit',
     });
     return await monitor(frontend, backendProcess);
@@ -104,7 +106,17 @@ interface BackendCommand {
   args: string[];
 }
 
-type PreparedArguments = {argv: string[]} | {exitCode: number};
+type PreparedArguments = {argv: string[]; theme: ThemeName} | {exitCode: number};
+
+async function themeFromBackend(backend: BackendCommand, argv: string[]): Promise<ThemeName> {
+  const result = await resolveSetupDefaults(backend, argv);
+  if (result.exitCode !== 0) return DEFAULT_THEME_NAME;
+  try {
+    return parseSetupDefaults(result.stdout.trim()).theme;
+  } catch {
+    return DEFAULT_THEME_NAME;
+  }
+}
 
 async function prepareInteractiveArgs(
   backend: BackendCommand,
@@ -112,7 +124,15 @@ async function prepareInteractiveArgs(
   frontendEntrypoint: string,
   argv: string[],
 ): Promise<PreparedArguments> {
-  if (!shouldOfferInteractiveSetup(argv)) return {argv};
+  const requestedTheme = optionValue(argv, '--theme');
+  if (requestedTheme !== undefined && !isThemeName(requestedTheme)) {
+    console.error(`vs: unknown --theme ${requestedTheme}. Available: ${THEME_NAMES.join(', ')}.`);
+    return {exitCode: 2};
+  }
+
+  if (!shouldOfferInteractiveSetup(argv)) {
+    return {argv, theme: requestedTheme ?? (await themeFromBackend(backend, argv))};
+  }
 
   const defaultsResult = await resolveSetupDefaults(backend, argv);
   if (defaultsResult.exitCode !== 0) {
@@ -127,7 +147,8 @@ async function prepareInteractiveArgs(
     console.error(`vs: ${error instanceof Error ? error.message : String(error)}`);
     return {exitCode: 1};
   }
-  if (defaults.repository_owner === null) return {argv};
+  const theme = requestedTheme ?? defaults.theme;
+  if (defaults.repository_owner === null) return {argv, theme};
 
   const setupEntrypoint =
     process.env['VIBESYS_SETUP_ENTRYPOINT'] ?? join(dirname(frontendEntrypoint), 'setup.js');
@@ -139,7 +160,7 @@ async function prepareInteractiveArgs(
   const setupDir = await mkdtemp(join(tmpdir(), 'vibesys-setup-'));
   const resultPath = join(setupDir, 'selection.json');
   try {
-    const exitCode = await runSetupFrontend(runtime, setupEntrypoint, defaults, resultPath);
+    const exitCode = await runSetupFrontend(runtime, setupEntrypoint, defaults, resultPath, theme);
     if (exitCode !== 0) return {exitCode};
     let selection: SetupSelection;
     try {
@@ -147,7 +168,7 @@ async function prepareInteractiveArgs(
     } catch {
       return {exitCode: 130};
     }
-    return {argv: applySetupSelection(argv, selection)};
+    return {argv: applySetupSelection(argv, selection), theme};
   } finally {
     await rm(setupDir, {recursive: true, force: true});
   }
@@ -158,7 +179,7 @@ function resolveSetupDefaults(
   argv: string[],
 ): Promise<{exitCode: number; stdout: string; stderr: string}> {
   const args = [...backend.args, 'tui-defaults'];
-  for (const option of ['--config', '--input', '--exp-name']) {
+  for (const option of ['--config', '--input', '--exp-name', '--theme']) {
     const value = optionValue(argv, option);
     if (value !== undefined) args.push(option, value);
   }
@@ -179,6 +200,7 @@ function runSetupFrontend(
   entrypoint: string,
   defaults: SetupDefaults,
   resultPath: string,
+  theme: ThemeName,
 ): Promise<number> {
   return new Promise(resolve => {
     const child = spawn(runtime, [entrypoint], {
@@ -186,6 +208,7 @@ function runSetupFrontend(
         ...process.env,
         VIBESYS_SETUP_DEFAULTS: JSON.stringify(defaults),
         VIBESYS_SETUP_RESULT: resultPath,
+        VIBESYS_THEME: theme,
       },
       stdio: 'inherit',
     });

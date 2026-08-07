@@ -2,6 +2,9 @@ import {createTestRenderer} from '@opentui/core/testing';
 import {afterEach, describe, expect, it} from 'vitest';
 import {createSetupForm} from './setup-form.js';
 import type {SetupDefaults} from './setup-model.js';
+import {resolveTheme} from './ui/theme.js';
+
+const THEME = resolveTheme('dark');
 
 const cleanup: Array<() => void> = [];
 
@@ -15,6 +18,7 @@ const DEFAULTS: SetupDefaults = {
   repository_owner: '',
   repository_name: 'x',
   visibility: 'private',
+  theme: 'dark',
 };
 
 const OWNER_ERROR = 'Repository owner must be one GitHub user or organization name.';
@@ -22,7 +26,7 @@ const OWNER_ERROR = 'Repository owner must be one GitHub user or organization na
 describe('interactive setup form', () => {
   it('dismisses a stale validation error once the user edits the input', async () => {
     const testRenderer = await createTestRenderer({width: 92, height: 24});
-    const form = createSetupForm(testRenderer.renderer, DEFAULTS);
+    const form = createSetupForm(testRenderer.renderer, DEFAULTS, THEME);
     cleanup.push(() => {
       form.destroy();
       testRenderer.renderer.destroy();
@@ -47,7 +51,7 @@ describe('interactive setup form', () => {
 
   it('still blocks submission while the value is invalid', async () => {
     const testRenderer = await createTestRenderer({width: 92, height: 24});
-    const form = createSetupForm(testRenderer.renderer, DEFAULTS);
+    const form = createSetupForm(testRenderer.renderer, DEFAULTS, THEME);
     cleanup.push(() => {
       form.destroy();
       testRenderer.renderer.destroy();

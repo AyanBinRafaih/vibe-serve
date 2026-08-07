@@ -2,6 +2,7 @@ import {writeFile} from 'node:fs/promises';
 import {CliRenderEvents, createCliRenderer} from '@opentui/core';
 import {createSetupForm} from './setup-form.js';
 import type {SetupDefaults} from './setup-model.js';
+import {resolveTheme} from './ui/theme.js';
 
 const rawDefaults = process.env['VIBESYS_SETUP_DEFAULTS'];
 const resultPath = process.env['VIBESYS_SETUP_RESULT'];
@@ -10,8 +11,9 @@ if (!rawDefaults || !resultPath) {
 }
 
 const defaults = JSON.parse(rawDefaults) as SetupDefaults;
+const theme = resolveTheme(process.env['VIBESYS_THEME']);
 const renderer = await createCliRenderer({exitOnCtrlC: false});
-const form = createSetupForm(renderer, defaults);
+const form = createSetupForm(renderer, defaults, theme);
 renderer.start();
 
 await new Promise<void>(resolve => renderer.once(CliRenderEvents.DESTROY, resolve));
