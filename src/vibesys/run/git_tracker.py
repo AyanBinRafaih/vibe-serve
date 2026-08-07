@@ -65,87 +65,39 @@ class GitTracker:
         self._log = log
         self._excluded_dirs = frozenset(excluded_dirs)
         self._trusted_input_baseline: str | None = None
+        self._git_dir: Path | None = None
+        self._work_tree: Path | None = None
+        # Keep dynamic snapshot exclusions outside the candidate worktree. An
+        # isolated agent may create or replace ``root/.git`` as another user;
+        # framework bookkeeping must remain host-owned and writable.
+        self._exclude_file = self.root.parent / ".vibesys-git-excludes" / self.root.name
 
     @property
     def _GIT_ENV(self) -> dict[str, str]:
-        """Git env with safe.directory set to workspace to avoid ownership errors."""
-        return {
+        """Git env pinned to the repository selected during initialization."""
+        safe_directory = self._work_tree or self.root
+        config = (
+            ("safe.directory", str(safe_directory)),
+            ("core.excludesFile", str(self._exclude_file)),
+        )
+        result = {
             **self._GIT_ENV_STATIC,
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "safe.directory",
-            "GIT_CONFIG_VALUE_0": str(self.root),
+            "GIT_CONFIG_COUNT": str(len(config)),
         }
-
-    # Marker file placed in the tracking repository's git dir so resumed runs
-    # re-pin the same repository even if an agent has since created a nested
-    # repo (e.g. `uv init` inside the workspace) that discovery would find
-    # first.
-    _TRACKER_MARKER = "vibesys-tracker"
-
-    def _resolve_repo_root(self) -> Path | None:
-        """Innermost ancestor (including ``self.root``) holding the tracking repo.
-
-        Prefers a git dir carrying the tracker marker; otherwise falls back to
-        the innermost ``.git`` owned by the current user. Agent processes in
-        Docker run as root, so their stray ``git init`` artifacts are skipped
-        by the ownership filter and can never shadow the tracking repository.
-        """
-        fallback: Path | None = None
-        for candidate in (self.root, *self.root.parents):
-            git_path = candidate / ".git"
-            try:
-                stat = git_path.stat()
-            except OSError:
-                continue
-            if git_path.is_dir() and (git_path / "info" / self._TRACKER_MARKER).is_file():
-                return candidate
-            if fallback is None and stat.st_uid == os.getuid():
-                fallback = candidate
-        return fallback
-
-    def _mark_tracking_repo(self) -> None:
-        """Stamp the resolved repository so later resolutions stay pinned."""
-        repo_root = self._resolve_repo_root()
-        if repo_root is None:
-            return
-        git_path = repo_root / ".git"
-        if not git_path.is_dir():
-            return  # linked worktree gitlink — admin area lives in the main repo
-        marker = git_path / "info" / self._TRACKER_MARKER
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            if not marker.is_file():
-                marker.write_text("")
-        except OSError as exc:
-            self._log(f"[git-tracking] could not stamp tracking repo: {exc}")
+        for index, (key, value) in enumerate(config):
+            result[f"GIT_CONFIG_KEY_{index}"] = key
+            result[f"GIT_CONFIG_VALUE_{index}"] = value
+        if self._git_dir is not None and self._work_tree is not None:
+            result["GIT_DIR"] = str(self._git_dir)
+            result["GIT_WORK_TREE"] = str(self._work_tree)
+        return result
 
     def run(
         self, cmd: list[str], *, check: bool = True, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[bytes]:
-        """Run a git command in the workspace, logging stderr on failure.
-
-        Commands address the pinned tracking repository via explicit
-        ``--git-dir``/``--work-tree`` (bypassing git's upward discovery and its
-        ownership checks) so a nested repository an agent creates inside the
-        workspace cannot capture snapshots or fail them with dubious-ownership
-        errors. ``git init`` and runs without a resolvable repo fall back to
-        plain discovery.
-        """
+        """Run a git command in the workspace, logging stderr on failure."""
         if env is None:
             env = {**os.environ, **self._GIT_ENV}
-        repo_root = self._resolve_repo_root()
-        if (
-            cmd[:1] == ["git"]
-            and cmd[1:2] != ["init"]
-            and repo_root is not None
-            and (repo_root / ".git").is_dir()  # gitlink worktrees use discovery
-        ):
-            cmd = [
-                "git",
-                f"--git-dir={repo_root / '.git'}",
-                f"--work-tree={repo_root}",
-                *cmd[1:],
-            ]
         result = subprocess.run(cmd, cwd=self.root, capture_output=True, env=env)
         if check and result.returncode != 0:
             stderr = result.stderr.decode(errors="replace").strip()
@@ -167,7 +119,7 @@ class GitTracker:
                 raise ValueError(
                     f"--git-tracking with --resume but no git repository in {self.root}"
                 )
-            self._mark_tracking_repo()
+            self._bind_repository()
             if trusted_input_baseline is not None:
                 self._trusted_input_baseline = self._resolve_trusted_input_baseline(
                     trusted_input_baseline
@@ -182,7 +134,7 @@ class GitTracker:
 
         if not self._inside_work_tree():
             self.run(["git", "init"])
-        self._mark_tracking_repo()
+        self._bind_repository()
 
         gitignore = self.root / ".gitignore"
         existing_gitignore = gitignore.read_text() if gitignore.is_file() else ""
@@ -252,22 +204,112 @@ class GitTracker:
         except Exception:
             return None
 
-    def checkout_tree(self, sha: str, *, clean: bool = False) -> bool:
+    @property
+    def history_root(self) -> Path | None:
+        """Return the repository worktree containing checkpoint history.
+
+        Sandboxed agents edit only ``root``, which can be a subdirectory of
+        the experiment repository. Run environments mount this larger root
+        read-only so agents can inspect the commits the framework advertises
+        without granting them ownership of snapshot bookkeeping.
+        """
+        return self._work_tree
+
+    def pending_changes(self) -> list[str]:
+        """Return tracked and untracked workspace paths changed since ``HEAD``.
+
+        Role-isolated agents such as the orchestrator and judge are allowed to
+        inspect the candidate but not mutate it.  Callers checkpoint framework
+        state first, then use this method to detect any writes the agent made
+        during its turn before restoring the checkpoint.
+        """
+        result = self.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                ".",
+            ]
+        )
+        prefix_result = self.run(["git", "rev-parse", "--show-prefix"])
+        prefix = prefix_result.stdout.decode(errors="replace").strip()
+        return sorted(
+            line[3:].removeprefix(prefix) if prefix else line[3:]
+            for line in result.stdout.decode(errors="replace").splitlines()
+            if len(line) > 3
+        )
+
+    def checkout_tree(
+        self,
+        sha: str,
+        *,
+        clean: bool = False,
+        preserve_paths: Iterable[str | Path] = (),
+    ) -> bool:
         """Materialize *sha*'s tree into the working directory.
 
-        Uses ``git checkout <sha> -- .`` so HEAD stays where it is and the
-        next ``git commit`` produces a new child commit (rather than
-        rewriting history).  With ``clean=True``, untracked files left over
-        from a prior failed attempt are removed via ``git clean -fd``.
+        Restores both the index and worktree from *sha* so paths introduced
+        after that snapshot are deleted as well as modified paths being reset.
+        HEAD stays where it is, so the next commit produces a new child commit
+        rather than rewriting history. With ``clean=True``, untracked files
+        left over from a prior failed attempt are removed via ``git clean
+        -fd``. Files below workspace-relative ``preserve_paths`` are captured
+        before the restore and reapplied afterwards. This is intended for
+        framework-owned memory that must survive a candidate-code rollback.
         """
+        preserved: dict[Path, bytes] = {}
         try:
-            self.run(["git", "checkout", sha, "--", "."])
+            preserved = self._capture_preserved_paths(preserve_paths)
+            self.run(
+                [
+                    "git",
+                    "restore",
+                    f"--source={sha}",
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    ".",
+                ]
+            )
             if clean:
-                self.run(["git", "clean", "-fd"], check=False)
+                self.run(["git", "clean", "-fd", "--", "."], check=False)
+            self._restore_preserved_paths(preserved)
             return True
         except Exception as exc:
-            self._log(f"[warn] git checkout {sha[:8]} failed: {exc}")
+            try:
+                self._restore_preserved_paths(preserved)
+            except Exception as preserve_exc:
+                self._log(
+                    "[warn] failed to restore preserved workspace memory after "
+                    f"tree restore error: {preserve_exc}"
+                )
+            self._log(f"[warn] git tree restore {sha[:8]} failed: {exc}")
             return False
+
+    def _capture_preserved_paths(self, paths: Iterable[str | Path]) -> dict[Path, bytes]:
+        """Read regular files below workspace-relative *paths*."""
+        preserved: dict[Path, bytes] = {}
+        for raw_path in paths:
+            relative = Path(raw_path)
+            if relative.is_absolute() or relative == Path(".") or ".." in relative.parts:
+                raise ValueError(f"preserved path must be workspace-relative: {raw_path}")
+            source = self.root / relative
+            if source.is_file():
+                preserved[relative] = source.read_bytes()
+            elif source.is_dir():
+                for child in source.rglob("*"):
+                    if child.is_file():
+                        preserved[child.relative_to(self.root)] = child.read_bytes()
+        return preserved
+
+    def _restore_preserved_paths(self, preserved: dict[Path, bytes]) -> None:
+        """Reapply files captured by :meth:`_capture_preserved_paths`."""
+        for relative, content in preserved.items():
+            destination = self.root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
 
     def trusted_input_changes(self) -> list[str]:
         """Return evaluator-owned paths changed since the trusted baseline."""
@@ -354,23 +396,32 @@ class GitTracker:
     # read (e.g. neuron-explorer's mode-600 ``system_profile.json``).  A single
     # such file makes ``git add -A`` exit 128 and would otherwise abort the whole
     # run.  These are always transient scratch artifacts we never want in a
-    # checkpoint, so we exclude them (local-only, via ``.git/info/exclude``)
-    # rather than fail.
+    # checkpoint, so we exclude them through a framework-owned exclude file
+    # outside the worktree rather than fail.
 
     def _collect_unreadable(self) -> list[str]:
         """Workspace-relative paths the snapshotting user cannot read.
 
-        Walks the worktree (skipping ``.git``, never following symlinks) and
-        records files lacking ``R_OK`` and directories lacking ``R_OK|X_OK``
-        (an unsearchable dir hides its whole subtree from ``git add`` too).
+        Walks the worktree (skipping Git-ignored runtime/artifact directories,
+        never following symlinks) and records files lacking ``R_OK`` and
+        directories lacking ``R_OK|X_OK`` (an unsearchable dir hides its whole
+        subtree from ``git add`` too). Pruning ignored trees matters because a
+        Python/CUDA environment can contain gigabytes and hundreds of thousands
+        of files that ``git add`` itself will never inspect.
         """
         unreadable: list[str] = []
         root = str(self.root)
+        ignored_dirs = {".git", *self._excluded_dirs}
+        ignored_dirs.update(
+            pattern.removesuffix("/")
+            for pattern in self._ARTIFACT_GITIGNORE_PATTERNS
+            if pattern.endswith("/") and not set(pattern).intersection("*?[")
+        )
         for dirpath, dirnames, filenames in os.walk(root):
-            if ".git" in dirnames:
-                dirnames.remove(".git")
             kept = []
             for d in dirnames:
+                if d in ignored_dirs:
+                    continue
                 full = os.path.join(dirpath, d)
                 if os.access(full, os.R_OK | os.X_OK):
                     kept.append(d)
@@ -396,36 +447,16 @@ class GitTracker:
         return paths
 
     def _exclude_paths(self, rel_paths: list[str]) -> None:
-        """Append *rel_paths* to the repository's ``info/exclude`` (local, untracked).
-
-        The workspace may live below the repository root (experiment
-        directories are themselves the repo), so the exclude file must be the
-        resolved git dir's — writing to ``self.root/.git`` would create a
-        directory no repository reads. Incoming paths are relative to either
-        the workspace (``_collect_unreadable``) or the repo toplevel (git
-        stderr); both are rebased onto the toplevel and anchored.
-        """
+        """Append *rel_paths* to the framework-owned Git exclude file."""
         rel_paths = [p for p in dict.fromkeys(rel_paths) if p]
         if not rel_paths:
             return
-        git_dir = Path(self.run(["git", "rev-parse", "--absolute-git-dir"]).stdout.decode().strip())
-        toplevel = Path(
-            self.run(["git", "rev-parse", "--show-toplevel"]).stdout.decode().strip()
-        ).resolve()
-        entries: list[str] = []
-        for path in rel_paths:
-            candidates = (self.root / path, toplevel / path)
-            absolute = next((c for c in candidates if c.exists()), candidates[0])
-            try:
-                rebased = absolute.resolve().relative_to(toplevel)
-            except ValueError:
-                continue
-            entries.append("/" + rebased.as_posix())
-        exclude_file = git_dir / "info" / "exclude"
+        exclude_file = self._exclude_file
         exclude_file.parent.mkdir(parents=True, exist_ok=True)
         existing = exclude_file.read_text() if exclude_file.exists() else ""
         have = set(existing.splitlines())
-        new = [entry for entry in entries if entry not in have]
+        new = [self._exclude_pattern(p) for p in rel_paths]
+        new = [p for p in new if p not in have]
         if not new:
             return
         prefix = "" if (not existing or existing.endswith("\n")) else "\n"
@@ -451,6 +482,35 @@ class GitTracker:
             self._exclude_paths(offenders)
         # Final attempt: let run() raise with full diagnostics if it still fails.
         self.run(["git", "add", "-A", "--", "."])
+
+    def _bind_repository(self) -> None:
+        """Pin future commands to the repository currently containing ``root``.
+
+        Agents can run tools such as plain ``uv init`` that create a nested
+        ``.git`` directory after the framework initialized tracking. Without
+        explicit ``GIT_DIR``/``GIT_WORK_TREE``, later commands silently switch
+        repositories based on the current directory.
+        """
+        git_dir = self.run(["git", "rev-parse", "--absolute-git-dir"])
+        work_tree = self.run(["git", "rev-parse", "--show-toplevel"])
+        self._git_dir = Path(git_dir.stdout.decode(errors="replace").strip()).resolve()
+        self._work_tree = Path(work_tree.stdout.decode(errors="replace").strip()).resolve()
+
+    def _exclude_pattern(self, rel_path: str) -> str:
+        """Return an exact repository-root-relative ignore pattern."""
+        target = Path(rel_path)
+        if self._work_tree is not None:
+            try:
+                workspace_prefix = self.root.resolve().relative_to(self._work_tree)
+                # The proactive host scan reports workspace-relative paths,
+                # while Git's stderr can report worktree-relative paths. Do
+                # not apply the workspace prefix twice on the retry path.
+                prefix_parts = workspace_prefix.parts
+                if target.parts[: len(prefix_parts)] != prefix_parts:
+                    target = workspace_prefix / target
+            except ValueError:
+                pass
+        return "/" + target.as_posix().lstrip("/")
 
     def _inside_work_tree(self) -> bool:
         result = self.run(["git", "rev-parse", "--is-inside-work-tree"], check=False)

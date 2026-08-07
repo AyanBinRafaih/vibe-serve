@@ -53,7 +53,7 @@ The shared prefix is **always 32 k tokens, always identical across all 20 reques
 ## Notes
 
 - Text-generation, hybrid (linear-attn + full-attn) causal LM. **Single L4
-  (Ada, sm_89, 24 GB) target.** 
+  (Ada, sm_89, 24 GB) target.**
 - Implement model layers explicitly (own attention / linear-attention / MLP
   / norm / RoPE); use `transformers` only as a utility for config / tokenizer
   / weight loading. The reference implementation in `reference/reference.py`

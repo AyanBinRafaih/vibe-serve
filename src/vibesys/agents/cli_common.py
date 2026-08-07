@@ -13,8 +13,11 @@ routing) stay in the individual runner modules.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import TextIO
 
@@ -32,6 +35,121 @@ CLI_SKILL_DIRS: tuple[str, ...] = (
     ".cursor/skills",
     ".opencode/skills",
 )
+
+_NATIVE_SCHEMA_DIR = Path(".cache/vibesys/response-schemas")
+
+# Codex's native response format accepts the object/array/scalar subset used
+# by Pydantic's ordinary model schemas. Reject constructs that require schema
+# evaluation features outside that subset instead of discovering the problem
+# after an expensive agent turn has started. Field names are not inspected as
+# keywords; ``properties`` and ``$defs`` are traversed as maps of subschemas.
+_UNSUPPORTED_NATIVE_SCHEMA_KEYWORDS = frozenset(
+    {
+        "$anchor",
+        "$dynamicAnchor",
+        "$dynamicRef",
+        "$id",
+        "$schema",
+        "allOf",
+        "contains",
+        "dependentRequired",
+        "dependentSchemas",
+        "else",
+        "if",
+        "maxContains",
+        "minContains",
+        "not",
+        "oneOf",
+        "patternProperties",
+        "prefixItems",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+
+
+def _validate_native_output_schema(schema: object) -> dict[str, object]:
+    """Normalize and validate the strict JSON Schema subset used by Codex.
+
+    Native structured output requires every declared object property and
+    forbids undeclared keys. Pydantic omits defaulted properties from
+    ``required`` and represents arbitrary mappings with a schema-valued
+    ``additionalProperties``; the former is normalized here while the latter
+    falls back to the portable prompt contract.
+    """
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise ValueError("native output schema must have an object root")
+
+    def visit(node: object, location: str) -> None:
+        if isinstance(node, list):
+            for index, value in enumerate(node):
+                visit(value, f"{location}/{index}")
+            return
+        if not isinstance(node, dict):
+            return
+        reference = node.get("$ref")
+        if reference is not None:
+            if not isinstance(reference, str) or not reference.startswith("#/"):
+                raise ValueError(f"native output schema uses a non-local $ref at {location}")
+            # Codex follows the older strict subset where a reference may not
+            # have annotation or validation siblings.
+            node.clear()
+            node["$ref"] = reference
+            return
+        node.pop("default", None)
+        properties = node.get("properties")
+        if properties is not None:
+            if not isinstance(properties, dict):
+                raise ValueError(f"native output schema {location}/properties must be an object")
+            additional = node.get("additionalProperties")
+            if additional not in (None, False):
+                raise ValueError(f"native output schema uses arbitrary object keys at {location}")
+            node["additionalProperties"] = False
+            node["required"] = list(properties)
+        elif node.get("type") == "object":
+            additional = node.get("additionalProperties")
+            if additional not in (None, False):
+                raise ValueError(f"native output schema uses arbitrary object keys at {location}")
+            node["additionalProperties"] = False
+            node["required"] = []
+        for key, value in node.items():
+            if key in {"properties", "$defs", "definitions"}:
+                if not isinstance(value, dict):
+                    raise ValueError(f"native output schema {location}/{key} must be an object")
+                for name, subschema in value.items():
+                    visit(subschema, f"{location}/{key}/{name}")
+                continue
+            if key in _UNSUPPORTED_NATIVE_SCHEMA_KEYWORDS:
+                raise ValueError(
+                    f"native output schema uses unsupported keyword {key!r} at {location}"
+                )
+            visit(value, f"{location}/{key}")
+
+    visit(schema, "#")
+    return schema
+
+
+def materialize_native_output_schema(workspace: Path, response_cls: type[BaseModel]) -> str:
+    """Atomically write a validated schema and return its relative CLI path."""
+    schema = _validate_native_output_schema(response_cls.model_json_schema())
+    encoded = (json.dumps(schema, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    relative = _NATIVE_SCHEMA_DIR / f"{response_cls.__name__}-{digest}.json"
+    target = workspace / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return relative.as_posix()
 
 
 def agent_label(kind: str) -> str:
@@ -55,18 +173,20 @@ def discover_skill_dirs(root: Path) -> list[Path]:
 def materialize_skills(
     workspace: Path, skill_dirs: list[Path], log_file: TextIO | None = None
 ) -> None:
-    """Copy each skill directory into the per-CLI skill-discovery paths.
+    """Copy each skill directory into the workspace and CLI discovery paths.
 
     Walks each ``skill_dirs`` entry for ``SKILL.md`` files and flattens each
-    parent directory into every path under :data:`CLI_SKILL_DIRS` (one per CLI
-    convention: ``.claude/skills``, ``.agents/skills``, ``.gemini/skills``,
-    ``.cursor/skills``, ``.opencode/skills``). This makes the skills visible
-    to whichever CLI provider ends up running in the workspace without the
-    caller having to know which one was picked.
+    parent directory into the workspace root and every path under
+    :data:`CLI_SKILL_DIRS` (one per CLI convention: ``.claude/skills``,
+    ``.agents/skills``, ``.gemini/skills``, ``.cursor/skills``,
+    ``.opencode/skills``). The root copy preserves the documented
+    ``<skill-name>/references/...`` paths used by prompts and agents, while the
+    hidden copies support native CLI discovery.
 
-    Existing destinations are replaced so skill edits are picked up across
-    iterations. Errors are logged but never raised — the loop should still
-    make progress even if a skill fails to materialize.
+    Existing destinations are replaced on every invocation so skill edits are
+    picked up across iterations and after candidate checkpoint rollback. Errors
+    are logged but never raised — the loop should still make progress even if a
+    skill fails to materialize.
     """
     if not skill_dirs:
         return
@@ -85,12 +205,14 @@ def materialize_skills(
     skip_names = {".git", "repos", "__pycache__"}
     skip_ignore = shutil.ignore_patterns(*skip_names)
 
-    for target_rel in CLI_SKILL_DIRS:
+    for target_rel in (".", *CLI_SKILL_DIRS):
         target_root = workspace / target_rel
         target_root.mkdir(parents=True, exist_ok=True)
         for name, src_skill in discovered.items():
             dest = target_root / name
             try:
+                if src_skill.resolve() == dest.resolve():
+                    continue
                 if dest.exists() or dest.is_symlink():
                     if dest.is_dir() and not dest.is_symlink():
                         shutil.rmtree(dest)

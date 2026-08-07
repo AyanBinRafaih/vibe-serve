@@ -8,6 +8,7 @@ deliberate never-raise policy on copy failures.
 
 from __future__ import annotations
 
+import json
 from io import StringIO
 from pathlib import Path
 
@@ -18,9 +19,15 @@ from vibesys.agents.cli_common import (
     agent_label,
     build_schema_hint,
     discover_skill_dirs,
+    materialize_native_output_schema,
     materialize_skills,
 )
-from vibesys.schemas import JudgeResponse
+from vibesys.schemas import (
+    ImplementerResponse,
+    JudgeResponse,
+    OrchestratorPlan,
+    PreRoundDecision,
+)
 
 
 def _skill(root: Path, name: str, body: str = "# skill\n") -> Path:
@@ -71,6 +78,7 @@ class TestMaterializeSkills:
 
         materialize_skills(ws, [src])
 
+        assert (ws / "alpha" / "SKILL.md").is_file()
         for rel in CLI_SKILL_DIRS:
             assert (ws / rel / "alpha" / "SKILL.md").is_file()
 
@@ -103,7 +111,16 @@ class TestMaterializeSkills:
         (src / "alpha" / "SKILL.md").write_text("# v2\n")
         materialize_skills(ws, [src])
 
+        assert (ws / "alpha/SKILL.md").read_text() == "# v2\n"
         assert (ws / ".claude/skills/alpha/SKILL.md").read_text() == "# v2\n"
+
+    def test_source_already_at_workspace_root_is_not_replaced(self, tmp_path):
+        ws = tmp_path / "ws"
+        skill = _skill(ws, "alpha", "# local\n")
+
+        materialize_skills(ws, [skill])
+
+        assert (skill / "SKILL.md").read_text() == "# local\n"
 
     def test_later_source_wins_on_a_name_collision(self, tmp_path):
         first = tmp_path / "a"
@@ -173,3 +190,53 @@ class TestBuildSchemaHint:
     def test_forbids_markdown_fences(self):
         """CLI tools wrap JSON in fences unless told not to."""
         assert "Do not wrap it in markdown fences" in build_schema_hint(JudgeResponse)
+
+
+class TestMaterializeNativeOutputSchema:
+    @pytest.mark.parametrize(
+        "response_cls",
+        [PreRoundDecision, OrchestratorPlan, JudgeResponse],
+    )
+    def test_active_agent_schemas_materialize_atomically(self, tmp_path, response_cls):
+        relative = materialize_native_output_schema(tmp_path, response_cls)
+        target = tmp_path / relative
+        schema = json.loads(target.read_text())
+
+        def assert_strict_objects(node):
+            if isinstance(node, list):
+                for value in node:
+                    assert_strict_objects(value)
+            elif isinstance(node, dict):
+                if "$ref" in node:
+                    assert set(node) == {"$ref"}
+                if "properties" in node:
+                    assert set(node["required"]) == set(node["properties"])
+                    assert node["additionalProperties"] is False
+                for value in node.values():
+                    assert_strict_objects(value)
+
+        assert relative.startswith(".cache/vibesys/response-schemas/")
+        assert_strict_objects(schema)
+        assert "default" not in target.read_text()
+        assert not list(target.parent.glob(f".{target.name}.*"))
+
+    def test_schema_valued_mapping_falls_back_before_writing(self, tmp_path):
+        with pytest.raises(ValueError, match="arbitrary object keys"):
+            materialize_native_output_schema(tmp_path, ImplementerResponse)
+
+        assert not (tmp_path / ".cache/vibesys/response-schemas").exists()
+
+    def test_rejects_unsupported_schema_constructs_before_writing(self, tmp_path):
+        class UnsupportedResponse(JudgeResponse):
+            @classmethod
+            def model_json_schema(cls, *args, **kwargs):
+                return {
+                    "type": "object",
+                    "properties": {"analysis": {"type": "string"}},
+                    "not": {"required": ["analysis"]},
+                }
+
+        with pytest.raises(ValueError, match="unsupported keyword 'not'"):
+            materialize_native_output_schema(tmp_path, UnsupportedResponse)
+
+        assert not (tmp_path / ".cache/vibesys/response-schemas").exists()
