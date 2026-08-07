@@ -1,11 +1,12 @@
 You are implementing a causal-LM inference service. The external API/model
 contract is fixed; server language and runtime are not.
 
-When the objective requires a bespoke model implementation, define the model
-layers you own explicitly (attention, MLP, normalization, positional encoding,
-and related state). Utility config/tokenizer/weight-loading APIs are allowed;
-ready-made model or serving-engine implementations are not. Materialize every
-parameter and runtime buffer on the declared device and verify a real forward.
+Preserve named serving engines/source trees (vLLM, SGLang, TensorRT-LLM, or
+`third_party/`); optimize it in place and use from-scratch when requested.
+
+For a bespoke objective, define owned layers (attention, MLP, normalization, and
+positional encoding); ready-made model or serving-engine implementations are not
+allowed. Materialize parameters/buffers on the declared device and verify forward.
 
 
 For every scoped text endpoint: do not emit EOS text; stop before a matched stop
@@ -131,7 +132,7 @@ activation. Record point-local useful batch/tokens, kernel/path, fallbacks,
 graph bucket, and resource limits without hot-loop synchronization.
 
 
-For candidate components that use Python, use `uv`; this is not a requirement that the serving hot path, scheduler, transport, or kernels remain Python.
+For candidate components that use Python, use `uv`; this is not a requirement that the serving hot path remain Python.
 
 Keep correctness and workload shape fixed. Preserve prompt-dependent generation,
 cache/mask/position alignment, deterministic greedy output where required, and
@@ -141,19 +142,20 @@ one active execution; never serve a later arrival via completed output/token
 replay without model execution.
 
 Use the existing benchmark/controller path. Extend it only when the hypothesis
-changes staged control flow or serialization, then prove injected failure makes
-zero paid calls and one synthetic success traverses the new path. Capture exact
-candidate source/build inputs before launch, retain each completed row
-immediately, and run compatible control/candidate phases on one initialized
+changes control flow or serialization; prove injected failure makes zero paid
+calls and a synthetic success traverses it. Capture source/build inputs before
+launch, retain rows immediately, and run compatible phases on one initialized
 server when valid.
 
 ## Use references as implementation support
 
-Load only narrow serving-systems references named by the plan or newly justified
-by evidence—for example API format, async scheduling, continuous batching,
-attention backend, CUDA graphs, or performance modeling. Do not preload the
-entire serving library and do not retain FastAPI, Python, or an incumbent module
-boundary unless the external contract requires it.
+Read `serving-systems/SKILL.md`, then the one materialized
+`references/platforms/<backend>/floor.md`. The platform floor is authoritative:
+do not apply another backend's guidance. For every mechanism named by the
+plan, read its portable contract and the selected platform implementation when
+one exists; load only narrow references needed by the evidence. Search the
+reference tree before relying on priors. Name consulted references and their
+recommendations in the summary.
 
 ## Progress tracking
 

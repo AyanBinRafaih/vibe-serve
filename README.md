@@ -64,13 +64,44 @@ accuracy and performance results.
 
 ## Installation
 
-Requires Python 3.12+.
+1. Install Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+2. For the default GitHub-synced runs, install the [GitHub CLI](https://cli.github.com/)
+   and sign in with `gh auth login`. You do not need `gh` when every run uses
+   `--local`.
+3. From the repository root, create the local configuration files:
 
 ```bash
-uv sync
-cp .env.example .env       # provider keys (Anthropic / OpenAI / Vertex / …)
+cp .env.example .env       # provider keys for API-backed/deepagents runs
 cp agent.toml.example agent.toml
 ```
+
+### Coding-agent setup
+
+Choose one of these agent options in `agent.toml` or with command-line flags:
+
+| Agent | Selection | Authentication |
+| --- | --- | --- |
+| Codex CLI | `--agent-backend cli --cli-provider codex` | Install Codex and run `codex login`. |
+| Claude Code | `--agent-backend cli --cli-provider claude` | Install Claude Code and use its login flow. |
+| Gemini CLI | `--agent-backend cli --cli-provider gemini` | Install Gemini CLI and use its login flow. |
+| OpenCode | `--agent-backend cli --cli-provider opencode` | Install OpenCode and configure its provider. |
+| DeepAgents | `--agent-backend deepagents` | Put the selected provider's API credentials in `.env`. |
+
+The default `agent.toml.example` selects the Codex CLI. CLI credentials stay
+with the CLI; API credentials are loaded from `.env` automatically.
+
+3. Check the installation:
+
+```bash
+./vs validate examples/data-structures/queue-spsc
+```
+
+`uv run` creates the Python environment automatically. You do not need to run
+`uv sync` first.
+
+To use the interactive TUI, install Node.js 20+, Bun, and pnpm 11 (or enable
+Corepack). Run `./vs`; it installs the frontend dependencies and builds the TUI
+when needed. npm is not required.
 
 ## Quickstart
 
@@ -87,58 +118,19 @@ cp agent.toml.example agent.toml
 
 `--outer-loop` defaults to `agent`. Pass `--outer-loop plain` or `--outer-loop evolve` to switch. See `./vs --outer-loop <kind> --help` for loop-specific flags, and [`docs/cli-flags.md`](docs/cli-flags.md) for the supported flag combinations.
 
-A separate entry point exposes the issue MCP server used by the plain loop:
+## Search strategies
 
-```bash
-vibesys-issue-mcp                         # serves issues.json over MCP
-```
+VibeSys supports three outer-loop search strategies:
 
-## Domains — pointing vibesys at your problem space
+- `agent` (default): an orchestrator plans each round and delegates to the
+  implementer, judge, and profiler. It uses the `multi-agent` inner loop by
+  default; pass `--inner-loop single-agent` to run the single-agent ablation.
+- `evolve`: an evolutionary search over candidate implementations.
+- `plain`: an issue-board loop that drains implementation issues and evaluates
+  performance.
 
-A **domain** is the bundle of cross-cutting context the agents need for whatever
-you're building: the background knowledge the implementer must read, and the
-correctness/performance/integrity gates the judge enforces. It answers *"what
-kind of system is this, and what does 'good' mean here?"* — kept separate from
-the neutral prompt skeleton and from the per-task I/O contract (`--modality`).
-
-Each input bundle declares its domain in `vibesys.input.toml`:
-
-```toml
-[agent]
-domain = "llm-serving"
-```
-
-The domain must be a registered name such as `llm-serving` or `generic`. A
-domain is an in-repo package: prompt templates plus optional environment
-setup/teardown hooks. The package's `templates/` directory contains role files
-such as `implementer.md`, `judge.md`, and optionally `single_agent.md`; those
-files drop into the prompts at labelled points. Omit `single_agent.md` and it's
-derived from `implementer.md` plus `judge.md`.
-
-Full authoring guide: [`src/vibesys/domains/README.md`](src/vibesys/domains/README.md).
-
-## Interface: how the artifact is evaluated
-
-See the full flag-composition guide in [`docs/cli-flags.md`](docs/cli-flags.md).
-
-`--interface` describes only how evaluator-owned code reaches the candidate.
-The selected domain and input bundle define the implementation language,
-toolchain, artifact, and callable contract:
-
-```bash
-./vs --outer-loop agent --interface inprocess ...   # default: direct invocation
-./vs --outer-loop agent --interface service ...     # network service
-```
-
-- **`inprocess`** (default): evaluator-owned code invokes the candidate directly
-  inside an evaluator process. This can be a Python module, a C ABI shared
-  library, or another input-defined callable contract.
-- **`service`**: evaluator-owned code communicates with a running candidate over
-  a network protocol defined by the input bundle.
-
-Neither mode implies a programming language. Domain prompts may define shared
-language or toolchain requirements, while each input's candidate contract defines
-the exact artifact and API or protocol.
+For contributor workflows and extension guides, see
+[`docs/development.md`](docs/development.md).
 
 ## Per-target inputs
 
@@ -148,11 +140,11 @@ Each evaluation target lives under `examples/<name>/`:
 examples/<name>/
 ├── OBJECTIVE.md          # free-form deployment goal (model + hardware + workload + interface)
 ├── vibesys.input.toml  # manifest-declared domain, checker, benchmark, and optional inputs
-├── reference/            # reference HuggingFace Transformers implementation
+├── reference/            # optional reference or seed inputs
 │   ├── reference.py
 │   ├── config.json
 │   └── meta.json         # model id + revision
-├── accuracy_checker/     # checker.py + tests/data — the correctness gate
+├── accuracy_checker/     # optional checker.py + tests/data — the correctness gate
 ├── benchmark/            # benchmark.py + load levels — emits the metric to optimize
 └── README.md             # human-readable description
 ```
@@ -171,11 +163,11 @@ For multi-objective evolutionary runs, drop an `objectives.toml` next to `OBJECT
 
 ```toml
 [model]
-name = "gpt-5.4"             # auto-detected provider for claude-* / gpt-* / gemini-*
+name = "gpt-5.4"             # auto-detected provider for claude-* / gpt-* / gemini-* / gemma-*
 # provider = "openai"        # optional override
 
 [backend]
-name = "cuda"                 # or "metal" for Apple Silicon (local exec only)
+name = "cuda"                 # or "metal", "trainium", "rocm", or "cpu"
 
 [agent]
 backend = "cli"               # "cli" (codex/claude/gemini/opencode) or "deepagents"
@@ -193,7 +185,8 @@ model = "gpt-5.6-luna"        # implementer calls
 reasoning_effort = "xhigh"
 
 [repository]
-owner = "vibesys-playground"  # any GitHub user/org; enables pre-launch repository setup
+# Optional GitHub user/org override. If omitted, use the account from `gh auth status`.
+# owner = "your-github-user"
 visibility = "private"        # private, public, or internal
 
 [tui]
@@ -214,139 +207,11 @@ The interactive client ships four light/dark theme pairs — `dark` (default) /
 with `[tui].theme` or `--theme`, or switch mid-session with `/theme <name>`.
 See [`docs/cli-flags.md`](docs/cli-flags.md#client-theme).
 
-Optional `[feature_flags]` entries are documented in
-[`src/vibesys/FEATURE_FLAGS.md`](src/vibesys/FEATURE_FLAGS.md). All flags default
-to off; `omnigent_agent_backend` swaps the `cli` backend from agentshim to
-Omnigent and additionally needs `uv sync --extra omnigent` on Python 3.12+.
-
 The config is validated against a typed schema on load (`vibesys/config.py`): unknown sections or keys, unknown providers/backends, and missing required fields are rejected with an error rather than silently ignored.
 
-## Skills library
-
-`resources/skills/` contains the Agent Skills entries the inner loop's agents read at runtime: model architectures, serving algorithms, programming frameworks, backend libraries, hardware platforms, and reference engines. New optimization techniques and model families enter as new skill entries; the framework itself is target-agnostic.
-
-## Outputs
-
-Every run creates `exp_env/<timestamp>-<name>/`:
-
-```
-exp_env/<run>/
-├── workspace/                # unified, git-tracked candidate workspace
-│   ├── roadmap.md            # or roadmap/index.md
-│   └── progress.md           # or progress/round-NNNN.md
-├── logs/
-│   ├── run-*.log             # top-level run log
-│   ├── run-*-roundNNN.log    # per-round agent log (agent loop)
-│   ├── rounds.json           # per-round audit
-│   ├── active_hypothesis.json # resumable implementer handoff, while active
-│   ├── state.json            # cursor (plain loop)
-│   ├── issues.json           # IssueBoard (plain loop)
-│   ├── population.json       # Individual list (evolve loop)
-│   └── docker.log
-└── reference/                # snapshot of --ref at start
-```
-
-Resume any run with `--resume` (defaults to "latest"):
-
-```bash
-./vs --resume                  # newest run
-./vs --resume 20260507-...     # specific dir
-./vs --resume /path/to/clone   # local experiment clone
-./vs --resume owner/repo       # clone a GitHub experiment, then resume it
-```
-
-When `[repository].owner` is configured, an interactive fresh run first opens a
-setup form populated with the input path, an automatically generated experiment
-name, owner, repository name, and visibility. Use Tab/Shift-Tab to move through
-the defaults and Enter to launch. Clear the owner field for a local-only run.
-
-The generated repository owner comes only from `agent.toml`; no organization is
-hard-coded. `agent.toml.example` uses `vibesys-playground` as its editable
-default. Authenticate the GitHub CLI before launching a remotely tracked run:
-
-```bash
-gh auth login
-./vs \
-  --input examples/data-structures/queue-spsc \
-  ...
-```
-
-For non-interactive use, `--repo queue-trial` uses the configured owner, while
-`--repo another-org/queue-trial` overrides it explicitly. Durable workspace and
-run state are committed and pushed after each workspace checkpoint and again
-when the run closes; raw `logs/*.log` files stay local. Checkpoint push failures
-are retried without stopping the run. Later runs automatically push again when
-resumed from a clone with an `origin`.
-
-## Repository layout
-
-```
-src/vibesys/
-├── __main__.py                   # Python backend entry point for TS launcher
-├── context.py                    # _RunContext: lifecycle + ctx.invoke()
-├── agent_runner.py               # invoke wrappers + structured-response extraction
-├── prompts.py                    # Jinja + backend-fragment renderer
-├── schemas.py                    # Pydantic response schemas
-├── llm_client.py                 # LLM client factory
-├── config.py / constants.py
-│
-├── loops/                        # the three outer-loop search policies
-│   ├── agent/                    # issue-tracker (Orchestrator-driven)
-│   ├── plain/                    # Ralph-style queue-drain
-│   ├── evolve/                   # population-based
-│   └── profiler.py               # shared Performance Evaluator helper
-│
-├── sandbox/                      # execution-environment policy
-│   ├── docker_sandbox.py
-│   ├── modal_sandbox.py
-│   ├── modal_model_setup.py
-│   └── run_environment.py
-│
-├── agents/                       # coding-agent harness abstraction
-│   └── callbacks.py              # LangChain logger (deepagents path)
-└── backends/                     # cuda / metal compute backends
-
-examples/                         # standalone workload bundles
-resources/                        # framework-owned assets exposed to agent runs
-├── profilers/                    # profiler MCP servers and analysis helpers
-└── skills/                       # Agent Skills library
-```
-
-- **agent**: a fresh orchestrator defines a causal hypothesis; an implementer
-  keeps a hypothesis-scoped session across rounds; an independent fresh judge
-  reviews nominated candidates, every `--judge-every` rounds (default 3), and
-  the final round. Framework-owned accuracy/benchmark gates run every
-  `--official-eval-every` accepted candidates (default 3), when the
-  orchestrator requests them, and on the final round. Other accepted candidates
-  remain provisional working checkpoints. Official Modal gates reuse a healthy
-  deployment only for the exact candidate commit, then explicitly stop it after
-  the final gate; candidate services must also scale to zero after a short idle
-  timeout as the crash backstop. Use `--memory-layout directories` for
-  `roadmap/index.md` plus one `progress/round-NNNN.md` file per round.
-- **plain**: drain `IssueBoard` (one impl + one judge per issue, BLOCK
-  after `--max-attempts-per-issue`) → `perf_eval` (may file new issues).
-  Early-exits when queue is empty and `perf_eval` files nothing.
-- **evolve**: per generation × child: select parent (Pareto frontier with
-  `--frontier-bias`, scalar softmax otherwise) + inspirations →
-  `git checkout` parent tree → mutator → judge → profiler → commit.
-  The input bundle's domain supplies role prompts, environment hooks, and
-  profiler compatibility. No early stop; runs the full
-  `--max-generations × --children-per-generation`.
-  Pass `--search-policy openevolve` to delegate population sampling,
-  MAP-Elites archiving, islands, and migration to pinned OpenEvolve 0.3.1;
-  VibeSys still owns agent mutation and multi-file evaluation. See
-  [`docs/openevolve.md`](docs/openevolve.md).
-
-## Development
-
-```bash
-./scripts/format.sh                                # format checked Python dirs
-./scripts/check_format.sh                          # check formatting for CI
-./scripts/check_lint.sh                            # check Ruff lint for CI
-uv run pytest                                       # full suite
-uv run pytest tests/loops/plain/test_plain_loop.py  # one file
-uv run pytest -k orchestrator                       # by keyword
-```
+Fresh runs use GitHub-backed tracking by default. Pass `--local` for a local-only
+run under `exp_env/`; see [`docs/cli-flags.md`](docs/cli-flags.md) for repository
+and resume options.
 
 ## Citation
 

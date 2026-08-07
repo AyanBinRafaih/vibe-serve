@@ -19,19 +19,21 @@ domain = "llm-serving"
 | Domain        | What it does |
 |---------------|--------------|
 | `llm-serving` | LLM inference server context: the `serving-systems` skill/references, `/model` weights, the accuracy + benchmark + reward-hack judge gates. |
+| `microservices` | Microservice workload context: service lifecycle, protocol correctness, and workload-specific evaluator guidance. |
 | `generic`     | Empty — no domain prose injected. The neutral baseline; copy it to start your own. |
 
 ## Anatomy of a domain package
 
-Each domain owns one package folder. Prompt content lives under `templates/` in
-Markdown files named for the agent roles. Domain-specific environment
-setup/teardown code lives next to the templates when the domain needs it.
+Each domain owns one Python package, while all framework prompt assets live in
+the central `vibesys/prompts/` package. Domain-specific environment
+setup/teardown code stays next to the domain definition.
 
 ```text
 src/vibesys/domains/my_domain/
   __init__.py       # exports DEFINITION
   hooks.py          # optional domain-specific EnvironmentHooks implementation
-  templates/
+
+src/vibesys/prompts/domains/my_domain/
     README.md        # optional human documentation
     implementer.md   # injected as {{ domain_implementer }}
     judge.md         # injected as {{ domain_judge }}
@@ -42,7 +44,7 @@ src/vibesys/domains/my_domain/
 
 Rules:
 
-- **Inside `templates/`, the filename is the address.** `implementer.md` maps to
+- **Inside the domain prompt directory, the filename is the address.** `implementer.md` maps to
   `{{ domain_implementer }}`, `judge.md` maps to `{{ domain_judge }}`, and so on.
 - **A missing role file injects nothing** for that role.
 - **`single_agent.md` is optional.** Omit it and it's derived automatically by
@@ -70,7 +72,7 @@ use any of these in any file without tracking which role you're in:
 |----------|---------|
 | `modality` | The `--modality` value (e.g. `text_generation`). |
 | `interface` | The `--interface` value: `inprocess` (direct invocation inside an evaluator process) or `service` (over the wire). It does not imply a language or artifact format. |
-| `reference_path` | Path to the reference implementation. |
+| `reference_path` | Path to the reference material, or `.` when the input bundle has no `reference/` directory. |
 | `benchmark_command` | Benchmark command declared by the input manifest, or falsy if no benchmark is attached. |
 | `accuracy_command` | Accuracy-checker command declared by the input manifest, or falsy if not attached. |
 | `runtime_notes` | Runtime-environment notes for the round. |
@@ -93,13 +95,15 @@ Example (inside `judge.md`):
 
 ## How to add a domain
 
-1. Copy `generic/` to a new in-repo `src/vibesys/domains/<module_name>/`
-   package, using underscores for the Python module name when the CLI domain
-   name contains hyphens.
-2. Edit `templates/README.md` with the title and "use for…" line.
+1. Copy `src/vibesys/domains/generic/` to a new in-repo
+   `src/vibesys/domains/<module_name>/` package, using underscores for the
+   Python module name when the CLI domain name contains hyphens.
+2. Copy `src/vibesys/prompts/domains/generic/` to
+   `src/vibesys/prompts/domains/<module_name>/` and edit its `README.md` with
+   the title and "use for…" line.
 3. Add `implementer.md` (what to read / what "done" means here) and `judge.md`
-   (what to check) under `templates/`. Leave a file out to inject nothing for
-   that role.
+   (what to check) under the central prompt directory. Leave a file out to
+   inject nothing for that role.
 4. Optionally add `single_agent.md` for the `--inner-loop single-agent`
    ablation; omit it to derive it from the other two.
 5. Optionally add `orchestrator.md` and `profiler.md` when the neutral planning
@@ -109,7 +113,8 @@ Example (inside `judge.md`):
    `EnvironmentHooks` in that package and attach it to the definition.
 7. Register the definition in `vibesys.domains.registry.DOMAINS`.
 8. Add `[agent].domain = "<name>"` to the input manifest and run either
-   `vibesys --outer-loop agent ...` or `vibesys --outer-loop evolve ...`.
+   `./vs --outer-loop agent ...` or `./vs --outer-loop evolve ...` from the
+   repository root.
 
 Domains are registered explicitly so prompt context, environment hooks, and tests
 stay tied to the same domain identity.

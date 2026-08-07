@@ -59,11 +59,16 @@ Start with 1:1 and adjust based on queue depth and GPU utilization per pool.
 
 ## Compatibility
 
-| Implementation | Engines | Transports |
-|:---------------|:--------|:-----------|
-| vLLM KV connector | vLLM | NIXL, others via `kv_connector/` |
-| SGLang disaggregation | SGLang | NIXL, Mooncake, Mori, native, Ascend, fake |
-| TRT-LLM disaggregation | TRT-LLM | native (NCCL), NIXL |
+| Implementation | Engines | Transports | Backend |
+|:---------------|:--------|:-----------|:--------|
+| vLLM KV connector | vLLM | NIXL, others via `kv_connector/` | `cuda`, `rocm` |
+| SGLang disaggregation | SGLang | NIXL, Mooncake, Mori, native, Ascend, fake | `cuda`, `rocm` |
+| TRT-LLM disaggregation | TRT-LLM | native (NCCL), NIXL | `cuda` |
+| **N/A** | — | — | `metal`, `cpu` — single host, no fabric to disaggregate across |
+
+Prefill/decode disaggregation presupposes a multi-node fabric and independently
+scalable worker pools. On single-SoC and single-host backends the whole design
+is inapplicable, not merely unimplemented.
 
 ## Engine pointers
 
@@ -86,5 +91,5 @@ Start with 1:1 and adjust based on queue depth and GPU utilization per pool.
 
 - `algorithms/parallelism/` — can combine with TP/PP/EP within each pool
 - `algorithms/paged-attention/` — KV layout + transfer chunking
-- `hardware/nvidia/` — NVLink / NVSwitch / NVL72 / NIC choices
+- your platform's `hardware.md` — NVLink / NVSwitch / NVL72 / NIC choices
 - `engines/sglang/`, `engines/vllm/`, `engines/trtllm/` — source

@@ -198,8 +198,8 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--exp-name",
         required=False,
-        default="test",
-        help="Experiment name (creates exp_env/<name>/)",
+        default=None,
+        help="Experiment name; generated from the input bundle when omitted.",
     )
     parser.add_argument(
         "--config",
@@ -313,11 +313,15 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="[OWNER/]NAME",
         help=(
-            "Create a GitHub repository for this experiment, commit its durable "
-            "state, and push after each workspace checkpoint and at shutdown. "
-            "A configured [repository].owner supplies an omitted owner. Requires "
-            "an authenticated `gh` CLI."
+            "Override the generated GitHub repository name for this experiment. "
+            "A configured [repository].owner or authenticated `gh` account supplies "
+            "an omitted owner."
         ),
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Keep this experiment local under exp_env; do not create or sync GitHub.",
     )
     parser.add_argument(
         "--repo-visibility",
@@ -325,7 +329,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         choices=list(RepositoryVisibility),
         default=None,
         help=(
-            "Visibility for a repository created by --repo. Defaults to "
+            "Visibility for the experiment repository. Defaults to "
             "[repository].visibility in agent.toml."
         ),
     )
@@ -386,19 +390,19 @@ def load_config_and_skills(
             _configuration_error(str(e), code="config_load_failed", stage="config_loading")
 
     repository = getattr(args, "repo", None)
+    if getattr(args, "local", False) and repository is not None:
+        _configuration_error(
+            "--local cannot be combined with --repo",
+            code="invalid_repository",
+            stage="repository_setup",
+        )
     if repository is not None:
         if "/" not in repository:
-            owner = config.repository.owner
-            if owner is None:
-                _configuration_error(
-                    f"--repo {repository!r} omits OWNER, but [repository].owner is not set",
-                    code="invalid_repository",
-                    stage="repository_setup",
-                )
+            owner = _resolve_repository_owner(config)
             repository = f"{owner}/{repository}"
         if not REPOSITORY_SLUG.fullmatch(repository):
             _configuration_error(
-                f"--repo must be NAME with [repository].owner configured or an "
+                f"--repo must be NAME with a configured or authenticated owner, or an "
                 f"explicit GitHub OWNER/NAME pair, got {repository!r}",
                 code="invalid_repository",
                 stage="repository_setup",
@@ -420,6 +424,36 @@ def load_config_and_skills(
         )
         skills = resolve_skill_source_dirs(raw_skills, backend=backend, domain=domain)
     return config, skills, backend
+
+
+def _resolve_repository_owner(config: Config) -> str:
+    """Resolve the configured repository owner or the authenticated ``gh`` user."""
+    if config.repository.owner is not None:
+        return config.repository.owner
+    try:
+        return GitHubCLI().current_user()
+    except GitHubCLIError as exc:
+        _configuration_error(
+            str(exc),
+            code="repository_setup_failed",
+            stage="repository_setup",
+        )
+
+
+def _prepare_experiment_repository(args: argparse.Namespace, config: Config) -> None:
+    """Resolve fresh-run naming and remote selection before entering a loop."""
+    if args.resume is not None:
+        return
+
+    if args.exp_name is None:
+        args.exp_name = generate_experiment_name(args.input_bundle.root)
+
+    if args.local:
+        return
+
+    if args.repo is None:
+        owner = _resolve_repository_owner(config)
+        args.repo = f"{owner}/{repository_name_from_experiment(args.exp_name)}"
 
 
 def _prepare_stub_agent_smoke_defaults(argv: list[str]) -> list[str]:
@@ -705,10 +739,11 @@ def _run_tui_defaults(argv: list[str]) -> None:
 
     input_path = args.input.expanduser().resolve() if args.input is not None else None
     experiment_name = args.exp_name or generate_experiment_name(input_path)
+    repository_owner = _resolve_repository_owner(config)
     defaults = InteractiveSetupDefaults(
         input_path=str(input_path) if input_path is not None else "",
         experiment_name=experiment_name,
-        repository_owner=config.repository.owner,
+        repository_owner=repository_owner,
         repository_name=repository_name_from_experiment(experiment_name),
         visibility=config.repository.visibility,
         theme=args.theme or config.tui.theme,
@@ -763,6 +798,8 @@ def _run_validate(argv: list[str]) -> None:
         print(f"  workspace source: {source.name} -> {source.dest} @ {source.commit}")
     if bundle.evaluator_path is not None:
         print(f"  evaluator source: {bundle.evaluator_path}")
+    if bundle.hidden_evaluator_path is not None:
+        print(f"  hidden evaluator source: {bundle.hidden_evaluator_path}")
     if bundle.benchmark_result is not None:
         print(f"  benchmark metric: {bundle.benchmark_result.metric}")
 
@@ -948,6 +985,7 @@ def _validate_agent(args: argparse.Namespace) -> None:
 def _run_agent(args: argparse.Namespace) -> None:
     bundle: InputBundle = args.input_bundle
     config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
+    _prepare_experiment_repository(args, config)
     from vibesys.loops.agent.loop import run_agent_loop
 
     objective = _with_operator_constraints(_load_objective(bundle), args.constraint)
@@ -996,6 +1034,7 @@ def _run_agent(args: argparse.Namespace) -> None:
         workspace_seed=bundle.workspace_seed_path,
         workspace_sources=bundle.workspace_sources,
         evaluator_path=bundle.evaluator_path,
+        hidden_evaluator_path=bundle.hidden_evaluator_path,
         benchmark_result=bundle.benchmark_result,
         accuracy_timeout_seconds=bundle.manifest.accuracy.timeout_seconds,
         benchmark_timeout_seconds=bundle.manifest.benchmark.timeout_seconds,
@@ -1298,6 +1337,7 @@ def _restore_openevolve_objectives(
 def _run_evolve(args: argparse.Namespace) -> None:
     bundle: InputBundle = args.input_bundle
     config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
+    _prepare_experiment_repository(args, config)
     from vibesys.loops.evolve.loop import run_evolve_loop
 
     objective = _load_objective(bundle)
@@ -1335,6 +1375,8 @@ def _run_evolve(args: argparse.Namespace) -> None:
         workspace_seed=bundle.workspace_seed_path,
         workspace_sources=bundle.workspace_sources,
         evaluator_path=bundle.evaluator_path,
+        hidden_evaluator_path=bundle.hidden_evaluator_path,
+        accuracy_timeout_seconds=bundle.manifest.accuracy.timeout_seconds,
         objective=objective,
         max_generations=args.max_generations,
         children_per_generation=args.children_per_generation,
@@ -1401,6 +1443,7 @@ def _validate_plain(args: argparse.Namespace) -> None:
 def _run_plain(args: argparse.Namespace) -> None:
     bundle: InputBundle = args.input_bundle
     config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
+    _prepare_experiment_repository(args, config)
     from vibesys.loops.plain.loop import (
         PlainLoopState,
         load_state,
@@ -1453,6 +1496,7 @@ def _run_plain(args: argparse.Namespace) -> None:
         workspace_seed=bundle.workspace_seed_path,
         workspace_sources=bundle.workspace_sources,
         evaluator_path=bundle.evaluator_path,
+        hidden_evaluator_path=bundle.hidden_evaluator_path,
         max_rounds=args.max_rounds,
         max_attempts_per_issue=args.max_attempts_per_issue,
         max_issues_per_perf_eval=args.max_issues_per_perf_eval,
