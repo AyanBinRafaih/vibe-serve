@@ -39,7 +39,7 @@ _RECENT_PROGRESS_ROUNDS = 4
 def resolve_paths(workspace: Path, layout: str) -> tuple[Path, Path]:
     """Resolve both memory locations, preserving the layout of resumed runs."""
     if layout not in MEMORY_LAYOUTS:
-        raise ValueError(
+        raise ValueError(  # noqa: TRY003  # tracked: #288
             f"Unknown memory layout {layout!r}; choose from {', '.join(MEMORY_LAYOUTS)}"
         )
 
@@ -47,7 +47,7 @@ def resolve_paths(workspace: Path, layout: str) -> tuple[Path, Path]:
         legacy = workspace / f"{name}.md"
         directory = workspace / name
         if legacy.exists() and directory.exists():
-            raise ValueError(
+            raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"Both {legacy.name} and {directory.name}/ exist; keep only one {name} layout"
             )
         if legacy.exists():
@@ -72,7 +72,6 @@ def _structured_artifact_root(progress_path: Path) -> Path:
     ``progress.md`` runs use a sibling directory so the existing Markdown file
     remains untouched.
     """
-
     if progress_path.suffix == ".md":
         return progress_path.with_name(f"{progress_path.stem}-artifacts")
     return progress_path
@@ -80,7 +79,6 @@ def _structured_artifact_root(progress_path: Path) -> Path:
 
 def _write_json_atomic(path: Path, payload: object) -> Path:
     """Atomically replace a framework-owned JSON handoff artifact."""
-
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
@@ -97,7 +95,6 @@ def _write_json_atomic(path: Path, payload: object) -> Path:
 
 def write_plan_artifact(progress_path: Path, round_number: int, plan: OrchestratorPlan) -> Path:
     """Persist the exact typed plan used by the framework for one round."""
-
     path = _structured_artifact_root(progress_path) / "plans" / f"round-{round_number:04d}.json"
     return _write_json_atomic(path, plan.model_dump(mode="json"))
 
@@ -109,7 +106,6 @@ def write_implementer_artifact(
     response: ImplementerResponse,
 ) -> Path:
     """Persist parsed implementer claims as untrusted data for Judge audit."""
-
     path = (
         _structured_artifact_root(progress_path)
         / "evidence"
@@ -120,25 +116,21 @@ def write_implementer_artifact(
 
 def validation_artifact_root(progress_path: Path) -> Path:
     """Return the framework-owned validation ledger directory."""
-
     return _structured_artifact_root(progress_path) / "validation"
 
 
 def profiler_artifact_root(progress_path: Path, round_number: int) -> Path:
     """Return the only durable output directory writable by a Profiler turn."""
-
     return _structured_artifact_root(progress_path) / "profiles" / f"round-{round_number:04d}"
 
 
 def validation_recipe_schema_path(progress_path: Path) -> Path:
     """Return the framework-owned candidate recipe-schema path."""
-
     return validation_artifact_root(progress_path) / "recipe-schema.json"
 
 
 def write_validation_recipe_schema(progress_path: Path) -> Path:
     """Publish the authoritative recipe contract for on-demand agent reads."""
-
     return _write_json_atomic(
         validation_recipe_schema_path(progress_path),
         ValidationRecipeArtifact.model_json_schema(mode="validation"),
@@ -152,7 +144,6 @@ def write_validation_result_artifact(
     results: list[FrameworkValidationResult],
 ) -> Path:
     """Persist framework-executed validation results for replay and reuse."""
-
     path = (
         validation_artifact_root(progress_path)
         / f"round-{round_number:04d}-attempt-{retry:02d}.json"
@@ -167,13 +158,11 @@ def write_validation_result_artifact(
 
 def validation_result_artifact_paths(progress_path: Path) -> list[Path]:
     """Return validation result artifacts in deterministic creation order."""
-
     return sorted(validation_artifact_root(progress_path).glob("round-*-attempt-*.json"))
 
 
 def implementer_artifact_paths(progress_path: Path, round_number: int) -> list[Path]:
     """Return persisted implementer attempts for one round in attempt order."""
-
     evidence_root = _structured_artifact_root(progress_path) / "evidence"
     pattern = f"round-{round_number:04d}-attempt-*-implementer.json"
     return sorted(evidence_root.glob(pattern))
@@ -181,7 +170,6 @@ def implementer_artifact_paths(progress_path: Path, round_number: int) -> list[P
 
 def next_implementer_attempt(progress_path: Path, round_number: int) -> int:
     """Return the next durable attempt number for an interrupted round."""
-
     attempts: list[int] = []
     prefix = f"round-{round_number:04d}-attempt-"
     suffix = "-implementer.json"
@@ -402,7 +390,7 @@ def _append(progress_path: Path, block: str, round_number: int) -> None:
     replacement.replace(document)
 
 
-def append_pre_round_decision(
+def append_pre_round_decision(  # noqa: D103  # tracked: #288
     progress_path: Path, round_number: int, decision: PreRoundDecision
 ) -> None:
     block = (
@@ -414,7 +402,7 @@ def append_pre_round_decision(
     _append(progress_path, block, round_number)
 
 
-def append_profiler_summary(
+def append_profiler_summary(  # noqa: D103  # tracked: #288
     progress_path: Path, round_number: int, summary: ProfilerSummary
 ) -> None:
     perf_line = ""
@@ -431,7 +419,7 @@ def append_profiler_summary(
     _append(progress_path, block, round_number)
 
 
-def append_orchestrator_plan(
+def append_orchestrator_plan(  # noqa: D103  # tracked: #288
     progress_path: Path, round_number: int, plan: OrchestratorPlan
 ) -> None:
     revert_line = ""
@@ -455,7 +443,7 @@ def append_orchestrator_plan(
     _append(progress_path, block, round_number)
 
 
-def append_hypothesis_continuation(
+def append_hypothesis_continuation(  # noqa: D103  # tracked: #288
     progress_path: Path,
     round_number: int,
     *,
@@ -474,7 +462,7 @@ def append_hypothesis_continuation(
     _append(progress_path, block, round_number)
 
 
-def append_implementer(
+def append_implementer(  # noqa: D103  # tracked: #288
     progress_path: Path, round_number: int, retry: int, response: ImplementerResponse
 ) -> None:
     perf_line = ""
@@ -508,7 +496,7 @@ def append_implementer(
     _append(progress_path, block, round_number)
 
 
-def append_judge(
+def append_judge(  # noqa: D103  # tracked: #288
     progress_path: Path, round_number: int, retry: int, response: JudgeResponse
 ) -> None:
     block = (
@@ -520,7 +508,7 @@ def append_judge(
     _append(progress_path, block, round_number)
 
 
-def append_judge_skipped(
+def append_judge_skipped(  # noqa: D103  # tracked: #288
     progress_path: Path,
     round_number: int,
     *,
@@ -536,7 +524,7 @@ def append_judge_skipped(
     _append(progress_path, block, round_number)
 
 
-def append_official_evaluation_decision(
+def append_official_evaluation_decision(  # noqa: D103, PLR0913  # tracked: #288
     progress_path: Path,
     round_number: int,
     retry: int,
@@ -557,7 +545,7 @@ def append_official_evaluation_decision(
     _append(progress_path, block, round_number)
 
 
-def append_single_agent_round(
+def append_single_agent_round(  # noqa: D103  # tracked: #288
     progress_path: Path,
     round_number: int,
     retry: int,
@@ -592,7 +580,7 @@ def append_single_agent_round(
     _append(progress_path, block, round_number)
 
 
-def append_framework_accuracy_gate(
+def append_framework_accuracy_gate(  # noqa: D103, PLR0913  # tracked: #288
     progress_path: Path,
     round_number: int,
     retry: int,
@@ -620,7 +608,6 @@ def append_framework_validation_gate(
     results: list[FrameworkValidationResult],
 ) -> None:
     """Record the deterministic local validation gate in the progress ledger."""
-
     passed = bool(results) and all(result.passed for result in results)
     lines = [
         f"## Round {round_number} — Framework local validation (attempt {retry})",
@@ -636,7 +623,7 @@ def append_framework_validation_gate(
     _append(progress_path, "\n".join(lines) + "\n", round_number)
 
 
-def append_framework_benchmark(
+def append_framework_benchmark(  # noqa: D103, PLR0913  # tracked: #288
     progress_path: Path,
     round_number: int,
     retry: int,
@@ -659,7 +646,7 @@ def append_framework_benchmark(
     _append(progress_path, block, round_number)
 
 
-def append_exhaustion_note(
+def append_exhaustion_note(  # noqa: D103  # tracked: #288
     progress_path: Path, round_number: int, attempts: int, last_feedback: str
 ) -> None:
     block = (

@@ -16,7 +16,7 @@ OPENCODE_DEFAULT_MODEL = "google-vertex/gemini-3-pro-preview"
 class OpencodeCodingAgent(CLICodingAgent[OpencodeGenerationSession]):
     """Coding agent implementation using the Opencode CLI tool."""
 
-    def __init__(
+    def __init__(  # noqa: ANN204  # tracked: #288
         self,
         model: str | None = None,
         event_handler: AgentEventHandler | None = None,
@@ -60,7 +60,7 @@ class OpencodeCodingAgent(CLICodingAgent[OpencodeGenerationSession]):
         cmd: list[str],
         cwd: str | None = None,
         timeout: int | None = None,
-        silent: bool = False,
+        silent: bool = False,  # noqa: FBT001, FBT002  # tracked: #288
     ) -> OpencodeGenerationSession:
         return OpencodeGenerationSession(
             binary_name=self.binary_name,
@@ -81,7 +81,8 @@ class OpencodeCodingAgent(CLICodingAgent[OpencodeGenerationSession]):
         Opencode discovers the MCP servers from cwd and uses the ``mcp`` key (not
         ``mcpServers``) and a single combined ``command`` array. Non-
         interactive ``opencode run`` already auto-approves all permissions,
-        so no extra ``permission`` block is needed."""
+        so no extra ``permission`` block is needed.
+        """
         server_config: dict[str, dict[str, Any]] = {
             s.name: {
                 "type": "local",
@@ -98,6 +99,6 @@ class OpencodeCodingAgent(CLICodingAgent[OpencodeGenerationSession]):
             defaults={"$schema": "https://opencode.ai/config.json"},
         )
 
-    def uninstall_mcp_servers(self, workspace: Path, servers: list[MCPServerSpec]) -> None:
+    def uninstall_mcp_servers(self, workspace: Path, servers: list[MCPServerSpec]) -> None:  # noqa: ARG002  # tracked: #288
         """Restore the workspace's original ``opencode.json``. Idempotent."""
         self._restore_mcp_config_file(workspace / "opencode.json")

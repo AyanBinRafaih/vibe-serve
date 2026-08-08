@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tomllib
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Sequence  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -12,7 +12,7 @@ import yaml
 
 from vibesys.constants import PROJECT_ROOT, ComputeBackend
 from vibesys.domains.base import DomainName
-from vibesys.schemas import SkillResourceSelection
+from vibesys.schemas import SkillResourceSelection  # noqa: TC001  # tracked: #288
 
 DEFAULT_SKILL_ROOTS: tuple[Path, ...] = (Path("resources/skills"),)
 SIDECAR_NAME = ".vibesys.toml"
@@ -71,7 +71,7 @@ class SkillRule:
         """Rule precedence: deeper target paths are more specific."""
         return len(self.target_path.parts)
 
-    def applies_to(self, skill_dir: Path) -> bool:
+    def applies_to(self, skill_dir: Path) -> bool:  # noqa: D102  # tracked: #288
         try:
             skill_dir.resolve().relative_to(self.target_path)
         except ValueError:
@@ -306,9 +306,9 @@ def coerce_skill_root(raw: str | Path, *, project_root: Path = PROJECT_ROOT) -> 
         path = project_root / path
     path = path.resolve()
     if not path.exists():
-        raise ValueError(f"--skills-dir path does not exist: {raw}")
+        raise ValueError(f"--skills-dir path does not exist: {raw}")  # noqa: TRY003  # tracked: #288
     if not path.is_dir():
-        raise ValueError(f"--skills-dir path is not a directory: {raw}")
+        raise ValueError(f"--skills-dir path is not a directory: {raw}")  # noqa: TRY003  # tracked: #288
     return path
 
 
@@ -320,7 +320,6 @@ def build_skill_catalog(skill_dirs: Iterable[str | Path]) -> dict[str, SkillCata
     A skill's frontmatter name must match its materialized directory name so an
     outer-loop recommendation cannot resolve differently across providers.
     """
-
     catalog: dict[str, SkillCatalogEntry] = {}
     for raw_root in skill_dirs:
         root = Path(raw_root).expanduser().resolve()
@@ -342,12 +341,11 @@ def build_skill_catalog(skill_dirs: Iterable[str | Path]) -> dict[str, SkillCata
     return catalog
 
 
-def _resolve_skill_resource(
+def _resolve_skill_resource(  # noqa: PLR0911  # tracked: #288
     entry: SkillCatalogEntry,
     raw_resource: str,
 ) -> tuple[str | None, str | None]:
     """Resolve one skill-relative file to its agent-visible path and diagnostic."""
-
     resource = raw_resource.strip()
     if not resource:
         return None, "resource path must be a non-empty string"
@@ -387,7 +385,6 @@ def resolve_skill_selections(
     selections for one skill are merged in first-seen order to keep continuation
     prompts compact and deterministic.
     """
-
     merged: dict[str, tuple[str, list[str]]] = {}
     diagnostics: list[str] = []
     for index, selection in enumerate(selections, start=1):
@@ -407,7 +404,7 @@ def resolve_skill_selections(
                     f"selection #{index} skill {skill!r} resource {raw_resource!r}: {error}"
                 )
                 continue
-            assert workspace_path is not None
+            assert workspace_path is not None  # noqa: S101  # tracked: #288
             if workspace_path == entry.router_path or workspace_path in resources:
                 continue
             resources.append(workspace_path)

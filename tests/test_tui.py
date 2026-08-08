@@ -35,11 +35,11 @@ from vibesys.server.service import SupervisionService
 from vibesys.server.transport import SupervisionSocketServer
 
 
-def _events(path):
+def _events(path):  # noqa: ANN001, ANN202  # tracked: #288
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def test_chat_is_audited_but_not_injected(tmp_path):
+def test_chat_is_audited_but_not_injected(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     supervisor.record(EventType.CHAT, "What is happening?", status="answered")
@@ -47,12 +47,12 @@ def test_chat_is_audited_but_not_injected(tmp_path):
     started = next(
         event for event in supervisor.read_events() if event.type == "invocation_started"
     )
-    assert started.data.user_prompt == "original prompt"
+    assert started.data.user_prompt == "original prompt"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
     event_types = [event["type"] for event in _events(tmp_path / "run-events.jsonl")]
     assert event_types.index("chat") < event_types.index("invocation_started")
 
 
-def test_pause_takes_effect_at_next_safe_point(tmp_path):
+def test_pause_takes_effect_at_next_safe_point(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     supervisor.pause_after_call()
@@ -69,7 +69,7 @@ def test_pause_takes_effect_at_next_safe_point(tmp_path):
     assert result == [None]
 
 
-def test_invocation_audit_contains_prompts_and_result(tmp_path):
+def test_invocation_audit_contains_prompts_and_result(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     supervisor.before_agent("implementer", "round 4", "Do work", "System rules")
@@ -84,11 +84,11 @@ def test_invocation_audit_contains_prompts_and_result(tmp_path):
     assert finished["data"]["result"] == {"summary": "done"}
 
 
-def test_inspector_answers_round_and_failure_queries(tmp_path):
+def test_inspector_answers_round_and_failure_queries(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     (tmp_path / "logs").mkdir()
     supervisor.attach(tmp_path / "logs")
-    (supervisor.log_dir / "progress.md").write_text(
+    (supervisor.log_dir / "progress.md").write_text(  # pyright: ignore[reportOptionalOperand]  # tracked: #297
         "## Round 1 — Judge\nPASS\n\n## Round 2 — Judge\nFAIL: latency regressed\n"
     )
     inspector = RunInspector(supervisor)
@@ -96,7 +96,7 @@ def test_inspector_answers_round_and_failure_queries(tmp_path):
     assert "latency regressed" in inspector.answer("why did the judge fail?")
 
 
-def test_general_chat_is_distinct_from_status_query(tmp_path):
+def test_general_chat_is_distinct_from_status_query(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     supervisor.chat("hello there")
@@ -104,7 +104,7 @@ def test_general_chat_is_distinct_from_status_query(tmp_path):
     assert event_types == ["server_started", "chat"]
 
 
-def test_side_channel_chat_output_is_tagged_without_changing_active_agent(tmp_path):
+def test_side_channel_chat_output_is_tagged_without_changing_active_agent(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     supervisor.before_agent("implementer", "round-1", "work")
@@ -121,10 +121,10 @@ def test_side_channel_chat_output_is_tagged_without_changing_active_agent(tmp_pa
     assert [event.agent_kind for event in agent_events] == ["chat", "implementer"]
     assert agent_events[0].round_label == "experiment-chat"
     assert agent_events[0].invocation_id == "chat-1"
-    assert agent_events[1].data.content == "experiment output"
+    assert agent_events[1].data.content == "experiment output"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
 
 
-def test_bootstrap_events_migrate_to_run_audit_without_replacing_history(tmp_path):
+def test_bootstrap_events_migrate_to_run_audit_without_replacing_history(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     logs = tmp_path / "run" / "logs"
     historical = RunSupervisor()
     historical.attach(logs)
@@ -159,7 +159,7 @@ def test_bootstrap_events_migrate_to_run_audit_without_replacing_history(tmp_pat
     ]
 
 
-def test_history_query_reads_prior_and_current_session_events(tmp_path):
+def test_history_query_reads_prior_and_current_session_events(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     logs = tmp_path / "run" / "logs"
     historical = RunSupervisor()
     historical.attach(logs)
@@ -179,7 +179,7 @@ def test_history_query_reads_prior_and_current_session_events(tmp_path):
     assert {event.round_label for event in supervisor.read_events()} == {None, "round-2"}
 
 
-def test_performance_query_reads_rounds_json(tmp_path):
+def test_performance_query_reads_rounds_json(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     logs = tmp_path / "run" / "logs"
     logs.mkdir(parents=True)
     (logs / "rounds.json").write_text(
@@ -214,12 +214,12 @@ def test_performance_query_reads_rounds_json(tmp_path):
 
     response = SupervisionService(supervisor).execute(PerformanceQuery())
 
-    assert [round.round for round in response.performance] == [1, 3]
+    assert [round.round for round in response.performance] == [1, 3]  # noqa: A001  # tracked: #288
     assert response.performance[1].perf_metric == 2400.0
     assert response.performance[1].perf_unit == "total_ops_per_sec"
 
 
-def test_chat_reports_structured_failed_invocation(tmp_path):
+def test_chat_reports_structured_failed_invocation(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     supervisor.before_agent("implementer", "round 5", "prompt")
@@ -229,19 +229,19 @@ def test_chat_reports_structured_failed_invocation(tmp_path):
     assert "agent process exited" in answer
 
 
-def test_service_accepts_chat(tmp_path):
+def test_service_accepts_chat(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     (tmp_path / "logs").mkdir()
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path / "logs")
     service = SupervisionService(supervisor)
     chat = service.execute(ChatQuery(text="what is the current status?"))
-    assert chat.chat.question == "what is the current status?"
+    assert chat.chat.question == "what is the current status?"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
     events = _events(tmp_path / "logs" / "run-events.jsonl")
     assert any(event["type"] == "chat" for event in events)
     assert any(event["type"] == "status_query" for event in events)
 
 
-def test_service_routes_chat_to_configured_agent_handler(tmp_path):
+def test_service_routes_chat_to_configured_agent_handler(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     questions = []
@@ -249,14 +249,14 @@ def test_service_routes_chat_to_configured_agent_handler(tmp_path):
 
     response = SupervisionService(supervisor).execute(ChatQuery(text="what changed?"))
 
-    assert response.chat.answer == "agent answer"
+    assert response.chat.answer == "agent answer"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
     assert questions == ["what changed?"]
     assert response.events[-1].type is EventType.CHAT
     assert response.events[-1].agent_kind == "chat"
     assert _events(tmp_path / "run-events.jsonl")[-1]["type"] == "chat"
 
 
-def test_chat_explains_configuration_failure_without_a_run_context(tmp_path):
+def test_chat_explains_configuration_failure_without_a_run_context(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     supervisor.record(
@@ -273,11 +273,11 @@ def test_chat_explains_configuration_failure_without_a_run_context(tmp_path):
 
     response = SupervisionService(supervisor).execute(ChatQuery(text="why did startup fail?"))
 
-    assert "config_loading" in response.chat.answer
-    assert "agent.toml was not found" in response.chat.answer
+    assert "config_loading" in response.chat.answer  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert "agent.toml was not found" in response.chat.answer  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
 
 
-def test_run_context_chat_exposes_trajectory_without_inlining_it_in_prompt(tmp_path):
+def test_run_context_chat_exposes_trajectory_without_inlining_it_in_prompt(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path / "logs")
     (tmp_path / "logs" / "progress.md").write_text("Round 2 improved throughput.")
@@ -285,16 +285,16 @@ def test_run_context_chat_exposes_trajectory_without_inlining_it_in_prompt(tmp_p
     ctx.supervisor = supervisor
     ctx.agent_runner = Mock()
     ctx.agent_runner.invoke_text.return_value = "It improved in round 2."
-    ctx._paths = RunPaths(
+    ctx._paths = RunPaths(  # noqa: SLF001  # tracked: #288
         exp_dir=tmp_path,
         log_dir=tmp_path / "logs",
         workspace=tmp_path / "workspace",
         run_log_path=tmp_path / "run.log",
     )
-    ctx.gpu_env = lambda: {}
-    ctx._progress_stack = []
-    ctx._chat_lock = threading.Lock()
-    ctx._chat_history = []
+    ctx.gpu_env = dict
+    ctx._progress_stack = []  # noqa: SLF001  # tracked: #288
+    ctx._chat_lock = threading.Lock()  # noqa: SLF001  # tracked: #288
+    ctx._chat_history = []  # noqa: SLF001  # tracked: #288
     ctx.logger = Mock()
     ctx.logger.file = Mock()
 
@@ -324,14 +324,14 @@ def test_run_context_chat_exposes_trajectory_without_inlining_it_in_prompt(tmp_p
     assert "It improved in round 2." not in continuation["user_prompt"]
     assert "_vibesys_chat/instructions.md" in continuation["system_prompt"]
     assert "Prefer targeted commands" not in continuation["system_prompt"]
-    assert ctx._load_chat_history() == [("what improved?", "It improved in round 2.")]
+    assert ctx._load_chat_history() == [("what improved?", "It improved in round 2.")]  # noqa: SLF001  # tracked: #288
 
 
-def test_socket_transport_supports_multiple_clients_and_event_replay(tmp_path):
+def test_socket_transport_supports_multiple_clients_and_event_replay(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path / "logs")
     service = SupervisionService(supervisor)
-    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"
+    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108  # tracked: #288
 
     with SupervisionSocketServer(socket_path, service):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as first:
@@ -355,17 +355,17 @@ def test_socket_transport_supports_multiple_clients_and_event_replay(tmp_path):
     assert any(event["type"] == "server_started" for event in replay["events"])
 
 
-def test_socket_transport_returns_clear_chat_agent_errors(tmp_path):
+def test_socket_transport_returns_clear_chat_agent_errors(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path / "logs")
 
     def fail_chat(question: str) -> str:
-        raise RuntimeError(f"Chat agent failed while answering: {question}")
+        raise RuntimeError(f"Chat agent failed while answering: {question}")  # noqa: TRY003  # tracked: #288
 
     supervisor.set_chat_handler(fail_chat)
-    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"
+    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108  # tracked: #288
 
-    with SupervisionSocketServer(socket_path, SupervisionService(supervisor)):
+    with SupervisionSocketServer(socket_path, SupervisionService(supervisor)):  # noqa: SIM117  # tracked: #288
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(socket_path))
             stream = client.makefile("rwb")
@@ -377,13 +377,13 @@ def test_socket_transport_returns_clear_chat_agent_errors(tmp_path):
     assert response["error"] == "Chat agent failed while answering: what happened?"
 
 
-def test_socket_subscription_replays_then_streams_new_events(tmp_path):
+def test_socket_subscription_replays_then_streams_new_events(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path / "logs")
     service = SupervisionService(supervisor)
-    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"
+    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108  # tracked: #288
 
-    with SupervisionSocketServer(socket_path, service):
+    with SupervisionSocketServer(socket_path, service):  # noqa: SIM117  # tracked: #288
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(2)
             client.connect(str(socket_path))
@@ -402,11 +402,11 @@ def test_socket_subscription_replays_then_streams_new_events(tmp_path):
     assert streamed["event"]["type"] == "chat"
 
 
-def test_cli_parse_failure_is_streamed_after_client_attaches():
-    session_dir = Path("/tmp") / f"vs-test-{uuid.uuid4().hex}"
+def test_cli_parse_failure_is_streamed_after_client_attaches():  # noqa: ANN201  # tracked: #288
+    session_dir = Path("/tmp") / f"vs-test-{uuid.uuid4().hex}"  # noqa: S108  # tracked: #288
     session_dir.mkdir()
     socket_path = session_dir / "control.sock"
-    process = subprocess.Popen(
+    process = subprocess.Popen(  # noqa: S603  # tracked: #288
         [
             sys.executable,
             "-m",
@@ -438,6 +438,7 @@ def test_cli_parse_failure_is_streamed_after_client_attaches():
             stream.write(SubscribeRequest(after_sequence=0).model_dump_json().encode() + b"\n")
             stream.flush()
             messages = []
+            events = []
             while True:
                 line = stream.readline()
                 if not line:
@@ -470,8 +471,8 @@ def test_cli_parse_failure_is_streamed_after_client_attaches():
     assert stderr == ""
 
 
-def test_supervision_runtime_streams_configuration_failure_before_exiting():
-    session_dir = Path("/tmp") / f"vs-runtime-test-{uuid.uuid4().hex}"
+def test_supervision_runtime_streams_configuration_failure_before_exiting():  # noqa: ANN201  # tracked: #288
+    session_dir = Path("/tmp") / f"vs-runtime-test-{uuid.uuid4().hex}"  # noqa: S108  # tracked: #288
     socket_path = session_dir / "control.sock"
     received_events = []
     chat_responses = []
@@ -541,28 +542,28 @@ def test_supervision_runtime_streams_configuration_failure_before_exiting():
         shutil.rmtree(session_dir, ignore_errors=True)
 
 
-def test_run_context_records_invocation_boundary(tmp_path):
+def test_run_context_records_invocation_boundary(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
     ctx = _RunContext.__new__(_RunContext)
     ctx.supervisor = supervisor
     ctx.agent_runner = Mock()
     ctx.agent_runner.invoke.return_value = {"summary": "measured"}
-    ctx._paths = RunPaths(
+    ctx._paths = RunPaths(  # noqa: SLF001  # tracked: #288
         exp_dir=tmp_path,
         log_dir=tmp_path / "logs",
         workspace=tmp_path,
         run_log_path=tmp_path / "run.log",
     )
-    ctx.gpu_env = lambda: {}
-    ctx._progress_stack = []
+    ctx.gpu_env = dict
+    ctx._progress_stack = []  # noqa: SLF001  # tracked: #288
 
     result = ctx.invoke(
         kind="implementer",
         system_prompt="system",
         user_prompt="original",
-        response_cls=dict,
-        fallback_factory=dict,
+        response_cls=dict,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        fallback_factory=dict,  # pyright: ignore[reportArgumentType]  # tracked: #297
         round_label="round 6 attempt 2",
     )
 
@@ -574,6 +575,6 @@ def test_run_context_records_invocation_boundary(tmp_path):
     assert started["data"]["user_prompt"] == "original"
 
 
-def test_committed_protocol_schema_matches_python_contract():
+def test_committed_protocol_schema_matches_python_contract():  # noqa: ANN201  # tracked: #288
     schema_path = Path("clients/tui/src/generated/protocol.schema.json")
     assert json.loads(schema_path.read_text()) == ProtocolDocument.model_json_schema()
