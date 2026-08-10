@@ -108,20 +108,44 @@ when needed. npm is not required.
 VibeSys can be installed as a package (`pip install .`, or
 `pip install "git+<repo-url>"`). When a JavaScript toolchain (Bun, or Node with
 npm) is available at install time, the build compiles the OpenTUI client and
-vendors it into the wheel, so a single install ships a usable TUI. Launch it
-with the `vibesys-tui` console script (it still requires Bun at runtime, like
-`./vs`):
+vendors it into the wheel, so a single install ships a usable TUI.
 
 ```bash
 pip install "git+<repo-url>"
-vibesys-tui --input <bundle> ...
 ```
 
-If no JavaScript toolchain is present at install time, the build prints a warning
-and skips the TUI; the engine still installs and runs headless via
-`python -m vibesys ...`. Because the TUI is built from source during install, a
-prebuilt PyPI wheel would not include it — install from source (git/sdist) to get
-the bundled TUI.
+This installs two entry points:
+
+- **`vibesys-tui`** — the interactive TUI, the installed-package equivalent of
+  `./vs`. It requires Bun at runtime (like `./vs`) and forwards all arguments to
+  the engine, so it accepts the same run flags described in
+  [`docs/cli-flags.md`](docs/cli-flags.md).
+- **`python -m vibesys`** — the headless engine (no JavaScript needed). Use this
+  in CI/scripts, or when you did not install with a JS toolchain.
+
+```bash
+# Interactive TUI (needs Bun)
+vibesys-tui --input <bundle> --local --agent-backend cli --cli-provider codex
+
+# Same run, headless (no TUI, no Bun)
+vibesys-tui --input <bundle> --local --headless        # or:
+python -m vibesys --input <bundle> --local
+vibesys-tui --help                                      # full flag list
+```
+
+**Configuration outside the repo.** The `.env` and `agent.toml.example` files
+live in the repo, so an installed-only user supplies configuration directly:
+pass `--config /path/to/agent.toml`, export provider keys into the environment
+(e.g. `OPENAI_API_KEY`), and authenticate coding-agent CLIs through their own
+login flows (`codex login`, etc.). Add `--local` to skip GitHub sync (no `gh`
+required).
+
+**If no JavaScript toolchain is present at install time**, the build prints a
+warning and skips the TUI; the engine still installs and runs headless via
+`python -m vibesys ...`. Running `vibesys-tui` then reports that the TUI is not
+bundled and points you to the headless command. Because the TUI is built from
+source during install, a prebuilt PyPI wheel would not include it — install from
+source (git/sdist) with a JS toolchain to get the bundled TUI.
 
 ## Quickstart
 
