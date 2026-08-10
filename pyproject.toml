@@ -36,13 +36,19 @@ omnigent = ["omnigent==0.6.0"]
 
 [project.scripts]
 vibesys-issue-mcp = "vs_issue_board.mcp:main"
+# The `vibesys` launcher: starts the interactive TUI (bundled only when the
+# wheel was built with a JavaScript toolchain), or runs the headless engine with
+# `--headless`/`validate`/no TTY. The engine itself is also `python -m vibesys`.
+vibesys = "vibesys.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["vibesys*"]
 
 [tool.setuptools.package-data]
-vibesys = ["prompts/*.j2", "prompts/**/*.j2", "prompts/**/*.md", "domains/README.md"]
+# ``_tui`` is produced at build time by setup.py's build_py step and injected
+# into the wheel's build tree; the glob keeps it as package data when present.
+vibesys = ["prompts/*.j2", "prompts/**/*.j2", "prompts/**/*.md", "domains/README.md", "_tui/**/*"]
 
 [dependency-groups]
 dev = [

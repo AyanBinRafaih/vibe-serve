@@ -4,6 +4,19 @@ This document is the canonical map for VibeSys's CLI flag axes. Update it in
 the same PR whenever a flag, backend, domain, loop, runtime environment, or
 profiler behavior changes.
 
+## Entry Points
+
+The same flags below apply no matter how you launch VibeSys:
+
+| Entry point | Use |
+| --- | --- |
+| `./vs` | In-repo launcher. Builds/runs the interactive TUI (needs Bun), or runs headless for `validate`/`--headless`. |
+| `vibesys` | Installed-package launcher (equivalent to `./vs`). Forwards all flags to the engine; launches the TUI by default (needs Bun) and runs headless with `--headless`, for `validate`, or when not attached to a TTY. |
+| `python -m vibesys` | The headless engine directly. No JavaScript runtime required. |
+
+Examples in this document use `./vs`; substitute `vibesys` (add `--headless` to
+skip the TUI) when running from an installed package.
+
 ## Mental Model
 
 Several flags look independent, but they combine into one execution contract:
