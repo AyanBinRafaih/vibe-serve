@@ -228,15 +228,31 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--skills-dir",
-        default=list(DEFAULT_SKILL_ROOTS),
+        default=None,
         action="append",
         type=Path,
+        metavar="PATH",
         help=(
-            "Path to a skill source candidate root (can be repeated). Each "
-            "entry can be either a single skill directory (containing a "
-            "top-level `SKILL.md`) or a parent directory of multiple skill "
-            "directories. Skills with VibeSys routing metadata are loaded only "
-            "for matching domains and backends. Default: `resources/skills/`."
+            "Skill source that REPLACES the built-in preset roots (can be "
+            "repeated). Each entry is a skill directory (containing a top-level "
+            "`SKILL.md`), a parent directory of many skills, or a single "
+            "`SKILL.md` file. When omitted, the preset `resources/skills/` is "
+            "used. To keep the presets and add your own, use --extra-skills."
+        ),
+    )
+    parser.add_argument(
+        "--extra-skills",
+        default=None,
+        action="append",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Additional skill source stacked ON TOP of the preset roots (or on "
+            "top of --skills-dir when that is given). Repeat for multiple. Each "
+            "entry is a skill directory, a parent directory of many skills, or a "
+            "single `SKILL.md` file. Skills with VibeSys routing metadata still "
+            "load only for matching domains and backends; a same-named skill "
+            "from here overrides a preset one."
         ),
     )
     parser.add_argument(
@@ -246,7 +262,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "Disable skills entirely: no skill directories are copied into "
             "the workspace and no per-CLI skill-discovery paths are populated. "
             "Used for ablations measuring the skill library's contribution. "
-            "Overrides --skills-dir."
+            "Overrides --skills-dir and --extra-skills."
         ),
     )
     parser.add_argument(
@@ -417,12 +433,11 @@ def load_config_and_skills(
     if getattr(args, "no_skills", False):
         skills = None
     else:
-        raw_skills = (
-            args.skills_dir
-            if isinstance(args.skills_dir, list)
-            else ([args.skills_dir] if args.skills_dir else None)
-        )
-        skills = resolve_skill_source_dirs(raw_skills, backend=backend, domain=domain)
+        # --skills-dir overrides the presets; when omitted, the presets are the
+        # base. --extra-skills always stacks on top (presets or the override).
+        base = getattr(args, "skills_dir", None) or list(DEFAULT_SKILL_ROOTS)
+        extra = getattr(args, "extra_skills", None) or []
+        skills = resolve_skill_source_dirs([*base, *extra], backend=backend, domain=domain)
     return config, skills, backend
 
 

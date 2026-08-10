@@ -300,15 +300,28 @@ def discover_sidecar_rules(root: Path) -> list[SkillRule]:
 
 
 def coerce_skill_root(raw: str | Path, *, project_root: Path = PROJECT_ROOT) -> Path:
-    """Resolve one configured skill root path."""
+    """Resolve one configured skill source to a directory.
+
+    A source may be a skill directory (containing ``SKILL.md``), a parent tree
+    of many skills, or a single ``SKILL.md`` file (resolved to its containing
+    skill directory).
+    """
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = project_root / path
     path = path.resolve()
     if not path.exists():
-        raise ValueError(f"--skills-dir path does not exist: {raw}")  # noqa: TRY003  # tracked: #288
+        raise ValueError(f"skill source path does not exist: {raw}")  # noqa: TRY003  # tracked: #288
+    if path.is_file():
+        if path.name != "SKILL.md":
+            raise ValueError(  # noqa: TRY003  # tracked: #288
+                f"skill source file must be a SKILL.md file: {raw}"
+            )
+        return path.parent
     if not path.is_dir():
-        raise ValueError(f"--skills-dir path is not a directory: {raw}")  # noqa: TRY003  # tracked: #288
+        raise ValueError(  # noqa: TRY003  # tracked: #288
+            f"skill source path is not a directory or SKILL.md file: {raw}"
+        )
     return path
 
 
