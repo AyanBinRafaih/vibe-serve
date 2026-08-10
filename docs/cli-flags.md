@@ -238,7 +238,9 @@ context for the agent and evolve loops. Registered domains include:
 | `microservices` | Microservice workload guidance, lifecycle rules, and service-level evaluation context. |
 | `generic` | No extra domain guidance. Useful for custom/non-LLM targets. |
 
-Each input bundle must declare `[agent].domain`; there is no CLI override. New
+Each input bundle must declare `[agent].domain`; there is no CLI override for a
+bundle passed with `--input`. When synthesizing a bundle from `--input-*` flags
+instead, `--input-domain` sets `[agent].domain` for the generated manifest. New
 domains are added in source by registering a domain package with optional
 environment setup/teardown hooks.
 
@@ -410,6 +412,54 @@ The revision must be an ancestor of the current experiment `HEAD`. The guard
 continues to reject pending trusted-input edits and every trusted-input change
 committed after that baseline. Omitting the flag retains the original initial
 workspace baseline, so ordinary resumes cannot silently bless agent tampering.
+
+### Providing inputs without a bundle (`--input-*`)
+
+For external usage where no `examples/` bundle is on disk, pass the bundle's
+contents as separate `--input-*` flags instead of `--input`. VibeSys synthesizes
+a bundle under `exp_env/_inputs/<exp-name>/` and then loads it through the same
+path as `--input`, so every loop, resume, and evaluator behaves identically. The
+two forms are mutually exclusive: combining `--input` with any `--input-*` flag
+is rejected.
+
+Required flags:
+
+| Flag | Maps to |
+| --- | --- |
+| `--input-objective TEXT` or `--input-objective-file PATH` | `OBJECTIVE.md` |
+| `--input-domain {llm-serving,generic,microservices}` | `[agent].domain` |
+| `--input-accuracy-command CMD` | `[accuracy].command` (shell-quoted argv) |
+| `--input-benchmark-command CMD` | `[benchmark].command` (shell-quoted argv) |
+
+Optional flags:
+
+| Flag | Maps to |
+| --- | --- |
+| `--input-accuracy-timeout SECONDS` / `--input-benchmark-timeout SECONDS` | command `timeout_seconds` |
+| `--input-benchmark-metric NAME` + `--input-benchmark-result-arg OPT` | `[benchmark.result]` (both required together) |
+| `--input-reference DIR` | copied to `reference/` |
+| `--input-evaluator-dir DIR` | contents copied into the bundle root (evaluator scripts the commands invoke) |
+| `--input-workspace-seed DIR` | `[workspace].seed` (staged inside the bundle) |
+| `--input-evaluator-source DIR` | `[evaluator].source` (staged inside the bundle) |
+| `--input-hidden-evaluator-source DIR` | `[hidden_evaluator].source` (staged inside the bundle) |
+
+Unlike bundle-declared `workspace.seed` and `evaluator.source`, which must
+resolve inside `examples/starters/` and `examples/evaluators/`, the synthesized
+bundle stages these directories inside itself, so any local directory is
+accepted. Git-pinned `[[workspace.sources]]` entries are not exposed as flags;
+use `--input` for those.
+
+```bash
+./vs \
+  --input-objective-file ./OBJECTIVE.md \
+  --input-domain llm-serving \
+  --input-accuracy-command "python checker.py" \
+  --input-benchmark-command "python benchmark.py --result-json out.json" \
+  --input-benchmark-metric requests_per_second \
+  --input-benchmark-result-arg --result-json \
+  --input-evaluator-dir ./evaluator \
+  --local
+```
 
 ## Common Commands
 

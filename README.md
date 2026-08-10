@@ -154,6 +154,14 @@ agent domain, correctness command, benchmark command, optional starter
 workspace, optional trusted evaluator source, and optional benchmark result
 metric.
 
+For external usage without a bundle on disk, supply the same pieces as separate
+`--input-objective`/`--input-objective-file`, `--input-domain`,
+`--input-accuracy-command`, and `--input-benchmark-command` flags (plus optional
+`--input-reference`, `--input-evaluator-dir`, and others). VibeSys synthesizes a
+bundle and runs it identically. See
+[`docs/cli-flags.md`](docs/cli-flags.md#providing-inputs-without-a-bundle---input-)
+for the full flag list.
+
 `OBJECTIVE.md` is read at the start of every run and must live next to the
 `reference/` directory (sibling, not inside). See `examples/model-serving/Llama-3-8B/`, `examples/model-serving/moonshine-streaming/`, `examples/model-serving/qwen3-32b-code-edit/`, `examples/model-serving/olmo-hybrid-prefix-caching/`, `examples/model-serving/Llama-3.1-8B-Instruct-MLX-8bit/`, `examples/model-serving/show-o2-1.5B-HQ-h100/`, and `examples/model-serving/show-o2-1.5B-HQ-macbook/` for the paper scenarios.
 
