@@ -4,6 +4,19 @@ This document is the canonical map for VibeSys's CLI flag axes. Update it in
 the same PR whenever a flag, backend, domain, loop, runtime environment, or
 profiler behavior changes.
 
+## Entry Points
+
+The same flags below apply no matter how you launch VibeSys:
+
+| Entry point | Use |
+| --- | --- |
+| `./vs` | In-repo launcher. Builds/runs the interactive TUI (needs Bun), or runs headless for `validate`/`--headless`. |
+| `vibesys` | Installed-package launcher (equivalent to `./vs`). Forwards all flags to the engine; launches the TUI by default (needs Bun) and runs headless with `--headless`, for `validate`, or when not attached to a TTY. |
+| `python -m vibesys` | The headless engine directly. No JavaScript runtime required. |
+
+Examples in this document use `./vs`; substitute `vibesys` (add `--headless` to
+skip the TUI) when running from an installed package.
+
 ## Mental Model
 
 Several flags look independent, but they combine into one execution contract:
@@ -17,7 +30,7 @@ Several flags look independent, but they combine into one execution contract:
 | Profiler | `--profiler` | Bottleneck evidence source: `nsys`, `torch`, `neuron`, `otel`, `macos_cpu`, `linux_cpu`, or `auto`. |
 | Domain | `[agent].domain` in `vibesys.input.toml` | Problem-space package used by the agent and evolve loops, such as `llm-serving`, `microservices`, or `generic`. |
 | Modality | `--modality` | Per-task I/O contract, such as `text_generation` or `speech_to_text`. |
-| Skills | `--skills-dir`, `--no-skills` | Candidate skill roots and the ablation switch that disables skill loading. |
+| Skills | `--skills-dir`, `--extra-skills`, `--no-skills` | Override the preset skill roots, stack extra skills on top of the presets, or disable skill loading. |
 | Target inputs | `--input` | Target bundle directory with manifest-declared correctness and benchmark commands. |
 | Experiment repository | `--repo`, `--repo-visibility`, `--local`, `--resume` | Fresh runs use GitHub by default; `--local` keeps one under `exp_env/`, and `--resume` accepts local paths or GitHub repositories. |
 | Client theme | `--theme` | Presentation only. Which semantic theme the interactive client renders with. |
@@ -238,7 +251,9 @@ context for the agent and evolve loops. Registered domains include:
 | `microservices` | Microservice workload guidance, lifecycle rules, and service-level evaluation context. |
 | `generic` | No extra domain guidance. Useful for custom/non-LLM targets. |
 
-Each input bundle must declare `[agent].domain`; there is no CLI override. New
+Each input bundle must declare `[agent].domain`; there is no CLI override for a
+bundle passed with `--input`. When synthesizing a bundle from `--input-*` flags
+instead, `--input-domain` sets `[agent].domain` for the generated manifest. New
 domains are added in source by registering a domain package with optional
 environment setup/teardown hooks.
 
@@ -289,9 +304,26 @@ suffix.
 
 ## Skills
 
-`--skills-dir` supplies skill candidate roots. Each value may point at one skill
-directory containing `SKILL.md`, or at a parent tree containing multiple skills.
-The default candidate root is `resources/skills/`.
+Skill sources come from two flags, both repeatable, and each value may point at
+one skill directory containing `SKILL.md`, a parent tree containing multiple
+skills, or a single `SKILL.md` file:
+
+- **`--skills-dir PATH`** *replaces* the built-in preset roots. When omitted, the
+  preset `resources/skills/` is the base.
+- **`--extra-skills PATH`** *stacks on top of* the presets (or on top of
+  `--skills-dir` when that is given). Use this to add your own skills while
+  keeping the presets such as the `llm-serving` serving-systems skills. A
+  same-named skill from `--extra-skills` overrides a preset one.
+
+```bash
+# presets + your own skill directory and a single SKILL.md file
+./vs --input <bundle> \
+  --extra-skills ./my-skills \
+  --extra-skills ./one-off-skill/SKILL.md
+
+# use ONLY your skills, ignoring the presets
+./vs --input <bundle> --skills-dir ./my-skills
+```
 
 Before a run starts, VibeSys discovers each `SKILL.md` under the candidate
 roots and validates its frontmatter. Optional `.vibesys.toml` sidecars can
@@ -311,9 +343,10 @@ Effective skill loading is the intersection of the declared constraints:
   backend is in that list;
 - skills matched by a sidecar rule with `domains` load only when the input
   bundle's `[agent].domain` is in that list;
-- `--skills-dir` adds candidate roots, but routing metadata still filters the
-  discovered skills;
-- `--no-skills` disables all skill loading, including scoped skills.
+- `--skills-dir` and `--extra-skills` add candidate roots, but routing metadata
+  still filters the discovered skills;
+- `--no-skills` disables all skill loading, including scoped skills, and
+  overrides both `--skills-dir` and `--extra-skills`.
 
 See [Skill Metadata](skill-metadata.md) for the VibeSys-specific metadata
 contract and validation rules.
@@ -410,6 +443,54 @@ The revision must be an ancestor of the current experiment `HEAD`. The guard
 continues to reject pending trusted-input edits and every trusted-input change
 committed after that baseline. Omitting the flag retains the original initial
 workspace baseline, so ordinary resumes cannot silently bless agent tampering.
+
+### Providing inputs without a bundle (`--input-*`)
+
+For external usage where no `examples/` bundle is on disk, pass the bundle's
+contents as separate `--input-*` flags instead of `--input`. VibeSys synthesizes
+a bundle under `exp_env/_inputs/<exp-name>/` and then loads it through the same
+path as `--input`, so every loop, resume, and evaluator behaves identically. The
+two forms are mutually exclusive: combining `--input` with any `--input-*` flag
+is rejected.
+
+Required flags:
+
+| Flag | Maps to |
+| --- | --- |
+| `--input-objective TEXT` or `--input-objective-file PATH` | `OBJECTIVE.md` |
+| `--input-domain {llm-serving,generic,microservices}` | `[agent].domain` |
+| `--input-accuracy-command CMD` | `[accuracy].command` (shell-quoted argv) |
+| `--input-benchmark-command CMD` | `[benchmark].command` (shell-quoted argv) |
+
+Optional flags:
+
+| Flag | Maps to |
+| --- | --- |
+| `--input-accuracy-timeout SECONDS` / `--input-benchmark-timeout SECONDS` | command `timeout_seconds` |
+| `--input-benchmark-metric NAME` + `--input-benchmark-result-arg OPT` | `[benchmark.result]` (both required together) |
+| `--input-reference DIR` | copied to `reference/` |
+| `--input-evaluator-dir DIR` | contents copied into the bundle root (evaluator scripts the commands invoke) |
+| `--input-workspace-seed DIR` | `[workspace].seed` (staged inside the bundle) |
+| `--input-evaluator-source DIR` | `[evaluator].source` (staged inside the bundle) |
+| `--input-hidden-evaluator-source DIR` | `[hidden_evaluator].source` (staged inside the bundle) |
+
+Unlike bundle-declared `workspace.seed` and `evaluator.source`, which must
+resolve inside `examples/starters/` and `examples/evaluators/`, the synthesized
+bundle stages these directories inside itself, so any local directory is
+accepted. Git-pinned `[[workspace.sources]]` entries are not exposed as flags;
+use `--input` for those.
+
+```bash
+./vs \
+  --input-objective-file ./OBJECTIVE.md \
+  --input-domain llm-serving \
+  --input-accuracy-command "python checker.py" \
+  --input-benchmark-command "python benchmark.py --result-json out.json" \
+  --input-benchmark-metric requests_per_second \
+  --input-benchmark-result-arg --result-json \
+  --input-evaluator-dir ./evaluator \
+  --local
+```
 
 ## Common Commands
 
