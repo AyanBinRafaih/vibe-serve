@@ -36,10 +36,10 @@ omnigent = ["omnigent==0.6.0"]
 
 [project.scripts]
 vibesys-issue-mcp = "vs_issue_board.mcp:main"
-# Launches the bundled OpenTUI client (present only when the wheel was built
-# with a JavaScript toolchain available). Falls back to a clear message plus
-# headless `python -m vibesys` otherwise.
-vibesys-tui = "vibesys.tui_launcher:main"
+# The `vibesys` launcher: starts the interactive TUI (bundled only when the
+# wheel was built with a JavaScript toolchain), or runs the headless engine with
+# `--headless`/`validate`/no TTY. The engine itself is also `python -m vibesys`.
+vibesys = "vibesys.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -11,11 +11,11 @@ The same flags below apply no matter how you launch VibeSys:
 | Entry point | Use |
 | --- | --- |
 | `./vs` | In-repo launcher. Builds/runs the interactive TUI (needs Bun), or runs headless for `validate`/`--headless`. |
+| `vibesys` | Installed-package launcher (equivalent to `./vs`). Forwards all flags to the engine; launches the TUI by default (needs Bun) and runs headless with `--headless`, for `validate`, or when not attached to a TTY. |
 | `python -m vibesys` | The headless engine directly. No JavaScript runtime required. |
-| `vibesys-tui` | Installed-package TUI (present when the wheel was built with a JS toolchain). Forwards all flags to the engine and requires Bun at runtime; add `--headless` to skip the frontend. |
 
-Examples in this document use `./vs`; substitute `vibesys-tui` (or
-`python -m vibesys` for headless) when running from an installed package.
+Examples in this document use `./vs`; substitute `vibesys` (add `--headless` to
+skip the TUI) when running from an installed package.
 
 ## Mental Model
 
