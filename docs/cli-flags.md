@@ -30,7 +30,7 @@ Several flags look independent, but they combine into one execution contract:
 | Profiler | `--profiler` | Bottleneck evidence source: `nsys`, `torch`, `neuron`, `otel`, `macos_cpu`, `linux_cpu`, or `auto`. |
 | Domain | `[agent].domain` in `vibesys.input.toml` | Problem-space package used by the agent and evolve loops, such as `llm-serving`, `microservices`, or `generic`. |
 | Modality | `--modality` | Per-task I/O contract, such as `text_generation` or `speech_to_text`. |
-| Skills | `--skills-dir`, `--no-skills` | Candidate skill roots and the ablation switch that disables skill loading. |
+| Skills | `--skills-dir`, `--extra-skills`, `--no-skills` | Override the preset skill roots, stack extra skills on top of the presets, or disable skill loading. |
 | Target inputs | `--input` | Target bundle directory with manifest-declared correctness and benchmark commands. |
 | Experiment repository | `--repo`, `--repo-visibility`, `--local`, `--resume` | Fresh runs use GitHub by default; `--local` keeps one under `exp_env/`, and `--resume` accepts local paths or GitHub repositories. |
 | Client theme | `--theme` | Presentation only. Which semantic theme the interactive client renders with. |
@@ -304,9 +304,26 @@ suffix.
 
 ## Skills
 
-`--skills-dir` supplies skill candidate roots. Each value may point at one skill
-directory containing `SKILL.md`, or at a parent tree containing multiple skills.
-The default candidate root is `resources/skills/`.
+Skill sources come from two flags, both repeatable, and each value may point at
+one skill directory containing `SKILL.md`, a parent tree containing multiple
+skills, or a single `SKILL.md` file:
+
+- **`--skills-dir PATH`** *replaces* the built-in preset roots. When omitted, the
+  preset `resources/skills/` is the base.
+- **`--extra-skills PATH`** *stacks on top of* the presets (or on top of
+  `--skills-dir` when that is given). Use this to add your own skills while
+  keeping the presets such as the `llm-serving` serving-systems skills. A
+  same-named skill from `--extra-skills` overrides a preset one.
+
+```bash
+# presets + your own skill directory and a single SKILL.md file
+./vs --input <bundle> \
+  --extra-skills ./my-skills \
+  --extra-skills ./one-off-skill/SKILL.md
+
+# use ONLY your skills, ignoring the presets
+./vs --input <bundle> --skills-dir ./my-skills
+```
 
 Before a run starts, VibeSys discovers each `SKILL.md` under the candidate
 roots and validates its frontmatter. Optional `.vibesys.toml` sidecars can
@@ -326,9 +343,10 @@ Effective skill loading is the intersection of the declared constraints:
   backend is in that list;
 - skills matched by a sidecar rule with `domains` load only when the input
   bundle's `[agent].domain` is in that list;
-- `--skills-dir` adds candidate roots, but routing metadata still filters the
-  discovered skills;
-- `--no-skills` disables all skill loading, including scoped skills.
+- `--skills-dir` and `--extra-skills` add candidate roots, but routing metadata
+  still filters the discovered skills;
+- `--no-skills` disables all skill loading, including scoped skills, and
+  overrides both `--skills-dir` and `--extra-skills`.
 
 See [Skill Metadata](skill-metadata.md) for the VibeSys-specific metadata
 contract and validation rules.

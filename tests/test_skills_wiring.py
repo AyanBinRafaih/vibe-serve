@@ -17,6 +17,7 @@ from vibesys.skills import (
     SkillMetadataError,
     _is_in_hidden_dir,
     build_skill_catalog,
+    coerce_skill_root,
     discover_sidecar_rules,
     discover_skill_dirs,
     load_sidecar_rules,
@@ -37,12 +38,28 @@ NKI_SKILL_NAMES = {
 }
 
 
-def _args(tmp_path, backend, *, no_skills=False, skills_dir=None):  # noqa: ANN001, ANN202  # tracked: #288
+def _args(  # noqa: ANN202, PLR0913  # tracked: #288
+    tmp_path,  # noqa: ANN001  # tracked: #288
+    backend,  # noqa: ANN001  # tracked: #288
+    *,
+    no_skills=False,  # noqa: ANN001  # tracked: #288
+    skills_dir=None,  # noqa: ANN001  # tracked: #288
+    extra_skills=None,  # noqa: ANN001  # tracked: #288
+    default_presets=True,  # noqa: ANN001  # tracked: #288
+):
     cfg = tmp_path / "agent.toml"
     cfg.write_text('[model]\nname = "gpt-5.5"\n')
-    if skills_dir is None:
+    # By default emulate "presets only" by pointing --skills-dir at the repo
+    # presets; pass default_presets=False to exercise the omitted-flag path.
+    if skills_dir is None and default_presets:
         skills_dir = [Path("resources/skills")]
-    return SimpleNamespace(config=cfg, no_skills=no_skills, skills_dir=skills_dir, backend=backend)
+    return SimpleNamespace(
+        config=cfg,
+        no_skills=no_skills,
+        skills_dir=skills_dir,
+        extra_skills=extra_skills,
+        backend=backend,
+    )
 
 
 def _skill_names(skills: list[str] | None) -> set[str]:
@@ -101,6 +118,62 @@ def test_no_skills_disables_even_compatible_skills(tmp_path):  # noqa: ANN001, A
         domain=DomainName.LLM_SERVING,
     )
     assert skills is None
+
+
+def test_omitted_skills_dir_uses_presets(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    # With no --skills-dir the preset roots (resources/skills) are the base.
+    _, skills, _ = load_config_and_skills(
+        _args(tmp_path, ComputeBackend.CUDA, default_presets=False),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        domain=DomainName.LLM_SERVING,
+    )
+    assert "serving-systems" in _skill_names(skills)
+
+
+def test_extra_skills_stack_on_presets(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    custom_root = tmp_path / "mine"
+    _write_skill(custom_root, "custom-skill")
+
+    _, skills, _ = load_config_and_skills(
+        _args(tmp_path, ComputeBackend.CUDA, extra_skills=[custom_root]),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        domain=DomainName.LLM_SERVING,
+    )
+    names = _skill_names(skills)
+    assert "custom-skill" in names  # user skill loaded
+    assert "serving-systems" in names  # preset still present
+
+
+def test_skills_dir_replaces_presets(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    custom_root = tmp_path / "mine"
+    _write_skill(custom_root, "custom-skill")
+
+    _, skills, _ = load_config_and_skills(
+        _args(tmp_path, ComputeBackend.CUDA, skills_dir=[custom_root]),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        domain=DomainName.LLM_SERVING,
+    )
+    names = _skill_names(skills)
+    assert names == {"custom-skill"}  # only the override, presets replaced
+
+
+def test_coerce_skill_root_accepts_skill_md_file(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    skill_dir = _write_skill(tmp_path, "portable")
+
+    assert coerce_skill_root(skill_dir / "SKILL.md") == skill_dir.resolve()
+
+    (tmp_path / "notes.md").write_text("x\n")
+    with pytest.raises(ValueError, match="must be a SKILL"):
+        coerce_skill_root(tmp_path / "notes.md")
+
+
+def test_resolve_accepts_single_skill_md_file(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    root = tmp_path / "mine"
+    skill_dir = _write_skill(root, "one")
+    _write_skill(root, "two")  # sibling that must NOT be pulled in
+
+    resolved = resolve_skill_source_dirs(
+        [skill_dir / "SKILL.md"], backend=ComputeBackend.CUDA, domain=DomainName.GENERIC
+    )
+
+    assert _skill_names(resolved) == {"one"}
 
 
 def test_sidecar_rule_filters_descendant_skill_subtree_by_backend(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
