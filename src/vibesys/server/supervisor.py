@@ -37,6 +37,7 @@ class RunSupervisor:
         self._condition = threading.Condition()
         self._pause_after_call = False
         self._paused = False
+        self._pending_steer: list[str] = []
         self._active_invocation: str | None = None
         self._run_status = "starting"
         self._store: EventStore | None = None
@@ -225,15 +226,30 @@ class RunSupervisor:
             self._condition.notify_all()
         self.record(EventType.CONTROL, "/resume", status=EventStatus.CONSUMED)
 
+    def steer(self, text: str) -> None:
+        """Queue an operator instruction for the next agent invocation.
+
+        The message is drained and appended to the next agent's user prompt in
+        :meth:`before_agent`. It applies whether the run is live or paused (in
+        which case it takes effect when the run resumes).
+        """
+        with self._condition:
+            self._pending_steer.append(text)
+        self.record(EventType.CONTROL, f"/steer: {text}", status=EventStatus.PENDING)
+
     def before_agent(  # noqa: D102  # tracked: #288
         self, kind: str, round_label: str, user_prompt: str, system_prompt: str = ""
-    ) -> None:
+    ) -> str:
         with self._condition:
             while self._paused:
                 self._condition.wait()
+            steer_messages = self._pending_steer
+            self._pending_steer = []
             self._current_kind, self._current_round = kind, round_label
             invocation_id = uuid.uuid4().hex
             self._active_invocation = invocation_id
+
+        effective_prompt = _with_steering(user_prompt, steer_messages)
 
         phase = PhaseData(phase=kind, attempt=_attempt_from_label(round_label))
         self.record(
@@ -250,8 +266,18 @@ class RunSupervisor:
             agent_kind=kind,
             round_label=round_label,
             invocation_id=invocation_id,
-            data=InvocationStartedData(system_prompt=system_prompt, user_prompt=user_prompt),
+            data=InvocationStartedData(system_prompt=system_prompt, user_prompt=effective_prompt),
         )
+        if steer_messages:
+            self.record(
+                EventType.CONTROL,
+                "/steer",
+                status=EventStatus.CONSUMED,
+                agent_kind=kind,
+                round_label=round_label,
+                invocation_id=invocation_id,
+            )
+        return effective_prompt
 
     def after_agent(  # noqa: D102  # tracked: #288
         self,
@@ -320,3 +346,17 @@ class RunSupervisor:
 def _attempt_from_label(round_label: str) -> int | None:
     match = re.search(r"retry-(\d+)", round_label)
     return int(match.group(1)) if match else None
+
+
+def _with_steering(user_prompt: str, messages: list[str]) -> str:
+    """Append queued operator steering instructions to an agent's user prompt."""
+    if not messages:
+        return user_prompt
+    block = "\n".join(f"- {message}" for message in messages)
+    return (
+        f"{user_prompt.rstrip()}\n\n"
+        "## Operator steering (live)\n\n"
+        "The operator sent the following instruction(s) for this invocation. "
+        "Treat them as high-priority guidance for the work you do now:\n\n"
+        f"{block}\n"
+    )
