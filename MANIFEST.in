@@ -1,0 +1,10 @@
+# Include the TypeScript TUI sources in the sdist so a source build can compile
+# and vendor the OpenTUI client. Exclude generated/installed artifacts, which
+# the build regenerates on the target machine.
+graft clients/tui/src
+include clients/tui/package.json
+include clients/tui/tsconfig.json
+include clients/tui/tsconfig.check.json
+include clients/tui/README.md
+prune clients/tui/dist
+prune clients/tui/node_modules

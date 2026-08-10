@@ -103,6 +103,26 @@ To use the interactive TUI, install Node.js 20+, Bun, and pnpm 11 (or enable
 Corepack). Run `./vs`; it installs the frontend dependencies and builds the TUI
 when needed. npm is not required.
 
+### Installing outside the repo (`pip install`)
+
+VibeSys can be installed as a package (`pip install .`, or
+`pip install "git+<repo-url>"`). When a JavaScript toolchain (Bun, or Node with
+npm) is available at install time, the build compiles the OpenTUI client and
+vendors it into the wheel, so a single install ships a usable TUI. Launch it
+with the `vibesys-tui` console script (it still requires Bun at runtime, like
+`./vs`):
+
+```bash
+pip install "git+<repo-url>"
+vibesys-tui --input <bundle> ...
+```
+
+If no JavaScript toolchain is present at install time, the build prints a warning
+and skips the TUI; the engine still installs and runs headless via
+`python -m vibesys ...`. Because the TUI is built from source during install, a
+prebuilt PyPI wheel would not include it — install from source (git/sdist) to get
+the bundled TUI.
+
 ## Quickstart
 
 ```bash
