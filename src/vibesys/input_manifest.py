@@ -258,17 +258,32 @@ class InputBundle(BaseModel):
         return self.manifest.workspace.sources
 
 
+def _within(child: Path, parent: Path) -> bool:
+    """Return whether ``child`` resolves inside ``parent`` (or equals it)."""
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
 def load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
     path: Path,
     *,
     project_root: Path | None = None,
     allow_materialized_sources: bool = False,
+    allow_bundle_local_sources: bool = False,
 ) -> InputBundle:
     """Load and validate a command-based input bundle.
 
     ``allow_materialized_sources`` is used only when resuming an experiment
     from its copied workspace. Starter and evaluator sources may have lived
     outside the original bundle and are no longer needed once materialized.
+
+    ``allow_bundle_local_sources`` additionally permits workspace seed and
+    evaluator sources to resolve inside the bundle root itself, not only under
+    the repository ``examples/`` trees. It is used for bundles synthesized from
+    standalone CLI flags, which stage their trusted sources inside the bundle.
     """
     project_root = (project_root or PROJECT_ROOT).resolve()
     root = path.expanduser().resolve()
@@ -324,13 +339,14 @@ def load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
         and not allow_materialized_sources
     ):
         starters_root = (project_root / "examples" / "starters").resolve()
+        allowed_seed_roots = (
+            (root, starters_root) if allow_bundle_local_sources else (starters_root,)
+        )
         workspace_seed_path = (root / manifest.workspace.seed).resolve()
-        try:
-            workspace_seed_path.relative_to(starters_root)
-        except ValueError as exc:
+        if not any(_within(workspace_seed_path, allowed) for allowed in allowed_seed_roots):
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"workspace.seed must resolve inside {starters_root}: {manifest.workspace.seed}"
-            ) from exc
+            )
         if not workspace_seed_path.exists():
             raise FileNotFoundError(f"workspace.seed path does not exist: {workspace_seed_path}")  # noqa: TRY003  # tracked: #288
         if not workspace_seed_path.is_dir():
@@ -339,14 +355,15 @@ def load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
     evaluator_path = None
     if manifest.evaluator is not None and not allow_materialized_sources:
         evaluators_root = (project_root / "examples" / "evaluators").resolve()
+        allowed_eval_roots = (
+            (root, evaluators_root) if allow_bundle_local_sources else (evaluators_root,)
+        )
         evaluator_path = (root / manifest.evaluator.source).resolve()
-        try:
-            evaluator_path.relative_to(evaluators_root)
-        except ValueError as exc:
+        if not any(_within(evaluator_path, allowed) for allowed in allowed_eval_roots):
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"evaluator.source must resolve inside {evaluators_root}: "
                 f"{manifest.evaluator.source}"
-            ) from exc
+            )
         if not evaluator_path.exists():
             raise FileNotFoundError(f"evaluator.source path does not exist: {evaluator_path}")  # noqa: TRY003  # tracked: #288
         if not evaluator_path.is_dir():
@@ -355,14 +372,15 @@ def load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
     hidden_evaluator_path = None
     if manifest.hidden_evaluator is not None and not allow_materialized_sources:
         evaluators_root = (project_root / "examples" / "evaluators").resolve()
+        allowed_hidden_roots = (
+            (root, evaluators_root) if allow_bundle_local_sources else (evaluators_root,)
+        )
         hidden_evaluator_path = (root / manifest.hidden_evaluator.source).resolve()
-        try:
-            hidden_evaluator_path.relative_to(evaluators_root)
-        except ValueError as exc:
+        if not any(_within(hidden_evaluator_path, allowed) for allowed in allowed_hidden_roots):
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"hidden_evaluator.source must resolve inside {evaluators_root}: "
                 f"{manifest.hidden_evaluator.source}"
-            ) from exc
+            )
         if not hidden_evaluator_path.exists():
             raise FileNotFoundError(  # noqa: TRY003  # tracked: #288
                 f"hidden_evaluator.source path does not exist: {hidden_evaluator_path}"

@@ -25,8 +25,11 @@ from vibesys.server.protocol import (
     ChatQuery,
     EventsQuery,
     HistoryQuery,
+    PauseCommand,
     PerformanceQuery,
+    ResumeCommand,
     SnapshotQuery,
+    SteerCommand,
     SubscribeRequest,
 )
 from vibesys.server.runtime import run_server
@@ -66,7 +69,66 @@ def test_pause_takes_effect_at_next_safe_point(tmp_path):  # noqa: ANN001, ANN20
     assert waiter.is_alive()
     supervisor.resume()
     waiter.join(timeout=1)
-    assert result == [None]
+    # before_agent returns the effective prompt (unchanged without steering).
+    assert result == ["prompt"]
+
+
+def test_steer_injects_into_next_invocation(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.steer("focus on the KV cache")
+
+    effective = supervisor.before_agent("implementer", "round 1", "Do the work")
+
+    assert "Do the work" in effective
+    assert "focus on the KV cache" in effective
+    assert "Operator steering" in effective
+    started = next(e for e in supervisor.read_events() if e.type == "invocation_started")
+    assert started.data.user_prompt == effective  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    # Steering is one-shot: a later invocation without a new /steer is unchanged.
+    supervisor.after_agent("implementer", "round 1")
+    next_effective = supervisor.before_agent("judge", "round 1", "Review it")
+    assert next_effective == "Review it"
+
+
+def test_steer_while_paused_applies_on_resume(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.pause_after_call()
+    supervisor.after_agent("implementer", "round 1")
+
+    result: list[str] = []
+    waiter = threading.Thread(
+        target=lambda: result.append(supervisor.before_agent("judge", "round 1", "Review"))
+    )
+    waiter.start()
+    time.sleep(0.02)
+    assert waiter.is_alive()
+
+    supervisor.steer("check for reward hacking")
+    supervisor.resume()
+    waiter.join(timeout=1)
+
+    assert len(result) == 1
+    assert "Review" in result[0]
+    assert "check for reward hacking" in result[0]
+
+
+def test_service_control_commands_ack(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    service = SupervisionService(supervisor)
+
+    pause = service.execute(PauseCommand())
+    resume = service.execute(ResumeCommand())
+    steer = service.execute(SteerCommand(text="prioritize latency"))
+
+    assert (pause.ack.action, pause.ack.status) == ("pause", "pending")  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert (resume.ack.action, resume.ack.status) == ("resume", "consumed")  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert (steer.ack.action, steer.ack.status) == ("steer", "pending")  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    # The queued steer reaches the next agent invocation.
+    effective = supervisor.before_agent("implementer", "round 1", "Work")
+    assert "prioritize latency" in effective
 
 
 def test_invocation_audit_contains_prompts_and_result(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288

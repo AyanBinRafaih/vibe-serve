@@ -45,6 +45,7 @@ from vibesys.profilers import (
     resolve_profiler_kind,
 )
 from vibesys.render import HeadlessRenderer, output_sink
+from vibesys.resource_paths import profiler_support_dir
 from vibesys.run import (
     DeviceLease,
     ExperimentRepository,
@@ -477,8 +478,8 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     if resolved_profiler_kind in ACTIVE_PROFILER_KINDS:
         definition = profiler_definition(resolved_profiler_kind)
         profiler_support_name = definition.support_name
-        default_support = PROJECT_ROOT / "resources" / "profilers" / definition.kind.value
-        if default_support.is_dir():
+        default_support = profiler_support_dir(definition.kind.value)
+        if default_support is not None:
             profiler_support_path = str(default_support)
 
     skill_source_paths = _coerce_skills_dirs(skills_dirs)
@@ -496,6 +497,12 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
 
     environment_reference = ref_dir or (input_dir / "reference")
     input_project_dir = input_dir if (input_dir / "pyproject.toml").is_file() else None
+    if (
+        input_project_dir is None
+        and workspace_seed_path is not None
+        and (workspace_seed_path / "pyproject.toml").is_file()
+    ):
+        input_project_dir = workspace_seed_path
 
     workspace_files = Workspace(
         paths.workspace,
@@ -1069,7 +1076,9 @@ class _RunContext:
         """
         supervisor = getattr(self, "supervisor", None)
         if supervisor is not None:
-            supervisor.before_agent(kind, round_label, user_prompt, system_prompt)
+            # before_agent blocks while paused and returns the prompt with any
+            # queued operator steering appended, so the next invocation sees it.
+            user_prompt = supervisor.before_agent(kind, round_label, user_prompt, system_prompt)
         result: T | None = None
         error: BaseException | None = None
         try:

@@ -23,6 +23,7 @@ from vibesys.server.protocol import (
     ResumeCommand,
     RunSnapshot,
     SnapshotQuery,
+    SteerCommand,
 )
 from vibesys.server.supervisor import RunSupervisor  # noqa: TC001  # tracked: #288
 
@@ -46,6 +47,12 @@ class SupervisionService:
             return Response(
                 request_id=request.request_id,
                 ack=CommandAck(action="resume", status="consumed"),
+            )
+        if isinstance(request, SteerCommand):
+            self.supervisor.steer(request.text)
+            return Response(
+                request_id=request.request_id,
+                ack=CommandAck(action="steer", status="pending"),
             )
         if isinstance(request, ChatQuery):
             sequence = self.supervisor.snapshot().sequence
