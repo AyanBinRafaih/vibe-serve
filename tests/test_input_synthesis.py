@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from vibesys.domains.base import DomainName
@@ -13,16 +15,16 @@ from vibesys.input_synthesis import (
     synthesize_input_bundle,
 )
 
+_BASE_SPEC = SynthesizedInputSpec(
+    objective="Serve the model quickly.",
+    domain=DomainName.LLM_SERVING,
+    accuracy_command=("python", "checker.py"),
+    benchmark_command=("python", "benchmark.py"),
+)
 
-def _minimal_spec(**overrides) -> SynthesizedInputSpec:  # noqa: ANN003  # tracked: #288
-    base = {
-        "objective": "Serve the model quickly.",
-        "domain": DomainName.LLM_SERVING,
-        "accuracy_command": ("python", "checker.py"),
-        "benchmark_command": ("python", "benchmark.py"),
-    }
-    base.update(overrides)
-    return SynthesizedInputSpec(**base)
+
+def _minimal_spec(**overrides: object) -> SynthesizedInputSpec:
+    return dataclasses.replace(_BASE_SPEC, **overrides)
 
 
 def test_synthesize_minimal_bundle_round_trips(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -65,6 +67,7 @@ def test_synthesize_populates_optional_fields(tmp_path):  # noqa: ANN001, ANN201
     assert bundle.benchmark_result.metric == "latency_ms"
     assert bundle.benchmark_result.json_argument == "--result-json"
     assert bundle.reference_path == (root / "reference").resolve()
+    assert bundle.reference_path is not None
     assert (bundle.reference_path / "golden.txt").read_text() == "42\n"
     assert bundle.workspace_seed_path == (root / "_seed").resolve()
 
