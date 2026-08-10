@@ -8,6 +8,7 @@ import {ExperimentLogView} from './experiment-log.js';
 import {createInputPanel} from './input.js';
 import {bindKeybindings} from './keybindings.js';
 import {OverlayView} from './overlay.js';
+import {RightPaneView, rightPaneWidth, splitFits} from './right-pane.js';
 import {RoundStripView} from './round-strip.js';
 import {createMarkdownStyle} from './styles.js';
 import {resolveTheme, type ThemeName} from './theme.js';
@@ -23,6 +24,8 @@ const SCOPED_KEY_HELP =
   '[/]: round · Tab: agent · PgUp/PgDn · Ctrl+T: todos · Ctrl+P: prompt · Esc: experiments';
 const LOG_KEY_HELP =
   '↑↓ or scroll: select · Enter or /open-round: open its rounds · /open-round --N';
+const SPLIT_KEY_HELP =
+  'Ctrl+W: switch pane · PgUp/PgDn: scroll focused pane · Esc on the pane: close it';
 
 export function createOpenTuiApp(renderer: CliRenderer, controller: SessionController): OpenTuiApp {
   let themeName: ThemeName = controller.state.themeName;
@@ -70,6 +73,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   const agentMap = new AgentMapView(renderer, theme);
   const overlay = new OverlayView(renderer, theme);
   const experimentLog = new ExperimentLogView(renderer, controller, theme);
+  const rightPane = new RightPaneView(renderer, theme);
   const conversation = new ConversationView(renderer, controller, markdownStyle, theme);
   const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme);
   const input = createInputPanel(renderer, value => void controller.submit(value), theme);
@@ -80,6 +84,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   // The log lives in the main pane rather than floating over it: it is the
   // landing view, not a dialog.
   main.add(experimentLog.output);
+  main.add(rightPane.output);
   root.add(header);
   root.add(roundStrip.output);
   root.add(main);
@@ -106,6 +111,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     agentMap.applyTheme(theme);
     overlay.applyTheme(theme);
     experimentLog.applyTheme(theme);
+    rightPane.applyTheme(theme);
     conversation.applyTheme(theme, markdownStyle);
     chat.applyTheme(theme, markdownStyle);
     input.applyTheme(theme);
@@ -113,21 +119,38 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   };
 
   let chatWasOpen = false;
+  let lastState: SessionState = controller.state;
   const render = (state: SessionState): void => {
+    lastState = state;
     const releasePreviousStyle =
       state.themeName === themeName ? undefined : applyTheme(state.themeName);
     const showLog = experimentLogVisible(state);
+    // A split only happens when the terminal can carry both panes. Narrower
+    // than that, a visualization keeps the modal it had before the split
+    // existed rather than squeezing two unreadable columns onto the screen.
+    const splitOpen = state.layout.right !== null;
+    const showSplit = splitOpen && splitFits(renderer.terminalWidth);
+    const paneFallback = splitOpen && !showSplit ? state.layout.right : null;
+    // Whatever holds the left side, log or transcript, shares the row with the
+    // pane rather than being replaced by it.
+    const leftWidth = showSplit
+      ? renderer.terminalWidth - rightPaneWidth(renderer.terminalWidth)
+      : renderer.terminalWidth;
     const returnHint = state.chatOpen || state.overlay !== null ? ' · Esc: close dialog' : '';
     const selection = state.selectedAgentKind ? ` · selected ${state.selectedAgentKind}` : '';
     const scope = state.hypothesisScope === null ? '' : ` · ${state.hypothesisScope.label}`;
     header.content = showLog
       ? `VibeSys · ${statusText(state)} · experiments`
       : `VibeSys · ${statusText(state)}${scope}${selection}${returnHint}`;
-    help.content = showLog
-      ? LOG_KEY_HELP
-      : state.hypothesisScope === null
-        ? KEY_HELP
-        : SCOPED_KEY_HELP;
+    // The log carries its own key hints in its footer, so when it shares the
+    // row with a pane the global line is the place for the pane's keys.
+    help.content = showSplit
+      ? SPLIT_KEY_HELP
+      : showLog
+        ? LOG_KEY_HELP
+        : state.hypothesisScope === null
+          ? KEY_HELP
+          : SCOPED_KEY_HELP;
     // The round strip and agent map are per-round detail. They belong to a
     // hypothesis trajectory, not to the list of claims.
     agentMap.output.visible = !showLog;
@@ -140,8 +163,34 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
       agentMap.render(state);
       conversation.render(state);
     }
+    // The agent map is the first thing to give up room: it is a summary the
+    // visualization largely supersedes while the split is open.
+    agentMap.output.visible = !showLog && !showSplit;
+    viewport.borderColor =
+      showSplit && state.layout.focus === 'left' ? theme.borderFocus : theme.border;
+    // Match the chat to the left pane's rectangle so it sits beside the
+    // visualization instead of over it. Bounds come from the siblings that
+    // actually occupy those rows, so a taller todo strip still fits.
+    if (showSplit) {
+      const top = header.height + (showLog ? 0 : roundStrip.output.height);
+      const below = todoStrip.output.height + help.height + input.box.height;
+      chat.setPaneBounds({
+        left: 1,
+        width: leftWidth - 2,
+        top,
+        height: renderer.terminalHeight - top - below,
+      });
+    } else {
+      chat.setPaneBounds(null);
+    }
+    experimentLog.setAvailableWidth(showSplit ? leftWidth : null);
     experimentLog.render(state);
-    overlay.render(state);
+    rightPane.render(state, showSplit);
+    overlay.render(
+      paneFallback === null
+        ? state
+        : {...state, overlay: {kind: 'detail' as const, content: paneFallback.content}},
+    );
     chat.render(state);
     if (state.chatOpen && !chatWasOpen) chat.focus();
     if (!state.chatOpen && chatWasOpen) input.focus();
@@ -157,11 +206,17 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     selectNextRound: () => controller.selectNextRound(),
     selectPreviousRound: () => controller.selectPreviousRound(),
     toggleTodos: () => controller.toggleTodos(),
+    scrollRightPane: delta => rightPane.scrollBy(delta),
   });
+  // Pane widths come from the terminal, so a resize has to redraw even though
+  // no state changed.
+  const onResize = (): void => render(lastState);
+  renderer.on('resize', onResize);
   const unsubscribe = controller.subscribe(render);
 
   return {
     destroy(): void {
+      renderer.off('resize', onResize);
       unsubscribe();
       unbindKeys();
       input.destroy();

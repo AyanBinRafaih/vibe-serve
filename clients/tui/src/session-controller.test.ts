@@ -147,8 +147,13 @@ describe('session controller', () => {
     await controller.submit('/perf');
 
     expect(transport.requests).toEqual([{type: 'query.performance'}]);
-    expect(controller.state.overlay?.content).toContain('Performance · total_ops_per_sec');
-    expect(controller.state.overlay?.content).toContain('best r2 2.4k total_ops_per_sec');
+    // The chart lands beside the transcript, not over it.
+    expect(controller.state.overlay).toBeNull();
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(controller.state.layout.right?.title).toBe('Performance');
+    expect(controller.state.layout.right?.content).toContain('Performance · total_ops_per_sec');
+    expect(controller.state.layout.right?.content).toContain('best r2 2.4k total_ops_per_sec');
+    expect(controller.state.layout.focus).toBe('right');
   });
 
   it('opens a multi-turn chat panel and renders agent answers there', async () => {
@@ -345,7 +350,8 @@ describe('session controller', () => {
     await controller.submit('/history rounds');
 
     expect(transport.requests).toEqual([{type: 'query.history'}]);
-    expect(controller.state.overlay?.content).toContain('No rounds have started yet.');
+    expect(controller.state.layout.right?.view).toBe('timeline');
+    expect(controller.state.layout.right?.content).toContain('No rounds have started yet.');
     expect(controller.state.hypothesisScope).toBeNull();
   });
 
@@ -548,6 +554,95 @@ describe('session controller', () => {
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-01'});
   });
 
+  it('swaps the pane contents when a second visualization command runs', async () => {
+    const transport = new FakeTransport(
+      [],
+      [{round: 1, perf_metric: 1200, perf_unit: 'ops', passed: true, profile_skipped: false}],
+    );
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submit('/perf');
+    expect(controller.state.layout.right?.view).toBe('perf');
+
+    await controller.submit('/history rounds');
+
+    expect(controller.state.layout.right?.view).toBe('timeline');
+    expect(controller.state.overlay).toBeNull();
+  });
+
+  it('keeps the open pane current as rounds land', async () => {
+    const transport = new FakeTransport(
+      [],
+      [{round: 1, perf_metric: 1200, perf_unit: 'ops', passed: true, profile_skipped: false}],
+    );
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submit('/perf');
+    const before = perfRequests(transport);
+
+    transport.emit({type: 'event', event: event(9, 'round_finished')});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The experiment log refetches on the same event; count only the pane's.
+    expect(perfRequests(transport) - before).toBe(1);
+  });
+
+  it('does not refetch the pane once it is closed', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submit('/perf');
+    controller.closePane();
+    const before = perfRequests(transport);
+
+    transport.emit({type: 'event', event: event(9, 'round_finished')});
+    await Promise.resolve();
+
+    expect(perfRequests(transport)).toBe(before);
+    expect(controller.state.layout.right).toBeNull();
+  });
+
+  it('closes the pane without disturbing the chat', async () => {
+    const transport = new FakeTransport([], [], {
+      question: 'why?',
+      answer: 'Round 2 regressed.',
+      effect: 'none',
+    });
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.sendChat('why?');
+    await controller.submit('/perf');
+
+    controller.closePane();
+
+    expect(controller.state.layout.right).toBeNull();
+    expect(controller.state.chatOpen).toBe(true);
+    expect(controller.state.chatConversation.map(entry => entry.content)).toEqual([
+      'why?',
+      'Round 2 regressed.',
+    ]);
+  });
+
+  it('sends chat messages while the pane stays put', async () => {
+    const transport = new FakeTransport([], [], {
+      question: 'what regressed?',
+      answer: 'The sampler reorder.',
+      effect: 'none',
+    });
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submit('/perf');
+    const pane = controller.state.layout.right;
+
+    await controller.sendChat('what regressed?');
+
+    expect(controller.state.chatConversation.at(-1)?.content).toBe('The sampler reorder.');
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(controller.state.layout.right?.content).toBe(pane?.content);
+  });
+
   it('surfaces a failed experiment query without closing the view', async () => {
     const transport = new FakeTransport([], [], undefined, new Error('socket closed'));
     const controller = new SocketSessionController(transport);
@@ -670,6 +765,10 @@ class DeferredChatTransport implements SupervisionTransport {
   close(): Promise<void> {
     return Promise.resolve();
   }
+}
+
+function perfRequests(transport: FakeTransport): number {
+  return transport.requests.filter(request => request.type === 'query.performance').length;
 }
 
 function entry(

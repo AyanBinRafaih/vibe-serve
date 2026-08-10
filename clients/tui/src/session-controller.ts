@@ -13,13 +13,17 @@ import {
   applyEvent,
   applySnapshot,
   type ConversationEntry,
+  closePane,
   enterExperimentDrilldown,
   enterExperimentRound,
   failExperiments,
+  failPane,
   initialSessionState,
   leaveExperimentDrilldown,
   moveExperimentSelection,
   openExperimentLog,
+  openPane,
+  type PaneView,
   type SessionState,
   selectNextAgent,
   selectNextRound,
@@ -27,9 +31,11 @@ import {
   selectPreviousRound,
   selectRound,
   setExperiments,
+  setPaneContent,
   setTheme,
   showDetail,
   showLive,
+  togglePaneFocus,
   toggleTodos,
 } from './session-model.js';
 import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
@@ -51,6 +57,9 @@ export interface SessionController {
   setTheme(themeName: ThemeName): void;
   openExperimentLog(): Promise<void>;
   openRound(roundNumber?: number): void;
+  openPane(view: PaneView): Promise<void>;
+  closePane(): void;
+  togglePaneFocus(): void;
   moveExperimentSelection(delta: number): void;
   enterExperimentDrilldown(): void;
   leaveExperimentDrilldown(): void;
@@ -76,6 +85,7 @@ export class SocketSessionController implements SessionController {
   #chatDrain: Promise<void> | null = null;
   /** Single-flight guard: phase events arrive faster than the fetch settles. */
   #experimentFetch: Promise<void> | null = null;
+  #paneFetch: Promise<void> | null = null;
 
   constructor(
     private readonly client: SupervisionTransport,
@@ -175,6 +185,63 @@ export class SocketSessionController implements SessionController {
     return opened === this.#state
       ? showDetail(this.#state, 'Select a hypothesis first, or use /open-round --N.')
       : opened;
+  }
+
+  async openPane(view: PaneView): Promise<void> {
+    this.#setState(openPane(this.#state, view));
+    await this.#loadPane(view);
+  }
+
+  closePane(): void {
+    this.#setState(closePane(this.#state));
+  }
+
+  togglePaneFocus(): void {
+    this.#setState(togglePaneFocus(this.#state));
+  }
+
+  /**
+   * Re-runs the query behind whichever visualization is on screen. The pane
+   * holds rendered text, so refreshing it is the same path as opening it.
+   */
+  async #loadPane(view: PaneView): Promise<void> {
+    if (this.#paneFetch !== null) return this.#paneFetch;
+    const fetch = this.#requestPane(view).finally(() => {
+      this.#paneFetch = null;
+    });
+    this.#paneFetch = fetch;
+    return fetch;
+  }
+
+  async #requestPane(view: PaneView): Promise<void> {
+    const request: RequestInput =
+      view === 'perf' ? {type: 'query.performance'} : {type: 'query.history'};
+    try {
+      const response = await this.client.request(request);
+      const content =
+        view === 'perf'
+          ? renderPerformanceCurve(response.performance ?? [], response.events ?? [])
+          : renderRoundHistory(response.events ?? []);
+      this.#setState(setPaneContent(this.#state, view, content));
+    } catch (error) {
+      this.#setState(failPane(this.#state, view, String(error)));
+    }
+  }
+
+  /**
+   * Both visualizations are functions of completed rounds and recorded
+   * metrics, so those two events bound every change either can show.
+   */
+  #refreshPaneFor(events: readonly RunEvent[]): void {
+    const right = this.#state.layout.right;
+    if (right === null) return;
+    const relevant = events.some(
+      event =>
+        event.type === 'round_finished' ||
+        event.type === 'benchmark_result' ||
+        event.data?.kind === 'benchmark_result',
+    );
+    if (relevant) void this.#loadPane(right.view);
   }
 
   moveExperimentSelection(delta: number): void {
@@ -315,6 +382,10 @@ export class SocketSessionController implements SessionController {
       await this.sendChat(parsed.request.text);
       return;
     }
+    if (parsed.paneView !== undefined) {
+      await this.openPane(parsed.paneView);
+      return;
+    }
     try {
       const response = await this.client.request(parsed.request);
       const rendered = renderResponse(parsed.request, response, parsed.responseView);
@@ -328,12 +399,14 @@ export class SocketSessionController implements SessionController {
     if (message.type === 'event') {
       this.#setState(applyEvent(this.#state, message.event));
       this.#refreshExperimentsFor([message.event]);
+      this.#refreshPaneFor([message.event]);
     }
     if (message.type === 'event_batch') {
       let state = this.#state;
       for (const event of message.events) state = applyEvent(state, event);
       this.#setState(state);
       this.#refreshExperimentsFor(message.events);
+      this.#refreshPaneFor(message.events);
     }
     if (message.type === 'protocol_error') {
       this.#setState(showDetail(this.#state, message.message, 'error'));

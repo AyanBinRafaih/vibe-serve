@@ -32,6 +32,7 @@ export interface SessionState {
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
   hypothesisScope: HypothesisScope | null;
+  layout: LayoutState;
   /**
    * Set once a typed tool_call/tool_result event is seen. From then on the
    * legacy tool-channel text chunks (still present in event files recorded
@@ -77,6 +78,27 @@ export interface HypothesisScope {
   id: string;
   label: string;
   rounds: number[];
+}
+
+/**
+ * A visualization command's output, rendered beside the transcript rather than
+ * over it. Content is pre-rendered text so the pane stays agnostic about which
+ * command produced it and a new command needs no new layout code.
+ */
+export type PaneView = 'perf' | 'timeline';
+
+export interface RightPane {
+  view: PaneView;
+  title: string;
+  content: string;
+  pending: boolean;
+  error: string | null;
+}
+
+export interface LayoutState {
+  /** null means single-pane: the transcript has the full width. */
+  right: RightPane | null;
+  focus: 'left' | 'right';
 }
 
 export interface UsageMeter {
@@ -143,6 +165,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     // list of claims before it reads as a long list of rounds.
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
     hypothesisScope: null,
+    layout: {right: null, focus: 'left'},
     typedToolEvents: false,
   };
 }
@@ -289,6 +312,67 @@ export function selectedExperiment(state: SessionState): HypothesisEntry | null 
   if (log === null || log.selectedId === null) return null;
   const index = log.entries.map(entryKey).indexOf(log.selectedId);
   return index === -1 ? null : (log.entries[index] ?? null);
+}
+
+export const PANE_TITLES: Record<PaneView, string> = {
+  perf: 'Performance',
+  timeline: 'Round timeline',
+};
+
+/**
+ * Opens or retargets the right pane. A second visualization command replaces
+ * the pane's contents rather than stacking, which is why the view is set here
+ * rather than pushed onto anything.
+ */
+export function openPane(state: SessionState, view: PaneView): SessionState {
+  const existing = state.layout.right;
+  return {
+    ...state,
+    overlay: null,
+    layout: {
+      right: {
+        view,
+        title: PANE_TITLES[view],
+        // Keep the old content while the new query is in flight only when the
+        // pane is not changing view, so the pane never shows one command's
+        // output under another command's title.
+        content: existing !== null && existing.view === view ? existing.content : '',
+        pending: true,
+        error: null,
+      },
+      focus: 'right',
+    },
+  };
+}
+
+export function setPaneContent(state: SessionState, view: PaneView, content: string): SessionState {
+  const right = state.layout.right;
+  // A slower response for a pane the operator has since replaced or closed
+  // must not overwrite what is on screen now.
+  if (right === null || right.view !== view) return state;
+  return {
+    ...state,
+    layout: {...state.layout, right: {...right, content, pending: false, error: null}},
+  };
+}
+
+export function failPane(state: SessionState, view: PaneView, error: string): SessionState {
+  const right = state.layout.right;
+  if (right === null || right.view !== view) return state;
+  return {...state, layout: {...state.layout, right: {...right, pending: false, error}}};
+}
+
+export function closePane(state: SessionState): SessionState {
+  if (state.layout.right === null) return state;
+  return {...state, layout: {right: null, focus: 'left'}};
+}
+
+export function togglePaneFocus(state: SessionState): SessionState {
+  if (state.layout.right === null) return state;
+  return {
+    ...state,
+    layout: {...state.layout, focus: state.layout.focus === 'left' ? 'right' : 'left'},
+  };
 }
 
 export function setTheme(state: SessionState, themeName: ThemeName): SessionState {

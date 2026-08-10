@@ -14,6 +14,20 @@ describe('parseInput', () => {
     expect(parseInput('/open-round --3')).toEqual({openRound: {round: 3}});
     expect(parseInput('/open-round 3')).toEqual({openRound: {round: 3}});
     expect(parseInput('/open-round latest').error).toContain('Unknown round: latest');
+    // Visualization commands opt into the right pane through one field.
+    expect(parseInput('/perf')).toMatchObject({
+      request: {type: 'query.performance'},
+      paneView: 'perf',
+    });
+    expect(parseInput('/history rounds')).toMatchObject({
+      request: {type: 'query.history'},
+      paneView: 'timeline',
+    });
+    // Modal surfaces stay modal: no pane routing on any of them.
+    expect(parseInput('/help').paneView).toBeUndefined();
+    expect(parseInput('/theme').paneView).toBeUndefined();
+    expect(parseInput('/chat').paneView).toBeUndefined();
+    expect(parseInput('/nope').paneView).toBeUndefined();
     expect(parseInput('/perf')).toMatchObject({
       request: {type: 'query.performance'},
       responseView: 'perf',

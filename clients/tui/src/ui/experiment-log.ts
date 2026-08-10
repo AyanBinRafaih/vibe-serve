@@ -39,6 +39,7 @@ export class ExperimentLogView {
   #theme: Theme;
   #renderedState: SessionState | null = null;
   #renderedWidth = 0;
+  #availableWidth: number | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
@@ -96,6 +97,15 @@ export class ExperimentLogView {
     this.output.add(this.#footerLine);
   }
 
+  /**
+   * Columns the log actually has. Set when a visualization pane shares the
+   * row, so the table drops columns for the space it has rather than for the
+   * whole terminal.
+   */
+  setAvailableWidth(width: number | null): void {
+    this.#availableWidth = width;
+  }
+
   applyTheme(theme: Theme): void {
     this.#theme = theme;
     this.output.borderColor = theme.accent;
@@ -113,7 +123,7 @@ export class ExperimentLogView {
       return;
     }
     this.output.visible = true;
-    const width = this.renderer.terminalWidth;
+    const width = this.#availableWidth ?? this.renderer.terminalWidth;
     if (state === this.#renderedState && width === this.#renderedWidth) return;
     this.#renderedState = state;
     this.#renderedWidth = width;
@@ -234,7 +244,8 @@ export class ExperimentLogView {
   }
 
   #bodyWidth(): number {
-    return Math.max(MIN_BODY_WIDTH, this.renderer.terminalWidth - PANEL_CHROME_COLUMNS);
+    const width = this.#availableWidth ?? this.renderer.terminalWidth;
+    return Math.max(MIN_BODY_WIDTH, width - PANEL_CHROME_COLUMNS);
   }
 
   #clear(): void {

@@ -1,4 +1,5 @@
 import type {RequestInput} from './protocol.js';
+import type {PaneView} from './session-model.js';
 import {isThemeName, listThemes, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export type ParsedInput = {
@@ -11,6 +12,12 @@ export type ParsedInput = {
   experimentLog?: boolean;
   /** Opens a hypothesis trajectory: the selected row, or the given round. */
   openRound?: {round?: number};
+  /**
+   * Renders the response in the right pane beside the transcript. Every
+   * visualization command opts in through this field; modal surfaces such as
+   * /help and errors leave it unset.
+   */
+  paneView?: PaneView;
   error?: string;
 };
 
@@ -28,7 +35,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
     name: '/open-round',
     description: 'Open the selected hypothesis, or /open-round --N for round N',
   },
-  {name: '/perf', description: 'Plot performance by round'},
+  {name: '/perf', description: 'Plot performance by round in the right pane'},
   {name: '/theme', description: 'List themes, or switch with /theme <name>'},
 ];
 
@@ -90,7 +97,9 @@ export function parseInput(text: string): ParsedInput {
   if (history) {
     const scope = history[1]?.trim();
     if (!scope) return {experimentLog: true};
-    if (scope === 'rounds') return {request: {type: 'query.history'}, responseView: 'history'};
+    if (scope === 'rounds') {
+      return {request: {type: 'query.history'}, responseView: 'history', paneView: 'timeline'};
+    }
     return {error: `Unknown history scope: ${scope}. Use /history or /history rounds.`};
   }
   if (text === '/experiments') return {experimentLog: true};
@@ -106,7 +115,9 @@ export function parseInput(text: string): ParsedInput {
     }
     return {openRound: {round: Number(match[1])}};
   }
-  if (text === '/perf') return {request: {type: 'query.performance'}, responseView: 'perf'};
+  if (text === '/perf') {
+    return {request: {type: 'query.performance'}, responseView: 'perf', paneView: 'perf'};
+  }
   if (text.startsWith('/')) return {error: `Unknown command: ${text}. Use /help.`};
   if (text === '') return {error: 'Enter a question or use /help.'};
   return {request: {type: 'query.chat', text}};

@@ -4,14 +4,19 @@ import {afterEach, describe, expect, it} from 'vitest';
 import type {HypothesisEntry} from '../protocol.js';
 import type {SessionController} from '../session-controller.js';
 import {
+  closePane,
   enterExperimentDrilldown,
   enterExperimentRound,
   initialSessionState,
   leaveExperimentDrilldown,
   moveExperimentSelection,
   openExperimentLog,
+  openPane,
+  type PaneView,
   type SessionState,
   setExperiments,
+  setPaneContent,
+  togglePaneFocus,
 } from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import {resolveTheme, type ThemeName} from './theme.js';
@@ -805,6 +810,142 @@ describe('theming', () => {
     expect(controller.state.experimentLog?.selectedId).toBe('H-001');
   });
 
+  it('renders the transcript and the visualization side by side', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = splitController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await controller.openPane('perf');
+    const frame = await frameAfter(testRenderer);
+
+    // Both live at once; neither obscures the other.
+    expect(frame).toContain('batched the prefill step');
+    expect(frame).toContain('best r7 1135 tok_s');
+    expect(frame).toContain('Performance');
+    expect(frame).toContain('Ctrl+W: switch pane');
+  });
+
+  it('moves focus between panes and shows which one has it', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = splitController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+
+    const onRight = await frameAfter(testRenderer);
+    expect(onRight).toContain('· focused');
+    const theme = resolveTheme('dark');
+    expect(spanColors(testRenderer, 'Performance · focused')?.fg).toBe(theme.borderFocus);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    const onLeft = await frameAfter(testRenderer);
+
+    expect(controller.state.layout.focus).toBe('left');
+    expect(onLeft).not.toContain('· focused');
+  });
+
+  it('closes the pane with Escape and restores the full-width transcript', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = splitController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const frame = await frameAfterEscape(testRenderer);
+
+    expect(controller.state.layout.right).toBeNull();
+    expect(frame).not.toContain('best r7 1135 tok_s');
+    expect(frame).toContain('batched the prefill step');
+    expect(frame).toContain('Agents');
+  });
+
+  it('falls back to the modal below the split threshold and recovers on resize', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = splitController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    const wide = await frameAfter(testRenderer);
+    expect(wide).toContain('Ctrl+W: switch pane');
+
+    testRenderer.renderer.resize(80, 20);
+    const narrow = await frameAfter(testRenderer);
+
+    // Single view, chart in the modal it used before the split existed.
+    expect(narrow).toContain('best r7 1135 tok_s');
+    expect(narrow).toContain('Command');
+    expect(narrow).not.toContain('Ctrl+W: switch pane');
+
+    testRenderer.renderer.resize(140, 20);
+    const recovered = await frameAfter(testRenderer);
+
+    expect(recovered).toContain('Ctrl+W: switch pane');
+    expect(recovered).toContain('batched the prefill step');
+  });
+
+  it('puts a visualization beside the experiment log rather than replacing it', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {claim: 'batch the prefill step', resolved_outcome: 'proven'}),
+    ];
+    controller.paneContent = 'Performance · tok_s\nbest r41 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await controller.openPane('perf');
+
+    const frame = await frameAfter(testRenderer);
+
+    expect(frame).toContain('H-07');
+    expect(frame).toContain('best r41 1135 tok_s');
+    // The table gives up its widest column to make room, rather than vanishing.
+    expect(frame).toContain('Hypothesis');
+  });
+
+  it('styles both panes and the focus indicator from the selected theme', async () => {
+    const theme = resolveTheme('solarized-light');
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = splitController();
+    controller.publish({...controller.state, themeName: 'solarized-light'});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    await frameAfter(testRenderer);
+
+    expect(spanColors(testRenderer, 'Performance · focused')?.fg).toBe(theme.borderFocus);
+    expect(spanColors(testRenderer, 'best r7 1135 tok_s')?.fg).toBe(theme.textPrimary);
+
+    controller.togglePaneFocus();
+    await frameAfter(testRenderer);
+
+    // Focus moved to the transcript, so the pane border drops back to the
+    // ordinary border colour and the transcript takes the focus colour.
+    expect(spanColors(testRenderer, 'Performance')?.fg).toBe(theme.border);
+  });
+
+  it('keeps the pane current while the run advances', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = splitController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    expect(await frameAfter(testRenderer)).toContain('best r7 1135 tok_s');
+
+    // A later round lands and the controller refetches; the pane redraws in
+    // place rather than needing to be reopened.
+    controller.paneContent = 'Performance · tok_s\n    1180 ┤    ●\nbest r8 1180 tok_s';
+    await controller.openPane('perf');
+    const updated = await frameAfter(testRenderer);
+
+    expect(updated).toContain('best r8 1180 tok_s');
+    expect(updated).not.toContain('best r7 1135 tok_s');
+  });
+
   it('shows an explicit placeholder for records with no hypothesis id', async () => {
     const testRenderer = await createTestRenderer({width: 120, height: 16});
     const controller = new FakeController(initialSessionState());
@@ -850,6 +991,25 @@ async function frameAfter(testRenderer: TestRendererSetup): Promise<string> {
 async function frameAfterEscape(testRenderer: TestRendererSetup): Promise<string> {
   await new Promise(resolve => setTimeout(resolve, 40));
   return frameAfter(testRenderer);
+}
+
+function splitController(): FakeController {
+  const controller = new FakeController({
+    ...initialSessionState(),
+    status: 'running',
+    rounds: [{number: 7, status: 'active'}],
+    conversation: [
+      {
+        id: 'a',
+        kind: 'assistant',
+        label: 'implementer · round 7',
+        content: 'batched the prefill step',
+        roundNumber: 7,
+      },
+    ],
+  });
+  controller.paneContent = 'Performance · tok_s\n    1135 ┤   ●\nbest r7 1135 tok_s';
+  return controller;
 }
 
 function logEntry(
@@ -1021,6 +1181,20 @@ class FakeController implements SessionController {
   enterExperimentDrilldown(): void {
     this.publish(enterExperimentDrilldown(this.state));
   }
+  openPane(view: PaneView): Promise<void> {
+    this.publish(setPaneContent(openPane(this.state, view), view, this.paneContent));
+    return Promise.resolve();
+  }
+  closePane(): void {
+    this.publish(closePane(this.state));
+  }
+  togglePaneFocus(): void {
+    this.publish(togglePaneFocus(this.state));
+  }
+
+  /** Content the fake server returns for whichever visualization is opened. */
+  paneContent = 'Performance · median_tok_per_sec\n  1200 ┤●';
+
   openRound(roundNumber?: number): void {
     if (roundNumber === undefined) {
       this.enterExperimentDrilldown();

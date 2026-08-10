@@ -11,6 +11,7 @@ export interface KeybindingActions {
   selectNextRound(): void;
   selectPreviousRound(): void;
   toggleTodos(): void;
+  scrollRightPane(delta: number): void;
 }
 
 export function bindKeybindings(
@@ -23,6 +24,26 @@ export function bindKeybindings(
     if (key.ctrl && key.name === 'c') {
       key.preventDefault();
       renderer.destroy();
+      return;
+    }
+    // Pane switching works from anywhere the split is open, including with the
+    // chat focused, so the operator never has to close the chat to look at the
+    // visualization beside it.
+    if (key.ctrl && key.name === 'w' && controller.state.layout.right !== null) {
+      controller.togglePaneFocus();
+      key.preventDefault();
+      return;
+    }
+    // The focused pane takes the scroll keys. Everything else the chat or the
+    // transcript would normally handle is left alone.
+    if (
+      controller.state.layout.focus === 'right' &&
+      controller.state.layout.right !== null &&
+      (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape')
+    ) {
+      if (key.name === 'escape') controller.closePane();
+      else actions.scrollRightPane(key.name === 'pageup' ? -1 : 1);
+      key.preventDefault();
       return;
     }
     if (controller.state.chatOpen) {

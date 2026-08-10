@@ -22,11 +22,11 @@ available slash commands are:
 | --- | --- |
 | `/help` | Show commands and planned controls. |
 | `/history` | Return to the experiment log, one row per hypothesis. |
-| `/history rounds` | List rounds with agent-active elapsed time. |
+| `/history rounds` | List rounds with agent-active elapsed time, in the right pane. |
 | `/experiments` | Same as `/history`. |
 | `/open-round` | Open the rounds behind the selected hypothesis. |
 | `/open-round --N` | Open round N, inside whichever hypothesis owns it. |
-| `/perf` | Plot the recorded performance metric by round. |
+| `/perf` | Plot the recorded performance metric by round, in the right pane. |
 | `/theme` | List themes; `/theme <name>` switches immediately. |
 
 ### Experiment log
@@ -61,6 +61,27 @@ current without being reopened. Rows are ordered by first round and never
 reshuffle. Records written before hypothesis tracking render as
 `(Unidentified)` rather than being dropped. Columns drop widest first as the
 terminal narrows; hypothesis, rounds, and outcome always survive.
+
+### Split panes
+
+Visualization commands render beside the current view rather than over it.
+`/perf` and `/history rounds` put their output in a right pane and leave the
+transcript, the chat, or the experiment log in the left one, both live at the
+same time. A second visualization command replaces the pane's contents rather
+than stacking another surface on top.
+
+`Ctrl+W` moves focus between the panes; the focused one carries the theme's
+focus border and says so in its title. Page Up and Page Down scroll whichever
+pane has focus, and Escape on the right pane closes it and restores the
+full-width view. Chat and transcript state survive the pane closing.
+
+Pane widths are computed from the terminal, so a wide terminal gives the
+visualization real room while the left pane keeps a readable floor. Below 100
+columns there is not enough width for both, and visualizations fall back to the
+modal they used before panes existed. The layout re-flows on resize in either
+direction.
+
+`/help`, `/theme`, and errors stay modal.
 
 Inside a hypothesis the footer shows keyboard navigation. `[` and `]` select rounds, Tab and
 Shift+Tab select agents, Page Up/Page Down scroll the transcript, Ctrl+T expands
