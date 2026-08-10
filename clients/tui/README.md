@@ -22,12 +22,28 @@ available slash commands are:
 | --- | --- |
 | `/help` | Show commands and planned controls. |
 | `/chat` | Open a read-only chat about the run; `/chat <question>` asks immediately. |
+| | Slash commands work inside the chat too, and do the same thing as in the main input. |
 | `/pause` | Pause after the current agent call finishes. |
 | `/resume` | Resume a paused run. |
 | `/steer <message>` | Queue an instruction that is appended to the next agent invocation's prompt. |
 | `/history` | List rounds with agent-active elapsed time. |
 | `/perf` | Plot the recorded performance metric by round. |
 | `/theme` | List themes; `/theme <name>` switches immediately. |
+
+### Experiment chat
+
+The chat is answered by a coding agent scoped to the run, using the backend,
+provider, and model from `[agent]` in `agent.toml`, with conversation state
+carried across turns through `_vibesys_chat/conversation.jsonl` in the
+workspace. The agent handler exists only while the run context does, so a
+question asked during startup or after the run finishes has no agent to reach;
+the reply says so and falls back to a read-only keyword summary of the recorded
+events rather than presenting that summary as the answer.
+
+Text typed in the chat that starts with `/` is parsed as a slash command
+through the same path as the main input, so `/history` there does exactly what
+`/history` does anywhere else. Anything else is a question for the agent, and a
+question containing a slash mid-sentence is still a question.
 
 The footer shows keyboard navigation. `[` and `]` select rounds, Tab and
 Shift+Tab select agents, Page Up/Page Down scroll the transcript, Ctrl+T expands

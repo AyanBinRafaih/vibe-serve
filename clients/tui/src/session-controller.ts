@@ -34,6 +34,7 @@ export interface SessionController {
   submit(value: string): Promise<void>;
   closeChat(): void;
   sendChat(value: string): Promise<void>;
+  submitChat(value: string): Promise<void>;
   live(): void;
   selectNextAgent(): void;
   selectPreviousAgent(): void;
@@ -132,6 +133,17 @@ export class SocketSessionController implements SessionController {
 
   closeChat(): void {
     this.#setState({...this.#state, chatOpen: false});
+  }
+
+  /**
+   * What the chat input submits. A slash command runs through exactly the same
+   * path as the main input, so the two surfaces cannot disagree about what a
+   * command does; anything else is a question for the chat agent.
+   */
+  submitChat(value: string): Promise<void> {
+    const text = value.trim();
+    if (!text.startsWith('/')) return this.sendChat(value);
+    return this.submit(text);
   }
 
   sendChat(value: string): Promise<void> {
