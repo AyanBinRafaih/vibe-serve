@@ -3,7 +3,7 @@ import {hasActiveAgentTiming} from '../round-timing.js';
 import {type RoundSummary, roundAgentElapsedMs} from '../run-map.js';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
-import {visibleRoundNumber} from '../session-model.js';
+import {scopedRounds, visibleRoundNumber} from '../session-model.js';
 import type {Theme} from './theme.js';
 
 export class RoundStripView {
@@ -46,7 +46,10 @@ export class RoundStripView {
     if (state === this.#renderedState) return;
     this.#renderedState = state;
     this.#clear();
-    if (state.rounds.length === 0) {
+    // Inside a hypothesis the strip covers that hypothesis's rounds only, so
+    // round navigation stays within the trajectory the operator opened.
+    const rounds = scopedRounds(state);
+    if (rounds.length === 0) {
       this.output.add(
         new TextRenderable(this.renderer, {
           content: 'Waiting for rounds...',
@@ -62,8 +65,8 @@ export class RoundStripView {
       flexDirection: 'row',
     });
     const selected = visibleRoundNumber(state);
-    const runningRound = latestActiveRoundNumber(state.rounds);
-    for (const round of state.rounds.slice(-8)) {
+    const runningRound = latestActiveRoundNumber(rounds);
+    for (const round of rounds.slice(-8)) {
       row.add(this.#renderRound(round, {selected, runningRound}));
     }
     this.output.add(row);

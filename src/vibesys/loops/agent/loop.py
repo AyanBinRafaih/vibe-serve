@@ -101,6 +101,12 @@ class _RoundRecord:
     reviewed: bool = True
     hypothesis_id: str | None = None
     hypothesis_outcome: str | None = None
+    # Plan text carried alongside the id so a resolved hypothesis stays
+    # readable after ``active_hypothesis.json`` has moved on. Only the live
+    # plan is persisted there, so without this the claim and the attempted
+    # change are recoverable for the active hypothesis only.
+    hypothesis_claim: str | None = None
+    hypothesis_task: str | None = None
     hypothesis_parent_round: int | None = None
     # Exact tree from which this hypothesis started. This can be newer than
     # the historical end-of-round checkpoint when an operator or framework
@@ -134,6 +140,8 @@ class _RoundRecord:
             "reviewed": self.reviewed,
             "hypothesis_id": self.hypothesis_id,
             "hypothesis_outcome": self.hypothesis_outcome,
+            "hypothesis_claim": self.hypothesis_claim,
+            "hypothesis_task": self.hypothesis_task,
             "hypothesis_parent_round": self.hypothesis_parent_round,
             "hypothesis_parent_commit": self.hypothesis_parent_commit,
             "metrics": self.metrics,
@@ -159,6 +167,8 @@ class _RoundRecord:
             reviewed=bool(data.get("reviewed", True)),
             hypothesis_id=data.get("hypothesis_id"),
             hypothesis_outcome=data.get("hypothesis_outcome"),
+            hypothesis_claim=data.get("hypothesis_claim"),
+            hypothesis_task=data.get("hypothesis_task"),
             hypothesis_parent_round=data.get("hypothesis_parent_round"),
             hypothesis_parent_commit=data.get("hypothesis_parent_commit"),
             metrics=data.get("metrics", {}),
@@ -3107,6 +3117,8 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         reviewed=reviewed,
                         hypothesis_id=plan.hypothesis_id,
                         hypothesis_outcome=hypothesis_outcome,
+                        hypothesis_claim=plan.hypothesis or None,
+                        hypothesis_task=plan.task or None,
                         hypothesis_parent_round=active_hypothesis.parent_round,
                         hypothesis_parent_commit=active_hypothesis.parent_commit,
                         metrics=accepted_metrics,

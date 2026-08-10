@@ -3397,3 +3397,43 @@ def test_loop_resume_with_round_number_starts_there(tmp_path, ref_file):  # noqa
     assert result is True
     # Round 4 and 5 only: 2 plan calls (one task, one done).
     assert runner.counters["orch_plan"] == 2
+
+
+def test_round_record_round_trips_hypothesis_plan_text():  # noqa: ANN201  # tracked: #288
+    """The claim and attempted change must survive into rounds.json.
+
+    ``active_hypothesis.json`` only holds the live plan, so a resolved
+    hypothesis would otherwise lose the text the experiment log displays.
+    """
+    record = _RoundRecord(
+        round_number=7,
+        commit="a" * 40,
+        perf_metric=112.0,
+        perf_unit="tok_s",
+        passed=True,
+        hypothesis_id="H-07",
+        hypothesis_outcome="proven",
+        hypothesis_claim="batching prefill removes per-request launch overhead",
+        hypothesis_task="batch the prefill step",
+    )
+
+    restored = _RoundRecord.from_json(record.to_json())
+
+    assert restored.hypothesis_claim == "batching prefill removes per-request launch overhead"
+    assert restored.hypothesis_task == "batch the prefill step"
+
+
+def test_round_record_reads_logs_written_before_hypothesis_text():  # noqa: ANN201  # tracked: #288
+    legacy = {
+        "round": 3,
+        "commit": "b" * 40,
+        "perf_metric": None,
+        "perf_unit": None,
+        "passed": False,
+        "hypothesis_id": "H-03",
+    }
+
+    restored = _RoundRecord.from_json(legacy)
+
+    assert restored.hypothesis_claim is None
+    assert restored.hypothesis_task is None

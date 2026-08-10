@@ -7,6 +7,10 @@ export type ParsedInput = {
   themeName?: ThemeName;
   request?: RequestInput;
   responseView?: 'history' | 'perf';
+  /** Opens the interactive experiment log rather than a one-shot overlay. */
+  experimentLog?: boolean;
+  /** Opens a hypothesis trajectory: the selected row, or the given round. */
+  openRound?: {round?: number};
   error?: string;
 };
 
@@ -18,7 +22,12 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   {name: '/help', description: 'Show this help'},
   {name: '/chat', description: 'Open experiment chat'},
-  {name: '/history', description: 'List rounds and their elapsed time'},
+  {name: '/history', description: 'Experiment log by hypothesis (/history rounds for rounds)'},
+  {name: '/experiments', description: 'Experiment log by hypothesis'},
+  {
+    name: '/open-round',
+    description: 'Open the selected hypothesis, or /open-round --N for round N',
+  },
   {name: '/perf', description: 'Plot performance by round'},
   {name: '/theme', description: 'List themes, or switch with /theme <name>'},
 ];
@@ -75,7 +84,28 @@ export function parseInput(text: string): ParsedInput {
     }
     return {localView: 'theme', themeName: requested};
   }
-  if (text === '/history') return {request: {type: 'query.history'}, responseView: 'history'};
+  // The experiment log is the default view of a run's history; the flat round
+  // list stays reachable as an explicit argument.
+  const history = text.match(/^\/history(?:\s+(.*))?$/);
+  if (history) {
+    const scope = history[1]?.trim();
+    if (!scope) return {experimentLog: true};
+    if (scope === 'rounds') return {request: {type: 'query.history'}, responseView: 'history'};
+    return {error: `Unknown history scope: ${scope}. Use /history or /history rounds.`};
+  }
+  if (text === '/experiments') return {experimentLog: true};
+  const openRound = text.match(/^\/open-round(?:\s+(.*))?$/);
+  if (openRound) {
+    const argument = openRound[1]?.trim();
+    if (!argument) return {openRound: {}};
+    // ``--N`` is the documented form; a bare number is accepted because it is
+    // the obvious thing to type.
+    const match = argument.match(/^(?:--)?(\d+)$/);
+    if (!match) {
+      return {error: `Unknown round: ${argument}. Use /open-round or /open-round --N.`};
+    }
+    return {openRound: {round: Number(match[1])}};
+  }
   if (text === '/perf') return {request: {type: 'query.performance'}, responseView: 'perf'};
   if (text.startsWith('/')) return {error: `Unknown command: ${text}. Use /help.`};
   if (text === '') return {error: 'Enter a question or use /help.'};

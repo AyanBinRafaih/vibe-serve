@@ -1,5 +1,6 @@
 import type {CliRenderer, KeyEvent, ScrollBoxRenderable} from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
+import {experimentLogVisible} from '../session-model.js';
 
 export interface KeybindingActions {
   completeInput(): boolean;
@@ -31,9 +32,33 @@ export function bindKeybindings(
       }
       return;
     }
+    // An overlay floats above whatever pane is behind it, so it takes Escape
+    // first whether that pane is the transcript or the experiment log.
     if (key.name === 'escape' && controller.state.overlay !== null) {
       controller.live();
       viewport.scrollTo(viewport.scrollHeight);
+      key.preventDefault();
+      return;
+    }
+    // The experiment log owns navigation while the table is on screen: arrows
+    // move the selection instead of the input cursor, and Enter opens the
+    // rounds behind the selected hypothesis.
+    if (experimentLogVisible(controller.state)) {
+      // Escape has nowhere to go from the root view: the log is the root.
+      if (key.name === 'up') controller.moveExperimentSelection(-1);
+      else if (key.name === 'down') controller.moveExperimentSelection(1);
+      else if (key.name === 'pageup') controller.moveExperimentSelection(-10);
+      else if (key.name === 'pagedown') controller.moveExperimentSelection(10);
+      else if (key.name === 'return' || key.name === 'enter') {
+        controller.enterExperimentDrilldown();
+      } else return;
+      key.preventDefault();
+      return;
+    }
+    // Inside a hypothesis, Escape steps back out to the table rather than
+    // dropping the operator into unfiltered live output.
+    if (key.name === 'escape' && controller.state.hypothesisScope !== null) {
+      controller.leaveExperimentDrilldown();
       key.preventDefault();
       return;
     }

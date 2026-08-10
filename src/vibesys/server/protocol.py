@@ -49,6 +49,12 @@ class PerformanceQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.performance"] = "query.performance"
 
 
+class ExperimentQuery(Request):
+    """Request the hypothesis-level experiment log for the attached run."""
+
+    type: Literal["query.experiments"] = "query.experiments"
+
+
 class EventsQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.events"] = "query.events"
     after_sequence: int = Field(default=0, ge=0)
@@ -67,6 +73,7 @@ ProtocolRequest = Annotated[
     | ChatQuery
     | HistoryQuery
     | PerformanceQuery
+    | ExperimentQuery
     | EventsQuery
     | SubscribeRequest,
     Field(discriminator="type"),
@@ -101,6 +108,55 @@ class PerformanceRound(ProtocolModel):  # noqa: D101  # tracked: #288
     profile_skipped: bool = False
 
 
+class HypothesisRound(ProtocolModel):
+    """One round belonging to a hypothesis, for the experiment-log drill-down."""
+
+    round: int
+    passed: bool
+    reviewed: bool
+    hypothesis_outcome: str | None = None
+    perf_metric: FiniteFloat | None = None
+    perf_unit: str | None = None
+    commit: str | None = None
+    official_evaluation: bool = False
+    candidate_disposition: str | None = None
+
+
+class HypothesisEntry(ProtocolModel):
+    """One unit of investigation: a hypothesis and every round it spans.
+
+    ``resolved_outcome`` is the terminal value the agent loop itself recorded
+    for the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``
+    member). It is copied, never recomputed, so the client cannot drift from
+    the framework's resolution semantics.
+    """
+
+    hypothesis_id: str
+    # False when the underlying records carry no ``hypothesis_id``, e.g. a log
+    # directory written before hypothesis tracking. The row is still returned
+    # so history stays complete; clients render it as an explicit placeholder.
+    identified: bool = True
+    claim: str | None = None
+    action: str | None = None
+    first_round: int
+    last_round: int
+    rounds: list[HypothesisRound] = Field(default_factory=list)
+    resolved_outcome: str | None = None
+    # ``pass``/``fail`` from the closing round, or None when independent review
+    # was deferred by sparse-review policy and the round is still provisional.
+    judge_verdict: Literal["pass", "fail"] | None = None
+    perf_metric: FiniteFloat | None = None
+    perf_unit: str | None = None
+    # Change against the last measured round preceding this hypothesis. None
+    # when either side is unmeasured or the baseline is zero.
+    perf_delta_pct: FiniteFloat | None = None
+    # Integration, not truth: whether a framework-owned gate accepted the
+    # candidate or it was retained on the Pareto frontier. Deliberately
+    # independent of ``resolved_outcome``.
+    kept: bool = False
+    active: bool = False
+
+
 class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     protocol_version: Literal[1] = PROTOCOL_VERSION
     request_id: str
@@ -112,6 +168,7 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     snapshot: RunSnapshot | None = None
     events: list[RunEvent] = Field(default_factory=list)
     performance: list[PerformanceRound] = Field(default_factory=list)
+    experiments: list[HypothesisEntry] = Field(default_factory=list)
 
 
 class SubscribedMessage(ProtocolModel):  # noqa: D101  # tracked: #288

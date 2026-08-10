@@ -401,6 +401,35 @@
       "title": "EventsQuery",
       "type": "object"
     },
+    "ExperimentQuery": {
+      "additionalProperties": false,
+      "description": "Request the hypothesis-level experiment log for the attached run.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.experiments",
+          "default": "query.experiments",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "ExperimentQuery",
+      "type": "object"
+    },
     "HistoryQuery": {
       "additionalProperties": false,
       "properties": {
@@ -427,6 +456,231 @@
         }
       },
       "title": "HistoryQuery",
+      "type": "object"
+    },
+    "HypothesisEntry": {
+      "additionalProperties": false,
+      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is the terminal value the agent loop itself recorded\nfor the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``\nmember). It is copied, never recomputed, so the client cannot drift from\nthe framework's resolution semantics.",
+      "properties": {
+        "hypothesis_id": {
+          "title": "Hypothesis Id",
+          "type": "string"
+        },
+        "identified": {
+          "default": true,
+          "title": "Identified",
+          "type": "boolean"
+        },
+        "claim": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Claim"
+        },
+        "action": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action"
+        },
+        "first_round": {
+          "title": "First Round",
+          "type": "integer"
+        },
+        "last_round": {
+          "title": "Last Round",
+          "type": "integer"
+        },
+        "rounds": {
+          "items": {
+            "$ref": "#/$defs/HypothesisRound"
+          },
+          "title": "Rounds",
+          "type": "array"
+        },
+        "resolved_outcome": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resolved Outcome"
+        },
+        "judge_verdict": {
+          "anyOf": [
+            {
+              "enum": [
+                "pass",
+                "fail"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Judge Verdict"
+        },
+        "perf_metric": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Metric"
+        },
+        "perf_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Unit"
+        },
+        "perf_delta_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Delta Pct"
+        },
+        "kept": {
+          "default": false,
+          "title": "Kept",
+          "type": "boolean"
+        },
+        "active": {
+          "default": false,
+          "title": "Active",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hypothesis_id",
+        "first_round",
+        "last_round"
+      ],
+      "title": "HypothesisEntry",
+      "type": "object"
+    },
+    "HypothesisRound": {
+      "additionalProperties": false,
+      "description": "One round belonging to a hypothesis, for the experiment-log drill-down.",
+      "properties": {
+        "round": {
+          "title": "Round",
+          "type": "integer"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        },
+        "reviewed": {
+          "title": "Reviewed",
+          "type": "boolean"
+        },
+        "hypothesis_outcome": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hypothesis Outcome"
+        },
+        "perf_metric": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Metric"
+        },
+        "perf_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Unit"
+        },
+        "commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commit"
+        },
+        "official_evaluation": {
+          "default": false,
+          "title": "Official Evaluation",
+          "type": "boolean"
+        },
+        "candidate_disposition": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Candidate Disposition"
+        }
+      },
+      "required": [
+        "round",
+        "passed",
+        "reviewed"
+      ],
+      "title": "HypothesisRound",
       "type": "object"
     },
     "InvocationFinishedData": {
@@ -791,6 +1045,13 @@
             "$ref": "#/$defs/PerformanceRound"
           },
           "title": "Performance",
+          "type": "array"
+        },
+        "experiments": {
+          "items": {
+            "$ref": "#/$defs/HypothesisEntry"
+          },
+          "title": "Experiments",
           "type": "array"
         }
       },
@@ -1499,6 +1760,7 @@
           "command.resume": "#/$defs/ResumeCommand",
           "query.chat": "#/$defs/ChatQuery",
           "query.events": "#/$defs/EventsQuery",
+          "query.experiments": "#/$defs/ExperimentQuery",
           "query.history": "#/$defs/HistoryQuery",
           "query.performance": "#/$defs/PerformanceQuery",
           "query.snapshot": "#/$defs/SnapshotQuery",
@@ -1524,6 +1786,9 @@
         },
         {
           "$ref": "#/$defs/PerformanceQuery"
+        },
+        {
+          "$ref": "#/$defs/ExperimentQuery"
         },
         {
           "$ref": "#/$defs/EventsQuery"

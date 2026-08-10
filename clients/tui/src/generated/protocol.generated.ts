@@ -7,6 +7,7 @@ export type Request =
   | ChatQuery
   | HistoryQuery
   | PerformanceQuery
+  | ExperimentQuery
   | EventsQuery
   | SubscribeRequest;
 export type ProtocolVersion = 1;
@@ -38,17 +39,21 @@ export type Type5 = "query.performance";
 export type ProtocolVersion6 = 1;
 export type RequestId6 = string;
 export type Timestamp6 = string;
-export type Type6 = "query.events";
-export type AfterSequence = number;
-export type TimeoutMs = number;
+export type Type6 = "query.experiments";
 export type ProtocolVersion7 = 1;
 export type RequestId7 = string;
 export type Timestamp7 = string;
-export type Type7 = "subscribe";
-export type AfterSequence1 = number;
+export type Type7 = "query.events";
+export type AfterSequence = number;
+export type TimeoutMs = number;
 export type ProtocolVersion8 = 1;
 export type RequestId8 = string;
 export type Timestamp8 = string;
+export type Type8 = "subscribe";
+export type AfterSequence1 = number;
+export type ProtocolVersion9 = 1;
+export type RequestId9 = string;
+export type Timestamp9 = string;
 export type Ok = boolean;
 export type Error = string | null;
 export type Action = "pause" | "resume";
@@ -56,16 +61,16 @@ export type Status = "pending" | "consumed";
 export type Question = string;
 export type Answer = string;
 export type Effect = "none";
-export type ProtocolVersion9 = 1;
+export type ProtocolVersion10 = 1;
 export type RunId = string;
 export type Sequence = number;
 export type Status1 = string;
 export type AgentKind = string | null;
 export type RoundLabel = string | null;
-export type ProtocolVersion10 = 1;
+export type ProtocolVersion11 = 1;
 export type Sequence1 = number;
 export type RunId1 = string;
-export type Timestamp9 = string;
+export type Timestamp10 = string;
 export type EventType =
   | "server_started"
   | "server_ready"
@@ -196,16 +201,40 @@ export type PerfUnit1 = string;
 export type Passed = boolean;
 export type ProfileSkipped = boolean;
 export type Performance = PerformanceRound[];
+export type HypothesisId = string;
+export type Identified = boolean;
+export type Claim = string | null;
+export type Action1 = string | null;
+export type FirstRound = number;
+export type LastRound = number;
+export type Round1 = number;
+export type Passed1 = boolean;
+export type Reviewed = boolean;
+export type HypothesisOutcome = string | null;
+export type PerfMetric2 = number | null;
+export type PerfUnit2 = string | null;
+export type Commit = string | null;
+export type OfficialEvaluation = boolean;
+export type CandidateDisposition = string | null;
+export type Rounds = HypothesisRound[];
+export type ResolvedOutcome = string | null;
+export type JudgeVerdict1 = ("pass" | "fail") | null;
+export type PerfMetric3 = number | null;
+export type PerfUnit3 = string | null;
+export type PerfDeltaPct = number | null;
+export type Kept = boolean;
+export type Active = boolean;
+export type Experiments = HypothesisEntry[];
 export type ServerMessage = SubscribedMessage | EventMessage | EventBatchMessage | ProtocolErrorMessage;
-export type Type8 = "subscribed";
-export type RequestId9 = string;
+export type Type9 = "subscribed";
+export type RequestId10 = string;
 export type RunId2 = string;
 export type LatestSequence = number;
-export type Type9 = "event";
-export type Type10 = "event_batch";
+export type Type10 = "event";
+export type Type11 = "event_batch";
 export type Events1 = RunEvent[];
-export type Type11 = "protocol_error";
-export type RequestId10 = string | null;
+export type Type12 = "protocol_error";
+export type RequestId11 = string | null;
 export type Code1 = string;
 export type Message1 = string;
 
@@ -255,25 +284,34 @@ export interface PerformanceQuery {
   timestamp?: Timestamp5;
   type?: Type5;
 }
-export interface EventsQuery {
+/**
+ * Request the hypothesis-level experiment log for the attached run.
+ */
+export interface ExperimentQuery {
   protocol_version?: ProtocolVersion6;
   request_id?: RequestId6;
   timestamp?: Timestamp6;
   type?: Type6;
-  after_sequence?: AfterSequence;
-  timeout_ms?: TimeoutMs;
 }
-export interface SubscribeRequest {
+export interface EventsQuery {
   protocol_version?: ProtocolVersion7;
   request_id?: RequestId7;
   timestamp?: Timestamp7;
   type?: Type7;
+  after_sequence?: AfterSequence;
+  timeout_ms?: TimeoutMs;
+}
+export interface SubscribeRequest {
+  protocol_version?: ProtocolVersion8;
+  request_id?: RequestId8;
+  timestamp?: Timestamp8;
+  type?: Type8;
   after_sequence?: AfterSequence1;
 }
 export interface Response {
-  protocol_version?: ProtocolVersion8;
-  request_id: RequestId8;
-  timestamp?: Timestamp8;
+  protocol_version?: ProtocolVersion9;
+  request_id: RequestId9;
+  timestamp?: Timestamp9;
   ok?: Ok;
   error?: Error;
   ack?: CommandAck | null;
@@ -281,6 +319,7 @@ export interface Response {
   snapshot?: RunSnapshot | null;
   events?: Events;
   performance?: Performance;
+  experiments?: Experiments;
 }
 export interface CommandAck {
   action: Action;
@@ -292,7 +331,7 @@ export interface ChatResult {
   effect?: Effect;
 }
 export interface RunSnapshot {
-  protocol_version?: ProtocolVersion9;
+  protocol_version?: ProtocolVersion10;
   run_id: RunId;
   sequence: Sequence;
   status: Status1;
@@ -303,10 +342,10 @@ export interface RunSnapshot {
  * One reproducible human, control, or invocation event.
  */
 export interface RunEvent {
-  protocol_version?: ProtocolVersion10;
+  protocol_version?: ProtocolVersion11;
   sequence?: Sequence1;
   run_id?: RunId1;
-  timestamp: Timestamp9;
+  timestamp: Timestamp10;
   type: EventType;
   text?: Text1;
   status?: EventStatus | null;
@@ -470,23 +509,61 @@ export interface PerformanceRound {
   passed: Passed;
   profile_skipped?: ProfileSkipped;
 }
+/**
+ * One unit of investigation: a hypothesis and every round it spans.
+ *
+ * ``resolved_outcome`` is the terminal value the agent loop itself recorded
+ * for the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``
+ * member). It is copied, never recomputed, so the client cannot drift from
+ * the framework's resolution semantics.
+ */
+export interface HypothesisEntry {
+  hypothesis_id: HypothesisId;
+  identified?: Identified;
+  claim?: Claim;
+  action?: Action1;
+  first_round: FirstRound;
+  last_round: LastRound;
+  rounds?: Rounds;
+  resolved_outcome?: ResolvedOutcome;
+  judge_verdict?: JudgeVerdict1;
+  perf_metric?: PerfMetric3;
+  perf_unit?: PerfUnit3;
+  perf_delta_pct?: PerfDeltaPct;
+  kept?: Kept;
+  active?: Active;
+}
+/**
+ * One round belonging to a hypothesis, for the experiment-log drill-down.
+ */
+export interface HypothesisRound {
+  round: Round1;
+  passed: Passed1;
+  reviewed: Reviewed;
+  hypothesis_outcome?: HypothesisOutcome;
+  perf_metric?: PerfMetric2;
+  perf_unit?: PerfUnit2;
+  commit?: Commit;
+  official_evaluation?: OfficialEvaluation;
+  candidate_disposition?: CandidateDisposition;
+}
 export interface SubscribedMessage {
-  type?: Type8;
-  request_id: RequestId9;
+  type?: Type9;
+  request_id: RequestId10;
   run_id: RunId2;
   latest_sequence: LatestSequence;
 }
 export interface EventMessage {
-  type?: Type9;
+  type?: Type10;
   event: RunEvent;
 }
 export interface EventBatchMessage {
-  type?: Type10;
+  type?: Type11;
   events: Events1;
 }
 export interface ProtocolErrorMessage {
-  type?: Type11;
-  request_id?: RequestId10;
+  type?: Type12;
+  request_id?: RequestId11;
   code: Code1;
   message: Message1;
 }

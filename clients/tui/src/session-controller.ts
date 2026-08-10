@@ -1,7 +1,7 @@
 import type {EventSubscription} from './client.js';
 import {HELP_TEXT, parseInput, themeListText} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
-import type {ProtocolResponse, RequestInput, ServerMessage} from './protocol.js';
+import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
 import {
   activeTimingElapsedMs,
   closeActiveAgentTimings,
@@ -13,13 +13,20 @@ import {
   applyEvent,
   applySnapshot,
   type ConversationEntry,
+  enterExperimentDrilldown,
+  enterExperimentRound,
+  failExperiments,
   initialSessionState,
+  leaveExperimentDrilldown,
+  moveExperimentSelection,
+  openExperimentLog,
   type SessionState,
   selectNextAgent,
   selectNextRound,
   selectPreviousAgent,
   selectPreviousRound,
   selectRound,
+  setExperiments,
   setTheme,
   showDetail,
   showLive,
@@ -42,6 +49,11 @@ export interface SessionController {
   selectRound(roundNumber: number): void;
   toggleTodos(): void;
   setTheme(themeName: ThemeName): void;
+  openExperimentLog(): Promise<void>;
+  openRound(roundNumber?: number): void;
+  moveExperimentSelection(delta: number): void;
+  enterExperimentDrilldown(): void;
+  leaveExperimentDrilldown(): void;
   subscribe(listener: (state: SessionState) => void): () => void;
 }
 
@@ -62,6 +74,8 @@ export class SocketSessionController implements SessionController {
   #chatMessageId = 0;
   readonly #chatQueue: Array<{id: string; text: string}> = [];
   #chatDrain: Promise<void> | null = null;
+  /** Single-flight guard: phase events arrive faster than the fetch settles. */
+  #experimentFetch: Promise<void> | null = null;
 
   constructor(
     private readonly client: SupervisionTransport,
@@ -77,6 +91,9 @@ export class SocketSessionController implements SessionController {
   async start(): Promise<void> {
     const response = await this.client.request({type: 'query.snapshot'});
     if (response.snapshot) this.#setState(applySnapshot(this.#state, response.snapshot));
+    // The log is the landing view, so it is populated before the first frame
+    // rather than on demand.
+    await this.#loadExperiments();
     this.#eventSubscription = await this.client.subscribe(
       0,
       message => this.#onMessage(message),
@@ -132,6 +149,62 @@ export class SocketSessionController implements SessionController {
 
   closeChat(): void {
     this.#setState({...this.#state, chatOpen: false});
+  }
+
+  async openExperimentLog(): Promise<void> {
+    this.#setState(openExperimentLog(this.#state));
+    await this.#loadExperiments();
+  }
+
+  openRound(roundNumber?: number): void {
+    this.#setState(this.#openRoundState(roundNumber));
+  }
+
+  #openRoundState(roundNumber: number | undefined): SessionState {
+    if (roundNumber !== undefined) {
+      return (
+        enterExperimentRound(this.#state, roundNumber) ??
+        showDetail(this.#state, `Round ${roundNumber} is not in any recorded hypothesis.`)
+      );
+    }
+    const scope = this.#state.hypothesisScope;
+    if (scope !== null) {
+      return showDetail(this.#state, `Already inside ${scope.id}. Esc returns to /experiments.`);
+    }
+    const opened = enterExperimentDrilldown(this.#state);
+    return opened === this.#state
+      ? showDetail(this.#state, 'Select a hypothesis first, or use /open-round --N.')
+      : opened;
+  }
+
+  moveExperimentSelection(delta: number): void {
+    this.#setState(moveExperimentSelection(this.#state, delta));
+  }
+
+  enterExperimentDrilldown(): void {
+    this.#setState(enterExperimentDrilldown(this.#state));
+  }
+
+  leaveExperimentDrilldown(): void {
+    this.#setState(leaveExperimentDrilldown(this.#state));
+  }
+
+  async #loadExperiments(): Promise<void> {
+    if (this.#experimentFetch !== null) return this.#experimentFetch;
+    const fetch = this.#requestExperiments().finally(() => {
+      this.#experimentFetch = null;
+    });
+    this.#experimentFetch = fetch;
+    return fetch;
+  }
+
+  async #requestExperiments(): Promise<void> {
+    try {
+      const response = await this.client.request({type: 'query.experiments'});
+      this.#setState(setExperiments(this.#state, response.experiments ?? []));
+    } catch (error) {
+      this.#setState(failExperiments(this.#state, String(error)));
+    }
   }
 
   sendChat(value: string): Promise<void> {
@@ -221,6 +294,14 @@ export class SocketSessionController implements SessionController {
       if (parsed.chatMessage) await this.sendChat(parsed.chatMessage);
       return;
     }
+    if (parsed.experimentLog) {
+      await this.openExperimentLog();
+      return;
+    }
+    if (parsed.openRound) {
+      this.openRound(parsed.openRound.round);
+      return;
+    }
     if (parsed.localView === 'theme') {
       if (parsed.themeName === undefined) {
         return this.#setState(
@@ -244,15 +325,34 @@ export class SocketSessionController implements SessionController {
   }
 
   #onMessage(message: ServerMessage): void {
-    if (message.type === 'event') this.#setState(applyEvent(this.#state, message.event));
+    if (message.type === 'event') {
+      this.#setState(applyEvent(this.#state, message.event));
+      this.#refreshExperimentsFor([message.event]);
+    }
     if (message.type === 'event_batch') {
       let state = this.#state;
       for (const event of message.events) state = applyEvent(state, event);
       this.#setState(state);
+      this.#refreshExperimentsFor(message.events);
     }
     if (message.type === 'protocol_error') {
       this.#setState(showDetail(this.#state, message.message, 'error'));
     }
+  }
+
+  /**
+   * A hypothesis appears when the orchestrator phase finishes writing its plan
+   * and resolves when the round finishes, so those two events bound every
+   * change to the log. Refetching on them keeps the landing view live without
+   * polling; the single-flight guard absorbs bursts.
+   */
+  #refreshExperimentsFor(events: readonly RunEvent[]): void {
+    if (this.#state.experimentLog === null) return;
+    const relevant = events.some(
+      event => event.type === 'round_finished' || event.type === 'phase_finished',
+    );
+    if (!relevant) return;
+    void this.#loadExperiments();
   }
 
   #setState(state: SessionState): void {

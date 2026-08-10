@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 
 from vibesys.server.events import EventType, RunEvent
+from vibesys.server.experiments import apply_baselines, build_experiment_log
 from vibesys.server.inspector import RunInspector
 from vibesys.server.protocol import (
     ChatQuery,
     ChatResult,
     CommandAck,
     EventsQuery,
+    ExperimentQuery,
     HistoryQuery,
+    HypothesisEntry,
     PauseCommand,
     PerformanceQuery,
     PerformanceRound,
@@ -58,6 +61,9 @@ class SupervisionService:
         if isinstance(request, PerformanceQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/perf")
             return Response(request_id=request.request_id, performance=self.performance_rounds())
+        if isinstance(request, ExperimentQuery):
+            self.supervisor.record(EventType.STATUS_QUERY, "/experiments")
+            return Response(request_id=request.request_id, experiments=self.experiments())
         if isinstance(request, SnapshotQuery):
             return Response(request_id=request.request_id, snapshot=self.snapshot())
         if isinstance(request, EventsQuery):
@@ -102,6 +108,29 @@ class SupervisionService:
                 )
             )
         return rounds
+
+    def experiments(self) -> list[HypothesisEntry]:
+        """Group persisted round state into one entry per hypothesis."""
+        raw = self._read_json("rounds.json")
+        rounds = [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+        active = self._read_json("active_hypothesis.json")
+        entries = build_experiment_log(rounds, active if isinstance(active, dict) else None)
+        apply_baselines(entries, rounds)
+        return entries
+
+    def _read_json(self, name: str) -> object | None:
+        log_dir = self.supervisor.log_dir
+        if log_dir is None:
+            return None
+        path = log_dir / name
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            # A run writing state concurrently can be observed mid-write. A
+            # transient parse failure must not take down the operator's view.
+            return None
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.wait_for_events(after_sequence, timeout)
