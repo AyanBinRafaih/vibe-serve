@@ -20,6 +20,7 @@ import argparse
 import json
 import math
 import os
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -34,7 +35,7 @@ from vibesys.constants import (
     PROJECT_ROOT,
     ComputeBackend,
 )
-from vibesys.domains.base import DomainName  # noqa: TC001  # tracked: #288
+from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.input_manifest import InputBundle, load_input_bundle
 from vibesys.profilers import CLI_PROFILER_CHOICES, ProfilerKind, coerce_profiler_kind
@@ -184,6 +185,146 @@ def _fail(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: Standalone-input flag dests that together synthesize a bundle when ``--input``
+#: is omitted. Kept in one place so conflict/requirement checks stay in sync.
+#: Every flag is spelled ``--input-<name>``; argparse maps it to ``input_<name>``.
+_STANDALONE_INPUT_DESTS = (
+    "input_objective",
+    "input_objective_file",
+    "input_domain",
+    "input_accuracy_command",
+    "input_benchmark_command",
+    "input_accuracy_timeout",
+    "input_benchmark_timeout",
+    "input_benchmark_metric",
+    "input_benchmark_result_arg",
+    "input_reference",
+    "input_evaluator_dir",
+    "input_workspace_seed",
+    "input_evaluator_source",
+    "input_hidden_evaluator_source",
+)
+
+
+def _add_standalone_input_args(parser: argparse.ArgumentParser) -> None:
+    """Add flags that synthesize an input bundle without a prebuilt ``--input``.
+
+    These let external users (e.g. a ``pip install``ed VibeSys with no
+    repository ``examples/`` on disk) pass the objective, domain, and evaluator
+    commands directly. When any are set and ``--input`` is omitted, the flags
+    are materialized into a bundle before the normal input-loading path runs.
+
+    All flags share the ``--input-`` prefix so they read as the pieces of
+    ``--input`` provided separately, and so none abbreviate to a retired flag
+    (e.g. ``--ref``, ``--domain``) that the CLI still rejects.
+    """
+    group = parser.add_argument_group(
+        "standalone input",
+        "Provide an input bundle's contents directly instead of --input. "
+        "Requires --input-objective/--input-objective-file, --input-domain, "
+        "--input-accuracy-command, and --input-benchmark-command; the rest are optional.",
+    )
+    group.add_argument(
+        "--input-objective",
+        default=None,
+        metavar="TEXT",
+        help="Objective text (becomes OBJECTIVE.md). Mutually exclusive with --input-objective-file.",
+    )
+    group.add_argument(
+        "--input-objective-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to a file whose contents become OBJECTIVE.md.",
+    )
+    group.add_argument(
+        "--input-domain",
+        type=DomainName,
+        choices=list(DomainName),
+        default=None,
+        help="Target domain for the synthesized bundle's [agent].domain.",
+    )
+    group.add_argument(
+        "--input-accuracy-command",
+        default=None,
+        metavar="CMD",
+        help="Accuracy evaluator command, shell-quoted (e.g. 'python checker.py').",
+    )
+    group.add_argument(
+        "--input-benchmark-command",
+        default=None,
+        metavar="CMD",
+        help="Benchmark command, shell-quoted (e.g. 'python benchmark.py').",
+    )
+    group.add_argument(
+        "--input-accuracy-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Optional timeout for the accuracy command.",
+    )
+    group.add_argument(
+        "--input-benchmark-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Optional timeout for the benchmark command.",
+    )
+    group.add_argument(
+        "--input-benchmark-metric",
+        default=None,
+        metavar="NAME",
+        help=(
+            "JSON field the benchmark emits as its scalar result "
+            "(with --input-benchmark-result-arg)."
+        ),
+    )
+    group.add_argument(
+        "--input-benchmark-result-arg",
+        default=None,
+        metavar="OPT",
+        help=(
+            "Option-style argv element the benchmark accepts for its JSON result path "
+            "(e.g. --result-json); pairs with --input-benchmark-metric."
+        ),
+    )
+    group.add_argument(
+        "--input-reference",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Directory copied into the bundle as reference/.",
+    )
+    group.add_argument(
+        "--input-evaluator-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Directory whose contents are copied into the bundle root (evaluator scripts, etc.).",
+    )
+    group.add_argument(
+        "--input-workspace-seed",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Directory copied in as the candidate workspace seed (manifest [workspace].seed).",
+    )
+    group.add_argument(
+        "--input-evaluator-source",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Trusted evaluator source directory (manifest [evaluator].source).",
+    )
+    group.add_argument(
+        "--input-hidden-evaluator-source",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Hidden evaluator source directory (manifest [hidden_evaluator].source).",
+    )
+
+
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments shared across every outer-loop parser."""
     parser.add_argument(
@@ -195,6 +336,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "vibesys.input.toml with accuracy and benchmark commands."
         ),
     )
+    _add_standalone_input_args(parser)
     parser.add_argument(
         "--exp-name",
         required=False,
@@ -945,19 +1087,144 @@ def _build_agent_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_target_inputs(args: argparse.Namespace) -> None:
-    input_arg = getattr(args, "input", None)
-    if input_arg is None:
+def _standalone_input_dests_set(args: argparse.Namespace) -> list[str]:
+    """Return the standalone-input flag dests that were provided (non-default)."""
+    return [dest for dest in _STANDALONE_INPUT_DESTS if getattr(args, dest, None) is not None]
+
+
+def _resolve_standalone_objective(args: argparse.Namespace) -> str:
+    if args.input_objective is not None and args.input_objective_file is not None:
         _configuration_error(
-            "Error: missing required target input: --input. "
-            "Pass a bundle containing OBJECTIVE.md and vibesys.input.toml.",
+            "Error: pass only one of --input-objective or --input-objective-file.",
+            code="invalid_arguments",
+            stage="argument_parsing",
+        )
+    if args.input_objective is not None:
+        return args.input_objective
+    if args.input_objective_file is None:
+        _configuration_error(
+            "Error: --input-objective or --input-objective-file is required.",
             code="missing_input",
             stage="input_loading",
         )
+    objective_file = args.input_objective_file.expanduser()
+    if not objective_file.is_file():
+        _configuration_error(
+            f"Error: --input-objective-file not found: {args.input_objective_file}",
+            code="invalid_input",
+            stage="input_loading",
+        )
+    return objective_file.read_text()
+
+
+def _parse_command_flag(raw: str, flag: str) -> tuple[str, ...]:
+    try:
+        parts = tuple(shlex.split(raw))
+    except ValueError as exc:
+        _configuration_error(
+            f"Error: could not parse {flag}: {exc}",
+            code="invalid_arguments",
+            stage="argument_parsing",
+        )
+    if not parts:
+        _configuration_error(
+            f"Error: {flag} must contain at least one argument.",
+            code="invalid_arguments",
+            stage="argument_parsing",
+        )
+    return parts
+
+
+def _synthesize_standalone_input(args: argparse.Namespace) -> Path:
+    """Materialize standalone-input flags into a bundle and return its path."""
+    from vibesys.input_synthesis import (  # noqa: PLC0415  # tracked: #288
+        InputSynthesisError,
+        SynthesizedInputSpec,
+        synthesize_input_bundle,
+    )
+
+    missing = [
+        flag
+        for flag, present in (
+            (
+                "--input-objective/--input-objective-file",
+                args.input_objective is not None or args.input_objective_file is not None,
+            ),
+            ("--input-domain", args.input_domain is not None),
+            ("--input-accuracy-command", args.input_accuracy_command is not None),
+            ("--input-benchmark-command", args.input_benchmark_command is not None),
+        )
+        if not present
+    ]
+    if missing:
+        _configuration_error(
+            "Error: standalone input requires " + ", ".join(missing) + ".",
+            code="missing_input",
+            stage="input_loading",
+        )
+
+    objective = _resolve_standalone_objective(args)
+    spec = SynthesizedInputSpec(
+        objective=objective,
+        domain=args.input_domain,
+        accuracy_command=_parse_command_flag(
+            args.input_accuracy_command, "--input-accuracy-command"
+        ),
+        benchmark_command=_parse_command_flag(
+            args.input_benchmark_command, "--input-benchmark-command"
+        ),
+        accuracy_timeout_seconds=args.input_accuracy_timeout,
+        benchmark_timeout_seconds=args.input_benchmark_timeout,
+        benchmark_metric=args.input_benchmark_metric,
+        benchmark_result_arg=args.input_benchmark_result_arg,
+        reference_dir=args.input_reference,
+        evaluator_dir=args.input_evaluator_dir,
+        workspace_seed_dir=args.input_workspace_seed,
+        evaluator_source_dir=args.input_evaluator_source,
+        hidden_evaluator_source_dir=args.input_hidden_evaluator_source,
+    )
+
+    if args.exp_name is None:
+        args.exp_name = generate_experiment_name(Path(str(args.input_domain)))
+    destination = PROJECT_ROOT / "exp_env" / "_inputs" / args.exp_name
+    try:
+        return synthesize_input_bundle(spec, destination)
+    except InputSynthesisError as exc:
+        _configuration_error(str(exc), code="invalid_input", stage="input_loading")
+
+
+def _validate_target_inputs(args: argparse.Namespace) -> None:
+    input_arg = getattr(args, "input", None)
+    standalone = _standalone_input_dests_set(args)
+    synthesized = False
+
+    if input_arg is not None and standalone:
+        _configuration_error(
+            "Error: --input cannot be combined with standalone input flags "
+            f"({', '.join('--' + dest.replace('_', '-') for dest in standalone)}).",
+            code="invalid_arguments",
+            stage="argument_parsing",
+        )
+
+    if input_arg is None:
+        if not standalone:
+            _configuration_error(
+                "Error: missing required target input. Pass --input with a bundle "
+                "containing OBJECTIVE.md and vibesys.input.toml, or provide "
+                "--input-objective/--input-objective-file, --input-domain, "
+                "--input-accuracy-command, and --input-benchmark-command to synthesize one.",
+                code="missing_input",
+                stage="input_loading",
+            )
+        input_arg = _synthesize_standalone_input(args)
+        args.input = input_arg
+        synthesized = True
+
     try:
         args.input_bundle = load_input_bundle(
             input_arg,
             allow_materialized_sources=getattr(args, "resume", None) is not None,
+            allow_bundle_local_sources=synthesized,
         )
     except (FileNotFoundError, ValueError) as exc:
         _configuration_error(str(exc), code="invalid_input", stage="input_loading")

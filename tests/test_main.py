@@ -161,6 +161,9 @@ def test_target_input_defaults_to_none():  # noqa: ANN201  # tracked: #288
     assert args.profiler is ProfilerKind.AUTO
     assert not hasattr(args, "profiler_support")
     assert not hasattr(args, "domain")
+    # Standalone-input flags default to None (they synthesize a bundle when set).
+    assert args.input_domain is None
+    assert args.input_objective is None
 
 
 @pytest.mark.parametrize(
@@ -727,7 +730,11 @@ def test_validate_target_inputs_requires_input():  # noqa: ANN201  # tracked: #2
     with pytest.raises(ConfigurationError) as exc:
         _validate_target_inputs(args)
 
-    assert "missing required target input: --input" in exc.value.diagnostic.message
+    message = exc.value.diagnostic.message
+    assert "missing required target input" in message
+    # The error points at both ways to supply a target.
+    assert "--input" in message
+    assert "--input-objective" in message
 
 
 def test_trusted_input_baseline_requires_resume(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288

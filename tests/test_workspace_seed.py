@@ -268,6 +268,33 @@ def test_manifest_resolves_hidden_evaluator_relative_to_bundle(tmp_path):  # noq
     assert loaded.hidden_evaluator_path == evaluator.resolve()
 
 
+def test_bundle_local_seed_rejected_without_flag_but_allowed_with_it(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    project_root = tmp_path / "project"
+    bundle = _write_bundle(project_root, '[workspace]\nseed = "_seed"')
+    (bundle / "_seed").mkdir()
+
+    # A seed inside the bundle escapes examples/starters under the default policy.
+    with pytest.raises(ValueError, match="must resolve inside"):
+        load_input_bundle(bundle, project_root=project_root)
+
+    loaded = load_input_bundle(bundle, project_root=project_root, allow_bundle_local_sources=True)
+    assert loaded.workspace_seed_path == (bundle / "_seed").resolve()
+
+
+def test_bundle_local_evaluator_sources_allowed_with_flag(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    project_root = tmp_path / "project"
+    bundle = _write_bundle(
+        project_root,
+        '[evaluator]\nsource = "_evaluator_src"\n\n[hidden_evaluator]\nsource = "_hidden_evaluator_src"',
+    )
+    (bundle / "_evaluator_src").mkdir()
+    (bundle / "_hidden_evaluator_src").mkdir()
+
+    loaded = load_input_bundle(bundle, project_root=project_root, allow_bundle_local_sources=True)
+    assert loaded.evaluator_path == (bundle / "_evaluator_src").resolve()
+    assert loaded.hidden_evaluator_path == (bundle / "_hidden_evaluator_src").resolve()
+
+
 @pytest.mark.parametrize(
     ("seed_value", "error"),
     [
