@@ -21,6 +21,10 @@ available slash commands are:
 | Command | Behavior |
 | --- | --- |
 | `/help` | Show commands and planned controls. |
+| `/chat` | Open a read-only chat about the run; `/chat <question>` asks immediately. |
+| `/pause` | Pause after the current agent call finishes. |
+| `/resume` | Resume a paused run. |
+| `/steer <message>` | Queue an instruction that is appended to the next agent invocation's prompt. |
 | `/history` | List rounds with agent-active elapsed time. |
 | `/perf` | Plot the recorded performance metric by round. |
 | `/theme` | List themes; `/theme <name>` switches immediately. |

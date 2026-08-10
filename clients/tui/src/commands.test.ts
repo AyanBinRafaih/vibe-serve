@@ -12,7 +12,19 @@ describe('parseInput', () => {
       localView: 'chat',
       chatMessage: 'what changed in the latest round?',
     });
-    expect(parseInput('/steer inspect the cache').error).toContain('Unknown command');
+  });
+
+  it('parses run-control commands', () => {
+    expect(parseInput('/pause')).toEqual({request: {type: 'command.pause'}});
+    expect(parseInput('/resume')).toEqual({request: {type: 'command.resume'}});
+    expect(parseInput('/steer prioritize the KV cache path')).toEqual({
+      request: {type: 'command.steer', text: 'prioritize the KV cache path'},
+    });
+  });
+
+  it('requires a message for /steer', () => {
+    expect(parseInput('/steer').error).toContain('Usage: /steer');
+    expect(parseInput('/steer   ').error).toContain('Usage: /steer');
   });
 
   it('sends ordinary text to the supervision chat endpoint', () => {
@@ -59,6 +71,9 @@ describe('slash-command input helpers', () => {
     expect(suggestSlashCommands('/').map(command => command.name)).toEqual([
       '/help',
       '/chat',
+      '/pause',
+      '/resume',
+      '/steer',
       '/history',
       '/perf',
       '/theme',

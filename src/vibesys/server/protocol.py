@@ -32,6 +32,11 @@ class ResumeCommand(Request):  # noqa: D101  # tracked: #288
     type: Literal["command.resume"] = "command.resume"
 
 
+class SteerCommand(Request):  # noqa: D101  # tracked: #288
+    type: Literal["command.steer"] = "command.steer"
+    text: str = Field(min_length=1)
+
+
 class SnapshotQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.snapshot"] = "query.snapshot"
 
@@ -63,6 +68,7 @@ class SubscribeRequest(Request):  # noqa: D101  # tracked: #288
 ProtocolRequest = Annotated[
     PauseCommand
     | ResumeCommand
+    | SteerCommand
     | SnapshotQuery
     | ChatQuery
     | HistoryQuery
@@ -83,7 +89,7 @@ class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288
 
 
 class CommandAck(ProtocolModel):  # noqa: D101  # tracked: #288
-    action: Literal["pause", "resume"]
+    action: Literal["pause", "resume", "steer"]
     status: Literal["pending", "consumed"]
 
 

@@ -18,6 +18,9 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   {name: '/help', description: 'Show this help'},
   {name: '/chat', description: 'Open experiment chat'},
+  {name: '/pause', description: 'Pause after the current agent call'},
+  {name: '/resume', description: 'Resume a paused run'},
+  {name: '/steer', description: 'Guide the next agent invocation: /steer <message>'},
   {name: '/history', description: 'List rounds and their elapsed time'},
   {name: '/perf', description: 'Plot performance by round'},
   {name: '/theme', description: 'List themes, or switch with /theme <name>'},
@@ -41,9 +44,6 @@ export const HELP_TEXT = [
   ...SLASH_COMMANDS.map(command => `  ${command.name.padEnd(18)} ${command.description}`),
   '',
   'Planned',
-  '  /pause             Pause at the next safe point',
-  '  /resume            Resume a paused run',
-  '  /steer <message>   Guide a future agent invocation',
   '  /round <number>    Inspect a completed round',
   '  /invocation <id>   Inspect an agent invocation',
 ].join('\n');
@@ -74,6 +74,14 @@ export function parseInput(text: string): ParsedInput {
       return {error: `Unknown theme: ${requested}. Available: ${THEME_NAMES.join(', ')}.`};
     }
     return {localView: 'theme', themeName: requested};
+  }
+  if (text === '/pause') return {request: {type: 'command.pause'}};
+  if (text === '/resume') return {request: {type: 'command.resume'}};
+  const steer = text.match(/^\/steer(?:\s+([\s\S]*))?$/);
+  if (steer) {
+    const message = steer[1]?.trim();
+    if (!message) return {error: 'Usage: /steer <message>'};
+    return {request: {type: 'command.steer', text: message}};
   }
   if (text === '/history') return {request: {type: 'query.history'}, responseView: 'history'};
   if (text === '/perf') return {request: {type: 'query.performance'}, responseView: 'perf'};

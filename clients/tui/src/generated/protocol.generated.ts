@@ -3,6 +3,7 @@
 export type Request =
   | PauseCommand
   | ResumeCommand
+  | SteerCommand
   | SnapshotQuery
   | ChatQuery
   | HistoryQuery
@@ -21,51 +22,56 @@ export type Type1 = "command.resume";
 export type ProtocolVersion2 = 1;
 export type RequestId2 = string;
 export type Timestamp2 = string;
-export type Type2 = "query.snapshot";
+export type Type2 = "command.steer";
+export type Text = string;
 export type ProtocolVersion3 = 1;
 export type RequestId3 = string;
 export type Timestamp3 = string;
-export type Type3 = "query.chat";
-export type Text = string;
+export type Type3 = "query.snapshot";
 export type ProtocolVersion4 = 1;
 export type RequestId4 = string;
 export type Timestamp4 = string;
-export type Type4 = "query.history";
+export type Type4 = "query.chat";
+export type Text1 = string;
 export type ProtocolVersion5 = 1;
 export type RequestId5 = string;
 export type Timestamp5 = string;
-export type Type5 = "query.performance";
+export type Type5 = "query.history";
 export type ProtocolVersion6 = 1;
 export type RequestId6 = string;
 export type Timestamp6 = string;
-export type Type6 = "query.events";
-export type AfterSequence = number;
-export type TimeoutMs = number;
+export type Type6 = "query.performance";
 export type ProtocolVersion7 = 1;
 export type RequestId7 = string;
 export type Timestamp7 = string;
-export type Type7 = "subscribe";
-export type AfterSequence1 = number;
+export type Type7 = "query.events";
+export type AfterSequence = number;
+export type TimeoutMs = number;
 export type ProtocolVersion8 = 1;
 export type RequestId8 = string;
 export type Timestamp8 = string;
+export type Type8 = "subscribe";
+export type AfterSequence1 = number;
+export type ProtocolVersion9 = 1;
+export type RequestId9 = string;
+export type Timestamp9 = string;
 export type Ok = boolean;
 export type Error = string | null;
-export type Action = "pause" | "resume";
+export type Action = "pause" | "resume" | "steer";
 export type Status = "pending" | "consumed";
 export type Question = string;
 export type Answer = string;
 export type Effect = "none";
-export type ProtocolVersion9 = 1;
+export type ProtocolVersion10 = 1;
 export type RunId = string;
 export type Sequence = number;
 export type Status1 = string;
 export type AgentKind = string | null;
 export type RoundLabel = string | null;
-export type ProtocolVersion10 = 1;
+export type ProtocolVersion11 = 1;
 export type Sequence1 = number;
 export type RunId1 = string;
-export type Timestamp9 = string;
+export type Timestamp10 = string;
 export type EventType =
   | "server_started"
   | "server_ready"
@@ -91,7 +97,7 @@ export type EventType =
   | "tool_result"
   | "todo_update"
   | "usage_update";
-export type Text1 = string;
+export type Text2 = string;
 export type EventStatus = "active" | "answered" | "pending" | "consumed" | "completed" | "failed";
 export type RoundLabel1 = string | null;
 export type AgentKind1 = string | null;
@@ -197,15 +203,15 @@ export type Passed = boolean;
 export type ProfileSkipped = boolean;
 export type Performance = PerformanceRound[];
 export type ServerMessage = SubscribedMessage | EventMessage | EventBatchMessage | ProtocolErrorMessage;
-export type Type8 = "subscribed";
-export type RequestId9 = string;
+export type Type9 = "subscribed";
+export type RequestId10 = string;
 export type RunId2 = string;
 export type LatestSequence = number;
-export type Type9 = "event";
-export type Type10 = "event_batch";
+export type Type10 = "event";
+export type Type11 = "event_batch";
 export type Events1 = RunEvent[];
-export type Type11 = "protocol_error";
-export type RequestId10 = string | null;
+export type Type12 = "protocol_error";
+export type RequestId11 = string | null;
 export type Code1 = string;
 export type Message1 = string;
 
@@ -230,50 +236,57 @@ export interface ResumeCommand {
   timestamp?: Timestamp1;
   type?: Type1;
 }
-export interface SnapshotQuery {
+export interface SteerCommand {
   protocol_version?: ProtocolVersion2;
   request_id?: RequestId2;
   timestamp?: Timestamp2;
   type?: Type2;
+  text: Text;
 }
-export interface ChatQuery {
+export interface SnapshotQuery {
   protocol_version?: ProtocolVersion3;
   request_id?: RequestId3;
   timestamp?: Timestamp3;
   type?: Type3;
-  text: Text;
 }
-export interface HistoryQuery {
+export interface ChatQuery {
   protocol_version?: ProtocolVersion4;
   request_id?: RequestId4;
   timestamp?: Timestamp4;
   type?: Type4;
+  text: Text1;
 }
-export interface PerformanceQuery {
+export interface HistoryQuery {
   protocol_version?: ProtocolVersion5;
   request_id?: RequestId5;
   timestamp?: Timestamp5;
   type?: Type5;
 }
-export interface EventsQuery {
+export interface PerformanceQuery {
   protocol_version?: ProtocolVersion6;
   request_id?: RequestId6;
   timestamp?: Timestamp6;
   type?: Type6;
-  after_sequence?: AfterSequence;
-  timeout_ms?: TimeoutMs;
 }
-export interface SubscribeRequest {
+export interface EventsQuery {
   protocol_version?: ProtocolVersion7;
   request_id?: RequestId7;
   timestamp?: Timestamp7;
   type?: Type7;
+  after_sequence?: AfterSequence;
+  timeout_ms?: TimeoutMs;
+}
+export interface SubscribeRequest {
+  protocol_version?: ProtocolVersion8;
+  request_id?: RequestId8;
+  timestamp?: Timestamp8;
+  type?: Type8;
   after_sequence?: AfterSequence1;
 }
 export interface Response {
-  protocol_version?: ProtocolVersion8;
-  request_id: RequestId8;
-  timestamp?: Timestamp8;
+  protocol_version?: ProtocolVersion9;
+  request_id: RequestId9;
+  timestamp?: Timestamp9;
   ok?: Ok;
   error?: Error;
   ack?: CommandAck | null;
@@ -292,7 +305,7 @@ export interface ChatResult {
   effect?: Effect;
 }
 export interface RunSnapshot {
-  protocol_version?: ProtocolVersion9;
+  protocol_version?: ProtocolVersion10;
   run_id: RunId;
   sequence: Sequence;
   status: Status1;
@@ -303,12 +316,12 @@ export interface RunSnapshot {
  * One reproducible human, control, or invocation event.
  */
 export interface RunEvent {
-  protocol_version?: ProtocolVersion10;
+  protocol_version?: ProtocolVersion11;
   sequence?: Sequence1;
   run_id?: RunId1;
-  timestamp: Timestamp9;
+  timestamp: Timestamp10;
   type: EventType;
-  text?: Text1;
+  text?: Text2;
   status?: EventStatus | null;
   round_label?: RoundLabel1;
   agent_kind?: AgentKind1;
@@ -471,22 +484,22 @@ export interface PerformanceRound {
   profile_skipped?: ProfileSkipped;
 }
 export interface SubscribedMessage {
-  type?: Type8;
-  request_id: RequestId9;
+  type?: Type9;
+  request_id: RequestId10;
   run_id: RunId2;
   latest_sequence: LatestSequence;
 }
 export interface EventMessage {
-  type?: Type9;
+  type?: Type10;
   event: RunEvent;
 }
 export interface EventBatchMessage {
-  type?: Type10;
+  type?: Type11;
   events: Events1;
 }
 export interface ProtocolErrorMessage {
-  type?: Type11;
-  request_id?: RequestId10;
+  type?: Type12;
+  request_id?: RequestId11;
   code: Code1;
   message: Message1;
 }

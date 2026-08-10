@@ -1075,7 +1075,9 @@ class _RunContext:
         """
         supervisor = getattr(self, "supervisor", None)
         if supervisor is not None:
-            supervisor.before_agent(kind, round_label, user_prompt, system_prompt)
+            # before_agent blocks while paused and returns the prompt with any
+            # queued operator steering appended, so the next invocation sees it.
+            user_prompt = supervisor.before_agent(kind, round_label, user_prompt, system_prompt)
         result: T | None = None
         error: BaseException | None = None
         try:
