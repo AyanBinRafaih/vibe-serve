@@ -130,11 +130,11 @@ def _run_bundled_tui(bundle: BundledTui, args: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def source_checkout_root() -> Path | None:
-    """Return the repository root containing ``clients/tui``, or ``None``.
+def _candidate_checkout_roots() -> list[Path]:
+    """Directories that might be a VibeSys checkout root, in priority order.
 
-    Checks the package location first (an editable install lives at
-    ``<repo>/src/vibesys``), then walks up from the current directory (a
+    The package location comes first (an editable install lives at
+    ``<repo>/src/vibesys``); then the current directory and its parents (a
     ``uv run vibesys`` invocation runs from the repo root).
     """
     candidates: list[Path] = []
@@ -143,7 +143,12 @@ def source_checkout_root() -> Path | None:
         candidates.append(package_file.parents[2])
     cwd = Path.cwd().resolve()
     candidates.extend([cwd, *cwd.parents])
-    for root in candidates:
+    return candidates
+
+
+def source_checkout_root() -> Path | None:
+    """Return the repository root containing ``clients/tui``, or ``None``."""
+    for root in _candidate_checkout_roots():
         if (root / "clients" / "tui" / "package.json").is_file():
             return root
     return None

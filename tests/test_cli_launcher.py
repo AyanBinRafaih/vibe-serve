@@ -215,3 +215,190 @@ def test_source_checkout_old_node_errors(monkeypatch, tmp_path, capsys):  # noqa
 
     assert cli.main([]) == 1
     assert "Node.js 20+" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 helper units (toolchain resolution, staleness, build)
+# ---------------------------------------------------------------------------
+
+
+def test_pnpm_argv_prefers_pnpm_then_corepack_then_none(monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
+    monkeypatch.setattr(cli.shutil, "which", lambda n: "/usr/bin/pnpm" if n == "pnpm" else None)
+    assert cli._pnpm_argv() == ["/usr/bin/pnpm"]  # noqa: SLF001  # tracked: #288
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda n: "/usr/bin/corepack" if n == "corepack" else None
+    )
+    assert cli._pnpm_argv() == ["/usr/bin/corepack", "pnpm"]  # noqa: SLF001  # tracked: #288
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: None)
+    assert cli._pnpm_argv() is None  # noqa: SLF001  # tracked: #288
+
+
+def test_bun_executable_path_then_home_fallback_then_none(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    monkeypatch.setattr(cli.shutil, "which", lambda n: "/usr/bin/bun" if n == "bun" else None)
+    assert cli._bun_executable() == Path("/usr/bin/bun")  # noqa: SLF001  # tracked: #288
+
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: None)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert cli._bun_executable() is None  # noqa: SLF001  # tracked: #288
+
+    bun = tmp_path / ".bun" / "bin" / "bun"
+    bun.parent.mkdir(parents=True)
+    bun.write_text("#!/bin/sh\n")
+    bun.chmod(0o755)
+    assert cli._bun_executable() == bun  # noqa: SLF001  # tracked: #288
+
+
+def test_node_executable(monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
+    monkeypatch.setattr(cli.shutil, "which", lambda n: "/usr/bin/node" if n == "node" else None)
+    assert cli._node_executable() == Path("/usr/bin/node")  # noqa: SLF001  # tracked: #288
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: None)
+    assert cli._node_executable() is None  # noqa: SLF001  # tracked: #288
+
+
+def test_node_major_parses_version_and_handles_errors(monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
+    import subprocess as sp  # noqa: PLC0415  # tracked: #288
+    from types import SimpleNamespace  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout="v20.3.1\n"),  # noqa: ARG005  # tracked: #288
+    )
+    assert cli._node_major(Path("/usr/bin/node")) == 20  # noqa: SLF001  # tracked: #288
+
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout="weird\n"),  # noqa: ARG005  # tracked: #288
+    )
+    assert cli._node_major(Path("/usr/bin/node")) is None  # noqa: SLF001  # tracked: #288
+
+    def _raise(*_a, **_k):  # noqa: ANN002, ANN003, ANN202  # tracked: #288
+        raise sp.CalledProcessError(1, "node")
+
+    monkeypatch.setattr(cli.subprocess, "run", _raise)
+    assert cli._node_major(Path("/usr/bin/node")) is None  # noqa: SLF001  # tracked: #288
+
+
+def _make_checkout(tmp_path):  # noqa: ANN001, ANN202  # tracked: #288
+    dist = tmp_path / "clients" / "tui" / "dist"
+    src = tmp_path / "clients" / "tui" / "src"
+    dist.mkdir(parents=True)
+    src.mkdir(parents=True)
+    (dist / "index.js").write_text("// index\n")
+    (dist / "launcher.js").write_text("// launcher\n")
+    (src / "app.ts").write_text("// src\n")
+    return tmp_path
+
+
+def _set_mtime(path, when):  # noqa: ANN001, ANN202  # tracked: #288
+    import os  # noqa: PLC0415  # tracked: #288
+
+    os.utime(path, (when, when))
+
+
+def test_needs_rebuild_states(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    root = _make_checkout(tmp_path)
+    dist = root / "clients" / "tui" / "dist"
+    src_file = root / "clients" / "tui" / "src" / "app.ts"
+
+    # Fresh: dist newer than sources -> no rebuild.
+    _set_mtime(src_file, 1000)
+    _set_mtime(dist / "index.js", 2000)
+    _set_mtime(dist / "launcher.js", 2000)
+    assert cli._needs_rebuild(root) is False  # noqa: SLF001  # tracked: #288
+
+    # Stale: a source is newer than the built entry -> rebuild.
+    _set_mtime(src_file, 3000)
+    assert cli._needs_rebuild(root) is True  # noqa: SLF001  # tracked: #288
+
+    # Missing build output -> rebuild.
+    (dist / "index.js").unlink()
+    assert cli._needs_rebuild(root) is True  # noqa: SLF001  # tracked: #288
+
+
+def test_ensure_built_requires_pnpm(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201  # tracked: #288
+    monkeypatch.setattr(cli, "_pnpm_argv", lambda: None)
+    assert cli._ensure_source_tui_built(tmp_path) is False  # noqa: SLF001  # tracked: #288
+    assert "pnpm is required" in capsys.readouterr().err
+
+
+def test_ensure_built_runs_pnpm_steps(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    from types import SimpleNamespace  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.setattr(cli, "_pnpm_argv", lambda: ["/usr/bin/pnpm"])
+    calls: list[list[str]] = []
+
+    def _run(cmd, cwd=None, capture_output=False, text=False, check=False):  # noqa: ANN001, ANN202, ARG001, FBT002  # tracked: #288
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _run)
+    assert cli._ensure_source_tui_built(tmp_path) is True  # noqa: SLF001  # tracked: #288
+    assert [c[1] for c in calls] == ["install", "--dir", "--dir"]
+
+
+def test_ensure_built_reports_failure(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201  # tracked: #288
+    from types import SimpleNamespace  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.setattr(cli, "_pnpm_argv", lambda: ["/usr/bin/pnpm"])
+
+    def _run(cmd, cwd=None, capture_output=False, text=False, check=False):  # noqa: ANN001, ANN202, ARG001, FBT002  # tracked: #288
+        return SimpleNamespace(returncode=1, stdout="boom-out", stderr="boom-err")
+
+    monkeypatch.setattr(cli.subprocess, "run", _run)
+    assert cli._ensure_source_tui_built(tmp_path) is False  # noqa: SLF001  # tracked: #288
+    err = capsys.readouterr().err
+    assert "failed to build" in err
+    assert "boom-err" in err
+
+
+def test_bundled_tui_missing_launcher_errors(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201  # tracked: #288
+    _force_interactive(monkeypatch)
+    bundle = _make_bundle(tmp_path)
+    bundle.launcher.unlink()  # runtime present + executable, launcher gone
+    monkeypatch.setattr(cli, "bundled_tui", lambda: bundle)
+
+    with patch("shutil.which", side_effect=AssertionError("must not search system runtimes")):
+        assert cli.main([]) == 1
+    assert "bundled Bun runtime" in capsys.readouterr().err
+
+
+def test_bundled_tui_resolves_when_staged(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    (tmp_path / "_tui").mkdir()
+    monkeypatch.setattr(cli, "files", lambda _pkg: tmp_path)
+    bundle = cli.bundled_tui()
+    assert bundle is not None
+    assert bundle.root == tmp_path / "_tui"
+    assert bundle.runtime == tmp_path / "_tui" / "bin" / "bun"
+    assert bundle.launcher == tmp_path / "_tui" / "app" / "dist" / "launcher.js"
+
+
+def test_source_checkout_root_none_when_no_candidate(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    monkeypatch.setattr(cli, "_candidate_checkout_roots", lambda: [tmp_path])
+    assert cli.source_checkout_root() is None
+
+
+def test_needs_rebuild_on_watched_config_file(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    root = _make_checkout(tmp_path)
+    dist = root / "clients" / "tui" / "dist"
+    pkg = root / "clients" / "tui" / "package.json"
+    pkg.write_text("{}\n")
+    _set_mtime(root / "clients" / "tui" / "src" / "app.ts", 1000)
+    _set_mtime(dist / "index.js", 2000)
+    _set_mtime(dist / "launcher.js", 2000)
+    _set_mtime(pkg, 3000)  # a watched config file newer than the build
+    assert cli._needs_rebuild(root) is True  # noqa: SLF001  # tracked: #288
+
+
+def test_source_checkout_build_failure_returns_one(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    _force_interactive(monkeypatch)
+    monkeypatch.setattr(cli, "bundled_tui", lambda: None)
+    monkeypatch.setattr(cli, "source_checkout_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_bun_executable", lambda: Path("/usr/bin/bun"))
+    monkeypatch.setattr(cli, "_node_executable", lambda: Path("/usr/bin/node"))
+    monkeypatch.setattr(cli, "_node_major", lambda _node: 20)
+    monkeypatch.setattr(cli, "_needs_rebuild", lambda _root: True)
+    monkeypatch.setattr(cli, "_ensure_source_tui_built", lambda _root: False)
+
+    assert cli.main([]) == 1
