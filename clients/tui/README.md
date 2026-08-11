@@ -46,9 +46,11 @@ outcome until it resolves. `Proven` reads in the theme's success color and
 does not depend on color.
 
 Arrow keys move the selection, the wheel and trackpad scroll the table
-independently of it, and clicking a row selects it. Enter, or `/open-round`,
-opens the rounds behind the selected hypothesis: the ordinary transcript,
-rounds strip, and agent map, filtered to that hypothesis. `/open-round --N`
+independently of it, and clicking a row selects it. Enter on an empty input, or
+`/open-round`, opens the rounds behind the selected hypothesis: the ordinary
+transcript, rounds strip, and agent map, filtered to that hypothesis. The input
+keeps Enter whenever something is typed, so a command entered from the log runs
+on its first Enter and its result opens over the table. `/open-round --N`
 jumps straight to round N inside whichever hypothesis owns it. Escape steps
 back to the table with the selection intact. The log is the root view, so
 opening a hypothesis is the only route to per-round output; there is no

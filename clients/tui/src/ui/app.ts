@@ -22,7 +22,7 @@ const KEY_HELP =
 const SCOPED_KEY_HELP =
   '[/]: round · Tab: agent · PgUp/PgDn · Ctrl+T: todos · Ctrl+P: prompt · Esc: experiments';
 const LOG_KEY_HELP =
-  '↑↓ or scroll: select · Enter or /open-round: open its rounds · /open-round --N';
+  '↑↓ or scroll: select · Enter: open its rounds · type a command to run it here';
 
 export function createOpenTuiApp(renderer: CliRenderer, controller: SessionController): OpenTuiApp {
   let themeName: ThemeName = controller.state.themeName;
@@ -150,6 +150,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   };
   const unbindKeys = bindKeybindings(renderer, controller, viewport, {
     completeInput: () => input.completeSuggestion(),
+    inputIsEmpty: () => input.isEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
     selectNextAgent: () => controller.selectNextAgent(),

@@ -728,6 +728,64 @@ describe('theming', () => {
     expect(controller.state.experimentLog?.selectedId).toBe('H-08');
   });
 
+  it('runs a typed command from the log on the first Enter', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = new FakeController(initialSessionState());
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {
+        claim: 'batch the prefill step',
+        resolved_outcome: 'proven',
+        rounds: [{round: 41, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/help');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+
+    // One Enter runs the command; the table is still the view behind it.
+    expect(controller.submissions).toEqual(['/help']);
+    expect(controller.state.hypothesisScope).toBeNull();
+    expect(await frameAfter(testRenderer)).toContain('Implementation Details');
+  });
+
+  it('opens a command overlay on the log and leaves the table behind it', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController(initialSessionState());
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {
+        claim: 'batch the prefill step',
+        resolved_outcome: 'proven',
+        rounds: [{round: 41, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      overlay: {kind: 'help', content: 'Available commands'},
+    });
+
+    const overlaid = await frameAfter(testRenderer);
+    expect(overlaid).toContain('Available commands');
+    expect(controller.state.experimentLog).not.toBeNull();
+
+    // Enter behind an overlay must not move the operator somewhere unseen.
+    testRenderer.mockInput.pressEnter();
+    await frameAfter(testRenderer);
+    expect(controller.state.hypothesisScope).toBeNull();
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const back = await frameAfterEscape(testRenderer);
+    expect(back).toContain('Implementation Details');
+    expect(back).not.toContain('Available commands');
+  });
+
   it('colors the outcome cell from the active theme in light and dark', async () => {
     for (const name of ['dark', 'light'] as const) {
       const theme = resolveTheme(name);
