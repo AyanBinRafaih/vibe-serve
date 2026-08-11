@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=70.1", "wheel>=0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,24 +8,35 @@ version = "0.1.0"
 description = "AI agent framework for generating bespoke systems from application, workload, and hardware requirements"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "agentshim>=0.5.0",
+    "cbor2<6",
+    "cryptography<50",
     "deepagents",
     "jinja2>=3.1",
     "langchain-google-vertexai>=3.2.2",
     "langchain-openai",
     "huggingface_hub",
+    "mcp>=1.0",
+    "modal>=1.4.2",
     "pydantic>=2",
     "pyyaml>=6",
     "python-dotenv>=1.0.1",
     "loguru>=0.7.2",
-    "vs-feature-flags",
-    "vs-github",
-    "vs-issue-board",
-    "vs-loop-state",
-    "vs-sandbox",
     "openevolve==0.3.1",
 ]
+
+[project.urls]
+Repository = "https://github.com/uw-syfi/vibesys"
+Issues = "https://github.com/uw-syfi/vibesys/issues"
 
 [project.optional-dependencies]
 # Opt-in backend behind the `omnigent_agent_backend` feature flag. Kept out of
@@ -41,18 +52,21 @@ vibesys-issue-mcp = "vs_issue_board.mcp:main"
 # `--headless`/`validate`/no TTY. The engine itself is also `python -m vibesys`.
 vibesys = "vibesys.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["vibesys*"]
-
 [tool.setuptools.package-data]
 # ``_tui`` is produced at build time by setup.py's build_py step and injected
 # into the wheel's build tree; the glob keeps it as package data when present.
-vibesys = ["prompts/*.j2", "prompts/**/*.j2", "prompts/**/*.md", "domains/README.md", "_tui/**/*", "_resources/**/*"]
+vibesys = ["prompts/*.j2", "prompts/**/*.j2", "prompts/**/*.md", "domains/README.md", "_tui/**/*", "_resources/**/*", "_sdk/**/*"]
+vs_feature_flags = ["py.typed"]
+vs_github = ["py.typed"]
+vs_issue_board = ["py.typed"]
+vs_loop_state = ["py.typed"]
+vs_sandbox = ["py.typed"]
 
 [dependency-groups]
 dev = [
+    "auditwheel==6.8.0",
     "chardet<6",
+    "check-wheel-contents",
     "diff-cover",
     "hypothesis",
     "matplotlib>=3.10.8",
@@ -65,6 +79,7 @@ dev = [
     # Pinned exactly (not `>=`): a routine lock refresh with a floating bound
     # could silently change what CI enforces under the strict rule set below.
     "ruff==0.15.12",
+    "twine",
     # Optional for users, required for contributors: without it pyright cannot
     # resolve the Omnigent backend and its tests silently skip. `uv sync --dev`
     # (what CI runs) therefore installs it. Version comes from the extra, so
@@ -207,6 +222,7 @@ reportUnknownArgumentType = "none"
 reportUnnecessaryTypeIgnoreComment = "error"
 pythonVersion = "3.12"
 include = ["src", "tests", "libs/vs-feature-flags/src", "libs/vs-feature-flags/tests", "libs/vs-github/src", "libs/vs-github/tests", "libs/vs-issue-board/src", "libs/vs-issue-board/tests", "libs/vs-loop-state/src", "libs/vs-loop-state/tests", "libs/vs-sandbox/src", "libs/vs-sandbox/tests", "sdk/vs-bench/src", "sdk/vs-bench/tests"]
+extraPaths = ["src", "libs/vs-feature-flags/src", "libs/vs-github/src", "libs/vs-issue-board/src", "libs/vs-loop-state/src", "libs/vs-sandbox/src", "sdk/vs-bench/src"]
 # `tests` and `libs/*/tests` are included above so the strict checker actually
 # sees them (previously they were unchecked entirely). Running them at full
 # strict produced thousands of errors, almost all from patterns strict mode was
@@ -263,12 +279,7 @@ package = true
 
 [tool.uv.workspace]
 exclude = ["exp_env/**"]
-members = ["libs/*", "sdk/*"]
+members = ["sdk/*"]
 
 [tool.uv.sources]
-vs-feature-flags = { workspace = true }
-vs-github = { workspace = true }
-vs-issue-board = { workspace = true }
-vs-loop-state = { workspace = true }
-vs-sandbox = { workspace = true }
 vs-bench = { workspace = true }
