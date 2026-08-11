@@ -1,7 +1,8 @@
 """The ``vibesys`` console entry point (unified launcher).
 
-``vibesys`` is the single entry point for both installed and in-repo use. The
-former ``./vs`` script is now a thin shim that runs ``uv run vibesys``.
+``vibesys`` is the single entry point for both installed and in-repo use, and
+replaces the former ``./vs`` script. From a source checkout, run it with
+``uv run vibesys``.
 
 It routes to the headless engine, with no JavaScript runtime required, when:
 
@@ -133,8 +134,8 @@ def source_checkout_root() -> Path | None:
     """Return the repository root containing ``clients/tui``, or ``None``.
 
     Checks the package location first (an editable install lives at
-    ``<repo>/src/vibesys``), then walks up from the current directory (the
-    ``./vs`` shim runs from the repo root).
+    ``<repo>/src/vibesys``), then walks up from the current directory (a
+    ``uv run vibesys`` invocation runs from the repo root).
     """
     candidates: list[Path] = []
     package_file = Path(__file__).resolve()

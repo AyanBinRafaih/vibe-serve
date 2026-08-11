@@ -11,12 +11,12 @@ start it:
 
 | Entry point | Use |
 | --- | --- |
-| `vibesys` | The unified launcher. Forwards all flags to the engine. Launches the interactive TUI by default and runs headless with `--headless`, `--help`, `validate`, or when not attached to a TTY. The TUI comes from a prebuilt platform wheel, or is built from source when run inside a checkout (needs Bun + Node 20+ + pnpm). |
-| `./vs` | Thin repo shim: runs `uv run vibesys` from the checkout, so a clone works with no install. Identical behavior to `vibesys`. |
+| `vibesys` | The unified launcher (installed). Forwards all flags to the engine. Launches the interactive TUI by default and runs headless with `--headless`, `--help`, `validate`, or when not attached to a TTY. The TUI comes from a prebuilt platform wheel, or is built from source when run inside a checkout (needs Bun + Node 20+ + pnpm). |
+| `uv run vibesys` | The same launcher from a source checkout with no install; `uv` provisions the environment. |
 | `python -m vibesys` | The headless engine directly. No JavaScript runtime required. |
 
-Examples in this document use `./vs`; it is interchangeable with `vibesys` (add
-`--headless` to skip the TUI).
+Examples in this document use `uv run vibesys`; drop the `uv run` prefix when the
+`vibesys` command is installed (add `--headless` to skip the TUI).
 
 ## Mental Model
 
@@ -48,9 +48,9 @@ come from the domain and input bundle, not the interface mode.
 | `plain` | Issue-board loop with deterministic issue draining and perf evaluation. | Uses backend prompt fragments from `src/vibesys/prompts/backend/`. |
 | `evolve` | Evolutionary search over candidate implementations. | Uses domain-aware mutator, judge, and profiler roles. |
 
-Run the commands below with `vibesys` (installed) or `./vs` (from a checkout;
-it just runs `uv run vibesys`). Both forward every argument to the engine and
-prepare the interactive client when needed.
+Run the commands below with `uv run vibesys` (from a checkout) or `vibesys`
+(installed). Both forward every argument to the engine and prepare the
+interactive client when needed.
 Use `vibesys --outer-loop <kind> --help` for loop-specific flags.
 
 ### Agent-loop review and memory policy
@@ -134,10 +134,10 @@ rather than force-pushing.
 GitHub `OWNER/NAME` pairs, and cloneable HTTPS/SSH URLs:
 
 ```bash
-./vs --resume 20260720-120000-example
-./vs --resume /work/experiments/example
-./vs --resume vibesys-playground/example
-./vs --resume https://github.com/my-org/example.git
+uv run vibesys --resume 20260720-120000-example
+uv run vibesys --resume /work/experiments/example
+uv run vibesys --resume vibesys-playground/example
+uv run vibesys --resume https://github.com/my-org/example.git
 ```
 
 Remote repositories are cloned under `exp_env/`. A local clone can live
@@ -149,7 +149,7 @@ be combined with `--resume`.
 
 Run `vibesys validate [INPUT_BUNDLE]` to check an input bundle's static harness
 contract without starting the interactive client, an optimization loop, or an
-agent. From a source checkout, use the equivalent `./vs validate` command.
+agent. From a source checkout, use the equivalent `uv run vibesys validate` command.
 
 The input bundle is the positional argument. When omitted, it defaults to the
 current directory:
@@ -299,7 +299,7 @@ per-status marker, and the running round is the only one with an elapsed-time
 suffix.
 
 ```bash
-./vs --input examples/model-serving/Llama-3-8B --theme solarized-light
+uv run vibesys --input examples/model-serving/Llama-3-8B --theme solarized-light
 ```
 
 ## Skills
@@ -317,12 +317,12 @@ skills, or a single `SKILL.md` file:
 
 ```bash
 # presets + your own skill directory and a single SKILL.md file
-./vs --input <bundle> \
+uv run vibesys --input <bundle> \
   --extra-skills ./my-skills \
   --extra-skills ./one-off-skill/SKILL.md
 
 # use ONLY your skills, ignoring the presets
-./vs --input <bundle> --skills-dir ./my-skills
+uv run vibesys --input <bundle> --skills-dir ./my-skills
 ```
 
 Before a run starts, VibeSys discovers each `SKILL.md` under the candidate
@@ -373,7 +373,7 @@ assumptions in a separate design document.
 For those bundles, pass the root once:
 
 ```bash
-./vs --input examples/<target> ...
+uv run vibesys --input examples/<target> ...
 ```
 
 The manifest declares the evaluator entrypoints and does not define a candidate
@@ -434,7 +434,7 @@ To intentionally upgrade evaluator-owned inputs in an existing experiment,
 commit the authorized refresh before resuming and pass that immutable revision:
 
 ```bash
-./vs --outer-loop agent \
+uv run vibesys --outer-loop agent \
   --resume /path/to/experiment \
   --trusted-input-baseline <refresh-commit>
 ```
@@ -481,7 +481,7 @@ accepted. Git-pinned `[[workspace.sources]]` entries are not exposed as flags;
 use `--input` for those.
 
 ```bash
-./vs \
+uv run vibesys \
   --input-objective-file ./OBJECTIVE.md \
   --input-domain llm-serving \
   --input-accuracy-command "python checker.py" \
@@ -497,7 +497,7 @@ use `--input` for those.
 Default agent loop on local CUDA-compatible host:
 
 ```bash
-./vs \
+uv run vibesys \
   --outer-loop agent \
   --backend cuda \
   --interface inprocess \
@@ -507,25 +507,25 @@ Default agent loop on local CUDA-compatible host:
 Docker CUDA run:
 
 ```bash
-./vs --outer-loop agent --backend cuda --docker ...
+uv run vibesys --outer-loop agent --backend cuda --docker ...
 ```
 
 Modal GPU run:
 
 ```bash
-./vs --outer-loop agent --backend cuda --modal --profiler torch ...
+uv run vibesys --outer-loop agent --backend cuda --modal --profiler torch ...
 ```
 
 Trainium run:
 
 ```bash
-./vs --outer-loop agent --backend trainium --profiler auto ...
+uv run vibesys --outer-loop agent --backend trainium --profiler auto ...
 ```
 
 Over-the-wire service target:
 
 ```bash
-./vs \
+uv run vibesys \
   --outer-loop agent \
   --interface service \
   --input examples/<target>
@@ -534,7 +534,7 @@ Over-the-wire service target:
 CPU-only target:
 
 ```bash
-./vs --outer-loop agent --backend cpu --interface service ...
+uv run vibesys --outer-loop agent --backend cpu --interface service ...
 ```
 
 CPU runs support local execution and Docker; use local execution unless you

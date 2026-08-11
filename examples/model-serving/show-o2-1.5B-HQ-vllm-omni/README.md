@@ -3,7 +3,7 @@ Show-o2 1.5B HQ input bundle.
 Use:
 
 ```bash
-./vs --input examples/model-serving/show-o2-1.5B-HQ-vllm-omni
+uv run vibesys --input examples/model-serving/show-o2-1.5B-HQ-vllm-omni
 ```
 
 This bundle targets `showlab/show-o2-1.5B-HQ`, a Show-o2 text-to-image

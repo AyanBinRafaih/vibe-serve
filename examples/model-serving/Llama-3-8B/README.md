@@ -3,7 +3,7 @@ Llama-3-8B input bundle.
 Use:
 
 ```bash
-./vs --input examples/model-serving/Llama-3-8B
+uv run vibesys --input examples/model-serving/Llama-3-8B
 ```
 
 Each folder contains scripts plus a short README.
