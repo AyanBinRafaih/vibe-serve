@@ -26,14 +26,17 @@ interpreter.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
+from typing import NoReturn
 
 _MIN_NODE_MAJOR = 20
 
@@ -130,28 +133,32 @@ def _run_bundled_tui(bundle: BundledTui, args: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _candidate_checkout_roots() -> list[Path]:
-    """Directories that might be a VibeSys checkout root, in priority order.
-
-    The package location comes first (an editable install lives at
-    ``<repo>/src/vibesys``); then the current directory and its parents (a
-    ``uv run vibesys`` invocation runs from the repo root).
-    """
-    candidates: list[Path] = []
-    package_file = Path(__file__).resolve()
-    if len(package_file.parents) >= 3:  # noqa: PLR2004  # tracked: #288
-        candidates.append(package_file.parents[2])
-    cwd = Path.cwd().resolve()
-    candidates.extend([cwd, *cwd.parents])
-    return candidates
+def _reject_json_constant(value: str) -> NoReturn:
+    message = "Invalid JSON constant"
+    raise json.JSONDecodeError(message, value, 0)
 
 
 def source_checkout_root() -> Path | None:
-    """Return the repository root containing ``clients/tui``, or ``None``."""
-    for root in _candidate_checkout_roots():
-        if (root / "clients" / "tui" / "package.json").is_file():
-            return root
-    return None
+    """Return the VibeSys checkout owning this module, or ``None``."""
+    try:
+        package_file = Path(__file__).resolve()
+        root = package_file.parents[2]
+        if (root / "src" / "vibesys" / "cli.py").resolve() != package_file:
+            return None
+
+        with (root / "pyproject.toml").open("rb") as pyproject_file:
+            pyproject = tomllib.load(pyproject_file)
+        project = pyproject.get("project")
+        if not isinstance(project, dict) or project.get("name") != "vibesys":
+            return None
+
+        with (root / "clients" / "tui" / "package.json").open(encoding="utf-8") as package_file:
+            tui_package = json.load(package_file, parse_constant=_reject_json_constant)
+        if not isinstance(tui_package, dict) or tui_package.get("name") != "@vibesys/tui":
+            return None
+    except (IndexError, OSError, UnicodeDecodeError, json.JSONDecodeError, tomllib.TOMLDecodeError):
+        return None
+    return root
 
 
 def _bun_executable() -> Path | None:

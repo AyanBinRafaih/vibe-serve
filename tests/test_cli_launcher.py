@@ -9,6 +9,22 @@ from unittest.mock import patch
 from vibesys import cli
 
 
+def _make_source_checkout(
+    tmp_path: Path,
+    *,
+    project_name: str = "vibesys",
+    tui_name: str = "@vibesys/tui",
+) -> Path:
+    cli_file = tmp_path / "src" / "vibesys" / "cli.py"
+    cli_file.parent.mkdir(parents=True)
+    cli_file.write_text("# fixture\n")
+    (tmp_path / "pyproject.toml").write_text(f'[project]\nname = "{project_name}"\n')
+    package_json = tmp_path / "clients" / "tui" / "package.json"
+    package_json.parent.mkdir(parents=True)
+    package_json.write_text(f'{{"name": "{tui_name}"}}\n')
+    return cli_file
+
+
 def _make_bundle(tmp_path):  # noqa: ANN001, ANN202  # tracked: #288
     tui = tmp_path / "_tui"
     runtime = tui / "bin" / "bun"
@@ -374,8 +390,30 @@ def test_bundled_tui_resolves_when_staged(monkeypatch, tmp_path):  # noqa: ANN00
     assert bundle.launcher == tmp_path / "_tui" / "app" / "dist" / "launcher.js"
 
 
-def test_source_checkout_root_none_when_no_candidate(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    monkeypatch.setattr(cli, "_candidate_checkout_roots", lambda: [tmp_path])
+def test_source_checkout_root_ignores_unrelated_current_directory(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
+    lookalike = tmp_path / "lookalike"
+    _make_source_checkout(lookalike)
+    nested = lookalike / "nested"
+    nested.mkdir()
+    monkeypatch.chdir(nested)
+    monkeypatch.setattr(cli, "__file__", tmp_path / "site-packages" / "vibesys" / "cli.py")
+
+    assert cli.source_checkout_root() is None
+
+
+def test_source_checkout_root_rejects_wrong_python_project_name(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
+    cli_file = _make_source_checkout(tmp_path, project_name="not-vibesys")
+    monkeypatch.setattr(cli, "__file__", cli_file)
+
+    assert cli.source_checkout_root() is None
+
+
+def test_source_checkout_root_rejects_nonstandard_json_constant(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
+    cli_file = _make_source_checkout(tmp_path)
+    package_json = tmp_path / "clients" / "tui" / "package.json"
+    package_json.write_text('{"name":"@vibesys/tui","x":NaN}\n')
+    monkeypatch.setattr(cli, "__file__", cli_file)
+
     assert cli.source_checkout_root() is None
 
 
