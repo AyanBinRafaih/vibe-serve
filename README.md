@@ -99,9 +99,10 @@ with the CLI; API credentials are loaded from `.env` automatically.
 `uv run` creates the Python environment automatically. You do not need to run
 `uv sync` first.
 
-To use the interactive TUI, install Node.js 20+, Bun, and pnpm 11 (or enable
-Corepack). Run `./vs`; it installs the frontend dependencies and builds the TUI
-when needed. npm is not required.
+From a checkout, `./vs` is a thin shim that runs `uv run vibesys` — the same
+unified launcher described below. To use the interactive TUI this way, install
+Node.js 20+, Bun, and pnpm 11 (or enable Corepack); `vibesys` builds the frontend
+from source on demand when run inside the checkout. npm is not required.
 
 ### Installing from PyPI
 

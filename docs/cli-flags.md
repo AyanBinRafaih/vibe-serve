@@ -6,16 +6,17 @@ profiler behavior changes.
 
 ## Entry Points
 
-The same flags below apply no matter how you launch VibeSys:
+`vibesys` is the single launcher; the same flags below apply no matter how you
+start it:
 
 | Entry point | Use |
 | --- | --- |
-| `./vs` | In-repo launcher. Builds/runs the interactive TUI (needs Bun), or runs headless for `validate`/`--headless`. |
-| `vibesys` | Installed-package launcher (equivalent to `./vs`). Forwards all flags to the engine; launches the TUI by default (needs Bun) and runs headless with `--headless`, for `validate`, or when not attached to a TTY. |
+| `vibesys` | The unified launcher. Forwards all flags to the engine. Launches the interactive TUI by default and runs headless with `--headless`, `--help`, `validate`, or when not attached to a TTY. The TUI comes from a prebuilt platform wheel, or is built from source when run inside a checkout (needs Bun + Node 20+ + pnpm). |
+| `./vs` | Thin repo shim: runs `uv run vibesys` from the checkout, so a clone works with no install. Identical behavior to `vibesys`. |
 | `python -m vibesys` | The headless engine directly. No JavaScript runtime required. |
 
-Examples in this document use `./vs`; substitute `vibesys` (add `--headless` to
-skip the TUI) when running from an installed package.
+Examples in this document use `./vs`; it is interchangeable with `vibesys` (add
+`--headless` to skip the TUI).
 
 ## Mental Model
 
@@ -47,11 +48,10 @@ come from the domain and input bundle, not the interface mode.
 | `plain` | Issue-board loop with deterministic issue draining and perf evaluation. | Uses backend prompt fragments from `src/vibesys/prompts/backend/`. |
 | `evolve` | Evolutionary search over candidate implementations. | Uses domain-aware mutator, judge, and profiler roles. |
 
-From a source checkout, use `./vs` for the commands below. It prepares a current
-interactive client when needed and forwards every argument to the TypeScript
-launcher. For installed npm users, the same launcher is exposed as `vs` and
-`vibesys`.
-Use `./vs --outer-loop <kind> --help` for loop-specific flags.
+Run the commands below with `vibesys` (installed) or `./vs` (from a checkout;
+it just runs `uv run vibesys`). Both forward every argument to the engine and
+prepare the interactive client when needed.
+Use `vibesys --outer-loop <kind> --help` for loop-specific flags.
 
 ### Agent-loop review and memory policy
 
