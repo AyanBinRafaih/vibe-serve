@@ -51,7 +51,8 @@ def _patch_loop_runner(loop_name: str, runner: Mock):  # noqa: ANN202  # tracked
     return patch.dict(cli._LOOP_COMMANDS, {loop_name: patched})  # noqa: SLF001  # tracked: #288
 
 
-TARGET_ARGS = ["--input", "examples/model-serving/Llama-3-8B"]
+TARGET_INPUT_ARGS = ["--input", "examples/model-serving/Llama-3-8B"]
+TARGET_ARGS = [*TARGET_INPUT_ARGS, "--runs-dir", "/tmp/vibesys-test-runs"]  # noqa: S108
 
 
 def _write_input_bundle(tmp_path: Path) -> Path:
@@ -164,6 +165,71 @@ def test_target_input_defaults_to_none():  # noqa: ANN201  # tracked: #288
     # Standalone-input flags default to None (they synthesize a bundle when set).
     assert args.input_domain is None
     assert args.input_objective is None
+
+
+def test_run_invocation_requires_runs_dir() -> None:
+    with pytest.raises(ConfigurationError) as exc:
+        parse_cli_invocation(["--outer-loop", "agent", *TARGET_INPUT_ARGS])
+
+    assert exc.value.diagnostic.code == "missing_runs_dir"
+    assert "--runs-dir PATH is required" in exc.value.diagnostic.message
+
+
+@pytest.mark.parametrize("value", ["", " \t "])
+def test_run_parser_rejects_an_empty_runs_directory(value: str) -> None:
+    with pytest.raises(ConfigurationError) as exc:
+        parse_cli_invocation([f"--runs-dir={value}", *TARGET_INPUT_ARGS])
+
+    assert exc.value.diagnostic.code == "invalid_arguments"
+    assert exc.value.diagnostic.stage == "argument_parsing"
+    assert "--runs-dir" in exc.value.diagnostic.message
+
+
+def test_runs_dir_is_normalized_to_an_absolute_collection_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _write_input_bundle(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    invocation = parse_cli_invocation(
+        ["--outer-loop", "agent", "--runs-dir", "runs", "--input", str(bundle)]
+    )
+
+    assert invocation.args.runs_dir == (tmp_path / "runs").resolve()
+
+
+def test_runs_dir_rejects_python_installation_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
+
+    prefix = tmp_path / ".venv"
+    monkeypatch.setattr(cli.sys, "prefix", str(prefix))
+
+    with pytest.raises(ConfigurationError) as exc:
+        parse_cli_invocation(
+            ["--outer-loop", "agent", "--runs-dir", str(prefix / "runs"), *TARGET_INPUT_ARGS]
+        )
+
+    assert exc.value.diagnostic.code == "invalid_runs_dir"
+    assert "Python installation prefix" in exc.value.diagnostic.message
+
+
+def test_source_checkout_exp_env_outside_venv_prefix_is_valid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.setattr(cli.sys, "prefix", str(tmp_path / ".venv"))
+
+    invocation = parse_cli_invocation(
+        ["--outer-loop", "agent", "--runs-dir", str(tmp_path / "exp_env"), *TARGET_INPUT_ARGS]
+    )
+
+    assert invocation.args.runs_dir == (tmp_path / "exp_env").resolve()
 
 
 @pytest.mark.parametrize(
@@ -468,6 +534,7 @@ def test_openevolve_partial_resume_options_merge_with_saved_config(tmp_path):  #
             args,
             existing=True,
             exp_name="run",
+            runs_dir=tmp_path,
         )
 
     assert policy_name == "openevolve"
@@ -495,6 +562,7 @@ def test_openevolve_resume_restores_flag_defined_objectives(tmp_path):  # noqa: 
             [],
             existing=True,
             exp_name="run",
+            runs_dir=tmp_path,
         )
 
     assert restored == expected
@@ -512,6 +580,7 @@ def test_openevolve_override_selects_policy_on_new_run(tmp_path):  # noqa: ANN00
         args,
         existing=False,
         exp_name="new",
+        runs_dir=tmp_path,
     )
 
     assert policy_name == "openevolve"
@@ -851,7 +920,11 @@ def test_missing_config_reports_configuration_error(tmp_path):  # noqa: ANN001, 
 # ---------------------------------------------------------------------------
 
 
-def test_tui_defaults_uses_repository_config_and_generated_name(tmp_path, capsys):  # noqa: ANN001, ANN201  # tracked: #288
+def test_tui_defaults_uses_repository_config_and_generated_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     import json  # noqa: PLC0415  # tracked: #288
 
     config_path = tmp_path / "agent.toml"
@@ -867,6 +940,7 @@ visibility = "private"
     )
     input_path = tmp_path / "Queue MPSC"
     input_path.mkdir()
+    monkeypatch.chdir(tmp_path)
     argv = [
         "vibesys",
         "tui-defaults",
@@ -885,6 +959,69 @@ visibility = "private"
     assert defaults["experiment_name"].startswith("queue-mpsc-")
     assert defaults["repository_name"] == defaults["experiment_name"]
     assert defaults["theme"] == "dark"
+    assert defaults["runs_dir"] == str((tmp_path / "exp_env").resolve())
+
+
+def test_tui_defaults_resolves_an_explicit_runs_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.chdir(tmp_path)
+    argv = [
+        "vibesys",
+        "tui-defaults",
+        "--config",
+        str(_write_theme_config(tmp_path, None)),
+        "--runs-dir",
+        "selected-runs",
+    ]
+
+    with patch.object(sys, "argv", argv):
+        main()
+
+    assert json.loads(capsys.readouterr().out)["runs_dir"] == str(
+        (tmp_path / "selected-runs").resolve()
+    )
+
+
+@pytest.mark.parametrize("value", ["", " \t "])
+def test_tui_defaults_parser_rejects_an_empty_runs_directory(value: str) -> None:
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
+
+    with pytest.raises(ConfigurationError) as exc:
+        cli._build_tui_defaults_parser().parse_args([f"--runs-dir={value}"])  # noqa: SLF001  # tracked: #288
+
+    assert exc.value.diagnostic.code == "invalid_arguments"
+    assert exc.value.diagnostic.stage == "argument_parsing"
+    assert "--runs-dir" in exc.value.diagnostic.message
+
+
+def test_tui_defaults_supports_configless_stub_directory_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.chdir(tmp_path)
+    argv = [
+        "vibesys",
+        "tui-defaults",
+        "--config",
+        str(tmp_path / "missing.toml"),
+        "--stub-agent",
+        "--directory-only",
+    ]
+
+    with patch.object(sys, "argv", argv):
+        main()
+
+    defaults = json.loads(capsys.readouterr().out)
+    assert defaults["runs_dir"] == str((tmp_path / "exp_env").resolve())
+    assert defaults["repository_owner"] is None
 
 
 def _write_theme_config(tmp_path, theme: str | None) -> Path:  # noqa: ANN001  # tracked: #288
@@ -1023,7 +1160,16 @@ def test_resume_without_input_infers_original_input(monkeypatch, tmp_path):  # n
     _write_resume_event(run_dir, bundle)
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
 
-    invocation = parse_cli_invocation(["--outer-loop", "agent", "--resume", "20260716-180256-test"])
+    invocation = parse_cli_invocation(
+        [
+            "--outer-loop",
+            "agent",
+            "--runs-dir",
+            str(tmp_path / "exp_env"),
+            "--resume",
+            "20260716-180256-test",
+        ]
+    )
 
     assert invocation.args.resume == "20260716-180256-test"
     assert invocation.args.input == bundle
@@ -1039,7 +1185,14 @@ def test_resume_accepts_exp_env_path_without_input(monkeypatch, tmp_path):  # no
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
 
     invocation = parse_cli_invocation(
-        ["--outer-loop", "agent", "--resume", str(run_dir.relative_to(tmp_path))]
+        [
+            "--outer-loop",
+            "agent",
+            "--runs-dir",
+            str(tmp_path / "exp_env"),
+            "--resume",
+            str(run_dir),
+        ]
     )
 
     assert invocation.args.resume == "20260716-180256-test"
@@ -1064,7 +1217,16 @@ def test_resume_accepts_external_local_clone_and_materialized_input(monkeypatch,
     workspace.rename(experiment / "workspace")
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path / "project")
 
-    invocation = parse_cli_invocation(["--outer-loop", "agent", "--resume", str(experiment)])
+    invocation = parse_cli_invocation(
+        [
+            "--outer-loop",
+            "agent",
+            "--runs-dir",
+            str(tmp_path / "runs"),
+            "--resume",
+            str(experiment),
+        ]
+    )
 
     assert invocation.args.resume == str(experiment.resolve())
     assert invocation.args.input_bundle.root == (experiment / "workspace").resolve()
@@ -1086,7 +1248,7 @@ def test_resume_github_repo_clones_into_exp_env(monkeypatch, tmp_path):  # noqa:
 
     monkeypatch.setattr(cli, "GitHubCLI", lambda: GitHubCLI(_runner=fake_run))
 
-    assert _resolve_run_dir("vibesys-playground/trial") == "trial"
+    assert _resolve_run_dir("vibesys-playground/trial", tmp_path / "exp_env") == "trial"
     assert commands == [
         ["gh", "auth", "status", "--hostname", "github.com"],
         ["gh", "repo", "clone", "vibesys-playground/trial", str(tmp_path / "exp_env/trial")],
@@ -1116,7 +1278,7 @@ def test_resume_github_repo_reuses_matching_local_clone(monkeypatch, tmp_path): 
         lambda: pytest.fail("matching local clone should not invoke GitHub CLI"),
     )
 
-    assert _resolve_run_dir("vibesys-playground/trial") == "trial"
+    assert _resolve_run_dir("vibesys-playground/trial", tmp_path / "exp_env") == "trial"
 
 
 def test_resume_github_repo_explains_missing_authentication(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1130,7 +1292,7 @@ def test_resume_github_repo_explains_missing_authentication(monkeypatch, tmp_pat
     monkeypatch.setattr(cli, "GitHubCLI", lambda: GitHubCLI(_runner=fake_run))
 
     with pytest.raises(ConfigurationError) as exc:
-        _resolve_run_dir("vibesys-playground/trial")
+        _resolve_run_dir("vibesys-playground/trial", tmp_path / "exp_env")
 
     assert exc.value.diagnostic.code == "resume_clone_failed"
     assert "gh auth login --hostname github.com" in exc.value.diagnostic.message
@@ -1147,6 +1309,8 @@ def test_resume_rejects_creating_a_second_repository(tmp_path):  # noqa: ANN001,
                 "agent",
                 "--input",
                 str(bundle),
+                "--runs-dir",
+                str(tmp_path / "exp_env"),
                 "--resume",
                 "run",
                 "--repo",
@@ -1166,9 +1330,13 @@ def test_resume_latest_without_input_uses_latest_run_metadata(monkeypatch, tmp_p
     latest = tmp_path / "exp_env" / "20260716-180256-test"
     _write_resume_event(older, older_bundle)
     _write_resume_event(latest, latest_bundle)
+    (tmp_path / "exp_env" / "_inputs").mkdir()
+    (tmp_path / "exp_env" / ".cache").mkdir()
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
 
-    invocation = parse_cli_invocation(["--outer-loop", "agent", "--resume"])
+    invocation = parse_cli_invocation(
+        ["--outer-loop", "agent", "--runs-dir", str(tmp_path / "exp_env"), "--resume"]
+    )
 
     assert invocation.args.resume == "20260716-180256-test"
     assert invocation.args.input_bundle.root == latest_bundle.resolve()
@@ -1180,7 +1348,7 @@ def test_resume_latest_reports_missing_exp_env(monkeypatch, tmp_path):  # noqa: 
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
 
     with pytest.raises(ConfigurationError) as exc:
-        _resolve_run_dir("latest")
+        _resolve_run_dir("latest", tmp_path / "exp_env")
 
     assert exc.value.diagnostic.code == "resume_not_found"
 
@@ -1192,7 +1360,7 @@ def test_resume_latest_reports_empty_exp_env(monkeypatch, tmp_path):  # noqa: AN
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
 
     with pytest.raises(ConfigurationError) as exc:
-        _resolve_run_dir("latest")
+        _resolve_run_dir("latest", tmp_path / "exp_env")
 
     assert exc.value.diagnostic.code == "resume_not_found"
 
@@ -1204,7 +1372,16 @@ def test_resume_without_input_reports_missing_metadata(monkeypatch, tmp_path):  
     monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
 
     with pytest.raises(ConfigurationError) as exc:
-        parse_cli_invocation(["--outer-loop", "agent", "--resume", "20260716-180256-test"])
+        parse_cli_invocation(
+            [
+                "--outer-loop",
+                "agent",
+                "--runs-dir",
+                str(tmp_path / "exp_env"),
+                "--resume",
+                "20260716-180256-test",
+            ]
+        )
 
     assert exc.value.diagnostic.code == "resume_input_not_found"
     assert exc.value.diagnostic.stage == "resume_resolution"

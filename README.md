@@ -64,7 +64,7 @@ accuracy and performance results.
 
 ## Installation
 
-1. Install Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+1. Install Python 3.12+, Git, and [uv](https://docs.astral.sh/uv/).
 2. For the default GitHub-synced runs, install the [GitHub CLI](https://cli.github.com/)
    and sign in with `gh auth login`. You do not need `gh` when every run uses
    `--local`.
@@ -100,32 +100,39 @@ with the CLI; API credentials are loaded from `.env` automatically.
 `uv sync` first.
 
 To use the interactive TUI, install Node.js 20+, Bun, and pnpm 11 (or enable
-Corepack). Run `./vs`; it installs the frontend dependencies and builds the TUI
-when needed. npm is not required.
+Corepack). Run `./vs --runs-dir "$PWD/exp_env"`; it installs the frontend
+dependencies and builds the TUI when needed. npm is not required.
 
-### Installing outside the repo (`pip install`)
-
-VibeSys can be installed as a package (`pip install .`, or
-`pip install "git+<repo-url>"`). When a JavaScript toolchain (Bun, or Node with
-npm) is available at install time, the build compiles the OpenTUI client and
-vendors it into the wheel, so a single install ships a usable TUI.
+### Installing from GitHub source
 
 ```bash
-pip install "git+<repo-url>"
+python -m pip install "git+https://github.com/uw-syfi/vibesys.git"
 ```
 
-This installs the **`vibesys`** command — the installed-package equivalent of
-`./vs`. It forwards all arguments to the engine, so it accepts the same run flags
-described in [`docs/cli-flags.md`](docs/cli-flags.md). By default it launches the
-interactive TUI (which requires Bun at runtime, like `./vs`); pass `--headless`
-to run without the TUI, which needs no JavaScript runtime:
+Source installs skip the repository's optional submodules and do not build the
+bundled native TUI. They run VibeSys headless; pass `--headless` explicitly to
+suppress the fallback notice. Use a supported PyPI wheel for the one-command
+install with the bundled Bun and OpenTUI runtime.
+
+### Installing from PyPI
 
 ```bash
-# Interactive TUI (needs Bun)
-vibesys --input <bundle> --local --agent-backend cli --cli-provider codex
+uv tool install vibesys
+```
+
+The published wheel installs the **`vibesys`** command and bundles the native
+Bun and OpenTUI runtime for Linux x86-64, Linux ARM64, macOS Intel, or macOS
+Apple Silicon. It accepts the same run flags described in
+[`docs/cli-flags.md`](docs/cli-flags.md). No separate JavaScript runtime is
+needed for the installed tool. Every run requires `--runs-dir PATH`; VibeSys
+stores experiment directories, synthesized inputs, and shared caches there.
+
+```bash
+# Interactive TUI
+vibesys --runs-dir ~/vibesys-runs --input <bundle> --local --agent-backend cli --cli-provider codex
 
 # Same run, headless (no TUI, no Bun)
-vibesys --headless --input <bundle> --local
+vibesys --headless --runs-dir ~/vibesys-runs --input <bundle> --local
 
 vibesys --help                    # full flag list
 ```
@@ -134,24 +141,19 @@ vibesys --help                    # full flag list
 is not a TTY (pipes, CI). The engine is additionally available directly as
 `python -m vibesys ...`.
 
-**Configuration outside the repo.** The `.env` and `agent.toml.example` files
-live in the repo, so an installed-only user supplies configuration directly:
-pass `--config /path/to/agent.toml`, export provider keys into the environment
-(e.g. `OPENAI_API_KEY`), and authenticate coding-agent CLIs through their own
-login flows (`codex login`, etc.). Add `--local` to skip GitHub sync (no `gh`
-required).
-
-**If no JavaScript toolchain is present at install time**, the build prints a
-warning and skips the TUI. `vibesys` then runs headless (with a one-time notice);
-use `--headless` to silence it. Because the TUI is built from source during
-install, a prebuilt PyPI wheel would not include it — install from source
-(git/sdist) with a JS toolchain to get the bundled TUI.
+The wheel does not bundle external coding-agent CLIs or their credentials.
+Install the selected Codex, Claude Code, Gemini, or OpenCode CLI separately and
+complete its login flow. For API-backed agents, export the provider credentials
+(for example, `OPENAI_API_KEY`) or load them through your own configuration.
+Pass `--config /path/to/agent.toml` for an installed-only configuration, and
+add `--local` to skip GitHub sync when `gh` is not installed.
 
 ## Quickstart
 
 ```bash
 # Issue-tracker outer loop, Codex CLI, Docker on local CUDA, 4 rounds
 ./vs \
+  --runs-dir ~/vibesys-runs \
   --input examples/model-serving/moonshine-streaming \
   --exp-name my-experiment \
   --docker \
@@ -262,8 +264,8 @@ See [`docs/cli-flags.md`](docs/cli-flags.md#client-theme).
 The config is validated against a typed schema on load (`vibesys/config.py`): unknown sections or keys, unknown providers/backends, and missing required fields are rejected with an error rather than silently ignored.
 
 Fresh runs use GitHub-backed tracking by default. Pass `--local` for a local-only
-run under `exp_env/`; see [`docs/cli-flags.md`](docs/cli-flags.md) for repository
-and resume options.
+run in the collection selected by `--runs-dir`; see
+[`docs/cli-flags.md`](docs/cli-flags.md) for repository and resume options.
 
 ## Citation
 

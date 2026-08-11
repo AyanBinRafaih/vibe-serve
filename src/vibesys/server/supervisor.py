@@ -168,13 +168,30 @@ class RunSupervisor:
                 round_label=self._current_round,
             )
 
+    def chat_agent_available(self) -> bool:
+        """True when an agent-backed chat handler is installed for this run.
+
+        The handler exists only for the lifetime of the run context, so chat
+        asked during setup or after teardown has no agent to reach.
+        """
+        with self._condition:
+            return self._chat_handler is not None
+
     def chat(self, text: str) -> str:  # noqa: D102  # tracked: #288
         with self._condition:
             handler = self._chat_handler
         if handler is None:
             from vibesys.server.inspector import RunInspector  # noqa: PLC0415  # tracked: #288
 
-            answer = RunInspector(self).answer(text)
+            # No agent is reachable, so say that rather than answering as if
+            # this were the normal path. The keyword diagnostic is still worth
+            # showing, but it is supporting detail, not the answer.
+            answer = (
+                "The experiment chat agent is not available for this run"
+                f" ({self._chat_unavailable_reason()}), so this is a read-only"
+                " summary from the recorded events rather than an answer.\n\n"
+                + RunInspector(self).answer(text)
+            )
         else:
             answer = handler(text)
         self.record(
@@ -186,6 +203,13 @@ class RunSupervisor:
             data=ChatData(answer=answer),
         )
         return answer
+
+    def _chat_unavailable_reason(self) -> str:
+        with self._condition:
+            status = self._run_status
+        if status in {"completed", "failed"}:
+            return "the run has finished"
+        return "the run has not finished starting up"
 
     def set_chat_handler(self, handler: Callable[[str], str] | None) -> None:
         """Install the current experiment's agent-backed chat handler."""

@@ -1,0 +1,489 @@
+"""Verify a VibeSys tool installation without access to its source checkout."""
+
+from __future__ import annotations
+
+import errno
+import importlib
+import importlib.metadata
+import os
+import pty
+import select
+import shutil
+import signal
+import site
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Never
+
+from vibesys.cli import bundled_tui
+from vibesys.input_project import materialize_input_project
+from vibesys.profilers import ACTIVE_PROFILER_KINDS
+from vibesys.resource_paths import (
+    default_skill_roots,
+    profiler_support_dir,
+    resources_root,
+)
+
+FRAMEWORK_PACKAGES = (
+    "vibesys",
+    "vs_feature_flags",
+    "vs_github",
+    "vs_issue_board",
+    "vs_loop_state",
+    "vs_sandbox",
+)
+REQUIRED_SYSTEM_TOOLS = ("git",)
+SYSTEM_JAVASCRIPT_TOOLS = ("bun", "node", "npm", "pnpm")
+TUI_SMOKE_MARKER_ENV = "VIBESYS_RELEASE_SMOKE_MARKER"
+TUI_SMOKE_MARKER_CONTENT = "renderer initialized; control protocol exchanged\n"
+PTY_OUTPUT_LIMIT = 64 * 1024
+
+
+def resolved_runtime_root(path: Path | None = None) -> Path:
+    """Resolve the clean-room root, including macOS's ``/tmp`` symlink."""
+    configured = path or Path(os.environ.get("VIBESYS_RELEASE_RUNTIME_ROOT", "/tmp"))  # noqa: S108
+    return configured.resolve()
+
+
+_RUNTIME_ROOT = resolved_runtime_root()
+
+
+class InstalledReleaseError(RuntimeError):
+    """Raised when an installed release is incomplete or contaminated."""
+
+    @classmethod
+    def command_failed(cls, command: list[str]) -> InstalledReleaseError:
+        """Build an error for a failed installed-artifact command."""
+        return cls(f"Installed verification command failed: {command}")
+
+    @classmethod
+    def interactive_failed(
+        cls,
+        command: list[str],
+        reason: str,
+        output: str,
+    ) -> InstalledReleaseError:
+        """Build an error for a failed PTY-backed interactive check."""
+        return cls(f"Installed interactive verification {reason}: {command}\n{output}")
+
+
+def verify_installed_release() -> None:
+    """Exercise the installed framework, SDK, resources, and native TUI."""
+    _verify_isolated_interpreter()
+    _verify_framework_imports()
+    verify_console_entry_point()
+    _verify_resources()
+    _verify_materialized_sdk()
+    _verify_tui()
+
+
+def _verify_isolated_interpreter() -> None:
+    if os.environ.get("PYTHONNOUSERSITE") != "1" or site.ENABLE_USER_SITE:
+        _fail("User-site packages are not disabled")
+    if os.environ.get("PYTHONPATH"):
+        _fail("PYTHONPATH must be empty")
+    _verify_required_system_tools()
+    for executable in SYSTEM_JAVASCRIPT_TOOLS:
+        if shutil.which(executable) is not None:
+            _fail(f"System JavaScript runtime is present on PATH: {executable}")
+    home = Path(os.environ.get("HOME", ""))
+    if not home.is_dir() or any(home.iterdir()):
+        _fail(f"HOME must be an empty isolated directory: {home}")
+    if Path.cwd().resolve() != _RUNTIME_ROOT:
+        _fail(f"Installed verification must run from {_RUNTIME_ROOT}, not {Path.cwd().resolve()}")
+
+
+def _verify_required_system_tools() -> None:
+    for executable in REQUIRED_SYSTEM_TOOLS:
+        if shutil.which(executable) is None:
+            _fail(f"Required system executable is absent from PATH: {executable}")
+
+
+def _verify_framework_imports() -> None:
+    distributions = importlib.metadata.packages_distributions()
+    for package in FRAMEWORK_PACKAGES:
+        module = importlib.import_module(package)
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            _fail(f"Installed package has no import path: {package}")
+        resolved = Path(module_file).resolve()
+        if "site-packages" not in str(resolved):
+            _fail(f"Package did not import from site-packages: {package} -> {resolved}")
+        if distributions.get(package) != ["vibesys"]:
+            _fail(
+                f"Package {package} is not owned only by the vibesys distribution: "
+                f"{distributions.get(package)}"
+            )
+
+
+def verify_console_entry_point() -> None:
+    """Exercise the installed VibeSys console scripts."""
+    executable = shutil.which("vibesys")
+    if executable is None:
+        _fail("Installed vibesys console script is absent from PATH")
+    _run([executable, "--headless", "--help"], timeout=30)
+    issue_mcp = shutil.which("vibesys-issue-mcp")
+    if issue_mcp is None:
+        _fail("Installed vibesys-issue-mcp console script is absent from PATH")
+    _run([issue_mcp, "--help"], timeout=30)
+
+
+def _verify_resources() -> None:
+    root = resources_root()
+    if root is None or "site-packages" not in str(root.resolve()):
+        _fail(f"Installed resources did not resolve from site-packages: {root}")
+    skill_roots = default_skill_roots()
+    if len(skill_roots) != 1 or not any(skill_roots[0].rglob("SKILL.md")):
+        _fail(f"Installed skills did not resolve: {skill_roots}")
+    for kind in ACTIVE_PROFILER_KINDS:
+        support = profiler_support_dir(kind.value)
+        if support is None or "site-packages" not in str(support.resolve()):
+            _fail(f"Installed profiler resources did not resolve for {kind.value}: {support}")
+
+
+def _verify_materialized_sdk() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="vibesys-installed-input-", dir=_RUNTIME_ROOT
+    ) as temporary:
+        root = Path(temporary)
+        project_root = root / "missing-checkout"
+        input_project = project_root / "examples" / "model-serving" / "input"
+        input_project.mkdir(parents=True)
+        (input_project / "pyproject.toml").write_text(
+            "[project]\n"
+            "name = 'installed-release-input'\n"
+            "version = '0.1.0'\n"
+            "requires-python = '>=3.12'\n"
+            "dependencies = ['vs-bench']\n"
+            "\n"
+            "[tool.uv.sources]\n"
+            "vs-bench = { path = '../../../sdk/vs-bench' }\n"
+        )
+        workspace = root / "workspace"
+        workspace.mkdir()
+        dependencies = materialize_input_project(
+            input_project,
+            workspace,
+            project_root=project_root,
+            copy_dir=_copy_tree,
+        )
+        if [dependency.name for dependency in dependencies] != ["vs-bench"]:
+            _fail(f"Packaged SDK did not materialize: {dependencies}")
+        source_path = dependencies[0].source_path.resolve()
+        if "site-packages" not in str(source_path):
+            _fail(f"SDK source did not resolve from the installed wheel: {source_path}")
+
+        _run(build_sdk_sync_command(workspace), timeout=180)
+        sdk_python = workspace / ".venv" / "bin" / "python"
+        _run(
+            [
+                str(sdk_python),
+                "-c",
+                "import vs_bench; print(vs_bench.__file__)",
+            ],
+            timeout=30,
+        )
+
+
+def _copy_tree(source: Path, destination: Path) -> None:
+    shutil.copytree(source, destination, dirs_exist_ok=True)
+
+
+def build_sdk_sync_command(workspace: Path) -> list[str]:
+    """Build the nested SDK sync command with the isolated interpreter."""
+    return [
+        "uv",
+        "sync",
+        "--no-cache",
+        "--no-config",
+        "--python",
+        sys.executable,
+        "--project",
+        str(workspace),
+    ]
+
+
+def _verify_tui() -> None:
+    bundle = bundled_tui()
+    if bundle is None:
+        _fail("Installed release has no bundled TUI")
+    if "site-packages" not in str(bundle.root.resolve()):
+        _fail(f"Bundled TUI did not resolve from site-packages: {bundle.root}")
+    environment = {
+        **os.environ,
+        "BUN_CONFIG_SKIP_INSTALL_PACKAGES": "1",
+        "VIBESYS_PYTHON": sys.executable,
+        "VIBESYS_TUI_RUNTIME": str(bundle.runtime),
+    }
+    _run(
+        [str(bundle.runtime), str(bundle.root / "app" / "dist" / "self-test.js")],
+        env=environment,
+        timeout=30,
+    )
+    executable = shutil.which("vibesys")
+    if executable is None:
+        _fail("Installed vibesys console script is absent from PATH")
+    run_interactive_tui_smoke(
+        [executable],
+        env=environment,
+        runtime_root=_RUNTIME_ROOT,
+        timeout=60,
+    )
+    run_headless_stub_smoke(
+        [executable],
+        env=environment,
+        runtime_root=_RUNTIME_ROOT,
+        timeout=60,
+    )
+
+
+def _write_stub_input(input_root: Path) -> None:
+    input_root.mkdir()
+    (input_root / "OBJECTIVE.md").write_text("Verify the installed release.\n")
+    (input_root / "vibesys.input.toml").write_text(
+        "version = 1\n"
+        "\n"
+        "[agent]\n"
+        'domain = "generic"\n'
+        "\n"
+        "[accuracy]\n"
+        'command = ["python", "-c", "raise SystemExit(0)"]\n'
+        "\n"
+        "[benchmark]\n"
+        'command = ["python", "-c", "raise SystemExit(0)"]\n'
+    )
+
+
+def _stub_smoke_command(
+    command_prefix: list[str],
+    *,
+    input_root: Path,
+    runs_root: Path,
+    headless: bool,
+) -> list[str]:
+    return [
+        *command_prefix,
+        *(["--headless"] if headless else []),
+        "--stub-agent",
+        "--input",
+        str(input_root),
+        "--exp-name",
+        "installed-release-smoke",
+        "--max-rounds",
+        "1",
+        "--local",
+        "--no-skills",
+        "--backend",
+        "cpu",
+        "--profiler",
+        "none",
+        "--runs-dir",
+        str(runs_root),
+    ]
+
+
+def run_interactive_tui_smoke(
+    command_prefix: list[str],
+    *,
+    env: dict[str, str],
+    runtime_root: Path,
+    timeout: int,
+) -> None:
+    """Run the installed interactive CLI through a PTY until controller startup."""
+    with tempfile.TemporaryDirectory(prefix="vibesys-tui-smoke-", dir=runtime_root) as temporary:
+        smoke_root = Path(temporary)
+        input_root = smoke_root / "input"
+        _write_stub_input(input_root)
+        marker = smoke_root / "controller-started"
+        runs_root = smoke_root / "runs"
+        smoke_environment = {**env, TUI_SMOKE_MARKER_ENV: str(marker)}
+        command = _stub_smoke_command(
+            command_prefix,
+            input_root=input_root,
+            runs_root=runs_root,
+            headless=False,
+        )
+        _run_in_pty(command, env=smoke_environment, timeout=timeout)
+        if not marker.is_file() or marker.read_text() != TUI_SMOKE_MARKER_CONTENT:
+            _fail("Interactive TUI did not write its control-protocol marker")
+
+
+def run_headless_stub_smoke(
+    command_prefix: list[str],
+    *,
+    env: dict[str, str],
+    runtime_root: Path,
+    timeout: int,
+) -> None:
+    """Run the installed headless stub loop to completion in an explicit collection."""
+    mutable_prefix_paths_before = _mutable_install_paths(Path(sys.prefix))
+    with tempfile.TemporaryDirectory(
+        prefix="vibesys-headless-smoke-", dir=runtime_root
+    ) as temporary:
+        smoke_root = Path(temporary)
+        input_root = smoke_root / "input"
+        _write_stub_input(input_root)
+        runs_root = smoke_root / "runs"
+        command = _stub_smoke_command(
+            command_prefix,
+            input_root=input_root,
+            runs_root=runs_root,
+            headless=True,
+        )
+        _run(command, env=env, timeout=timeout)
+        runs = [
+            path
+            for path in (runs_root.iterdir() if runs_root.is_dir() else ())
+            if path.is_dir() and not path.name.startswith((".", "_"))
+        ]
+        if len(runs) != 1 or not runs[0].name.endswith("-installed-release-smoke"):
+            _fail(f"Headless smoke did not create exactly one run under {runs_root}: {runs}")
+    added_prefix_paths = _mutable_install_paths(Path(sys.prefix)) - mutable_prefix_paths_before
+    if added_prefix_paths:
+        _fail(
+            "Headless smoke created a mutable run tree or cache beneath the Python "
+            f"installation prefix: {sorted(added_prefix_paths)}"
+        )
+
+
+def _mutable_install_paths(prefix: Path) -> set[Path]:
+    if not prefix.is_dir():
+        return set()
+    mutable_paths: set[Path] = set()
+    for path in prefix.rglob("*"):
+        parts = path.relative_to(prefix).parts
+        if (
+            "exp_env" in parts
+            or ".hf_cache" in parts
+            or any(parts[index : index + 2] == (".cache", "huggingface") for index in range(len(parts) - 1))
+        ):
+            mutable_paths.add(path.resolve())
+    return mutable_paths
+
+
+def _run_in_pty(command: list[str], *, env: dict[str, str], timeout: int) -> None:
+    master_fd, slave_fd = pty.openpty()
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            command,
+            env=env,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        os.close(master_fd)
+        raise InstalledReleaseError.command_failed(command) from exc
+    finally:
+        os.close(slave_fd)
+
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            readable, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
+            if readable:
+                _read_pty_output(master_fd, output)
+        while not timed_out and select.select([master_fd], [], [], 0)[0]:
+            if not _read_pty_output(master_fd, output):
+                break
+    finally:
+        os.close(master_fd)
+
+    if timed_out:
+        _terminate_process_group(process)
+        detail = _render_pty_output(output)
+        raise InstalledReleaseError.interactive_failed(
+            command, f"timed out after {timeout}s", detail
+        )
+
+    return_code = process.wait()
+    if return_code != 0:
+        detail = _render_pty_output(output)
+        raise InstalledReleaseError.interactive_failed(
+            command, f"exited with status {return_code}", detail
+        )
+
+
+def _read_pty_output(master_fd: int, output: bytearray) -> bool:
+    try:
+        chunk = os.read(master_fd, 4096)
+    except OSError as exc:
+        if exc.errno == errno.EIO:
+            return False
+        raise
+    if not chunk:
+        return False
+    output.extend(chunk)
+    if len(output) > PTY_OUTPUT_LIMIT:
+        del output[:-PTY_OUTPUT_LIMIT]
+    return True
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    process.wait(timeout=5)
+
+
+def _render_pty_output(output: bytearray) -> str:
+    return bytes(output).decode(errors="replace").strip()
+
+
+def _run(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: int,
+) -> None:
+    try:
+        subprocess.run(  # noqa: S603
+            command,
+            env=env,
+            check=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise InstalledReleaseError.command_failed(command) from exc
+
+
+def _fail(message: str) -> Never:
+    raise InstalledReleaseError(message)
+
+
+def main() -> int:
+    """Run installed verification with concise diagnostics."""
+    try:
+        verify_installed_release()
+    except InstalledReleaseError as exc:
+        print(f"installed release verification failed: {exc}", file=sys.stderr)
+        return 1
+    print("installed release verification passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

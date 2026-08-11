@@ -12,8 +12,9 @@ import {
   applySetupSelection,
   parseSetupDefaults,
   type SetupDefaults,
+  type SetupFields,
   type SetupSelection,
-  shouldOfferInteractiveSetup,
+  setupFieldsFor,
 } from './setup-model.js';
 import {DEFAULT_THEME_NAME, isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
@@ -94,7 +95,11 @@ export async function launch(argv: string[]): Promise<number> {
       env: {...process.env, VIBESYS_CONTROL_SOCKET: socketPath, VIBESYS_THEME: theme},
       stdio: 'inherit',
     });
-    return await monitor(frontend, backendProcess);
+    return await monitor(
+      frontend,
+      backendProcess,
+      Boolean(process.env['VIBESYS_RELEASE_SMOKE_MARKER']),
+    );
   } finally {
     disposeSignalCleanup();
     await runCleanup();
@@ -130,11 +135,12 @@ async function prepareInteractiveArgs(
     return {exitCode: 2};
   }
 
-  if (!shouldOfferInteractiveSetup(argv)) {
+  const fields = setupFieldsFor(argv);
+  if (fields === undefined) {
     return {argv, theme: requestedTheme ?? (await themeFromBackend(backend, argv))};
   }
 
-  const defaultsResult = await resolveSetupDefaults(backend, argv);
+  const defaultsResult = await resolveSetupDefaults(backend, argv, fields);
   if (defaultsResult.exitCode !== 0) {
     console.error(defaultsResult.stderr || 'vs: could not resolve interactive setup defaults');
     return {exitCode: defaultsResult.exitCode};
@@ -148,8 +154,6 @@ async function prepareInteractiveArgs(
     return {exitCode: 1};
   }
   const theme = requestedTheme ?? defaults.theme;
-  if (defaults.repository_owner === null) return {argv, theme};
-
   const setupEntrypoint =
     process.env['VIBESYS_SETUP_ENTRYPOINT'] ?? join(dirname(frontendEntrypoint), 'setup.js');
   if (!(await fileExists(setupEntrypoint))) {
@@ -160,7 +164,14 @@ async function prepareInteractiveArgs(
   const setupDir = await mkdtemp(join(tmpdir(), 'vibesys-setup-'));
   const resultPath = join(setupDir, 'selection.json');
   try {
-    const exitCode = await runSetupFrontend(runtime, setupEntrypoint, defaults, resultPath, theme);
+    const exitCode = await runSetupFrontend(
+      runtime,
+      setupEntrypoint,
+      defaults,
+      fields,
+      resultPath,
+      theme,
+    );
     if (exitCode !== 0) return {exitCode};
     let selection: SetupSelection;
     try {
@@ -177,12 +188,15 @@ async function prepareInteractiveArgs(
 function resolveSetupDefaults(
   backend: BackendCommand,
   argv: string[],
+  fields?: SetupFields,
 ): Promise<{exitCode: number; stdout: string; stderr: string}> {
   const args = [...backend.args, 'tui-defaults'];
-  for (const option of ['--config', '--input', '--exp-name', '--theme']) {
+  for (const option of ['--config', '--input', '--runs-dir', '--exp-name', '--theme']) {
     const value = optionValue(argv, option);
     if (value !== undefined) args.push(option, value);
   }
+  if (argv.includes('--stub-agent')) args.push('--stub-agent');
+  if (fields?.experiment === false) args.push('--directory-only');
   return runCaptured(backend.command, args);
 }
 
@@ -199,6 +213,7 @@ function runSetupFrontend(
   runtime: string,
   entrypoint: string,
   defaults: SetupDefaults,
+  fields: SetupFields,
   resultPath: string,
   theme: ThemeName,
 ): Promise<number> {
@@ -207,6 +222,7 @@ function runSetupFrontend(
       env: {
         ...process.env,
         VIBESYS_SETUP_DEFAULTS: JSON.stringify(defaults),
+        VIBESYS_SETUP_FIELDS: JSON.stringify(fields),
         VIBESYS_SETUP_RESULT: resultPath,
         VIBESYS_THEME: theme,
       },
@@ -331,11 +347,16 @@ function querySnapshot(socketPath: string): Promise<Record<string, unknown>> {
   });
 }
 
-async function monitor(frontend: ChildProcess, backend: ChildProcess): Promise<number> {
+async function monitor(
+  frontend: ChildProcess,
+  backend: ChildProcess,
+  releaseSmokeMode: boolean,
+): Promise<number> {
   while (true) {
     const frontendCode = exitStatus(frontend);
     const backendCode = exitStatus(backend);
     if (frontendCode !== undefined) {
+      if (releaseSmokeMode && frontendCode === 0) return 0;
       if (backendCode === undefined) {
         const gracefulBackendCode = await waitForExit(backend, BACKEND_EXIT_GRACE_MS);
         if (gracefulBackendCode === undefined) {

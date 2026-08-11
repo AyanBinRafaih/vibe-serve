@@ -318,6 +318,58 @@ def test_service_routes_chat_to_configured_agent_handler(tmp_path):  # noqa: ANN
     assert _events(tmp_path / "run-events.jsonl")[-1]["type"] == "chat"
 
 
+def test_chat_without_an_agent_says_so_instead_of_answering_as_if_normal(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    """The handler exists only while a run context does.
+
+    Asked during setup or after teardown there is no agent to reach, and the
+    keyword matcher must not be presented as the answer.
+    """
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    assert supervisor.chat_agent_available() is False
+
+    answer = supervisor.chat("what happened in this experiment?")
+
+    assert "chat agent is not available" in answer
+    assert "not finished starting up" in answer
+    # It must not send the operator to a command the chat cannot run.
+    assert "/history" not in answer
+
+
+def test_chat_without_an_agent_names_a_finished_run_as_the_reason(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.finish()
+
+    answer = supervisor.chat("what happened?")
+
+    assert "the run has finished" in answer
+
+
+def test_installing_an_agent_handler_takes_over_from_the_fallback(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.set_chat_handler(lambda question: f"agent answered: {question}")
+    assert supervisor.chat_agent_available() is True
+    assert supervisor.chat("why did round 3 fail?") == "agent answered: why did round 3 fail?"
+
+    # Teardown removes it again, and the fallback says so rather than pretending.
+    supervisor.set_chat_handler(None)
+    assert supervisor.chat_agent_available() is False
+    assert "chat agent is not available" in supervisor.chat("and round 4?")
+
+
+def test_keyword_fallback_does_not_advertise_slash_commands(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    answer = RunInspector(supervisor).answer("tell me about the experiment")
+
+    assert "/history" not in answer
+    assert "keywords" in answer
+
+
 def test_chat_explains_configuration_failure_without_a_run_context(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)

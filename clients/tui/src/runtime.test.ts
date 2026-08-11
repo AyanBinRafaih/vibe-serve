@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it} from 'bun:test';
 import {type RuntimeRenderer, runTuiSession} from './runtime.js';
 
 describe('TUI runtime lifecycle', () => {
@@ -24,6 +24,40 @@ describe('TUI runtime lifecycle', () => {
     expect(calls).toEqual([
       'renderer.start',
       'controller.start',
+      'renderer.destroy',
+      'app.destroy',
+      'controller.stop',
+    ]);
+  });
+
+  it('completes a startup smoke only after controller startup and then cleans up', async () => {
+    const calls: string[] = [];
+    const renderer: RuntimeRenderer = {
+      start: () => calls.push('renderer.start'),
+      destroy: () => calls.push('renderer.destroy'),
+      once: (_event, listener) => {
+        calls.push('renderer.once');
+        listener();
+      },
+    };
+    const controller = {
+      start: async () => {
+        calls.push('controller.start');
+      },
+      stop: async () => {
+        calls.push('controller.stop');
+      },
+    };
+    const app = {destroy: () => calls.push('app.destroy')};
+
+    await runTuiSession(renderer, controller, app, async () => {
+      calls.push('startup-smoke.complete');
+    });
+
+    expect(calls).toEqual([
+      'renderer.start',
+      'controller.start',
+      'startup-smoke.complete',
       'renderer.destroy',
       'app.destroy',
       'controller.stop',

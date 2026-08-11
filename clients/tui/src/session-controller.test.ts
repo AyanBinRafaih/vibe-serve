@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it} from 'bun:test';
 import type {EventSubscription} from './client.js';
 import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
 import {
@@ -556,6 +556,69 @@ describe('session controller', () => {
 
     expect(controller.state.experimentLog?.error).toContain('socket closed');
     expect(controller.state.experimentLog?.pending).toBe(false);
+  });
+
+  it('runs a slash command typed in the chat through the main input path', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.submit('/chat');
+    const before = transport.requests.length;
+
+    // The flat round list, which is the command that still answers with an
+    // overlay now that bare /history returns to the experiment log.
+    await controller.submitChat('/history rounds');
+
+    // Handled as a command, not forwarded to the chat agent.
+    expect(transport.requests.slice(before)).toEqual([{type: 'query.history'}]);
+    expect(controller.state.overlay?.content).toContain('No rounds have started yet.');
+    expect(controller.state.chatConversation).toHaveLength(0);
+  });
+
+  it('agrees with the main input about what a command does', async () => {
+    const performance = [
+      {
+        round: 1,
+        perf_metric: 1200,
+        perf_unit: 'total_ops_per_sec',
+        passed: true,
+        profile_skipped: false,
+      },
+    ];
+    const viaChat = new SocketSessionController(new FakeTransport([], performance));
+    const viaInput = new SocketSessionController(new FakeTransport([], performance));
+
+    await viaChat.submitChat('/perf');
+    await viaInput.submit('/perf');
+
+    expect(viaChat.state.overlay?.content).toBe(viaInput.state.overlay?.content);
+  });
+
+  it('reports an unknown slash command in the chat instead of asking the agent', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submitChat('/nope');
+
+    expect(controller.state.overlay?.kind).toBe('error');
+    expect(controller.state.overlay?.content).toContain('Unknown command');
+    expect(transport.requests).toEqual([]);
+  });
+
+  it('still sends ordinary questions, including text containing a slash', async () => {
+    const transport = new FakeTransport([], [], {
+      question: 'what changed in a/b testing?',
+      answer: 'Nothing yet.',
+      effect: 'none',
+    });
+    const controller = new SocketSessionController(transport);
+
+    await controller.submitChat('what changed in a/b testing?');
+
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat',
+      text: 'what changed in a/b testing?',
+    });
+    expect(controller.state.chatConversation.at(-1)?.content).toBe('Nothing yet.');
   });
 
   it('reports an unknown theme as an error without switching', async () => {
