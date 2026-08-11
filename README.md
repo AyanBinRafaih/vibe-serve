@@ -64,7 +64,7 @@ accuracy and performance results.
 
 ## Installation
 
-1. Install Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+1. Install Python 3.12+, Git, and [uv](https://docs.astral.sh/uv/).
 2. For the default GitHub-synced runs, install the [GitHub CLI](https://cli.github.com/)
    and sign in with `gh auth login`. You do not need `gh` when every run uses
    `--local`.
@@ -100,8 +100,19 @@ with the CLI; API credentials are loaded from `.env` automatically.
 `uv sync` first.
 
 To use the interactive TUI, install Node.js 20+, Bun, and pnpm 11 (or enable
-Corepack). Run `./vs`; it installs the frontend dependencies and builds the TUI
-when needed. npm is not required.
+Corepack). Run `./vs --runs-dir "$PWD/exp_env"`; it installs the frontend
+dependencies and builds the TUI when needed. npm is not required.
+
+### Installing from GitHub source
+
+```bash
+python -m pip install "git+https://github.com/uw-syfi/vibesys.git"
+```
+
+Source installs skip the repository's optional submodules and do not build the
+bundled native TUI. They run VibeSys headless; pass `--headless` explicitly to
+suppress the fallback notice. Use a supported PyPI wheel for the one-command
+install with the bundled Bun and OpenTUI runtime.
 
 ### Installing from PyPI
 
@@ -113,14 +124,15 @@ The published wheel installs the **`vibesys`** command and bundles the native
 Bun and OpenTUI runtime for Linux x86-64, Linux ARM64, macOS Intel, or macOS
 Apple Silicon. It accepts the same run flags described in
 [`docs/cli-flags.md`](docs/cli-flags.md). No separate JavaScript runtime is
-needed for the installed tool:
+needed for the installed tool. Every run requires `--runs-dir PATH`; VibeSys
+stores experiment directories, synthesized inputs, and shared caches there.
 
 ```bash
 # Interactive TUI
-vibesys --input <bundle> --local --agent-backend cli --cli-provider codex
+vibesys --runs-dir ~/vibesys-runs --input <bundle> --local --agent-backend cli --cli-provider codex
 
 # Same run, headless (no TUI, no Bun)
-vibesys --headless --input <bundle> --local
+vibesys --headless --runs-dir ~/vibesys-runs --input <bundle> --local
 
 vibesys --help                    # full flag list
 ```
@@ -141,6 +153,7 @@ add `--local` to skip GitHub sync when `gh` is not installed.
 ```bash
 # Issue-tracker outer loop, Codex CLI, Docker on local CUDA, 4 rounds
 ./vs \
+  --runs-dir ~/vibesys-runs \
   --input examples/model-serving/moonshine-streaming \
   --exp-name my-experiment \
   --docker \
@@ -251,8 +264,8 @@ See [`docs/cli-flags.md`](docs/cli-flags.md#client-theme).
 The config is validated against a typed schema on load (`vibesys/config.py`): unknown sections or keys, unknown providers/backends, and missing required fields are rejected with an error rather than silently ignored.
 
 Fresh runs use GitHub-backed tracking by default. Pass `--local` for a local-only
-run under `exp_env/`; see [`docs/cli-flags.md`](docs/cli-flags.md) for repository
-and resume options.
+run in the collection selected by `--runs-dir`; see
+[`docs/cli-flags.md`](docs/cli-flags.md) for repository and resume options.
 
 ## Citation
 

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import configparser
 import importlib.util
+import re
+import shlex
 import subprocess
 import tomllib
 import zipfile
@@ -30,6 +33,71 @@ INTERNAL_IMPORT_PACKAGES = {
     "vs_loop_state",
     "vs_sandbox",
 }
+
+
+def test_headless_readme_examples_select_a_run_collection() -> None:
+    """Removing the explicit collection from a headless example must fail here."""
+    readmes = [
+        PROJECT_ROOT / "examples/microservices/hotel-reservation/README.md",
+        PROJECT_ROOT / "examples/model-serving/qwen3-coder-tracelab-h100/README.md",
+    ]
+
+    for readme in readmes:
+        blocks = re.findall(r"```bash\n(.*?)```", readme.read_text(), flags=re.DOTALL)
+        headless_block = next(block for block in blocks if "--headless" in block)
+        arguments = shlex.split(headless_block.replace("\\\n", " "))
+        runs_index = arguments.index("--runs-dir")
+        assert arguments[runs_index + 1] == "$PWD/exp_env", readme
+
+
+def test_vcs_installs_do_not_initialize_repository_submodules() -> None:
+    """Removing the opt-out from one submodule must make source installs fail here."""
+    config = configparser.ConfigParser()
+    config.read(PROJECT_ROOT / ".gitmodules")
+
+    submodule_sections = [
+        section for section in config.sections() if section.startswith('submodule "')
+    ]
+    assert submodule_sections
+    assert [
+        section
+        for section in submodule_sections
+        if config.get(section, "update", fallback=None) != "none"
+    ] == []
+
+
+def test_tracked_submodule_initialization_commands_override_the_opt_out() -> None:
+    """Adding an ineffective setup command must make the documentation contract fail."""
+    result = subprocess.run(
+        [  # noqa: S607
+            "git",
+            "ls-files",
+            "-z",
+            "--",
+            "*.md",
+            "*.sh",
+            ":(exclude)third_party/**",
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tracked_files = [Path(path) for path in result.stdout.split("\0") if path]
+
+    ineffective_commands = []
+    for relative_path in tracked_files:
+        for line_number, line in enumerate(
+            (PROJECT_ROOT / relative_path).read_text().splitlines(), start=1
+        ):
+            if (
+                re.search(r"\bgit\s+submodule\s+update\b", line)
+                and "--init" in line
+                and "--checkout" not in line
+            ):
+                ineffective_commands.append(f"{relative_path}:{line_number}")
+
+    assert ineffective_commands == []
 
 
 def _load_packaging_support() -> ModuleType:
@@ -117,3 +185,4 @@ def test_built_distribution_caps_dependencies_without_current_intel_macos_wheels
 
     assert str(requirements["cbor2"].specifier) == "<6"
     assert str(requirements["cryptography"].specifier) == "<50"
+    assert str(requirements["mcp"].specifier) == "<2,>=1.0"

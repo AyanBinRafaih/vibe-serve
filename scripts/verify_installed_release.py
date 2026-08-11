@@ -5,7 +5,6 @@ from __future__ import annotations
 import errno
 import importlib
 import importlib.metadata
-import json
 import os
 import pty
 import select
@@ -36,6 +35,7 @@ FRAMEWORK_PACKAGES = (
     "vs_loop_state",
     "vs_sandbox",
 )
+REQUIRED_SYSTEM_TOOLS = ("git",)
 SYSTEM_JAVASCRIPT_TOOLS = ("bun", "node", "npm", "pnpm")
 TUI_SMOKE_MARKER_ENV = "VIBESYS_RELEASE_SMOKE_MARKER"
 TUI_SMOKE_MARKER_CONTENT = "renderer initialized; control protocol exchanged\n"
@@ -85,6 +85,7 @@ def _verify_isolated_interpreter() -> None:
         _fail("User-site packages are not disabled")
     if os.environ.get("PYTHONPATH"):
         _fail("PYTHONPATH must be empty")
+    _verify_required_system_tools()
     for executable in SYSTEM_JAVASCRIPT_TOOLS:
         if shutil.which(executable) is not None:
             _fail(f"System JavaScript runtime is present on PATH: {executable}")
@@ -93,6 +94,12 @@ def _verify_isolated_interpreter() -> None:
         _fail(f"HOME must be an empty isolated directory: {home}")
     if Path.cwd().resolve() != _RUNTIME_ROOT:
         _fail(f"Installed verification must run from {_RUNTIME_ROOT}, not {Path.cwd().resolve()}")
+
+
+def _verify_required_system_tools() -> None:
+    for executable in REQUIRED_SYSTEM_TOOLS:
+        if shutil.which(executable) is None:
+            _fail(f"Required system executable is absent from PATH: {executable}")
 
 
 def _verify_framework_imports() -> None:
@@ -113,11 +120,15 @@ def _verify_framework_imports() -> None:
 
 
 def verify_console_entry_point() -> None:
-    """Exercise the installed ``vibesys`` console script in headless mode."""
+    """Exercise the installed VibeSys console scripts."""
     executable = shutil.which("vibesys")
     if executable is None:
         _fail("Installed vibesys console script is absent from PATH")
     _run([executable, "--headless", "--help"], timeout=30)
+    issue_mcp = shutil.which("vibesys-issue-mcp")
+    if issue_mcp is None:
+        _fail("Installed vibesys-issue-mcp console script is absent from PATH")
+    _run([issue_mcp, "--help"], timeout=30)
 
 
 def _verify_resources() -> None:
@@ -221,6 +232,57 @@ def _verify_tui() -> None:
         runtime_root=_RUNTIME_ROOT,
         timeout=60,
     )
+    run_headless_stub_smoke(
+        [executable],
+        env=environment,
+        runtime_root=_RUNTIME_ROOT,
+        timeout=60,
+    )
+
+
+def _write_stub_input(input_root: Path) -> None:
+    input_root.mkdir()
+    (input_root / "OBJECTIVE.md").write_text("Verify the installed release.\n")
+    (input_root / "vibesys.input.toml").write_text(
+        "version = 1\n"
+        "\n"
+        "[agent]\n"
+        'domain = "generic"\n'
+        "\n"
+        "[accuracy]\n"
+        'command = ["python", "-c", "raise SystemExit(0)"]\n'
+        "\n"
+        "[benchmark]\n"
+        'command = ["python", "-c", "raise SystemExit(0)"]\n'
+    )
+
+
+def _stub_smoke_command(
+    command_prefix: list[str],
+    *,
+    input_root: Path,
+    runs_root: Path,
+    headless: bool,
+) -> list[str]:
+    return [
+        *command_prefix,
+        *(["--headless"] if headless else []),
+        "--stub-agent",
+        "--input",
+        str(input_root),
+        "--exp-name",
+        "installed-release-smoke",
+        "--max-rounds",
+        "1",
+        "--local",
+        "--no-skills",
+        "--backend",
+        "cpu",
+        "--profiler",
+        "none",
+        "--runs-dir",
+        str(runs_root),
+    ]
 
 
 def run_interactive_tui_smoke(
@@ -234,42 +296,72 @@ def run_interactive_tui_smoke(
     with tempfile.TemporaryDirectory(prefix="vibesys-tui-smoke-", dir=runtime_root) as temporary:
         smoke_root = Path(temporary)
         input_root = smoke_root / "input"
-        input_root.mkdir()
-        (input_root / "OBJECTIVE.md").write_text("Verify installed interactive startup.\n")
-        python_literal = json.dumps(sys.executable)
-        (input_root / "vibesys.input.toml").write_text(
-            "version = 1\n"
-            "\n"
-            "[agent]\n"
-            'domain = "generic"\n'
-            "\n"
-            "[accuracy]\n"
-            f'command = [{python_literal}, "-c", "raise SystemExit(0)"]\n'
-            "\n"
-            "[benchmark]\n"
-            f'command = [{python_literal}, "-c", "raise SystemExit(0)"]\n'
-        )
+        _write_stub_input(input_root)
         marker = smoke_root / "controller-started"
+        runs_root = smoke_root / "runs"
         smoke_environment = {**env, TUI_SMOKE_MARKER_ENV: str(marker)}
-        command = [
-            *command_prefix,
-            "--stub-agent",
-            "--input",
-            str(input_root),
-            "--exp-name",
-            "installed-release-smoke",
-            "--max-rounds",
-            "1",
-            "--local",
-            "--no-skills",
-            "--backend",
-            "cpu",
-            "--profiler",
-            "none",
-        ]
+        command = _stub_smoke_command(
+            command_prefix,
+            input_root=input_root,
+            runs_root=runs_root,
+            headless=False,
+        )
         _run_in_pty(command, env=smoke_environment, timeout=timeout)
         if not marker.is_file() or marker.read_text() != TUI_SMOKE_MARKER_CONTENT:
             _fail("Interactive TUI did not write its control-protocol marker")
+
+
+def run_headless_stub_smoke(
+    command_prefix: list[str],
+    *,
+    env: dict[str, str],
+    runtime_root: Path,
+    timeout: int,
+) -> None:
+    """Run the installed headless stub loop to completion in an explicit collection."""
+    mutable_prefix_paths_before = _mutable_install_paths(Path(sys.prefix))
+    with tempfile.TemporaryDirectory(
+        prefix="vibesys-headless-smoke-", dir=runtime_root
+    ) as temporary:
+        smoke_root = Path(temporary)
+        input_root = smoke_root / "input"
+        _write_stub_input(input_root)
+        runs_root = smoke_root / "runs"
+        command = _stub_smoke_command(
+            command_prefix,
+            input_root=input_root,
+            runs_root=runs_root,
+            headless=True,
+        )
+        _run(command, env=env, timeout=timeout)
+        runs = [
+            path
+            for path in (runs_root.iterdir() if runs_root.is_dir() else ())
+            if path.is_dir() and not path.name.startswith((".", "_"))
+        ]
+        if len(runs) != 1 or not runs[0].name.endswith("-installed-release-smoke"):
+            _fail(f"Headless smoke did not create exactly one run under {runs_root}: {runs}")
+    added_prefix_paths = _mutable_install_paths(Path(sys.prefix)) - mutable_prefix_paths_before
+    if added_prefix_paths:
+        _fail(
+            "Headless smoke created a mutable run tree or cache beneath the Python "
+            f"installation prefix: {sorted(added_prefix_paths)}"
+        )
+
+
+def _mutable_install_paths(prefix: Path) -> set[Path]:
+    if not prefix.is_dir():
+        return set()
+    mutable_paths: set[Path] = set()
+    for path in prefix.rglob("*"):
+        parts = path.relative_to(prefix).parts
+        if (
+            "exp_env" in parts
+            or ".hf_cache" in parts
+            or any(parts[index : index + 2] == (".cache", "huggingface") for index in range(len(parts) - 1))
+        ):
+            mutable_paths.add(path.resolve())
+    return mutable_paths
 
 
 def _run_in_pty(command: list[str], *, env: dict[str, str], timeout: int) -> None:
