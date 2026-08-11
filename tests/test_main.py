@@ -873,17 +873,21 @@ def test_stub_agent_smoke_defaults_preserve_explicit_input():  # noqa: ANN201  #
     assert _prepare_stub_agent_smoke_defaults(argv) == argv
 
 
-def test_stub_agent_can_run_without_agent_toml(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    from vibesys.main import _build_agent_parser  # noqa: PLC0415  # tracked: #288
+def test_stub_agent_can_run_without_agent_toml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
 
     bundle = _write_input_bundle(tmp_path)
-    args = _build_agent_parser().parse_args(
+    launch_dir = tmp_path / "launch"
+    launch_dir.mkdir()
+    monkeypatch.chdir(launch_dir)
+    args = cli._build_agent_parser().parse_args(  # noqa: SLF001  # tracked: #288
         [
             "--stub-agent",
             "--input",
             str(bundle),
-            "--config",
-            str(tmp_path / "missing-agent.toml"),
             "--no-skills",
         ]
     )
@@ -895,12 +899,92 @@ def test_stub_agent_can_run_without_agent_toml(tmp_path):  # noqa: ANN001, ANN20
     assert skills is None
 
 
-def test_missing_config_reports_configuration_error(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+def test_config_help_describes_launch_directory_discovery() -> None:
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
+
+    help_text = " ".join(
+        cli._build_agent_parser().format_help().split()  # noqa: SLF001  # tracked: #288
+    )
+
+    assert "agent.toml in the launch working directory" in help_text
+    assert "a missing file is an error" in help_text
+
+
+def test_omitted_config_reports_missing_launch_directory_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
+
+    bundle = _write_input_bundle(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    args = cli._build_agent_parser().parse_args(  # noqa: SLF001  # tracked: #288
+        ["--input", str(bundle), "--local", "--no-skills"]
+    )
+
+    with pytest.raises(ConfigurationError) as exc:
+        load_config_and_skills(args, domain=DomainName.GENERIC)
+
+    assert exc.value.diagnostic.code == "config_load_failed"
+    assert exc.value.diagnostic.stage == "config_loading"
+    assert str(tmp_path / "agent.toml") in exc.value.diagnostic.message
+
+
+def test_omitted_config_does_not_search_parent_for_agent_toml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
+
+    bundle = _write_input_bundle(tmp_path)
+    (tmp_path / "agent.toml").write_text('[model]\nname = "parent-model"\n')
+    launch_dir = tmp_path / "launch"
+    launch_dir.mkdir()
+    monkeypatch.chdir(launch_dir)
+    args = cli._build_agent_parser().parse_args(  # noqa: SLF001  # tracked: #288
+        ["--input", str(bundle), "--local", "--no-skills"]
+    )
+
+    with pytest.raises(ConfigurationError) as exc:
+        load_config_and_skills(args, domain=DomainName.GENERIC)
+
+    assert exc.value.diagnostic.code == "config_load_failed"
+    assert str(launch_dir / "agent.toml") in exc.value.diagnostic.message
+    assert "parent-model" not in exc.value.diagnostic.message
+
+
+def test_omitted_config_loads_launch_directory_config_when_present(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
+
+    bundle = _write_input_bundle(tmp_path)
+    launch_dir = tmp_path / "launch"
+    launch_dir.mkdir()
+    (launch_dir / "agent.toml").write_text('[model]\nname = "launch-model"\n')
+    monkeypatch.chdir(launch_dir)
+    args = cli._build_agent_parser().parse_args(  # noqa: SLF001  # tracked: #288
+        ["--input", str(bundle), "--local", "--no-skills"]
+    )
+
+    config, _, _ = load_config_and_skills(args, domain=DomainName.GENERIC)
+
+    assert args.config is None
+    assert config.model.name == "launch-model"
+
+
+@pytest.mark.parametrize("stub_args", [[], ["--stub-agent"]])
+def test_missing_explicit_config_reports_configuration_error(
+    tmp_path: Path,
+    stub_args: list[str],
+) -> None:
     from vibesys.main import _build_agent_parser  # noqa: PLC0415  # tracked: #288
 
     bundle = _write_input_bundle(tmp_path)
     args = _build_agent_parser().parse_args(
         [
+            *stub_args,
             "--input",
             str(bundle),
             "--config",
@@ -920,7 +1004,7 @@ def test_missing_config_reports_configuration_error(tmp_path):  # noqa: ANN001, 
 # ---------------------------------------------------------------------------
 
 
-def test_tui_defaults_uses_repository_config_and_generated_name(
+def test_tui_defaults_uses_launch_directory_config_and_generated_name(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -944,8 +1028,6 @@ visibility = "private"
     argv = [
         "vibesys",
         "tui-defaults",
-        "--config",
-        str(config_path),
         "--input",
         str(input_path),
     ]
@@ -960,6 +1042,68 @@ visibility = "private"
     assert defaults["repository_name"] == defaults["experiment_name"]
     assert defaults["theme"] == "dark"
     assert defaults["runs_dir"] == str((tmp_path / "exp_env").resolve())
+
+
+def test_tui_defaults_supports_first_launch_without_github_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json  # noqa: PLC0415  # tracked: #288
+
+    import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
+
+    github = Mock()
+    github.current_user.side_effect = cli.GitHubCLIError("GitHub CLI is unavailable")
+    monkeypatch.setattr(cli, "GitHubCLI", Mock(return_value=github))
+    (tmp_path / "agent.toml").write_text('[model]\nname = "gpt-5.4"\n')
+    monkeypatch.chdir(tmp_path)
+
+    with patch.object(sys, "argv", ["vibesys", "tui-defaults"]):
+        main()
+
+    defaults = json.loads(capsys.readouterr().out)
+    assert defaults["runs_dir"] == str((tmp_path / "exp_env").resolve())
+    assert defaults["input_path"] == ""
+    assert defaults["experiment_name"].startswith("experiment-")
+    assert defaults["repository_owner"] is None
+    assert defaults["repository_name"] == defaults["experiment_name"]
+    assert defaults["visibility"] == "private"
+    assert defaults["theme"] == "dark"
+    github.current_user.assert_called_once_with()
+
+
+def test_tui_defaults_reports_missing_launch_directory_config(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch.object(sys, "argv", ["vibesys", "tui-defaults"]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    assert exc.value.code == 2
+    assert str(tmp_path / "agent.toml") in capsys.readouterr().err
+
+
+def test_tui_defaults_rejects_an_explicit_missing_config(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing = tmp_path / "missing-agent.toml"
+
+    with (
+        patch.object(sys, "argv", ["vibesys", "tui-defaults", "--config", str(missing)]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        main()
+
+    assert exc.value.code == 2
+    assert str(missing) in capsys.readouterr().err
 
 
 def test_tui_defaults_resolves_an_explicit_runs_directory(
@@ -1010,8 +1154,6 @@ def test_tui_defaults_supports_configless_stub_directory_selection(
     argv = [
         "vibesys",
         "tui-defaults",
-        "--config",
-        str(tmp_path / "missing.toml"),
         "--stub-agent",
         "--directory-only",
     ]

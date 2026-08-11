@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import importlib
 import importlib.metadata
+import json
 import os
 import pty
 import select
@@ -16,7 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Never
+from typing import Never, cast
 
 from vibesys.cli import bundled_tui
 from vibesys.input_project import materialize_input_project
@@ -69,12 +70,18 @@ class InstalledReleaseError(RuntimeError):
         """Build an error for a failed PTY-backed interactive check."""
         return cls(f"Installed interactive verification {reason}: {command}\n{output}")
 
+    @classmethod
+    def invalid_first_launch_defaults(cls) -> InstalledReleaseError:
+        """Build an error for malformed installed setup defaults."""
+        return cls("Installed first-launch defaults are not valid JSON")
+
 
 def verify_installed_release() -> None:
     """Exercise the installed framework, SDK, resources, and native TUI."""
     _verify_isolated_interpreter()
     _verify_framework_imports()
     verify_console_entry_point()
+    verify_first_launch_defaults()
     _verify_resources()
     _verify_materialized_sdk()
     _verify_tui()
@@ -129,6 +136,66 @@ def verify_console_entry_point() -> None:
     if issue_mcp is None:
         _fail("Installed vibesys-issue-mcp console script is absent from PATH")
     _run([issue_mcp, "--help"], timeout=30)
+
+
+def verify_first_launch_defaults() -> None:
+    """Require a user-owned launch-directory config and no bundled default config."""
+    distribution_files = importlib.metadata.distribution("vibesys").files or ()
+    if any(Path(str(path)).name == "agent.toml" for path in distribution_files):
+        _fail("Installed VibeSys distribution unexpectedly contains agent.toml")
+    executable = shutil.which("vibesys")
+    if executable is None:
+        _fail("Installed vibesys console script is absent from PATH")
+    config_path = _RUNTIME_ROOT / "agent.toml"
+    if config_path.exists():
+        _fail(f"Installed first launch unexpectedly contains a config file: {config_path}")
+    config_path.write_text(
+        """\
+[model]
+name = "gpt-5.4"
+
+[repository]
+visibility = "public"
+
+[tui]
+theme = "solarized-light"
+"""
+    )
+    try:
+        output = _run_capture(
+            [executable, "tui-defaults"],
+            timeout=30,
+        )
+    finally:
+        config_path.unlink()
+    defaults = _parse_first_launch_defaults(output, source="launch-directory")
+    runs_dir = defaults.get("runs_dir")
+    expected_runs_dir = (_RUNTIME_ROOT / "exp_env").resolve()
+    if not isinstance(runs_dir, str) or Path(runs_dir).resolve() != expected_runs_dir:
+        _fail(f"Installed first-launch runs directory is invalid: {runs_dir!r}")
+    if defaults.get("input_path") != "":
+        _fail(f"Installed first-launch input path must be empty: {defaults.get('input_path')!r}")
+    expected_defaults = {
+        "repository_owner": None,
+        "visibility": "public",
+        "theme": "solarized-light",
+    }
+    for key, expected in expected_defaults.items():
+        if defaults.get(key) != expected:
+            _fail(
+                f"Installed first launch ignored agent.toml from its working directory: "
+                f"{key}={defaults.get(key)!r}"
+            )
+
+
+def _parse_first_launch_defaults(output: str, *, source: str) -> dict[str, object]:
+    try:
+        defaults: object = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise InstalledReleaseError.invalid_first_launch_defaults() from exc
+    if not isinstance(defaults, dict):
+        _fail(f"Installed {source} defaults must be a JSON object")
+    return cast("dict[str, object]", defaults)
 
 
 def _verify_resources() -> None:
@@ -358,7 +425,10 @@ def _mutable_install_paths(prefix: Path) -> set[Path]:
         if (
             "exp_env" in parts
             or ".hf_cache" in parts
-            or any(parts[index : index + 2] == (".cache", "huggingface") for index in range(len(parts) - 1))
+            or any(
+                parts[index : index + 2] == (".cache", "huggingface")
+                for index in range(len(parts) - 1)
+            )
         ):
             mutable_paths.add(path.resolve())
     return mutable_paths
@@ -468,6 +538,20 @@ def _run(
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise InstalledReleaseError.command_failed(command) from exc
+
+
+def _run_capture(command: list[str], *, timeout: int) -> str:
+    try:
+        result = subprocess.run(  # noqa: S603
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise InstalledReleaseError.command_failed(command) from exc
+    return result.stdout
 
 
 def _fail(message: str) -> Never:
