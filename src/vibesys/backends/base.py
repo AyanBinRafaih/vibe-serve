@@ -18,13 +18,17 @@ from __future__ import annotations
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import Protocol, runtime_checkable
-
-from deepagents.backends.protocol import SandboxBackendProtocol  # noqa: TC002  # tracked: #288
-from deepagents.backends.sandbox import BaseSandbox
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from vibesys.constants import ComputeBackend  # noqa: TC001  # tracked: #288
 from vibesys.profilers import ProfilerKind  # noqa: TC001  # tracked: #288
+
+if TYPE_CHECKING:
+    # Importing deepagents costs the LangChain and Anthropic stack. This module
+    # is the protocol layer, imported by anything that merely names a backend,
+    # so it stays free of that: both names below are annotations only.
+    from deepagents.backends.protocol import SandboxBackendProtocol
+    from deepagents.backends.sandbox import BaseSandbox
 
 
 class SandboxKind(StrEnum):
@@ -49,7 +53,7 @@ class ContentionMonitor(Protocol):
     def stop(self) -> None: ...  # noqa: D102  # tracked: #288
 
 
-SetupFn = Callable[[BaseSandbox], None]
+type SetupFn = Callable[[BaseSandbox], None]
 """A function the sandbox runs after every ``start()`` (initial or restart).
 
 Use it to install setup that doesn't survive container restart and that the

@@ -33,10 +33,7 @@ import sys
 from collections.abc import Callable, Mapping  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
-
-from deepagents.backends.protocol import SandboxBackendProtocol  # noqa: TC002  # tracked: #288
-from deepagents.backends.sandbox import BaseSandbox  # noqa: TC002  # tracked: #288
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from vibesys.backends import SandboxKind
 from vibesys.backends.base import ComputeBackendImpl, SetupFn  # noqa: TC001  # tracked: #288
@@ -44,6 +41,15 @@ from vibesys.constants import DEFAULT_AGENT_BACKEND, PROJECT_ROOT
 from vibesys.domains.environment import EnvironmentBindMount  # noqa: TC001  # tracked: #288
 from vibesys.input_manifest import WorkspaceSource  # noqa: TC001  # tracked: #288
 from vibesys.profilers import ProfilerKind
+
+if TYPE_CHECKING:
+    # deepagents drags in the whole LangChain and Anthropic stack, seconds of
+    # import time. Nothing here needs it at runtime: both names are used only
+    # as annotations, and ``from __future__ import annotations`` keeps those
+    # unevaluated. A stub or headless run must not pay for an agent backend it
+    # never constructs.
+    from deepagents.backends.protocol import SandboxBackendProtocol
+    from deepagents.backends.sandbox import BaseSandbox
 
 
 @dataclass(frozen=True)

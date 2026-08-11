@@ -18,13 +18,17 @@ from __future__ import annotations
 
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
-from langchain_core.tools import BaseTool  # noqa: TC002  # tracked: #288
 from pydantic import BaseModel
 
 from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #288
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
+
+if TYPE_CHECKING:
+    # Annotation only. This protocol is imported by every runner, including the
+    # stub, so it stays free of the LangChain stack a real backend needs.
+    from langchain_core.tools import BaseTool
 
 T = TypeVar("T", bound=BaseModel)
 

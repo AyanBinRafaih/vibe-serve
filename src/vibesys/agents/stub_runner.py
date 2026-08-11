@@ -5,13 +5,17 @@ from __future__ import annotations
 import time
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
-from langchain_core.tools import BaseTool  # noqa: TC002  # tracked: #288
 from pydantic import BaseModel
 
 from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #288
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
+
+if TYPE_CHECKING:
+    # Annotation only. The stub runner exists to run without an agent stack,
+    # so it must not import one.
+    from langchain_core.tools import BaseTool
 
 T = TypeVar("T", bound=BaseModel)
 
