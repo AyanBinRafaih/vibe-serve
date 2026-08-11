@@ -13,6 +13,8 @@ export interface InputPanel {
   box: BoxRenderable;
   suggestions: BoxRenderable;
   completeSuggestion(): boolean;
+  /** True when nothing is typed, so Enter belongs to whatever pane is behind. */
+  isEmpty(): boolean;
   focus(): void;
   applyTheme(theme: Theme): void;
   destroy(): void;
@@ -113,6 +115,7 @@ export function createInputPanel(
       input.value = suggestion.name;
       return true;
     },
+    isEmpty: () => input.value.trim() === '',
     focus: () => input.focus(),
     applyTheme(next: Theme): void {
       box.borderColor = next.success;

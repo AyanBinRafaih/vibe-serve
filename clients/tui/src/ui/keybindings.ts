@@ -3,6 +3,7 @@ import type {SessionController} from '../session-controller.js';
 
 export interface KeybindingActions {
   completeInput(): boolean;
+  inputIsEmpty(): boolean;
   closeChat(): void;
   toggleLatestPrompt(): void;
   selectNextAgent(): void;
@@ -22,6 +23,22 @@ export function bindKeybindings(
     if (key.ctrl && key.name === 'c') {
       key.preventDefault();
       renderer.destroy();
+      return;
+    }
+    // The theme picker owns its navigation keys wherever it was opened from,
+    // so arrows never reach the view behind it. A typed command still belongs
+    // to the input, which is why Enter is claimed only on an empty line.
+    if (controller.state.themePicker !== null) {
+      if (key.name === 'up') controller.moveThemeSelection(-1);
+      else if (key.name === 'down') controller.moveThemeSelection(1);
+      else if (key.name === 'pageup') controller.moveThemeSelection(-10);
+      else if (key.name === 'pagedown') controller.moveThemeSelection(10);
+      else if (key.name === 'escape') controller.closeThemePicker();
+      else if (key.name === 'return' || key.name === 'enter') {
+        if (!actions.inputIsEmpty()) return;
+        controller.applySelectedTheme();
+      } else return;
+      key.preventDefault();
       return;
     }
     if (controller.state.chatOpen) {

@@ -288,8 +288,9 @@ Resolution order, highest first:
 3. `dark`.
 
 An unknown name is rejected before any process starts. Inside a running
-session, `/theme` lists the available themes and `/theme <name>` switches
-immediately; that switch applies to the session only and does not edit
+session, `/theme` opens the theme list as a keyboard selection (Up/Down to
+move, Enter to apply, Escape to close without switching) and `/theme <name>`
+switches immediately; that switch applies to the session only and does not edit
 `agent.toml`.
 
 Themes define semantic roles — surfaces, text emphasis levels, borders,

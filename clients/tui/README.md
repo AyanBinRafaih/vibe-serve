@@ -28,7 +28,7 @@ available slash commands are:
 | `/steer <message>` | Queue an instruction that is appended to the next agent invocation's prompt. |
 | `/history` | List rounds with agent-active elapsed time. |
 | `/perf` | Plot the recorded performance metric by round. |
-| `/theme` | List themes; `/theme <name>` switches immediately. |
+| `/theme` | Pick a theme from a keyboard-navigable list; `/theme <name>` switches immediately. |
 
 ### Experiment chat
 
@@ -74,7 +74,12 @@ this so the baseline cannot drift.
 Pick one with `--theme <name>` or `[tui].theme` in `agent.toml`; the flag wins.
 The launcher resolves the name once and passes it to both the pre-launch setup
 screen and the main client through `VIBESYS_THEME`. Inside a session, `/theme`
-lists the themes and `/theme <name>` re-themes every view in place.
+opens the list as a selection: it starts on the theme in use, Up and Down move
+the highlight, Enter applies it, and Escape closes the list with the theme
+unchanged. Those keys belong to the picker while it is open, so they never
+reach the view behind it, and a command typed into the input still runs on its
+own Enter. `/theme <name>` re-themes every view in place without opening the
+list.
 
 `ui/theme.ts` is the only module holding color literals. A theme declares
 semantic roles — `canvas`, `surface`, `elevatedSurface`, `selectedSurface`;

@@ -1,5 +1,5 @@
 import type {EventSubscription} from './client.js';
-import {HELP_TEXT, parseInput, themeListText} from './commands.js';
+import {HELP_TEXT, parseInput} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import type {ProtocolResponse, RequestInput, ServerMessage} from './protocol.js';
 import {
@@ -13,7 +13,10 @@ import {
   applyEvent,
   applySnapshot,
   type ConversationEntry,
+  closeThemePicker,
   initialSessionState,
+  moveThemeSelection,
+  openThemePicker,
   type SessionState,
   selectNextAgent,
   selectNextRound,
@@ -43,6 +46,10 @@ export interface SessionController {
   selectRound(roundNumber: number): void;
   toggleTodos(): void;
   setTheme(themeName: ThemeName): void;
+  openThemePicker(): void;
+  moveThemeSelection(delta: number): void;
+  applySelectedTheme(): void;
+  closeThemePicker(): void;
   subscribe(listener: (state: SessionState) => void): () => void;
 }
 
@@ -129,6 +136,25 @@ export class SocketSessionController implements SessionController {
 
   setTheme(themeName: ThemeName): void {
     this.#setState(setTheme(this.#state, themeName));
+  }
+
+  openThemePicker(): void {
+    this.#setState(openThemePicker(this.#state));
+  }
+
+  moveThemeSelection(delta: number): void {
+    this.#setState(moveThemeSelection(this.#state, delta));
+  }
+
+  /** Enter in the picker: the highlighted theme becomes the session's. */
+  applySelectedTheme(): void {
+    const picker = this.#state.themePicker;
+    if (picker === null) return;
+    this.setTheme(picker.selected);
+  }
+
+  closeThemePicker(): void {
+    this.#setState(closeThemePicker(this.#state));
   }
 
   closeChat(): void {
@@ -234,11 +260,7 @@ export class SocketSessionController implements SessionController {
       return;
     }
     if (parsed.localView === 'theme') {
-      if (parsed.themeName === undefined) {
-        return this.#setState(
-          showDetail(this.#state, themeListText(this.#state.themeName), 'help'),
-        );
-      }
+      if (parsed.themeName === undefined) return this.openThemePicker();
       return this.setTheme(parsed.themeName);
     }
     if (!parsed.request) return;
