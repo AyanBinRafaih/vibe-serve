@@ -93,14 +93,14 @@ with the CLI; API credentials are loaded from `.env` automatically.
 3. Check the installation:
 
 ```bash
-./vs validate examples/data-structures/queue-spsc
+uv run vibesys validate examples/data-structures/queue-spsc
 ```
 
 `uv run` creates the Python environment automatically. You do not need to run
 `uv sync` first.
 
 To use the interactive TUI, install Node.js 20+, Bun, and pnpm 11 (or enable
-Corepack). Run `./vs --runs-dir "$PWD/exp_env"`; it installs the frontend
+Corepack). Run `uv run vibesys --runs-dir "$PWD/exp_env"`; it installs the frontend
 dependencies and builds the TUI when needed. npm is not required.
 
 ### Installing from GitHub source
@@ -152,7 +152,7 @@ add `--local` to skip GitHub sync when `gh` is not installed.
 
 ```bash
 # Issue-tracker outer loop, Codex CLI, Docker on local CUDA, 4 rounds
-./vs \
+uv run vibesys \
   --runs-dir ~/vibesys-runs \
   --input examples/model-serving/moonshine-streaming \
   --exp-name my-experiment \
@@ -162,7 +162,7 @@ add `--local` to skip GitHub sync when `gh` is not installed.
   --modality speech_to_text
 ```
 
-`--outer-loop` defaults to `agent`. Pass `--outer-loop plain` or `--outer-loop evolve` to switch. See `./vs --outer-loop <kind> --help` for loop-specific flags, and [`docs/cli-flags.md`](docs/cli-flags.md) for the supported flag combinations.
+`--outer-loop` defaults to `agent`. Pass `--outer-loop plain` or `--outer-loop evolve` to switch. See `uv run vibesys --outer-loop <kind> --help` for loop-specific flags, and [`docs/cli-flags.md`](docs/cli-flags.md) for the supported flag combinations.
 
 ## Search strategies
 
@@ -211,7 +211,7 @@ for the full flag list.
 `OBJECTIVE.md` is read at the start of every run and must live next to the
 `reference/` directory (sibling, not inside). See `examples/model-serving/Llama-3-8B/`, `examples/model-serving/moonshine-streaming/`, `examples/model-serving/qwen3-32b-code-edit/`, `examples/model-serving/olmo-hybrid-prefix-caching/`, `examples/model-serving/Llama-3.1-8B-Instruct-MLX-8bit/`, `examples/model-serving/show-o2-1.5B-HQ-h100/`, and `examples/model-serving/show-o2-1.5B-HQ-macbook/` for the paper scenarios.
 
-For multi-objective evolutionary runs, drop an `objectives.toml` next to `OBJECTIVE.md` (or pass `--objective name:max|min` flags) — see `./vs --outer-loop evolve --help`.
+For multi-objective evolutionary runs, drop an `objectives.toml` next to `OBJECTIVE.md` (or pass `--objective name:max|min` flags) — see `uv run vibesys --outer-loop evolve --help`.
 
 ## Configuration (`agent.toml`)
 

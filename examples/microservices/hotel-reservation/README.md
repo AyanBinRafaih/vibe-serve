@@ -92,7 +92,7 @@ between runs to keep the raw capture small.
 ## Optimize
 
 ```bash
-./vs --outer-loop agent \
+uv run vibesys --outer-loop agent \
   --input examples/microservices/hotel-reservation \
   --runs-dir "$PWD/exp_env" \
   --exp-name hotel-reservation-opt \

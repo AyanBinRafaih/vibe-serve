@@ -109,7 +109,7 @@ jobs:
         run: pnpm check:ts
 
       - name: Test repository launcher
-        run: ./vs --headless --help >/dev/null
+        run: uv run vibesys --headless --help >/dev/null
 
       - name: Check generated protocol bindings
         run: |

@@ -4,7 +4,7 @@ VibeSys can use the search policy from OpenEvolve 0.3.1 without copying its
 implementation:
 
 ```bash
-./vs --outer-loop evolve \
+uv run vibesys --outer-loop evolve \
   --search-policy openevolve \
   --input examples/data-structures/queue-spsc
 ```

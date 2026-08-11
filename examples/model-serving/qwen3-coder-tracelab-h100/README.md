@@ -17,7 +17,7 @@ stack without inspecting or modifying the replay implementation.
 Start an optimization run with:
 
 ```bash
-./vs \
+uv run vibesys \
   --input examples/model-serving/qwen3-coder-tracelab-h100 \
   --runs-dir "$PWD/exp_env" \
   --exp-name qwen3-coder-tracelab-h100 \
