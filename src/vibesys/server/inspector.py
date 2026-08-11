@@ -59,9 +59,12 @@ class RunInspector:
             number = int(current.group(1)) if current else self._latest_round_number()
             if number:
                 return self._status_answer(question, self.round_detail(max(1, number - 1)))
+        # Names only what this read-only matcher can actually answer. It must
+        # not advertise slash commands: this string is shown in the experiment
+        # chat, and the operator would have to leave it to run one.
         return (
-            f"{self.supervisor.status()}. Ask about a round, failure, judge, or benchmark; "
-            "use /history for the event timeline."
+            f"{self.supervisor.status()}. This summary matches on keywords, so it answers "
+            "questions about a round, a failure, the judge, or a benchmark."
         )
 
     def round_detail(self, number: int) -> str:  # noqa: D102  # tracked: #288

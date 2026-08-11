@@ -669,6 +669,12 @@ class FakeController implements SessionController {
     this.state = {...this.state, themeName};
     this.#notify();
   }
+  submitChat(value: string): Promise<void> {
+    const text = value.trim();
+    if (!text.startsWith('/')) return this.sendChat(value);
+    return this.submit(text);
+  }
+
   sendChat(value: string): Promise<void> {
     this.chatSubmissions.push(value);
     this.state = {
