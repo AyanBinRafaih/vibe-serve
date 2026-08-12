@@ -3,7 +3,8 @@ Show-o2 1.5B HQ input bundle.
 Use:
 
 ```bash
-uv run vibesys --input examples/model-serving/show-o2-1.5B-HQ-h100
+vibesys --runs-dir /work/vibesys-runs --local \
+  --input examples/model-serving/show-o2-1.5B-HQ-h100
 ```
 
 This bundle targets `showlab/show-o2-1.5B-HQ`, a Show-o2 text-to-image

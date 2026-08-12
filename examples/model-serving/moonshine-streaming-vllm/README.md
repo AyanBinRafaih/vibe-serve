@@ -3,7 +3,8 @@ moonshine-streaming-medium input bundle.
 Use:
 
 ```bash
-uv run vibesys --input examples/model-serving/moonshine-streaming-vllm
+vibesys --runs-dir /work/vibesys-runs --local \
+  --input examples/model-serving/moonshine-streaming-vllm
 ```
 
 Each folder contains scripts plus a short README.
