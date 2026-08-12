@@ -54,7 +54,7 @@ Always infer the model/workload modality and a bundle slug, then ask the user to
      `[benchmark].command`, usually as `["uv", "run", "python", ...]` arrays.
    - Add `[workspace].seed` or `[evaluator].source` only when the target needs
      a starter workspace or trusted evaluator code.
-   - Run the bundle with `./vs --input examples/model-serving/<slug> ...` from
+   - Run the bundle with `uv run vibesys --input examples/model-serving/<slug> ...` from
      the repository root.
    - Checkers should be executable as `python checker.py` and benchmarks as
      `python benchmark.py --url http://localhost:8000 ...` from their own
@@ -183,7 +183,7 @@ Write a short `README.md` with the exact paths to use:
 
 ```text
 Use:
-./vs --input examples/model-serving/<slug> \
+uv run vibesys --input examples/model-serving/<slug> \
   --exp-name <experiment-name> \
   --backend <backend> \
   --interface service
@@ -203,7 +203,7 @@ After creating or editing the example:
 2. Run lightweight `--help` checks for `accuracy_checker/checker.py` and `benchmark/benchmark.py` if imports allow it.
 3. Verify `reference/meta.json` is valid JSON.
 4. Verify the final layout with `find examples/model-serving/<slug> -maxdepth 3 -type f | sort`.
-5. Run `./vs validate examples/model-serving/<slug>` to check the manifest,
+5. Run `uv run vibesys validate examples/model-serving/<slug>` to check the manifest,
    required paths, and optional workspace/evaluator sources without starting an
    agent or downloading model weights.
 6. Do not download large model weights or run GPU-heavy checks unless the user asks.
@@ -215,5 +215,5 @@ End with:
 - The new bundle path.
 - The source example copied/adapted.
 - The optimization goal captured in `OBJECTIVE.md`.
-- The exact `./vs --input examples/model-serving/<slug> ...` command to start
+- The exact `uv run vibesys --input examples/model-serving/<slug> ...` command to start
   optimizing; evaluator paths come from `vibesys.input.toml`.

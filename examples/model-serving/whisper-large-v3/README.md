@@ -42,8 +42,9 @@ and serve `/v1/audio/transcriptions` for the benchmark.
 ## Run it
 
 ```bash
-./vs \
+vibesys \
   --input examples/model-serving/whisper-large-v3 \
+  --runs-dir /work/vibesys-runs --local \
   --exp-name whisper-offline \
   --docker \
   --agent-backend cli --cli-provider codex \

@@ -89,7 +89,7 @@ export class ThemePickerView {
     this.output.add(
       new TextRenderable(this.renderer, {
         content:
-          '↑↓: select · Enter: apply · Esc: close · applies to this session; set [tui].theme in agent.toml for the default',
+          '↑↓: select · Enter: apply · Esc: close · applies to this session; pass --theme <name> at launch',
         fg: this.#theme.textSubtle,
         width: '100%',
       }),

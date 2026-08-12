@@ -113,7 +113,7 @@ Example (inside `judge.md`):
    `EnvironmentHooks` in that package and attach it to the definition.
 7. Register the definition in `vibesys.domains.registry.DOMAINS`.
 8. Add `[agent].domain = "<name>"` to the input manifest and run either
-   `./vs --outer-loop agent ...` or `./vs --outer-loop evolve ...` from the
+   `uv run vibesys --outer-loop agent ...` or `uv run vibesys --outer-loop evolve ...` from the
    repository root.
 
 Domains are registered explicitly so prompt context, environment hooks, and tests

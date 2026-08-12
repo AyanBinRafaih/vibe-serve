@@ -18,10 +18,7 @@ MICROSERVICE_SCENARIOS = tuple(
     ids=lambda path: path.name,
 )
 def test_microservice_scenario_uses_shared_evaluator(scenario_path: Path) -> None:
-    bundle = load_input_bundle(
-        scenario_path,
-        project_root=PROJECT_ROOT,
-    )
+    bundle = load_input_bundle(scenario_path)
 
     assert bundle.evaluator_path == PROJECT_ROOT / "examples" / "evaluators" / "microservice"
     assert bundle.benchmark_command[:5] == (
@@ -56,10 +53,7 @@ def test_microservice_scenarios_are_discovered() -> None:
 
 
 def test_train_ticket_accuracy_uses_shared_evaluator() -> None:
-    bundle = load_input_bundle(
-        MICROSERVICE_ROOT / "train-ticket",
-        project_root=PROJECT_ROOT,
-    )
+    bundle = load_input_bundle(MICROSERVICE_ROOT / "train-ticket")
 
     assert bundle.accuracy_command[:5] == (
         "go",
@@ -72,10 +66,7 @@ def test_train_ticket_accuracy_uses_shared_evaluator() -> None:
 
 
 def test_hotel_accuracy_uses_shared_evaluator_with_random_cases() -> None:
-    bundle = load_input_bundle(
-        MICROSERVICE_ROOT / "hotel-reservation",
-        project_root=PROJECT_ROOT,
-    )
+    bundle = load_input_bundle(MICROSERVICE_ROOT / "hotel-reservation")
 
     assert bundle.accuracy_command[:7] == (
         "go",
@@ -150,6 +141,16 @@ def test_hotel_accuracy_uses_shared_evaluator_with_random_cases() -> None:
         '"--settle-seconds","5"]',
     ) in zip(bundle.benchmark_command, bundle.benchmark_command[1:], strict=False)
     assert ("--telemetry-output", "../../metrics/telemetry.json") in zip(
+        bundle.benchmark_command,
+        bundle.benchmark_command[1:],
+        strict=False,
+    )
+    assert ("./cmd/servicebench", "trace") in zip(
+        bundle.benchmark_command,
+        bundle.benchmark_command[1:],
+        strict=False,
+    )
+    assert ("--trace-graph-json", "../../metrics/trace-graph.json") in zip(
         bundle.benchmark_command,
         bundle.benchmark_command[1:],
         strict=False,

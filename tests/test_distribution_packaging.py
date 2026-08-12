@@ -24,6 +24,7 @@ INTERNAL_DISTRIBUTIONS = {
     "vs-github",
     "vs-issue-board",
     "vs-loop-state",
+    "vs-project-state",
     "vs-sandbox",
 }
 INTERNAL_IMPORT_PACKAGES = {
@@ -31,6 +32,7 @@ INTERNAL_IMPORT_PACKAGES = {
     "vs_github",
     "vs_issue_board",
     "vs_loop_state",
+    "vs_project_state",
     "vs_sandbox",
 }
 
@@ -47,7 +49,7 @@ def test_headless_readme_examples_select_a_run_collection() -> None:
         headless_block = next(block for block in blocks if "--headless" in block)
         arguments = shlex.split(headless_block.replace("\\\n", " "))
         runs_index = arguments.index("--runs-dir")
-        assert arguments[runs_index + 1] == "$PWD/exp_env", readme
+        assert arguments[runs_index + 1] == "/work/vibesys-runs", readme
 
 
 def test_vcs_installs_do_not_initialize_repository_submodules() -> None:
@@ -149,6 +151,22 @@ def test_namespace_discovery_excludes_build_and_cache_artifacts(tmp_path: Path) 
     }
 
 
+def test_build_output_cleanup_removes_only_owned_top_level_packages(tmp_path: Path) -> None:
+    module = _load_packaging_support()
+    build_lib = tmp_path / "build"
+    stale = build_lib / "example" / "deleted.py"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("STALE = True\n")
+    unrelated = build_lib / "other" / "keep.py"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("KEEP = True\n")
+
+    module.clear_distribution_build_outputs(build_lib, ["example", "example.nested"])
+
+    assert not stale.parent.exists()
+    assert unrelated.is_file()
+
+
 def test_root_metadata_declares_internal_runtime_dependencies_directly():  # noqa: ANN201
     """Reintroducing a workspace-only dependency must make PyPI resolution fail here."""
     pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
@@ -172,6 +190,7 @@ def test_built_distribution_caps_dependencies_without_current_intel_macos_wheels
     )
     wheel = next(tmp_path.glob("vibesys-*.whl"))
     with zipfile.ZipFile(wheel) as archive:
+        assert not any(Path(name).name == "agent.toml" for name in archive.namelist())
         metadata_path = next(
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
         )
