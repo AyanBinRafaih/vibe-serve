@@ -233,9 +233,7 @@ def test_hypothesis_plan_text_round_trips() -> None:
 
     reloaded = parse_round_record(serialize_round_record(record))
 
-    assert reloaded.hypothesis_claim == (
-        "batching prefill removes per-request launch overhead"
-    )
+    assert reloaded.hypothesis_claim == "batching prefill removes per-request launch overhead"
     assert reloaded.hypothesis_task == "batch the prefill step"
 
 
