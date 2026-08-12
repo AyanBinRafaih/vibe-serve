@@ -7,7 +7,7 @@ import {
   visiblePhases as visibleRunMapPhases,
   visibleRoundNumber as visibleRunMapRoundNumber,
 } from './run-map.js';
-import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
+import {DEFAULT_THEME_NAME, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export interface SessionState {
   sequence: number;
@@ -32,6 +32,8 @@ export interface SessionState {
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
   hypothesisScope: HypothesisScope | null;
+  /** Non-null while the theme list is open as a keyboard selection. */
+  themePicker: ThemePicker | null;
   /**
    * Set once a typed tool_call/tool_result event is seen. From then on the
    * legacy tool-channel text chunks (still present in event files recorded
@@ -77,6 +79,10 @@ export interface HypothesisScope {
   id: string;
   label: string;
   rounds: number[];
+}
+
+export interface ThemePicker {
+  selected: ThemeName;
 }
 
 export interface UsageMeter {
@@ -143,6 +149,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     // list of claims before it reads as a long list of rounds.
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
     hypothesisScope: null,
+    themePicker: null,
     typedToolEvents: false,
   };
 }
@@ -292,8 +299,37 @@ export function selectedExperiment(state: SessionState): HypothesisEntry | null 
 }
 
 export function setTheme(state: SessionState, themeName: ThemeName): SessionState {
-  if (state.themeName === themeName) return state;
-  return {...state, themeName, overlay: null};
+  // Applying the theme that is already active is still an answer to the
+  // picker, so the picker closes either way.
+  if (state.themeName === themeName) {
+    return state.themePicker === null ? state : {...state, themePicker: null};
+  }
+  return {...state, themeName, overlay: null, themePicker: null};
+}
+
+/** Opens the theme list as a selection, starting on the active theme. */
+export function openThemePicker(state: SessionState): SessionState {
+  return {...state, overlay: null, themePicker: {selected: state.themeName}};
+}
+
+/**
+ * Moves the highlighted theme. The list has ends rather than a cycle, so the
+ * selection clamps instead of wrapping.
+ */
+export function moveThemeSelection(state: SessionState, delta: number): SessionState {
+  const picker = state.themePicker;
+  if (picker === null) return state;
+  const current = THEME_NAMES.indexOf(picker.selected);
+  const index = Math.min(THEME_NAMES.length - 1, Math.max(0, current + delta));
+  const selected = THEME_NAMES[index];
+  if (selected === undefined || selected === picker.selected) return state;
+  return {...state, themePicker: {selected}};
+}
+
+/** Closes the picker, leaving the theme as it was when it opened. */
+export function closeThemePicker(state: SessionState): SessionState {
+  if (state.themePicker === null) return state;
+  return {...state, themePicker: null};
 }
 
 export function applySnapshot(state: SessionState, snapshot: RunSnapshot): SessionState {

@@ -1,5 +1,5 @@
 import type {RequestInput} from './protocol.js';
-import {isThemeName, listThemes, THEME_NAMES, type ThemeName} from './ui/theme.js';
+import {isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export type ParsedInput = {
   localView?: 'chat' | 'help' | 'theme';
@@ -32,21 +32,8 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
     description: 'Open the selected hypothesis, or /open-round --N for round N',
   },
   {name: '/perf', description: 'Plot performance by round'},
-  {name: '/theme', description: 'List themes, or switch with /theme <name>'},
+  {name: '/theme', description: 'Pick a theme, or switch with /theme <name>'},
 ];
-
-export function themeListText(current: ThemeName): string {
-  return [
-    'Themes',
-    ...listThemes().map(
-      theme =>
-        `  ${theme.name === current ? '›' : ' '} ${theme.name.padEnd(20)} ${theme.label} (${theme.appearance})`,
-    ),
-    '',
-    'Switch with /theme <name>. This applies to the current session only;',
-    'set [tui].theme in agent.toml or pass --theme to change the default.',
-  ].join('\n');
-}
 
 export const HELP_TEXT = [
   'Available',

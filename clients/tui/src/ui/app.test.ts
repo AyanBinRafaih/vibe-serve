@@ -4,14 +4,17 @@ import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing'
 import type {HypothesisEntry} from '../protocol.js';
 import type {SessionController} from '../session-controller.js';
 import {
+  closeThemePicker,
   enterExperimentDrilldown,
   enterExperimentRound,
   initialSessionState,
   leaveExperimentDrilldown,
   moveExperimentSelection,
+  moveThemeSelection,
   openExperimentLog,
   type SessionState,
   setExperiments,
+  setTheme,
 } from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import {resolveTheme, type ThemeName} from './theme.js';
@@ -564,6 +567,120 @@ describe('theming', () => {
     expect(body?.bg).toBe(solarized.conversation.assistant.background);
   });
 
+  it('navigates the theme list with the keyboard and applies on Enter', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [
+        {number: 1, status: 'completed'},
+        {number: 2, status: 'active'},
+      ],
+      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/theme');
+    testRenderer.mockInput.pressEnter();
+    const opened = await testRenderer.waitForFrame(value => value.includes('Themes'));
+    // The view opens on the theme in use.
+    expect(opened).toContain('\u203a dark');
+    expect(opened).toContain('active');
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    const moved = await testRenderer.waitForFrame(value => value.includes('\u203a light'));
+    expect(moved).not.toContain('\u203a dark');
+    // Navigating the list leaves the view behind it alone.
+    expect(controller.state.selectedRound).toBeNull();
+    expect(controller.state.selectedAgentKind).toBeNull();
+    expect(controller.state.themeName).toBe('dark');
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForVisualIdle();
+
+    expect(controller.state.themeName).toBe('light');
+    expect(controller.state.themePicker).toBeNull();
+    expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(resolveTheme('light').accent);
+  });
+
+  it('closes the theme list on Escape without switching theme', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/theme');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Themes'));
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('\u203a light'));
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    // A bare ESC is held by the stdin parser until its escape-sequence
+    // timeout expires, so the key lands a beat after it is pressed.
+    await new Promise(resolve => setTimeout(resolve, 40));
+    await testRenderer.flush();
+    const closed = testRenderer.captureCharFrame();
+
+    expect(closed).not.toContain('\u203a light');
+    expect(closed).toContain('live output');
+    expect(controller.state.themePicker).toBeNull();
+    expect(controller.state.themeName).toBe('dark');
+    // Escape closed the picker rather than resetting the view behind it.
+    expect(controller.liveCalls).toBe(0);
+  });
+
+  it('leaves Enter to a typed command while the theme list is open', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 24});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/theme');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Themes'));
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('\u203a light'));
+
+    await testRenderer.mockInput.typeText('/help');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 2);
+
+    // The command ran; the highlighted theme was not applied by its Enter.
+    expect(controller.submissions).toEqual(['/theme', '/help']);
+    expect(controller.state.themeName).toBe('dark');
+    expect(controller.state.themePicker?.selected).toBe('light');
+  });
+
+  it('owns its keys over the chat it was opened from', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController({...initialSessionState(), chatOpen: true});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Ask a question about'));
+
+    await controller.submitChat('/theme');
+    await testRenderer.waitForFrame(value => value.includes('Themes'));
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('\u203a light'));
+
+    // The chat is still open behind the picker, and neither the arrows nor
+    // Escape reached it.
+    expect(controller.state.chatOpen).toBe(true);
+    testRenderer.mockInput.pressKey('ESCAPE');
+    // A bare ESC is held by the stdin parser until its escape-sequence
+    // timeout expires, so the key lands a beat after it is pressed.
+    await new Promise(resolve => setTimeout(resolve, 40));
+    await testRenderer.flush();
+    expect(testRenderer.captureCharFrame()).not.toContain('\u203a light');
+    expect(controller.state.themePicker).toBeNull();
+    expect(controller.state.chatOpen).toBe(true);
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
   it('themes the overlay and the chat panel from the same theme', async () => {
     const latte = resolveTheme('catppuccin-latte');
     const testRenderer = await createTestRenderer({width: 90, height: 30});
@@ -985,6 +1102,7 @@ class FakeController implements SessionController {
       this.state = {...this.state, chatOpen: true, overlay: null};
       this.#notify();
     }
+    if (value.trim() === '/theme') this.openThemePicker();
     return Promise.resolve();
   }
   closeChat(): void {
@@ -994,6 +1112,19 @@ class FakeController implements SessionController {
   setTheme(themeName: ThemeName): void {
     this.state = {...this.state, themeName};
     this.#notify();
+  }
+  openThemePicker(): void {
+    this.publish({...this.state, overlay: null, themePicker: {selected: this.state.themeName}});
+  }
+  moveThemeSelection(delta: number): void {
+    this.publish(moveThemeSelection(this.state, delta));
+  }
+  applySelectedTheme(): void {
+    const picker = this.state.themePicker;
+    if (picker !== null) this.publish(setTheme(this.state, picker.selected));
+  }
+  closeThemePicker(): void {
+    this.publish(closeThemePicker(this.state));
   }
   submitChat(value: string): Promise<void> {
     const text = value.trim();

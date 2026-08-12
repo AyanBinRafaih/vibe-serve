@@ -300,20 +300,54 @@ describe('session controller', () => {
     ).toBe('catppuccin-latte');
   });
 
-  it('lists themes locally and marks the active one', async () => {
+  it('opens the theme list as a selection starting on the active theme', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport, 'solarized-dark');
 
     await controller.submit('/theme');
 
-    expect(controller.state.overlay?.kind).toBe('help');
-    expect(controller.state.overlay?.content).toContain('› solarized-dark');
-    expect(controller.state.overlay?.content).toContain('high-contrast-light');
+    expect(controller.state.themePicker?.selected).toBe('solarized-dark');
+    // The list is a selection, not a text overlay.
+    expect(controller.state.overlay).toBeNull();
     expect(controller.state.themeName).toBe('solarized-dark');
     expect(transport.requests).toEqual([]);
   });
 
-  it('switches theme locally and closes the listing overlay', async () => {
+  it('applies the selected theme and closes the picker', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submit('/theme');
+    controller.moveThemeSelection(2);
+    controller.applySelectedTheme();
+
+    expect(controller.state.themeName).toBe('solarized-dark');
+    expect(controller.state.themePicker).toBeNull();
+    expect(transport.requests).toEqual([]);
+  });
+
+  it('closes the picker without switching when it is dismissed', async () => {
+    const controller = new SocketSessionController(new FakeTransport(), 'light');
+
+    await controller.submit('/theme');
+    controller.moveThemeSelection(1);
+    controller.closeThemePicker();
+
+    expect(controller.state.themeName).toBe('light');
+    expect(controller.state.themePicker).toBeNull();
+  });
+
+  it('closes the picker when the selection is the theme already in use', async () => {
+    const controller = new SocketSessionController(new FakeTransport(), 'light');
+
+    await controller.submit('/theme');
+    controller.applySelectedTheme();
+
+    expect(controller.state.themeName).toBe('light');
+    expect(controller.state.themePicker).toBeNull();
+  });
+
+  it('switches theme locally and closes the picker', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
@@ -321,6 +355,7 @@ describe('session controller', () => {
     await controller.submit('/theme high-contrast-dark');
 
     expect(controller.state.themeName).toBe('high-contrast-dark');
+    expect(controller.state.themePicker).toBeNull();
     expect(controller.state.overlay).toBeNull();
     expect(transport.requests).toEqual([]);
   });

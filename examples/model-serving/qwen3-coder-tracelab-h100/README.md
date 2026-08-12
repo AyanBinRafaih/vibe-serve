@@ -9,17 +9,17 @@ Use:
 - `--bench examples/model-serving/qwen3-coder-tracelab-h100/benchmark`
 
 The benchmark replays real TraceLab public coding-agent sessions through
-TraceLab's own `session_runner` instead of independent chat requests. VibeSys
-keeps the TraceLab submodule and released trace data in a hidden evaluator area,
-outside the candidate workspace, so optimization agents can tune the serving
-stack without inspecting or modifying the replay implementation.
+TraceLab's own `session_runner` instead of independent chat requests. The
+TraceLab replay implementation is an ordinary evaluator source, materialized at
+`_evaluator/tracelab-replay` and visible to optimization agents.
 
 Start an optimization run with:
 
 ```bash
-./vs \
+vibesys \
   --input examples/model-serving/qwen3-coder-tracelab-h100 \
-  --runs-dir "$PWD/exp_env" \
+  --runs-dir /work/vibesys-runs \
+  --local \
   --exp-name qwen3-coder-tracelab-h100 \
   --modal \
   --modal-gpu H100 \
