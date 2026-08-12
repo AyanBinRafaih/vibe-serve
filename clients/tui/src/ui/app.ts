@@ -10,6 +10,7 @@ import {OverlayView} from './overlay.js';
 import {RoundStripView} from './round-strip.js';
 import {createMarkdownStyle} from './styles.js';
 import {resolveTheme, type ThemeName} from './theme.js';
+import {ThemePickerView} from './theme-picker.js';
 import {TodoStripView} from './todo-strip.js';
 
 export interface OpenTuiApp {
@@ -61,6 +62,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   const todoStrip = new TodoStripView(renderer, controller, theme);
   const agentMap = new AgentMapView(renderer, theme);
   const overlay = new OverlayView(renderer, theme);
+  const themePicker = new ThemePickerView(renderer, theme);
   const conversation = new ConversationView(renderer, controller, markdownStyle, theme);
   const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme);
   const input = createInputPanel(renderer, value => void controller.submit(value), theme);
@@ -76,6 +78,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   root.add(input.suggestions);
   root.add(input.box);
   root.add(overlay.output);
+  root.add(themePicker.output);
   root.add(chat.output);
   renderer.root.add(root);
   input.focus();
@@ -93,6 +96,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     todoStrip.applyTheme(theme);
     agentMap.applyTheme(theme);
     overlay.applyTheme(theme);
+    themePicker.applyTheme(theme);
     conversation.applyTheme(theme, markdownStyle);
     chat.applyTheme(theme, markdownStyle);
     input.applyTheme(theme);
@@ -103,7 +107,8 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   const render = (state: SessionState): void => {
     const releasePreviousStyle =
       state.themeName === themeName ? undefined : applyTheme(state.themeName);
-    const returnHint = state.chatOpen || state.overlay !== null ? ' · Esc: close dialog' : '';
+    const dialogOpen = state.chatOpen || state.overlay !== null || state.themePicker !== null;
+    const returnHint = dialogOpen ? ' · Esc: close dialog' : '';
     const selection = state.selectedAgentKind ? ` · selected ${state.selectedAgentKind}` : '';
     header.content = `VibeSys · ${statusText(state)}${selection}${returnHint}`;
     roundStrip.render(state);
@@ -111,6 +116,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     agentMap.render(state);
     conversation.render(state);
     overlay.render(state);
+    themePicker.render(state);
     chat.render(state);
     if (state.chatOpen && !chatWasOpen) chat.focus();
     if (!state.chatOpen && chatWasOpen) input.focus();
@@ -119,6 +125,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   };
   const unbindKeys = bindKeybindings(renderer, controller, viewport, {
     completeInput: () => input.completeSuggestion(),
+    inputIsEmpty: () => input.isEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
     selectNextAgent: () => controller.selectNextAgent(),
