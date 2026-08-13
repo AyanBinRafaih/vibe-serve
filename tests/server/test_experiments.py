@@ -13,7 +13,7 @@ from vibesys.server.experiments import UNIDENTIFIED, apply_baselines, build_expe
 from vibesys.server.protocol import ExperimentQuery
 from vibesys.server.service import SupervisionService
 from vs_loop_state import RoundRecord
-from vs_project_state import AgentRunConfiguration, PlainRunConfiguration, ProjectStore
+from vs_project import AgentRunConfiguration, PlainRunConfiguration, Project
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -218,13 +218,14 @@ def _plain_configuration() -> PlainRunConfiguration:
 def _project_run(
     project: Path,
     configuration: AgentRunConfiguration | PlainRunConfiguration | None = None,
-) -> tuple[ProjectStore, str]:
+) -> tuple[Project, str]:
     """Create a real project run, as ``tests/test_tui.py`` does."""
     project.mkdir()
     (project / "OBJECTIVE.md").write_text("Make the queue fast.\n", encoding="utf-8")
-    store = ProjectStore(project)
-    store.create_project("queue")
-    manifest = store.new_run_manifest(
+    vibesys_project = Project.open(project)
+    state = vibesys_project.state
+    state.create_project("queue")
+    manifest = state.new_run_manifest(
         "queue",
         run_id="queue-run",
         branch="vibesys/queue-run",
@@ -232,8 +233,8 @@ def _project_run(
         configuration=configuration or _agent_configuration(),
         trusted_input_baseline="0" * 40,
     )
-    store.create_run(manifest)
-    return store, manifest.run_id
+    state.create_run(manifest)
+    return vibesys_project, manifest.run_id
 
 
 def test_service_reads_rounds_and_the_active_plan_through_the_store(tmp_path: Path) -> None:
@@ -242,14 +243,14 @@ def test_service_reads_rounds_and_the_active_plan_through_the_store(tmp_path: Pa
     Round records are portable state and the active plan is machine-local, so
     this covers both halves of the store API the log depends on.
     """
-    store, run_id = _project_run(tmp_path / "project")
-    store.save_round(
+    project, run_id = _project_run(tmp_path / "project")
+    project.state.save_round(
         run_id, _round(1, hypothesis_id="H-01", hypothesis_outcome="proven", passed=True)
     )
-    namespace = store.local_namespace(run_id, RunStateNamespace.AGENT)
+    namespace = project.state.local_namespace(run_id, RunStateNamespace.AGENT)
     AgentStateStore(namespace).save_active(_active("H-02", 2, hypothesis="next idea"))
     supervisor = RunSupervisor()
-    supervisor.attach(tmp_path / "logs", project_store=store, run_id=run_id)
+    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
 
     response = SupervisionService(supervisor).execute(ExperimentQuery())
 
@@ -269,8 +270,8 @@ def test_service_returns_nothing_before_a_run_is_attached(tmp_path: Path) -> Non
 
 def test_service_returns_nothing_for_a_non_agent_outer_loop(tmp_path: Path) -> None:
     """Only the agent loop records hypotheses, so other loops have no log to show."""
-    store, run_id = _project_run(tmp_path / "project", _plain_configuration())
+    project, run_id = _project_run(tmp_path / "project", _plain_configuration())
     supervisor = RunSupervisor()
-    supervisor.attach(tmp_path / "logs", project_store=store, run_id=run_id)
+    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
 
     assert SupervisionService(supervisor).experiments() == []

@@ -96,11 +96,11 @@ class SupervisionService:
         project_run = self.supervisor.project_run
         if project_run is None:
             return []
-        manifest = project_run.store.load_run(project_run.run_id)
+        manifest = project_run.project.state.load_run(project_run.run_id)
         if manifest.configuration.outer_loop != "agent":
             return []
         rounds: list[PerformanceRound] = []
-        for record in project_run.store.load_rounds(project_run.run_id):
+        for record in project_run.project.state.load_rounds(project_run.run_id):
             if record.perf_metric is None or record.perf_unit is None:
                 continue
             rounds.append(
@@ -124,10 +124,10 @@ class SupervisionService:
         project_run = self.supervisor.project_run
         if project_run is None:
             return []
-        manifest = project_run.store.load_run(project_run.run_id)
+        manifest = project_run.project.state.load_run(project_run.run_id)
         if manifest.configuration.outer_loop != "agent":
             return []
-        rounds = project_run.store.load_rounds(project_run.run_id)
+        rounds = project_run.project.state.load_rounds(project_run.run_id)
         entries = build_experiment_log(rounds, self._active_hypothesis(project_run))
         apply_baselines(entries, rounds)
         return entries
@@ -144,7 +144,9 @@ class SupervisionService:
         # so importing the namespace enum at module scope is a cycle.
         from vibesys.run.state import RunStateNamespace  # noqa: PLC0415  # tracked: #288
 
-        namespace = project_run.store.local_namespace(project_run.run_id, RunStateNamespace.AGENT)
+        namespace = project_run.project.state.local_namespace(
+            project_run.run_id, RunStateNamespace.AGENT
+        )
         return AgentStateStore(namespace).load_active()
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
