@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
-
+from vibesys.loops.agent.model import ActiveHypothesis  # noqa: TC001  # tracked: #288
+from vibesys.loops.agent.state import AgentStateStore
 from vibesys.server.events import EventType, RunEvent
 from vibesys.server.experiments import apply_baselines, build_experiment_log
 from vibesys.server.inspector import RunInspector
@@ -25,7 +25,7 @@ from vibesys.server.protocol import (
     SnapshotQuery,
     SteerCommand,
 )
-from vibesys.server.supervisor import RunSupervisor  # noqa: TC001  # tracked: #288
+from vibesys.server.supervisor import ProjectRunState, RunSupervisor  # noqa: TC001  # tracked: #288
 
 
 class SupervisionService:
@@ -115,27 +115,37 @@ class SupervisionService:
         return rounds
 
     def experiments(self) -> list[HypothesisEntry]:
-        """Group persisted round state into one entry per hypothesis."""
-        raw = self._read_json("rounds.json")
-        rounds = [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
-        active = self._read_json("active_hypothesis.json")
-        entries = build_experiment_log(rounds, active if isinstance(active, dict) else None)
+        """Group persisted round state into one entry per hypothesis.
+
+        Both inputs come from the project store rather than from files this
+        module names itself, so a change to the on-disk layout is absorbed by
+        the store and its typed adapters. This mirrors ``performance_rounds``.
+        """
+        project_run = self.supervisor.project_run
+        if project_run is None:
+            return []
+        manifest = project_run.store.load_run(project_run.run_id)
+        if manifest.configuration.outer_loop != "agent":
+            return []
+        rounds = project_run.store.load_rounds(project_run.run_id)
+        entries = build_experiment_log(rounds, self._active_hypothesis(project_run))
         apply_baselines(entries, rounds)
         return entries
 
-    def _read_json(self, name: str) -> object | None:
-        log_dir = self.supervisor.log_dir
-        if log_dir is None:
-            return None
-        path = log_dir / name
-        if not path.is_file():
-            return None
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            # A run writing state concurrently can be observed mid-write. A
-            # transient parse failure must not take down the operator's view.
-            return None
+    @staticmethod
+    def _active_hypothesis(project_run: ProjectRunState) -> ActiveHypothesis | None:
+        """Load the live plan, or ``None`` when no hypothesis is open.
+
+        The active plan is machine-local rather than portable, and
+        ``AgentStateStore`` owns where it lives, so the file is never named
+        here.
+        """
+        # Deferred: ``vibesys.run`` re-enters this module through its logger,
+        # so importing the namespace enum at module scope is a cycle.
+        from vibesys.run.state import RunStateNamespace  # noqa: PLC0415  # tracked: #288
+
+        namespace = project_run.store.local_namespace(project_run.run_id, RunStateNamespace.AGENT)
+        return AgentStateStore(namespace).load_active()
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.wait_for_events(after_sequence, timeout)
