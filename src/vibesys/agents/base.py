@@ -19,13 +19,15 @@ from __future__ import annotations
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass, field
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import Generic, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
-from langchain_core.tools import BaseTool  # noqa: TC002  # tracked: #288
 from pydantic import BaseModel
 
 from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #288
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
+
+if TYPE_CHECKING:
+    from langchain_core.tools import BaseTool  # annotation only; avoid eager agent-stack import
 
 T = TypeVar("T", bound=BaseModel)
 

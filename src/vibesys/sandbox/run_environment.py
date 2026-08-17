@@ -33,10 +33,7 @@ import sys
 from collections.abc import Callable, Mapping  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
-
-from deepagents.backends.protocol import SandboxBackendProtocol  # noqa: TC002  # tracked: #288
-from deepagents.backends.sandbox import BaseSandbox  # noqa: TC002  # tracked: #288
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from vibesys.backends import SandboxKind
 from vibesys.backends.base import ComputeBackendImpl, SetupFn  # noqa: TC001  # tracked: #288
@@ -50,6 +47,11 @@ from vs_sandbox import ProjectPathPolicy
 
 _SHELL_COMMAND_ARG_COUNT = 3
 _RECORDED_ENVIRONMENT_NAMES = frozenset({"local", "docker", "modal"})
+
+if TYPE_CHECKING:
+    # Annotation only; deepagents pulls langchain + anthropic (~seconds).
+    from deepagents.backends.protocol import SandboxBackendProtocol
+    from deepagents.backends.sandbox import BaseSandbox
 
 
 @dataclass(frozen=True)

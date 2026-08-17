@@ -6,14 +6,16 @@ import re
 import time
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
-from langchain_core.tools import BaseTool  # noqa: TC002  # tracked: #288
 from pydantic import BaseModel
 
 from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #288
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
 from vibesys.schemas import HypothesisOutcome
+
+if TYPE_CHECKING:
+    from langchain_core.tools import BaseTool  # annotation only; avoid eager agent-stack import
 
 T = TypeVar("T", bound=BaseModel)
 
