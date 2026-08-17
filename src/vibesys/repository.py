@@ -29,6 +29,7 @@ class InteractiveSetupDefaults(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    runs_dir: str
     input_path: str
     experiment_name: str
     repository_owner: str | None
@@ -49,6 +50,21 @@ def generate_experiment_name(
         base = "experiment"
     timestamp = (now or datetime.now(UTC)).strftime("%Y%m%d-%H%M%S")
     return f"{base}-{timestamp}"
+
+
+def validate_experiment_name(experiment_name: str) -> str:
+    """Require a fresh experiment name to be one safe path component."""
+    if (
+        not experiment_name
+        or experiment_name in {".", ".."}
+        or "/" in experiment_name
+        or "\\" in experiment_name
+    ):
+        raise ValueError(  # noqa: TRY003  # tracked: #288
+            "--exp-name must be a non-empty single path component other than '.' or '..': "
+            f"{experiment_name!r}"
+        )
+    return experiment_name
 
 
 def repository_name_from_experiment(experiment_name: str) -> str:

@@ -1,15 +1,19 @@
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it} from 'bun:test';
 import type {RunEvent} from './protocol.js';
 import {
   applyEvent,
   closePane,
+  closeThemePicker,
   failPane,
   initialSessionState,
+  moveThemeSelection,
   openPane,
+  openThemePicker,
   selectNextAgent,
   selectNextRound,
   selectRound,
   setPaneContent,
+  setTheme,
   statusText,
   togglePaneFocus,
   toggleTodos,
@@ -706,3 +710,45 @@ function chatEvent(
     round_label: 'experiment-chat',
   };
 }
+
+describe('theme picker', () => {
+  it('opens on the active theme', () => {
+    const state = openThemePicker(initialSessionState('catppuccin-latte'));
+
+    expect(state.themePicker?.selected).toBe('catppuccin-latte');
+    expect(state.themeName).toBe('catppuccin-latte');
+  });
+
+  it('moves the selection without changing the theme in use', () => {
+    const opened = openThemePicker(initialSessionState());
+
+    const moved = moveThemeSelection(opened, 1);
+
+    expect(moved.themePicker?.selected).toBe('light');
+    expect(moved.themeName).toBe('dark');
+  });
+
+  it('clamps at both ends of the list rather than wrapping', () => {
+    const opened = openThemePicker(initialSessionState());
+
+    expect(moveThemeSelection(opened, -1)).toBe(opened);
+    expect(moveThemeSelection(opened, 99).themePicker?.selected).toBe('high-contrast-light');
+  });
+
+  it('ignores movement when the picker is closed', () => {
+    const state = initialSessionState();
+
+    expect(moveThemeSelection(state, 1)).toBe(state);
+  });
+
+  it('closes on dismissal and on applying a theme', () => {
+    const opened = moveThemeSelection(openThemePicker(initialSessionState()), 1);
+
+    expect(closeThemePicker(opened).themePicker).toBeNull();
+    expect(closeThemePicker(opened).themeName).toBe('dark');
+    expect(setTheme(opened, 'light').themePicker).toBeNull();
+    expect(setTheme(opened, 'light').themeName).toBe('light');
+    // Re-applying the active theme is still an answer to the picker.
+    expect(setTheme(opened, 'dark').themePicker).toBeNull();
+  });
+});

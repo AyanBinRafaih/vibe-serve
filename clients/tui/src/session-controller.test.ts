@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it} from 'bun:test';
 import type {EventSubscription} from './client.js';
 import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
 import {
@@ -305,20 +305,54 @@ describe('session controller', () => {
     ).toBe('catppuccin-latte');
   });
 
-  it('lists themes locally and marks the active one', async () => {
+  it('opens the theme list as a selection starting on the active theme', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport, 'solarized-dark');
 
     await controller.submit('/theme');
 
-    expect(controller.state.overlay?.kind).toBe('help');
-    expect(controller.state.overlay?.content).toContain('› solarized-dark');
-    expect(controller.state.overlay?.content).toContain('high-contrast-light');
+    expect(controller.state.themePicker?.selected).toBe('solarized-dark');
+    // The list is a selection, not a text overlay.
+    expect(controller.state.overlay).toBeNull();
     expect(controller.state.themeName).toBe('solarized-dark');
     expect(transport.requests).toEqual([]);
   });
 
-  it('switches theme locally and closes the listing overlay', async () => {
+  it('applies the selected theme and closes the picker', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submit('/theme');
+    controller.moveThemeSelection(2);
+    controller.applySelectedTheme();
+
+    expect(controller.state.themeName).toBe('solarized-dark');
+    expect(controller.state.themePicker).toBeNull();
+    expect(transport.requests).toEqual([]);
+  });
+
+  it('closes the picker without switching when it is dismissed', async () => {
+    const controller = new SocketSessionController(new FakeTransport(), 'light');
+
+    await controller.submit('/theme');
+    controller.moveThemeSelection(1);
+    controller.closeThemePicker();
+
+    expect(controller.state.themeName).toBe('light');
+    expect(controller.state.themePicker).toBeNull();
+  });
+
+  it('closes the picker when the selection is the theme already in use', async () => {
+    const controller = new SocketSessionController(new FakeTransport(), 'light');
+
+    await controller.submit('/theme');
+    controller.applySelectedTheme();
+
+    expect(controller.state.themeName).toBe('light');
+    expect(controller.state.themePicker).toBeNull();
+  });
+
+  it('switches theme locally and closes the picker', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
@@ -326,6 +360,7 @@ describe('session controller', () => {
     await controller.submit('/theme high-contrast-dark');
 
     expect(controller.state.themeName).toBe('high-contrast-dark');
+    expect(controller.state.themePicker).toBeNull();
     expect(controller.state.overlay).toBeNull();
     expect(transport.requests).toEqual([]);
   });
@@ -651,6 +686,49 @@ describe('session controller', () => {
 
     expect(controller.state.experimentLog?.error).toContain('socket closed');
     expect(controller.state.experimentLog?.pending).toBe(false);
+  });
+
+  it('runs a slash command typed in the chat through the main input path', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.submit('/chat');
+    const before = transport.requests.length;
+
+    // The flat round list, which is the command that still answers with an
+    // overlay now that bare /history returns to the experiment log.
+    await controller.submitChat('/history rounds');
+
+    // Handled as a command, not forwarded to the chat agent.
+    expect(transport.requests.slice(before)).toEqual([{type: 'query.history'}]);
+    expect(controller.state.chatConversation).toHaveLength(0);
+  });
+
+  it('reports an unknown slash command in the chat instead of asking the agent', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submitChat('/nope');
+
+    expect(controller.state.overlay?.kind).toBe('error');
+    expect(controller.state.overlay?.content).toContain('Unknown command');
+    expect(transport.requests).toEqual([]);
+  });
+
+  it('still sends ordinary questions, including text containing a slash', async () => {
+    const transport = new FakeTransport([], [], {
+      question: 'what changed in a/b testing?',
+      answer: 'Nothing yet.',
+      effect: 'none',
+    });
+    const controller = new SocketSessionController(transport);
+
+    await controller.submitChat('what changed in a/b testing?');
+
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat',
+      text: 'what changed in a/b testing?',
+    });
+    expect(controller.state.chatConversation.at(-1)?.content).toBe('Nothing yet.');
   });
 
   it('reports an unknown theme as an error without switching', async () => {

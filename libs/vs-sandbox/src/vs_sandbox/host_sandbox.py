@@ -4,8 +4,8 @@ VibeSys launches coding-agent CLIs (codex, claude, ...) with the provider's own
 approval/sandbox bypass flags (``--dangerously-bypass-approvals-and-sandbox``,
 ``--dangerously-skip-permissions``) so they can run autonomously. On the host
 execution path that leaves the spawned agent process able to read and write
-anywhere the VibeSys user can, so a misbehaving agent can step outside its
-``exp_env/<run>/workspace`` and reach sibling runs, unrelated repositories, or
+anywhere the VibeSys user can, so a misbehaving agent can step outside the
+canonical project root and reach sibling projects, unrelated repositories, or
 host secrets. Prompt-only containment is not a security boundary (issue #149).
 
 This module wraps the agent command in an OS confinement layer that exposes only:
@@ -14,10 +14,10 @@ This module wraps the agent command in an OS confinement layer that exposes only
   runtimes needed to launch,
 * resources supplied as typed :class:`~vs_sandbox.host_resources.HostResource`
   declarations (agent state, toolchains, model caches, MCP server code),
-* read-write access to the run workspace and a private ``/tmp``.
+* read-write access to the canonical project root and a private ``/tmp``.
 
-Everything else — including the workspace's *parent* and sibling runs — is
-denied, so absolute-path traversal outside the workspace fails. Network is left
+Everything else, including the project's *parent* and sibling projects, is
+denied, so absolute-path traversal outside the project fails. Network is left
 open so the agent can still reach its model provider.
 
 Two host backends implement the same ``wrap(argv) -> argv`` contract, selected
@@ -56,10 +56,27 @@ from pathlib import Path
 
 from vs_sandbox.host_resource_importer import prepare_host_resource_imports
 from vs_sandbox.host_resources import HostResource  # noqa: TC001  # tracked: #288
+from vs_sandbox.project_paths import ProjectPathPolicy
 
 DISABLE_ENV = "VIBESYS_AGENT_SANDBOX"
 
 _DISABLED_VALUES = frozenset({"0", "false", "off", "no"})
+
+
+class SandboxUnavailableError(RuntimeError):
+    """Raised when a caller requires host confinement but none is available."""
+
+
+@dataclass(frozen=True)
+class _BuildOptions:
+    """Validated shared inputs passed to an OS-specific sandbox builder."""
+
+    env: dict[str, str]
+    resources: Iterable[HostResource]
+    log: Callable[[str], None]
+    project_path_policy: ProjectPathPolicy
+    require_enforcement: bool
+
 
 # Read-only system/toolchain roots exposed inside the Linux namespace. Bound
 # with ``--ro-bind-try`` so a root that does not exist on a given host is
@@ -78,7 +95,7 @@ _SYSTEM_READ_ROOTS: tuple[str, ...] = (
 
 # Read-only system roots the macOS dynamic linker and command-line tools need to
 # launch anything at all. Kept deliberately broad on the *system* side (dyld,
-# frameworks, config) while the workspace's parent and sibling runs stay denied
+# frameworks, config) while the project's parent and siblings stay denied
 # by ``(deny default)``.
 _MACOS_SYSTEM_READ_ROOTS: tuple[str, ...] = (
     "/usr",
@@ -104,11 +121,11 @@ def _is_disabled(env: dict[str, str]) -> bool:
 
 @dataclass(frozen=True)
 class WorkspaceSandbox(ABC):
-    """A host confinement policy for a single run workspace.
+    """A host confinement policy for a single canonical project.
 
-    Both OS backends are built by :func:`build` from the same inputs — the
-    workspace plus the read/write allowlists computed from resource declarations
-    — and expose the same ``wrap(argv) -> argv`` contract consumed at the process
+    Both OS backends are built by :func:`build` from the same inputs: the
+    project plus the read/write allowlists computed from resource declarations.
+    They expose the same ``wrap(argv) -> argv`` contract consumed at the process
     launch chokepoint. Subclasses differ only
     in the OS mechanism they emit: :class:`HostSandbox` a bubblewrap namespace,
     :class:`SeatbeltSandbox` a ``sandbox-exec`` profile.
@@ -117,6 +134,7 @@ class WorkspaceSandbox(ABC):
     workspace: Path
     read_paths: tuple[Path, ...] = ()
     write_paths: tuple[Path, ...] = ()
+    project_path_policy: ProjectPathPolicy = field(default_factory=ProjectPathPolicy)
 
     @abstractmethod
     def wrap(self, argv: list[str]) -> list[str]:
@@ -125,7 +143,7 @@ class WorkspaceSandbox(ABC):
 
 @dataclass(frozen=True)
 class HostSandbox(WorkspaceSandbox):
-    """A bubblewrap confinement policy for a single run workspace."""
+    """A bubblewrap confinement policy for a single canonical project."""
 
     bwrap_path: str = field(kw_only=True)
     system_read_roots: tuple[str, ...] = _SYSTEM_READ_ROOTS
@@ -133,7 +151,8 @@ class HostSandbox(WorkspaceSandbox):
 
     def wrap(self, argv: list[str]) -> list[str]:
         """Return *argv* wrapped so it runs inside the confinement namespace."""
-        ws = str(self.workspace)
+        ws = str(self.workspace.resolve())
+        project_paths = self.project_path_policy.resolve(self.workspace)
         cmd: list[str] = [
             self.bwrap_path,
             "--die-with-parent",
@@ -172,9 +191,17 @@ class HostSandbox(WorkspaceSandbox):
             cmd += ["--dev-bind-try", str(node), str(node)]
         for path in self.write_paths:
             cmd += ["--bind-try", str(path), str(path)]
-        # The workspace is the one project path the agent may modify. Bound last
-        # so it wins over any read-only bind that happens to cover it.
+        # The project bind wins over imported host resources. Nested project
+        # restrictions are then overlaid in increasing strength: read-only
+        # paths first, hidden masks last.
         cmd += ["--bind", ws, ws]
+        for path in project_paths.read_only_paths:
+            cmd += ["--ro-bind", str(path.path), str(path.path)]
+        for path in project_paths.hidden_paths:
+            if path.is_directory:
+                cmd += ["--tmpfs", str(path.path)]
+            else:
+                cmd += ["--ro-bind", "/dev/null", str(path.path)]
         cmd += ["--chdir", ws, "--"]
         cmd += argv
         return cmd
@@ -209,22 +236,21 @@ def _sbpl_string(value: str) -> str:
 
 @dataclass(frozen=True)
 class SeatbeltSandbox(WorkspaceSandbox):
-    """A macOS Seatbelt (``sandbox-exec``) confinement policy for a workspace.
+    """A macOS Seatbelt (``sandbox-exec``) policy for a canonical project.
 
     macOS confinement follows the model that Codex's own Seatbelt sandbox uses,
     because it is the one that reliably launches Apple-Silicon toolchains:
     **reads are allowed broadly** (a ``(deny default)`` read policy makes dyld
     and code-signing abort every dynamically linked binary), while **writes are
-    denied by default** and permitted only on the workspace, the agent's config
-    dirs, and ``/tmp``. On top of that, the workspace's run-container tree — the
-    directory that holds sibling runs — is explicitly denied for both read and
-    write, with the workspace itself carved back out. That blocks the concrete
-    escape from issue #149 (discovering/using a sibling run) and all writes
-    outside the workspace.
+    denied by default** and permitted only on the project, the agent's config
+    dirs, and ``/tmp``. On top of that, the project's nearest ancestor trees are
+    explicitly denied for both read and write, with the project itself carved
+    back out. That blocks the concrete escape from issue #149 (discovering or
+    using a sibling project) and all writes outside the project.
 
     This is a weaker guarantee than the Linux bubblewrap backend, which hides the
-    entire host outside the workspace: on macOS, reads of unrelated host files
-    outside the run-container tree are still permitted. Use ``--docker`` on macOS
+    entire host outside the project: on macOS, reads of unrelated host files
+    outside the denied ancestor trees are still permitted. Use ``--docker`` on macOS
     if full read-confinement is required.
     """
 
@@ -232,11 +258,10 @@ class SeatbeltSandbox(WorkspaceSandbox):
     system_read_roots: tuple[str, ...] = _MACOS_SYSTEM_READ_ROOTS
 
     def blind_roots(self) -> list[Path]:
-        """Ancestor dirs of the workspace to deny (read+write) to hide siblings.
+        """Project ancestor directories to deny for sibling isolation.
 
-        Returns the workspace's parent and grandparent (the run and run-container
-        dirs in the ``exp_env/<run>/workspace`` layout), skipping the filesystem
-        root and any system location so the deny can never blind the toolchain.
+        Returns the project's parent and grandparent, skipping the filesystem
+        root and system locations so the deny can never blind the toolchain.
         """
         roots: list[Path] = []
         for anc in list(self.workspace.parents)[:2]:
@@ -250,7 +275,9 @@ class SeatbeltSandbox(WorkspaceSandbox):
 
     def profile(self) -> str:
         """Render the SBPL profile text for this policy."""
-        ws = _sbpl_string(str(self.workspace))
+        workspace = self.workspace.resolve()
+        project_paths = self.project_path_policy.resolve(workspace)
+        ws = _sbpl_string(str(workspace))
         lines = [
             "(version 1)",
             "(deny default)",
@@ -273,7 +300,7 @@ class SeatbeltSandbox(WorkspaceSandbox):
             "(allow file-read*)",
         ]
 
-        # Writes are denied by default; permit them only on the workspace, the
+        # Writes are denied by default; permit them only on the project, the
         # agent's own config/auth dirs, scratch tmp, and device nodes (a process
         # must be able to write /dev/null, /dev/stdout, /dev/tty, ...).
         write_roots = [str(self.workspace)] + [str(p) for p in self.write_paths]
@@ -282,15 +309,30 @@ class SeatbeltSandbox(WorkspaceSandbox):
         lines += [f"    (subpath {_sbpl_string(w)})" for w in write_roots]
         lines.append(")")
 
-        # Blind the sibling-run area: deny read+write on the run-container tree,
-        # then carve the workspace back out. The most-specific (last) matching
-        # rule wins in SBPL, so workspace access survives the deny.
+        # Blind nearby sibling projects by denying the project's ancestor
+        # trees, then carve the project back out. The most-specific (last)
+        # matching rule wins in SBPL, so project access survives the deny.
         blind = self.blind_roots()
         if blind:
             lines.append("(deny file-read* file-write*")
             lines += [f"    (subpath {_sbpl_string(str(r))})" for r in blind]
             lines.append(")")
             lines.append(f"(allow file-read* file-write* (subpath {ws}))")
+
+        # Project restrictions come after every project allow. Hidden paths
+        # deny both visibility and mutation; read-only paths deny mutation.
+        for path in project_paths.read_only_paths:
+            lines.append(
+                _seatbelt_path_rule("deny file-write*", path.path, is_directory=path.is_directory)
+            )
+        for path in project_paths.hidden_paths:
+            lines.append(
+                _seatbelt_path_rule(
+                    "deny file-read* file-write*",
+                    path.path,
+                    is_directory=path.is_directory,
+                )
+            )
 
         return "\n".join(lines) + "\n"
 
@@ -300,6 +342,18 @@ class SeatbeltSandbox(WorkspaceSandbox):
         # ``sandbox-exec`` runs the command from the caller's cwd, which the CLI
         # runner already sets to the workspace.
         return [self.sandbox_exec_path, "-p", self.profile(), *argv]
+
+
+def _seatbelt_path_rule(
+    operation: str,
+    path: Path,
+    *,
+    is_directory: bool,
+) -> str:
+    """Render a path-specific deny for a resolved project path."""
+    predicate = "subpath" if is_directory else "literal"
+    value = _sbpl_string(str(path))
+    return f"({operation} ({predicate} {value}))"
 
 
 def _resource_paths(
@@ -312,12 +366,14 @@ def _resource_paths(
     return list(imports.read_paths), list(imports.write_paths)
 
 
-def build(
+def build(  # noqa: PLR0913
     workspace: Path | str,
     *,
     env: dict[str, str],
     resources: Iterable[HostResource] = (),
     log: Callable[[str], None] | None = None,
+    project_path_policy: ProjectPathPolicy | None = None,
+    require_enforcement: bool = False,
 ) -> WorkspaceSandbox | None:
     """Build a host confinement policy for *workspace*, or ``None`` if not enforced.
 
@@ -326,7 +382,9 @@ def build(
     when the host OS has no supported backend, or when the backend's tool
     (``bwrap`` / ``sandbox-exec``) is unavailable. In those cases the caller runs
     the agent unconfined, exactly as before this change — the sandbox can never
-    *break* a run that used to work, it only ever adds a boundary.
+    *break* a run that used to work, it only ever adds a boundary. Set
+    ``require_enforcement`` to fail closed with :class:`SandboxUnavailableError`
+    instead. Omitting both new policy arguments preserves the legacy behavior.
     """
 
     def _log(msg: str) -> None:
@@ -334,82 +392,96 @@ def build(
             log(msg)
 
     workspace = Path(workspace).resolve()
+    policy = project_path_policy or ProjectPathPolicy()
+    policy.validate(workspace)
+    options = _BuildOptions(
+        env=env,
+        resources=resources,
+        log=_log,
+        project_path_policy=policy,
+        require_enforcement=require_enforcement,
+    )
 
     if _is_disabled(env):
-        _log(
+        message = (
             f"[hostsandbox] DISABLED via {DISABLE_ENV}; agent runs with full host "
             "filesystem access. Sibling runs and host files are reachable."
         )
-        return None
+        return _unavailable(message, require_enforcement=require_enforcement, log=_log)
 
     if sys.platform.startswith("linux"):
-        return _build_linux(
-            workspace,
-            env=env,
-            resources=resources,
-            log=_log,
-        )
+        return _build_linux(workspace, options)
     if sys.platform == "darwin":
-        return _build_macos(
-            workspace,
-            env=env,
-            resources=resources,
-            log=_log,
-        )
+        return _build_macos(workspace, options)
 
-    _log(
+    message = (
         f"[hostsandbox] no host confinement backend for {sys.platform!r}; agent "
         "runs unconfined. Use --docker for an externally sandboxed run."
     )
-    return None
+    return _unavailable(message, require_enforcement=require_enforcement, log=_log)
+
+
+def _unavailable(
+    message: str,
+    *,
+    require_enforcement: bool,
+    log: Callable[[str], None],
+) -> None:
+    log(message)
+    if require_enforcement:
+        raise SandboxUnavailableError(message)
 
 
 def _build_linux(
     workspace: Path,
-    *,
-    env: dict[str, str],
-    resources: Iterable[HostResource],
-    log: Callable[[str], None],
+    options: _BuildOptions,
 ) -> HostSandbox | None:
-    bwrap = shutil.which("bwrap", path=env.get("PATH")) or shutil.which("bwrap")
+    bwrap = shutil.which("bwrap", path=options.env.get("PATH")) or shutil.which("bwrap")
     if not bwrap:
-        log(
+        message = (
             "[hostsandbox] 'bwrap' not found on PATH; agent runs unconfined. "
             "Install bubblewrap or use --docker for an externally sandboxed run."
         )
-        return None
+        return _unavailable(
+            message,
+            require_enforcement=options.require_enforcement,
+            log=options.log,
+        )
 
-    read_paths, write_paths = _resource_paths(workspace, log, resources)
+    read_paths, write_paths = _resource_paths(workspace, options.log, options.resources)
     return HostSandbox(
         bwrap_path=bwrap,
         workspace=workspace,
         read_paths=tuple(read_paths),
         write_paths=tuple(write_paths),
+        project_path_policy=options.project_path_policy,
         gpu_device_nodes=tuple(_gpu_device_nodes()),
     )
 
 
 def _build_macos(
     workspace: Path,
-    *,
-    env: dict[str, str],
-    resources: Iterable[HostResource],
-    log: Callable[[str], None],
+    options: _BuildOptions,
 ) -> SeatbeltSandbox | None:
-    sandbox_exec = shutil.which("sandbox-exec", path=env.get("PATH")) or shutil.which(
+    sandbox_exec = shutil.which("sandbox-exec", path=options.env.get("PATH")) or shutil.which(
         "sandbox-exec"
     )
     if not sandbox_exec:
-        log(
+        message = (
             "[hostsandbox] 'sandbox-exec' not found; agent runs unconfined. "
             "Use --docker for an externally sandboxed run."
         )
-        return None
+        return _unavailable(
+            message,
+            require_enforcement=options.require_enforcement,
+            log=options.log,
+        )
 
-    read_paths, write_paths = _resource_paths(workspace, log, resources)
+    read_paths, write_paths = _resource_paths(workspace, options.log, options.resources)
     return SeatbeltSandbox(
         sandbox_exec_path=sandbox_exec,
         workspace=workspace,
         read_paths=tuple(read_paths),
         write_paths=tuple(write_paths),
+        project_path_policy=options.project_path_policy,
     )

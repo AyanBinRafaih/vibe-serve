@@ -35,6 +35,9 @@ from vibesys.constants import ComputeBackend
 _REGISTRY: dict[ComputeBackend, Callable[..., ComputeBackendImpl]] = {}
 
 
+_defaults_registered = False
+
+
 def register(backend: ComputeBackend, factory: Callable[..., ComputeBackendImpl]) -> None:  # noqa: D103  # tracked: #288
     _REGISTRY[backend] = factory
 
@@ -47,6 +50,7 @@ def get(
     image: str | None = None,
 ) -> ComputeBackendImpl:
     """Construct the ComputeBackendImpl for *backend*."""
+    _ensure_defaults()
     if backend not in _REGISTRY:
         raise ValueError(f"No backend impl registered for {backend!r}")  # noqa: TRY003  # tracked: #288
     return _REGISTRY[backend](
@@ -56,8 +60,7 @@ def get(
     )
 
 
-# Default registration.  Imported lazily to avoid pulling deepagents/Modal
-# into modules that just want the protocol types.
+# Deferred until get(): concrete backends import deepagents.
 def _register_defaults() -> None:
     from vibesys.backends.cuda import CudaBackend  # noqa: PLC0415  # tracked: #288
     from vibesys.backends.local import cpu_backend, metal_backend  # noqa: PLC0415  # tracked: #288
@@ -71,7 +74,12 @@ def _register_defaults() -> None:
     register(ComputeBackend.CPU, cpu_backend)
 
 
-_register_defaults()
+def _ensure_defaults() -> None:
+    global _defaults_registered  # noqa: PLW0603  # tracked: #288
+    if _defaults_registered:
+        return
+    _defaults_registered = True
+    _register_defaults()
 
 
 __all__ = [

@@ -16,17 +16,22 @@ from vibesys.domains.environment import (
 def _ensure_model_weights(
     ref_dir: Path,
     *,
-    project_root: Path,
+    cache_dir: Path,
+    runtime_artifact_dir: Path,
     log: Callable[[str], None],
-) -> None:
-    """Ensure model weights exist in ref_dir/model, downloading if needed."""
-    model_path = ref_dir / "model"
+) -> Path:
+    """Resolve model weights without writing outside the runtime artifact root."""
+    authored_model_path = ref_dir / "model"
+    if authored_model_path.exists():
+        return authored_model_path
+
+    model_path = runtime_artifact_dir / "model"
 
     if model_path.is_symlink() and not model_path.exists():
         model_path.unlink()
 
     if model_path.exists():
-        return
+        return model_path
 
     meta_path = ref_dir / "meta.json"
     if not meta_path.exists():
@@ -41,13 +46,14 @@ def _ensure_model_weights(
         raise ValueError(f"meta.json at {meta_path} missing required 'model_id' field")  # noqa: TRY003  # tracked: #288
 
     revision = meta.get("revision")
-    cache_dir = project_root / ".hf_cache"
     log(f"[model] Weights not found at {model_path}. Downloading {model_id} to {cache_dir}...")
     from huggingface_hub import snapshot_download  # noqa: PLC0415  # tracked: #288
 
     downloaded_path = snapshot_download(model_id, revision=revision, cache_dir=str(cache_dir))
+    model_path.parent.mkdir(parents=True, exist_ok=True)
     model_path.symlink_to(downloaded_path)
     log(f"[model] Created symlink {model_path} -> {downloaded_path}")
+    return model_path
 
 
 class LLMServingEnvironmentHooks:  # noqa: D101  # tracked: #288
@@ -61,7 +67,12 @@ class LLMServingEnvironmentHooks:  # noqa: D101  # tracked: #288
         model_path = ref_path / "model"
         meta_path = ref_path / "meta.json"
         if ctx.run_environment.materialize_local_model_weights or not meta_path.exists():
-            _ensure_model_weights(ref_path, project_root=ctx.project_root, log=ctx.log)
+            model_path = _ensure_model_weights(
+                ref_path,
+                cache_dir=ctx.model_cache_dir,
+                runtime_artifact_dir=ctx.runtime_artifact_dir,
+                log=ctx.log,
+            )
 
         bind_mounts: list[EnvironmentBindMount] = []
         if model_path.is_dir() or model_path.is_symlink():

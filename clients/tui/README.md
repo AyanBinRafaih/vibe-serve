@@ -9,9 +9,12 @@ vs --help
 
 The package installs `vs` and `vibesys` as aliases for the same launcher. The
 launcher starts the Python VibeSys backend with `python -m vibesys --headless`
-and then attaches the OpenTUI client. Install the Python `vibesys` package in
-the Python environment you want to use, or set `VIBESYS_PYTHON` to that Python
-executable.
+from the current directory and then attaches the OpenTUI client. The launcher
+passes run arguments through unchanged. With no `--input`, the current
+directory is the in-place project; pass `--input PATH` to select another
+complete project, or `--runs-dir PATH` to use an experiment collection. Install
+the Python `vibesys` package in the Python environment you want to use, or set
+`VIBESYS_PYTHON` to that Python executable.
 
 ## Operator interface
 
@@ -22,6 +25,7 @@ available slash commands are:
 | --- | --- |
 | `/help` | Show commands and planned controls. |
 | `/chat` | Open a read-only chat about the run; `/chat <question>` asks immediately. |
+| | Slash commands work inside the chat too, and do the same thing as in the main input. |
 | `/pause` | Pause after the current agent call finishes. |
 | `/resume` | Resume a paused run. |
 | `/steer <message>` | Queue an instruction that is appended to the next agent invocation's prompt. |
@@ -31,7 +35,7 @@ available slash commands are:
 | `/open-round` | Open the rounds behind the selected hypothesis. |
 | `/open-round --N` | Open round N, inside whichever hypothesis owns it. |
 | `/perf` | Plot the recorded performance metric by round, in the right pane. |
-| `/theme` | List themes; `/theme <name>` switches immediately. |
+| `/theme` | Pick a theme from a keyboard-navigable list; `/theme <name>` switches immediately. |
 
 ### Experiment log
 
@@ -46,9 +50,11 @@ outcome until it resolves. `Proven` reads in the theme's success color and
 does not depend on color.
 
 Arrow keys move the selection, the wheel and trackpad scroll the table
-independently of it, and clicking a row selects it. Enter, or `/open-round`,
-opens the rounds behind the selected hypothesis: the ordinary transcript,
-rounds strip, and agent map, filtered to that hypothesis. `/open-round --N`
+independently of it, and clicking a row selects it. Enter on an empty input, or
+`/open-round`, opens the rounds behind the selected hypothesis: the ordinary
+transcript, rounds strip, and agent map, filtered to that hypothesis. The input
+keeps Enter whenever something is typed, so a command entered from the log runs
+on its first Enter and its result opens over the table. `/open-round --N`
 jumps straight to round N inside whichever hypothesis owns it. Escape steps
 back to the table with the selection intact. The log is the root view, so
 opening a hypothesis is the only route to per-round output; there is no
@@ -87,6 +93,21 @@ direction.
 
 `/help`, `/theme`, and errors stay modal.
 
+### Experiment chat
+
+The chat is answered by a coding agent scoped to the run, using the effective
+backend, provider, and model configuration, with conversation state
+carried across turns through `_vibesys_chat/conversation.jsonl` in the
+workspace. The agent handler exists only while the run context does, so a
+question asked during startup or after the run finishes has no agent to reach;
+the reply says so and falls back to a read-only keyword summary of the recorded
+events rather than presenting that summary as the answer.
+
+Text typed in the chat that starts with `/` is parsed as a slash command
+through the same path as the main input, so `/history` there does exactly what
+`/history` does anywhere else. Anything else is a question for the agent, and a
+question containing a slash mid-sentence is still a question.
+
 Inside a hypothesis the footer shows keyboard navigation. `[` and `]` select rounds, Tab and
 Shift+Tab select agents, Page Up/Page Down scroll the transcript, Ctrl+T expands
 todos, Ctrl+P expands the latest prompt in the current selection, Ctrl+L and
@@ -113,10 +134,14 @@ overlay, round labels use the same body-text color as card content, and the
 chat panel's inner border matches its outer one. `theme.test.ts` pins all of
 this so the baseline cannot drift.
 
-Pick one with `--theme <name>` or `[tui].theme` in `agent.toml`; the flag wins.
-The launcher resolves the name once and passes it to both the pre-launch setup
-screen and the main client through `VIBESYS_THEME`. Inside a session, `/theme`
-lists the themes and `/theme <name>` re-themes every view in place.
+Pick one with `--theme <name>`; launches without the flag use `dark`. The
+launcher passes the selected name to the client through `VIBESYS_THEME`.
+Inside a session, `/theme` opens the list as a selection: it starts on the
+theme in use, Up and Down move the highlight, Enter applies it, and Escape
+closes the list with the theme unchanged. Those keys belong to the picker while
+it is open, so they never reach the view behind it, and a command typed into
+the input still runs on its own Enter. `/theme <name>` re-themes every view in
+place without opening the list.
 
 `ui/theme.ts` is the only module holding color literals. A theme declares
 semantic roles — `canvas`, `surface`, `elevatedSurface`, `selectedSurface`;

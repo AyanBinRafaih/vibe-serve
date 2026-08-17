@@ -106,6 +106,7 @@ export class ExperimentLogView {
     this.#availableWidth = width;
   }
 
+
   applyTheme(theme: Theme): void {
     this.#theme = theme;
     this.output.borderColor = theme.accent;

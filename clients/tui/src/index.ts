@@ -1,3 +1,4 @@
+import {writeFile} from 'node:fs/promises';
 import {createCliRenderer} from '@opentui/core';
 import {SupervisionClient} from './client.js';
 import {runTuiSession} from './runtime.js';
@@ -15,4 +16,12 @@ const controller = new SocketSessionController(
   resolveTheme(process.env['VIBESYS_THEME']).name,
 );
 const app = createOpenTuiApp(renderer, controller);
-await runTuiSession(renderer, controller, app);
+const startupSmokeMarker = process.env['VIBESYS_RELEASE_SMOKE_MARKER'];
+const completeStartupSmoke = startupSmokeMarker
+  ? async () => {
+      await writeFile(startupSmokeMarker, 'renderer initialized; control protocol exchanged\n', {
+        flag: 'wx',
+      });
+    }
+  : undefined;
+await runTuiSession(renderer, controller, app, completeStartupSmoke);

@@ -8,8 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO, cast
 
-from vibesys.agent_runner import log_and_print
-
 # Matches ANSI escape sequences (CSI colors, cursor control, and simple
 # single-character escapes) so the durable log stays plain text even when
 # subprocesses write colored diagnostics to stderr.
@@ -117,6 +115,8 @@ class RunLogger:
             return self.file.closed
 
     def lprint(self, text: str) -> None:  # noqa: D102  # tracked: #288
+        from vibesys.agent_runner import log_and_print  # noqa: PLC0415
+
         log_and_print(text, self.writer)
 
     def switch(self, label: int | str):  # noqa: ANN201  # tracked: #288

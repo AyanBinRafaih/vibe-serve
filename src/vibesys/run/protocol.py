@@ -19,6 +19,9 @@ from vibesys.constants import ComputeBackend
 from vibesys.input_manifest import WorkspaceSource
 from vibesys.profilers import ProfilerKind
 from vibesys.run.git_tracker import GitTracker
+from vibesys.run.state import RunState
+from vs_loop_state import RoundRecord
+from vs_project import Project, StateTransition
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -27,7 +30,6 @@ class LoopContext(Protocol):  # noqa: D101  # tracked: #288
     # -- run identity / configuration -----------------------------------------
     backend: ComputeBackend
     model_name: str
-    git_tracking: bool
     profiler_kind: ProfilerKind
     ref_name: str
     workspace_sources: tuple[WorkspaceSource, ...]
@@ -36,14 +38,16 @@ class LoopContext(Protocol):  # noqa: D101  # tracked: #288
     supervisor: Any
     agent_runner: Any
     judge_backend: Any
-    framework_judge_backend: Any
     run_environment: Any
     run_environment_view: Any
     git: GitTracker
+    state: RunState
+    project: Project
+    run_id: str
 
     # -- paths ----------------------------------------------------------------
     @property
-    def exp_dir(self) -> Path: ...  # noqa: D102  # tracked: #288
+    def project_root(self) -> Path: ...  # noqa: D102  # tracked: #288
 
     @property
     def log_dir(self) -> Path: ...  # noqa: D102  # tracked: #288
@@ -93,6 +97,15 @@ class LoopContext(Protocol):  # noqa: D101  # tracked: #288
     def snapshot_workspace(self, label: str) -> None: ...  # noqa: D102  # tracked: #288
 
     def trusted_input_changes(self) -> list[str]: ...  # noqa: D102  # tracked: #288
+
+    def begin_completed_round(  # noqa: D102  # tracked: #288
+        self,
+        record: RoundRecord,
+        *,
+        active_transition: StateTransition,
+    ) -> None: ...
+
+    def persist_completed_round(self) -> None: ...  # noqa: D102  # tracked: #288
 
     def reselect_gpu(self) -> None: ...  # noqa: D102  # tracked: #288
 

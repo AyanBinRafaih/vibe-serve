@@ -101,7 +101,7 @@ export class ChatOverlayView {
     this.output.add(this.#transcript);
     this.output.add(this.#inputBox);
     this.#hint = new TextRenderable(renderer, {
-      content: 'Enter to send · Esc to close',
+      content: 'Enter to send · /history and other commands work here · Esc to close',
       fg: theme.textSubtle,
       height: 1,
       width: '100%',
@@ -158,6 +158,6 @@ export class ChatOverlayView {
   readonly #submit = (value: string): void => {
     if (!value.trim()) return;
     this.#input.value = '';
-    void this.controller.sendChat(value);
+    void this.controller.submitChat(value);
   };
 }

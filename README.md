@@ -56,214 +56,70 @@ The framework factors the work along two axes:
 - **Performance evaluator** — profiles the implementation (Nsight Systems,
   PyTorch profiler) and feeds bottleneck hints into future design decisions.
 - **Skills library** — Agent Skills entries distilled from existing serving engines and research literature (continuous batching, paged-KV, FlashInfer/FlashAttention, MLX, hybrid-cache management, …). New model families, hardware platforms, and optimization techniques are added by writing a skill, not by modifying the framework.
-- **Execution environment** — an isolated workspace that mounts the user-provided artifacts read-only (so the Implementer cannot edit the checker or reference) and exposes the target hardware (local CUDA, Modal, Docker, or Apple Silicon) plus profilers.
+- **Execution environment**: an isolated runtime view where candidate source
+  is writable while evaluator-owned inputs and framework metadata are read-only
+  and integrity-checked. It exposes the target hardware (local CUDA, Modal,
+  Docker, or Apple Silicon) plus profilers.
 
 Each round is recorded in git and a framework-owned audit. Provisional rounds
 remain explicitly unreviewed; only judge-approved candidates receive official
 accuracy and performance results.
 
-## Installation
-
-1. Install Python 3.12+ and [uv](https://docs.astral.sh/uv/).
-2. For the default GitHub-synced runs, install the [GitHub CLI](https://cli.github.com/)
-   and sign in with `gh auth login`. You do not need `gh` when every run uses
-   `--local`.
-3. From the repository root, create the local configuration files:
-
-```bash
-cp .env.example .env       # provider keys for API-backed/deepagents runs
-cp agent.toml.example agent.toml
-```
-
-### Coding-agent setup
-
-Choose one of these agent options in `agent.toml` or with command-line flags:
-
-| Agent | Selection | Authentication |
-| --- | --- | --- |
-| Codex CLI | `--agent-backend cli --cli-provider codex` | Install Codex and run `codex login`. |
-| Claude Code | `--agent-backend cli --cli-provider claude` | Install Claude Code and use its login flow. |
-| Gemini CLI | `--agent-backend cli --cli-provider gemini` | Install Gemini CLI and use its login flow. |
-| OpenCode | `--agent-backend cli --cli-provider opencode` | Install OpenCode and configure its provider. |
-| DeepAgents | `--agent-backend deepagents` | Put the selected provider's API credentials in `.env`. |
-
-The default `agent.toml.example` selects the Codex CLI. CLI credentials stay
-with the CLI; API credentials are loaded from `.env` automatically.
-
-3. Check the installation:
-
-```bash
-./vs validate examples/data-structures/queue-spsc
-```
-
-`uv run` creates the Python environment automatically. You do not need to run
-`uv sync` first.
-
-To use the interactive TUI, install Node.js 20+, Bun, and pnpm 11 (or enable
-Corepack). Run `./vs`; it installs the frontend dependencies and builds the TUI
-when needed. npm is not required.
-
-### Installing outside the repo (`pip install`)
-
-VibeSys can be installed as a package (`pip install .`, or
-`pip install "git+<repo-url>"`). When a JavaScript toolchain (Bun, or Node with
-npm) is available at install time, the build compiles the OpenTUI client and
-vendors it into the wheel, so a single install ships a usable TUI.
-
-```bash
-pip install "git+<repo-url>"
-```
-
-This installs the **`vibesys`** command — the installed-package equivalent of
-`./vs`. It forwards all arguments to the engine, so it accepts the same run flags
-described in [`docs/cli-flags.md`](docs/cli-flags.md). By default it launches the
-interactive TUI (which requires Bun at runtime, like `./vs`); pass `--headless`
-to run without the TUI, which needs no JavaScript runtime:
-
-```bash
-# Interactive TUI (needs Bun)
-vibesys --input <bundle> --local --agent-backend cli --cli-provider codex
-
-# Same run, headless (no TUI, no Bun)
-vibesys --headless --input <bundle> --local
-
-vibesys --help                    # full flag list
-```
-
-`vibesys` also runs headless automatically for `validate` and when stdin/stdout
-is not a TTY (pipes, CI). The engine is additionally available directly as
-`python -m vibesys ...`.
-
-**Configuration outside the repo.** The `.env` and `agent.toml.example` files
-live in the repo, so an installed-only user supplies configuration directly:
-pass `--config /path/to/agent.toml`, export provider keys into the environment
-(e.g. `OPENAI_API_KEY`), and authenticate coding-agent CLIs through their own
-login flows (`codex login`, etc.). Add `--local` to skip GitHub sync (no `gh`
-required).
-
-**If no JavaScript toolchain is present at install time**, the build prints a
-warning and skips the TUI. `vibesys` then runs headless (with a one-time notice);
-use `--headless` to silence it. Because the TUI is built from source during
-install, a prebuilt PyPI wheel would not include it — install from source
-(git/sdist) with a JS toolchain to get the bundled TUI.
-
 ## Quickstart
 
+Install Python 3.12+, Git, and [uv](https://docs.astral.sh/uv/). Linux also
+requires `bubblewrap`; macOS includes the required `sandbox-exec` command. Then
+install VibeSys:
+
 ```bash
-# Issue-tracker outer loop, Codex CLI, Docker on local CUDA, 4 rounds
-./vs \
-  --input examples/model-serving/moonshine-streaming \
-  --exp-name my-experiment \
-  --docker \
-  --agent-backend cli --cli-provider codex \
-  --max-rounds 4 \
-  --modality speech_to_text
+uv tool install vibesys
 ```
 
-`--outer-loop` defaults to `agent`. Pass `--outer-loop plain` or `--outer-loop evolve` to switch. See `./vs --outer-loop <kind> --help` for loop-specific flags, and [`docs/cli-flags.md`](docs/cli-flags.md) for the supported flag combinations.
+Install and authenticate a supported coding-agent CLI. For Codex CLI, run
+`codex login`; see the [CLI reference](docs/cli-flags.md) for other supported
+agents.
 
-## Search strategies
+From the root of the project you want to optimize, add a named task under
+`.vibesys/tasks/`:
 
-VibeSys supports three outer-loop search strategies:
+- `.vibesys/tasks/<task>/OBJECTIVE.md` describes what to optimize and the
+  constraints the result must preserve.
+- `.vibesys/tasks/<task>/vibesys.input.toml` identifies the problem domain and
+  the programs that check correctness and benchmark performance.
+- `agent.toml` optionally selects the coding agent, model, and hardware backend.
+  Keep it untracked.
 
-- `agent` (default): an orchestrator plans each round and delegates to the
-  implementer, judge, and profiler. It uses the `multi-agent` inner loop by
-  default; pass `--inner-loop single-agent` to run the single-agent ablation.
-- `evolve`: an evolutionary search over candidate implementations.
-- `plain`: an issue-board loop that drains implementation issues and evaluates
-  performance.
-
-For contributor workflows and extension guides, see
-[`docs/development.md`](docs/development.md).
-
-## Per-target inputs
-
-Each evaluation target lives under `examples/<name>/`:
-
-```
-examples/<name>/
-├── OBJECTIVE.md          # free-form deployment goal (model + hardware + workload + interface)
-├── vibesys.input.toml  # manifest-declared domain, checker, benchmark, and optional inputs
-├── reference/            # optional reference or seed inputs
-│   ├── reference.py
-│   ├── config.json
-│   └── meta.json         # model id + revision
-├── accuracy_checker/     # optional checker.py + tests/data — the correctness gate
-├── benchmark/            # benchmark.py + load levels — emits the metric to optimize
-└── README.md             # human-readable description
-```
-
-Pass the bundle root with `--input examples/<name>/`. The manifest declares the
-agent domain, correctness command, benchmark command, optional starter
-workspace, optional trusted evaluator source, and optional benchmark result
-metric.
-
-For external usage without a bundle on disk, supply the same pieces as separate
-`--input-objective`/`--input-objective-file`, `--input-domain`,
-`--input-accuracy-command`, and `--input-benchmark-command` flags (plus optional
-`--input-reference`, `--input-evaluator-dir`, and others). VibeSys synthesizes a
-bundle and runs it identically. See
-[`docs/cli-flags.md`](docs/cli-flags.md#providing-inputs-without-a-bundle---input-)
-for the full flag list.
-
-`OBJECTIVE.md` is read at the start of every run and must live next to the
-`reference/` directory (sibling, not inside). See `examples/model-serving/Llama-3-8B/`, `examples/model-serving/moonshine-streaming/`, `examples/model-serving/qwen3-32b-code-edit/`, `examples/model-serving/olmo-hybrid-prefix-caching/`, `examples/model-serving/Llama-3.1-8B-Instruct-MLX-8bit/`, `examples/model-serving/show-o2-1.5B-HQ-h100/`, and `examples/model-serving/show-o2-1.5B-HQ-macbook/` for the paper scenarios.
-
-For multi-objective evolutionary runs, drop an `objectives.toml` next to `OBJECTIVE.md` (or pass `--objective name:max|min` flags) — see `./vs --outer-loop evolve --help`.
-
-## Configuration (`agent.toml`)
+For example:
 
 ```toml
 [model]
-name = "gpt-5.4"             # auto-detected provider for claude-* / gpt-* / gemini-* / gemma-*
-# provider = "openai"        # optional override
-
-[backend]
-name = "cuda"                 # or "metal", "trainium", "rocm", or "cpu"
+name = "gpt-5.4"
 
 [agent]
-backend = "cli"               # "cli" (codex/claude/gemini/opencode) or "deepagents"
-cli_provider = "codex"        # which coding-agent harness to drive
-# cli_timeout = 1800          # per-invocation timeout (seconds)
+backend = "cli"
+cli_provider = "codex"
 
-# Optional role-specific CLI models. Other roles, including the independent
-# judge, continue to use [model].name and [thinking].level.
-[agent.outer]
-model = "gpt-5.6-sol"         # orchestrator pre-round and planning calls
-reasoning_effort = "xhigh"
-
-[agent.inner]
-model = "gpt-5.6-luna"        # implementer calls
-reasoning_effort = "xhigh"
-
-[repository]
-# Optional GitHub user/org override. If omitted, use the account from `gh auth status`.
-# owner = "your-github-user"
-visibility = "private"        # private, public, or internal
-
-[tui]
-theme = "dark"                # interactive client theme; --theme overrides
-
-# Optional: benchmark load levels handed to the perf evaluator.
-# [[perf_eval.load_levels]]
-# rate = 1
-# duration = 20
-# max_tokens = 128
+[backend]
+name = "cpu"
 ```
 
-Provider credentials live in `.env` — see `.env.example`. The CLI flags `--agent-backend` / `--cli-provider` / `--backend` override these.
+See [`examples/`](examples/) for complete objectives and manifests across data
+structures, model serving, and microservices.
 
-The interactive client ships four light/dark theme pairs — `dark` (default) /
-`light`, `solarized-dark` / `solarized-light`, `catppuccin-mocha` /
-`catppuccin-latte`, and `high-contrast-dark` / `high-contrast-light`. Set one
-with `[tui].theme` or `--theme`, or switch mid-session with `/theme <name>`.
-See [`docs/cli-flags.md`](docs/cli-flags.md#client-theme).
+Run from the project root:
 
-The config is validated against a typed schema on load (`vibesys/config.py`): unknown sections or keys, unknown providers/backends, and missing required fields are rejected with an error rather than silently ignored.
+```bash
+cd /path/to/my-project
+vibesys validate --task my-task
+vibesys --task my-task --max-rounds 4
+```
 
-Fresh runs use GitHub-backed tracking by default. Pass `--local` for a local-only
-run under `exp_env/`; see [`docs/cli-flags.md`](docs/cli-flags.md) for repository
-and resume options.
+The directory must be its Git repository root, or outside Git so VibeSys can
+initialize a repository. An existing repository needs a baseline commit and a
+clean worktree. See [Running VibeSys](docs/running-vibesys.md) for copied
+projects, legacy input bundles, Docker, Modal, remote repositories, resume, and
+alternate search loops. The [CLI reference](docs/cli-flags.md) documents every
+flag. Contributor setup belongs in [`docs/development.md`](docs/development.md).
 
 ## Citation
 

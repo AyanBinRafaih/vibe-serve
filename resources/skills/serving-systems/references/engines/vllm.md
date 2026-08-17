@@ -19,7 +19,7 @@ git fetch --depth 1 origin 0210024ae796446a121f96d2d31053668ac0fd85
 git checkout -q FETCH_HEAD
 ```
 
-(From the vibesys repo root the equivalent is `git submodule update --init skills/serving-systems/repos/vllm`.)
+(From the vibesys repo root the equivalent is `git submodule update --init --checkout resources/skills/serving-systems/repos/vllm`.)
 
 ## Directory map
 
@@ -166,7 +166,7 @@ export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="0.10.0"
 pip install -e ./vllm
 ```
 
-Derive the version from `vllm/vllm/version.py` (`__version__`) or from the pinned dependency in `pyproject.toml` rather than hardcoding it. The VibeSys vLLM starter's `scripts/install_local_vllm.sh` handles this automatically.
+Derive the version from `vllm/vllm/version.py` (`__version__`) or from the pinned dependency in `pyproject.toml` rather than hardcoding it.
 
 ## See also
 

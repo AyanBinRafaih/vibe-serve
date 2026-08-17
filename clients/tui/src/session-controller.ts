@@ -1,5 +1,5 @@
 import type {EventSubscription} from './client.js';
-import {HELP_TEXT, parseInput, themeListText} from './commands.js';
+import {HELP_TEXT, parseInput} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
 import {
@@ -14,6 +14,7 @@ import {
   applySnapshot,
   type ConversationEntry,
   closePane,
+  closeThemePicker,
   enterExperimentDrilldown,
   enterExperimentRound,
   failExperiments,
@@ -21,8 +22,10 @@ import {
   initialSessionState,
   leaveExperimentDrilldown,
   moveExperimentSelection,
+  moveThemeSelection,
   openExperimentLog,
   openPane,
+  openThemePicker,
   type PaneView,
   type SessionState,
   selectNextAgent,
@@ -47,6 +50,7 @@ export interface SessionController {
   submit(value: string): Promise<void>;
   closeChat(): void;
   sendChat(value: string): Promise<void>;
+  submitChat(value: string): Promise<void>;
   live(): void;
   selectNextAgent(): void;
   selectPreviousAgent(): void;
@@ -63,6 +67,10 @@ export interface SessionController {
   moveExperimentSelection(delta: number): void;
   enterExperimentDrilldown(): void;
   leaveExperimentDrilldown(): void;
+  openThemePicker(): void;
+  moveThemeSelection(delta: number): void;
+  applySelectedTheme(): void;
+  closeThemePicker(): void;
   subscribe(listener: (state: SessionState) => void): () => void;
 }
 
@@ -155,6 +163,25 @@ export class SocketSessionController implements SessionController {
 
   setTheme(themeName: ThemeName): void {
     this.#setState(setTheme(this.#state, themeName));
+  }
+
+  openThemePicker(): void {
+    this.#setState(openThemePicker(this.#state));
+  }
+
+  moveThemeSelection(delta: number): void {
+    this.#setState(moveThemeSelection(this.#state, delta));
+  }
+
+  /** Enter in the picker: the highlighted theme becomes the session's. */
+  applySelectedTheme(): void {
+    const picker = this.#state.themePicker;
+    if (picker === null) return;
+    this.setTheme(picker.selected);
+  }
+
+  closeThemePicker(): void {
+    this.#setState(closeThemePicker(this.#state));
   }
 
   closeChat(): void {
@@ -274,6 +301,17 @@ export class SocketSessionController implements SessionController {
     }
   }
 
+  /**
+   * What the chat input submits. A slash command runs through exactly the same
+   * path as the main input, so the two surfaces cannot disagree about what a
+   * command does; anything else is a question for the chat agent.
+   */
+  submitChat(value: string): Promise<void> {
+    const text = value.trim();
+    if (!text.startsWith('/')) return this.sendChat(value);
+    return this.submit(text);
+  }
+
   sendChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text) return Promise.resolve();
@@ -370,11 +408,7 @@ export class SocketSessionController implements SessionController {
       return;
     }
     if (parsed.localView === 'theme') {
-      if (parsed.themeName === undefined) {
-        return this.#setState(
-          showDetail(this.#state, themeListText(this.#state.themeName), 'help'),
-        );
-      }
+      if (parsed.themeName === undefined) return this.openThemePicker();
       return this.setTheme(parsed.themeName);
     }
     if (!parsed.request) return;

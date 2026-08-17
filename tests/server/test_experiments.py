@@ -2,33 +2,52 @@
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
+from vibesys.loops.agent.model import ActiveHypothesis
+from vibesys.loops.agent.state import AgentStateStore
+from vibesys.run.state import RunStateNamespace
+from vibesys.schemas import OrchestratorPlan
 from vibesys.server import EventType, RunSupervisor
 from vibesys.server.experiments import UNIDENTIFIED, apply_baselines, build_experiment_log
 from vibesys.server.protocol import ExperimentQuery
 from vibesys.server.service import SupervisionService
+from vs_loop_state import RoundRecord
+from vs_project import AgentRunConfiguration, PlainRunConfiguration, Project, RunEnvironmentRecord
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _round(number: int, **overrides: object) -> dict[str, object]:
-    record: dict[str, object] = {
-        "round": number,
+def _round(number: int, **overrides: object) -> RoundRecord:
+    fields: dict[str, object] = {
+        "round_number": number,
         "commit": f"c{number}",
         "perf_metric": None,
         "perf_unit": None,
         "passed": False,
-        "reviewed": True,
-        "hypothesis_id": None,
-        "hypothesis_outcome": None,
-        "official_evaluation": False,
-        "candidate_disposition": "unassessed",
     }
-    record.update(overrides)
-    return record
+    fields.update(overrides)
+    return RoundRecord(**fields)  # type: ignore[arg-type]
+
+
+def _active(
+    hypothesis_id: str,
+    started_round: int,
+    *,
+    hypothesis: str = "",
+    task: str = "",
+) -> ActiveHypothesis:
+    return ActiveHypothesis(
+        plan=OrchestratorPlan(
+            hypothesis_id=hypothesis_id,
+            hypothesis=hypothesis,
+            task=task,
+            pass_criteria="",
+            reasoning="",
+        ),
+        started_round=started_round,
+    )
 
 
 def test_continuation_rounds_collapse_into_one_entry() -> None:
@@ -78,10 +97,7 @@ def test_active_hypothesis_is_marked_and_left_unresolved() -> None:
     rounds = [
         _round(4, hypothesis_id="H-09", hypothesis_outcome="continue", reviewed=False),
     ]
-    active = {
-        "plan": {"hypothesis_id": "H-09", "hypothesis": "retry with tuning"},
-        "started_round": 4,
-    }
+    active = _active("H-09", 4, hypothesis="retry with tuning")
 
     (entry,) = build_experiment_log(rounds, active)
 
@@ -91,10 +107,7 @@ def test_active_hypothesis_is_marked_and_left_unresolved() -> None:
 
 
 def test_active_hypothesis_appears_before_its_first_round_finishes() -> None:
-    active = {
-        "plan": {"hypothesis_id": "H-10", "hypothesis": "prefetch weights", "task": "add prefetch"},
-        "started_round": 12,
-    }
+    active = _active("H-10", 12, hypothesis="prefetch weights", task="add prefetch")
 
     entries = build_experiment_log(
         [_round(11, hypothesis_id="H-09", hypothesis_outcome="proven")], active
@@ -174,19 +187,72 @@ def test_measured_delta_uses_the_last_measurement_before_the_hypothesis() -> Non
     assert entries[1].perf_delta_pct == 12.0
 
 
-def test_service_reads_both_state_files(tmp_path: Path) -> None:
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "rounds.json").write_text(
-        json.dumps([_round(1, hypothesis_id="H-01", hypothesis_outcome="proven", passed=True)])
+def _agent_configuration() -> AgentRunConfiguration:
+    return AgentRunConfiguration(
+        outer_loop="agent",
+        inner_loop="single-agent",
+        interface="inprocess",
+        agent_backend="stub",
+        compute_backend="cpu",
+        profiler="none",
+        max_rounds=3,
+        max_retries_per_round=1,
+        judge_every=1,
+        official_eval_every=1,
+        memory_layout="files",
+        run_environment=RunEnvironmentRecord(name="local"),
     )
-    (logs / "active_hypothesis.json").write_text(
-        json.dumps(
-            {"plan": {"hypothesis_id": "H-02", "hypothesis": "next idea"}, "started_round": 2}
-        )
+
+
+def _plain_configuration() -> PlainRunConfiguration:
+    return PlainRunConfiguration(
+        outer_loop="plain",
+        agent_backend="stub",
+        compute_backend="cpu",
+        profiler="none",
+        max_rounds=3,
+        max_attempts_per_issue=1,
+        max_issues_per_perf_eval=1,
+        run_environment=RunEnvironmentRecord(name="local"),
     )
+
+
+def _project_run(
+    project: Path,
+    configuration: AgentRunConfiguration | PlainRunConfiguration | None = None,
+) -> tuple[Project, str]:
+    """Create a real project run, as ``tests/test_tui.py`` does."""
+    project.mkdir()
+    (project / "OBJECTIVE.md").write_text("Make the queue fast.\n", encoding="utf-8")
+    vibesys_project = Project.open(project)
+    state = vibesys_project.state
+    state.create_project("queue")
+    manifest = state.new_run_manifest(
+        "queue",
+        run_id="queue-run",
+        branch="vibesys/queue-run",
+        vibesys_version="0.2.0-test",
+        configuration=configuration or _agent_configuration(),
+        trusted_input_baseline="0" * 40,
+    )
+    state.create_run(manifest)
+    return vibesys_project, manifest.run_id
+
+
+def test_service_reads_rounds_and_the_active_plan_through_the_store(tmp_path: Path) -> None:
+    """The service must reach state through the store, not through file paths.
+
+    Round records are portable state and the active plan is machine-local, so
+    this covers both halves of the store API the log depends on.
+    """
+    project, run_id = _project_run(tmp_path / "project")
+    project.state.save_round(
+        run_id, _round(1, hypothesis_id="H-01", hypothesis_outcome="proven", passed=True)
+    )
+    namespace = project.state.local_namespace(run_id, RunStateNamespace.AGENT)
+    AgentStateStore(namespace).save_active(_active("H-02", 2, hypothesis="next idea"))
     supervisor = RunSupervisor()
-    supervisor.attach(logs)
+    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
 
     response = SupervisionService(supervisor).execute(ExperimentQuery())
 
@@ -196,12 +262,18 @@ def test_service_reads_both_state_files(tmp_path: Path) -> None:
     assert EventType.STATUS_QUERY.value in recorded
 
 
-def test_service_tolerates_a_missing_or_unreadable_log_dir(tmp_path: Path) -> None:
+def test_service_returns_nothing_before_a_run_is_attached(tmp_path: Path) -> None:
+    """The client queries the log before the run context exists; that is not an error."""
     supervisor = RunSupervisor()
-    supervisor.attach(tmp_path)
-    service = SupervisionService(supervisor)
+    supervisor.attach(tmp_path / "logs")
 
-    assert service.experiments() == []
+    assert SupervisionService(supervisor).experiments() == []
 
-    (tmp_path / "rounds.json").write_text("{ truncated")
-    assert service.experiments() == []
+
+def test_service_returns_nothing_for_a_non_agent_outer_loop(tmp_path: Path) -> None:
+    """Only the agent loop records hypotheses, so other loops have no log to show."""
+    project, run_id = _project_run(tmp_path / "project", _plain_configuration())
+    supervisor = RunSupervisor()
+    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
+
+    assert SupervisionService(supervisor).experiments() == []

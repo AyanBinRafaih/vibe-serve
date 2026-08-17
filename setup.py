@@ -1,37 +1,99 @@
-"""Setuptools shim that builds and vendors the OpenTUI client into the wheel.
+"""Setuptools shim that stages release-owned assets into the wheel.
 
 Project metadata lives in ``pyproject.toml``; this file exists only to hook a
-custom ``build_py`` step that compiles ``clients/tui`` and stages the result
-into ``vibesys/_tui`` so a single ``pip install`` ships a usable TUI, and
-stages ``resources/`` into ``vibesys/_resources`` so profiler support
-packages and preset skills work without a checkout. The step
-is best-effort — see ``tui_packaging.build_and_stage_tui`` — so installs without
-a JavaScript toolchain still succeed and run headless.
+custom ``build_py`` step that copies a prebuilt, target-specific TUI payload,
+framework resources, and the input SDK. Setuptools never installs JavaScript
+dependencies or mutates the checkout. Development builds without a payload
+remain headless; release builds require every staged input.
 """
 
 from __future__ import annotations
 
+import os
+import platform
 import sys
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
 from setuptools.command.build_py import build_py as _build_py
+from setuptools.dist import Distribution as _Distribution
 
 _REPO_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(_REPO_ROOT))
 
-from resources_packaging import stage_resources  # noqa: E402
-from tui_packaging import build_and_stage_tui  # noqa: E402
+from packaging_support import (  # noqa: E402
+    clear_distribution_build_outputs,
+    discover_distribution_packages,
+    release_has_native_payload,
+)
+from resources_packaging import stage_resources, stage_sdk  # noqa: E402
+from tui_packaging import stage_prebuilt_tui  # noqa: E402
+from wheel_targets import WheelTarget, resolve_wheel_target  # noqa: E402
 
 
 class build_py(_build_py):  # noqa: N801 - setuptools command classes are lowercase
     """Standard ``build_py`` plus staging the compiled TUI into the package."""
 
     def run(self) -> None:  # noqa: D102  # tracked: #288
+        clear_distribution_build_outputs(Path(self.build_lib), self.packages or [])
         super().run()
-        dest = Path(self.build_lib) / "vibesys" / "_tui"
-        build_and_stage_tui(_REPO_ROOT, dest)
-        stage_resources(_REPO_ROOT, Path(self.build_lib) / "vibesys" / "_resources")
+        package_root = Path(self.build_lib) / "vibesys"
+        target_key = os.environ.get("VIBESYS_WHEEL_TARGET")
+        bundle_value = os.environ.get("VIBESYS_TUI_BUNDLE")
+        bundle = Path(bundle_value) if bundle_value else None
+        required = target_key is not None
+        stage_prebuilt_tui(
+            bundle,
+            package_root / "_tui",
+            required=required,
+            expected_target=target_key,
+            expected_distribution_version=self.distribution.get_version(),
+        )
+        stage_resources(_REPO_ROOT, package_root / "_resources", required=required)
+        stage_sdk(_REPO_ROOT, package_root / "_sdk", required=required)
 
 
-setup(cmdclass={"build_py": build_py})
+class bdist_wheel(_bdist_wheel):  # noqa: N801
+    """Emit a native payload wheel with an explicit cross-platform Python tag."""
+
+    _release_target: WheelTarget | None = None
+
+    def finalize_options(self) -> None:
+        """Apply the requested release target before wheel paths are finalized."""
+        super().finalize_options()
+        target_key = os.environ.get("VIBESYS_WHEEL_TARGET")
+        if target_key is not None:
+            target = resolve_wheel_target(
+                target_key,
+                host_system=platform.system(),
+                host_machine=platform.machine(),
+            )
+            self._release_target = target
+            self.root_is_pure = False
+            self.plat_name = target.wheel_platform
+            self.plat_name_supplied = True
+
+    def get_tag(self) -> tuple[str, str, str]:
+        """Return the configured release platform or the default development tag."""
+        if self._release_target is None:
+            return super().get_tag()
+        return ("py3", "none", self._release_target.wheel_platform)
+
+
+class ReleaseDistribution(_Distribution):
+    """Select platlib only for wheels that contain a native release payload."""
+
+    def has_ext_modules(self) -> bool:
+        """Make release packages install at wheel root so audit tools can inspect them."""
+        return release_has_native_payload()
+
+
+packages, package_dirs = discover_distribution_packages(_REPO_ROOT)
+
+setup(
+    packages=packages,
+    package_dir=package_dirs,
+    cmdclass={"bdist_wheel": bdist_wheel, "build_py": build_py},
+    distclass=ReleaseDistribution,
+)
