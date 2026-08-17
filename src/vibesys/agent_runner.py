@@ -1,13 +1,17 @@
 """Agent runner helpers: run_agent, run_implementer_agent, run_judge_agent, run_perf_eval_agent."""
 
+from __future__ import annotations
+
 import json
 import re
 import uuid
 from collections.abc import Callable, Iterator
-from typing import Any, TextIO, TypeVar
+from typing import TYPE_CHECKING, Any, TextIO, TypeVar
 
-from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import BaseModel, ValidationError
+
+if TYPE_CHECKING:
+    from langchain_core.callbacks import BaseCallbackHandler
 
 from vibesys.agents.callbacks import AgentLogger
 from vibesys.render.sink import output_sink
