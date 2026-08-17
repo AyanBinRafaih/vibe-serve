@@ -27,9 +27,7 @@ from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #28
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
 
 if TYPE_CHECKING:
-    # Annotation only. This protocol is imported by every runner, including the
-    # stub, so it stays free of the LangChain stack a real backend needs.
-    from langchain_core.tools import BaseTool
+    from langchain_core.tools import BaseTool  # annotation only; avoid eager agent-stack import
 
 T = TypeVar("T", bound=BaseModel)
 

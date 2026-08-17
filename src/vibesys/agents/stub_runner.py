@@ -15,9 +15,7 @@ from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #28
 from vibesys.schemas import HypothesisOutcome
 
 if TYPE_CHECKING:
-    # Annotation only. The stub runner exists to run without an agent stack,
-    # so it must not import one.
-    from langchain_core.tools import BaseTool
+    from langchain_core.tools import BaseTool  # annotation only; avoid eager agent-stack import
 
 T = TypeVar("T", bound=BaseModel)
 

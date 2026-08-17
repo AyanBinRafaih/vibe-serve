@@ -60,9 +60,7 @@ def get(
     )
 
 
-# Default registration.  Deferred until a backend is actually constructed:
-# each concrete backend imports deepagents, and naming a backend (or importing
-# anything that names one) must not cost that.
+# Deferred until get(): concrete backends import deepagents.
 def _register_defaults() -> None:
     from vibesys.backends.cuda import CudaBackend  # noqa: PLC0415  # tracked: #288
     from vibesys.backends.local import cpu_backend, metal_backend  # noqa: PLC0415  # tracked: #288

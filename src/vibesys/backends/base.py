@@ -24,9 +24,7 @@ from vibesys.constants import ComputeBackend  # noqa: TC001  # tracked: #288
 from vibesys.profilers import ProfilerKind  # noqa: TC001  # tracked: #288
 
 if TYPE_CHECKING:
-    # Importing deepagents costs the LangChain and Anthropic stack. This module
-    # is the protocol layer, imported by anything that merely names a backend,
-    # so it stays free of that: both names below are annotations only.
+    # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
     from deepagents.backends.sandbox import BaseSandbox
 

@@ -110,29 +110,6 @@ pnpm check:ts
 When Python protocol models change, regenerate the files under
 `clients/tui/src/generated/` and review the diff.
 
-### How `./vs` prepares the client
-
-The repo-local `./vs` launcher runs three preparation steps before an
-interactive launch: installing dependencies, generating the client's protocol
-types, and compiling the client. Each one is triggered by its own inputs, and
-each records a digest of the content it last succeeded against under
-`.vs-cache/`, so a launch that changes nothing runs nothing, and a checkout or
-pull that leaves content identical does not trigger work.
-
-| Step | Runs when |
-| --- | --- |
-| `install` | `pnpm-lock.yaml`, either `package.json`, or `pnpm-workspace.yaml` changes, or `node_modules` is missing |
-| `protocol` | `src/vibesys/server/{protocol,events,schema}.py` changes, or the generated schema is missing |
-| `build` | anything under `clients/tui/src` or a tsconfig changes, or either step above ran |
-
-Editing backend Python outside those three protocol files does not rebuild the
-client. To inspect or override the decision:
-
-```bash
-VS_PREPARE_PLAN=1 ./vs       # print the steps this tree needs, then exit
-VS_PREPARE_PLAN=record ./vs  # record the tree as prepared, for a caller that built it already
-```
-
 ## Extend VibeSys
 
 Use the guide that matches the surface you are adding:

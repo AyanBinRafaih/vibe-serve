@@ -49,11 +49,7 @@ _SHELL_COMMAND_ARG_COUNT = 3
 _RECORDED_ENVIRONMENT_NAMES = frozenset({"local", "docker", "modal"})
 
 if TYPE_CHECKING:
-    # deepagents drags in the whole LangChain and Anthropic stack, seconds of
-    # import time. Nothing here needs it at runtime: both names are used only
-    # as annotations, and ``from __future__ import annotations`` keeps those
-    # unevaluated. A stub or headless run must not pay for an agent backend it
-    # never constructs.
+    # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
     from deepagents.backends.sandbox import BaseSandbox
 

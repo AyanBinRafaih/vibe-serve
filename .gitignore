@@ -269,6 +269,3 @@ src/vibesys/_tui/
 clients/tui/package-lock.json
 clients/tui/bun.lock
 clients/tui/bun.lockb
-
-# vs launcher preparation stamps
-.vs-cache/
