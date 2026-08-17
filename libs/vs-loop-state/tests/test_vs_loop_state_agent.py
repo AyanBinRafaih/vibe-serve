@@ -211,3 +211,43 @@ def test_distant_rollback_uses_requested_historical_commit() -> None:
 
     assert commit == "a" * 40
     assert child_round is None
+
+
+def test_hypothesis_plan_text_round_trips() -> None:
+    """The claim and attempted change must survive the round-record codec.
+
+    ``active_hypothesis.json`` only holds the live plan, so a resolved
+    hypothesis would otherwise lose the text the experiment log displays.
+    """
+    record = RoundRecord(
+        round_number=7,
+        commit="a" * 40,
+        perf_metric=112.0,
+        perf_unit="tok_s",
+        passed=True,
+        hypothesis_id="H-07",
+        hypothesis_outcome="proven",
+        hypothesis_claim="batching prefill removes per-request launch overhead",
+        hypothesis_task="batch the prefill step",
+    )
+
+    reloaded = parse_round_record(serialize_round_record(record))
+
+    assert reloaded.hypothesis_claim == "batching prefill removes per-request launch overhead"
+    assert reloaded.hypothesis_task == "batch the prefill step"
+
+
+def test_record_written_before_hypothesis_plan_text_loads() -> None:
+    reloaded = parse_round_record(
+        {
+            "round": 3,
+            "commit": "b" * 40,
+            "perf_metric": None,
+            "perf_unit": None,
+            "passed": False,
+            "hypothesis_id": "H-03",
+        }
+    )
+
+    assert reloaded.hypothesis_claim is None
+    assert reloaded.hypothesis_task is None

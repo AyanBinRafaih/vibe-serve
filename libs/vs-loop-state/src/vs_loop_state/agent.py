@@ -54,6 +54,12 @@ class RoundRecord:
     reviewed: bool = True
     hypothesis_id: str | None = None
     hypothesis_outcome: str | None = None
+    # Plan text carried alongside the id so a resolved hypothesis stays
+    # readable after ``active_hypothesis.json`` has moved on. Only the live
+    # plan is persisted there, so without this the claim and the attempted
+    # change are recoverable for the active hypothesis only.
+    hypothesis_claim: str | None = None
+    hypothesis_task: str | None = None
     hypothesis_parent_round: int | None = None
     # Exact tree from which this hypothesis started. This can be newer than
     # the historical end-of-round checkpoint when an operator or framework

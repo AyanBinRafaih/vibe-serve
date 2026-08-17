@@ -29,9 +29,48 @@ available slash commands are:
 | `/pause` | Pause after the current agent call finishes. |
 | `/resume` | Resume a paused run. |
 | `/steer <message>` | Queue an instruction that is appended to the next agent invocation's prompt. |
-| `/history` | List rounds with agent-active elapsed time. |
+| `/history` | Return to the experiment log, one row per hypothesis. |
+| `/history rounds` | List rounds with agent-active elapsed time. |
+| `/experiments` | Same as `/history`. |
+| `/open-round` | Open the rounds behind the selected hypothesis. |
+| `/open-round --N` | Open round N, inside whichever hypothesis owns it. |
 | `/perf` | Plot the recorded performance metric by round. |
 | `/theme` | Pick a theme from a keyboard-navigable list; `/theme <name>` switches immediately. |
+
+### Experiment log
+
+The client opens on the experiment log rather than on the per-round
+transcript. It groups rounds by `hypothesis_id`, so one hypothesis held across
+continuation rounds is a single row showing the claim, the round range, what
+the implementation details, the measured result, the judge verdict, the outcome the loop
+resolved (`Proven`, `Rejected`, or a terminal `HypothesisOutcome`), and whether
+the candidate was kept. The active hypothesis is marked with `▸` and carries no
+outcome until it resolves. `Proven` reads in the theme's success color and
+`Disproven` in its error color; the word is always spelled out, so the reading
+does not depend on color.
+
+Arrow keys move the selection, the wheel and trackpad scroll the table
+independently of it, and clicking a row selects it. Enter on an empty input, or
+`/open-round`, opens the rounds behind the selected hypothesis: the ordinary
+transcript, rounds strip, and agent map, filtered to that hypothesis. The input
+keeps Enter whenever something is typed, so a command entered from the log runs
+on its first Enter and its result opens over the table. `/open-round --N`
+jumps straight to round N inside whichever hypothesis owns it. Escape steps
+back to the table with the selection intact. The log is the root view, so
+opening a hypothesis is the only route to per-round output; there is no
+unfiltered live transcript to fall back to.
+
+`Measured` shows the verified metric for the round that resolved the
+hypothesis, as a delta against the last measurement preceding it once there is
+one to compare against. The framework records a verified metric only when its
+own official evaluation ran, on the sparse cadence or the final round, so a
+hypothesis resolved between evaluations legitimately shows no measurement.
+
+The table refetches when an agent phase or a round finishes, so it stays
+current without being reopened. Rows are ordered by first round and never
+reshuffle. Records written before hypothesis tracking render as
+`(Unidentified)` rather than being dropped. Columns drop widest first as the
+terminal narrows; hypothesis, rounds, and outcome always survive.
 
 ### Experiment chat
 
@@ -48,10 +87,10 @@ through the same path as the main input, so `/history` there does exactly what
 `/history` does anywhere else. Anything else is a question for the agent, and a
 question containing a slash mid-sentence is still a question.
 
-The footer shows keyboard navigation. `[` and `]` select rounds, Tab and
-Shift+Tab select agents, Page Up/Page Down scroll the transcript, Ctrl+T expands
-todos, Ctrl+P expands the latest prompt in the current selection, Ctrl+L returns
-to the live view, and Ctrl+C exits. Commands listed under "Planned" in `/help`
+Inside a hypothesis the footer shows keyboard navigation. `[` and `]` select
+rounds, Tab and Shift+Tab select agents, Page Up/Page Down scroll the transcript, Ctrl+T expands
+todos, Ctrl+P expands the latest prompt in the current selection, Ctrl+L and
+Escape return to the experiment log, and Ctrl+C exits. Commands listed under "Planned" in `/help`
 are not accepted yet.
 
 The launcher retains terminal results until the operator exits. If the backend

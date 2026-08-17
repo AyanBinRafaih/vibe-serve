@@ -1,4 +1,4 @@
-import type {RunEvent, RunSnapshot} from './protocol.js';
+import type {HypothesisEntry, RunEvent, RunSnapshot} from './protocol.js';
 import {
   type AgentPhase,
   applyRunMapEvent,
@@ -30,6 +30,8 @@ export interface SessionState {
   todosExpanded: boolean;
   usage: UsageMeter | null;
   themeName: ThemeName;
+  experimentLog: ExperimentLogState | null;
+  hypothesisScope: HypothesisScope | null;
   /** Non-null while the theme list is open as a keyboard selection. */
   themePicker: ThemePicker | null;
   /**
@@ -54,6 +56,29 @@ export interface PhaseTodos {
   agentKind: string | null;
   roundNumber: number | null;
   items: TodoItem[];
+}
+
+/**
+ * The experiment log is open when this is non-null. Selection is held as a
+ * hypothesis id rather than a row index so a refresh that inserts rows keeps
+ * the operator on the same hypothesis.
+ */
+export interface ExperimentLogState {
+  entries: HypothesisEntry[];
+  selectedId: string | null;
+  pending: boolean;
+  error: string | null;
+}
+
+/**
+ * The hypothesis whose rounds the operator opened. While this is set the
+ * client shows the ordinary per-round trajectory, filtered to these rounds,
+ * and the log table steps aside without losing its selection.
+ */
+export interface HypothesisScope {
+  id: string;
+  label: string;
+  rounds: number[];
 }
 
 export interface ThemePicker {
@@ -120,9 +145,157 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     todosExpanded: false,
     usage: null,
     themeName,
+    // The experiment log is the landing view: a run's history reads as a short
+    // list of claims before it reads as a long list of rounds.
+    experimentLog: {entries: [], selectedId: null, pending: true, error: null},
+    hypothesisScope: null,
     themePicker: null,
     typedToolEvents: false,
   };
+}
+
+/**
+ * Rows are keyed by hypothesis id, which the server orders by first round and
+ * never reshuffles. Selection therefore survives a refresh even when a new
+ * hypothesis lands above the current one.
+ */
+export function entryKey(entry: HypothesisEntry, index: number): string {
+  return entry.identified === false
+    ? `${entry.hypothesis_id}#${entry.first_round}`
+    : entry.hypothesis_id || `#${index}`;
+}
+
+/** True when the table itself is on screen rather than a hypothesis trajectory. */
+export function experimentLogVisible(state: SessionState): boolean {
+  return state.experimentLog !== null && state.hypothesisScope === null && !state.chatOpen;
+}
+
+export function openExperimentLog(state: SessionState): SessionState {
+  const existing = state.experimentLog;
+  return {
+    ...state,
+    overlay: null,
+    chatOpen: false,
+    hypothesisScope: null,
+    selectedRound: null,
+    selectedAgentKind: null,
+    experimentLog: existing ?? {entries: [], selectedId: null, pending: true, error: null},
+  };
+}
+
+export function setExperiments(state: SessionState, entries: HypothesisEntry[]): SessionState {
+  const log = state.experimentLog;
+  if (log === null) return state;
+  const keys = entries.map(entryKey);
+  // Keep the operator's row when it still exists; otherwise fall back to the
+  // active hypothesis, then to the first row.
+  const selectedId =
+    log.selectedId !== null && keys.includes(log.selectedId)
+      ? log.selectedId
+      : (keys[entries.findIndex(entry => entry.active === true)] ?? keys[0] ?? null);
+  return {
+    ...state,
+    experimentLog: {...log, entries, selectedId, pending: false, error: null},
+  };
+}
+
+export function failExperiments(state: SessionState, error: string): SessionState {
+  const log = state.experimentLog;
+  if (log === null) return state;
+  return {...state, experimentLog: {...log, pending: false, error}};
+}
+
+export function moveExperimentSelection(state: SessionState, delta: number): SessionState {
+  const log = state.experimentLog;
+  if (log === null || state.hypothesisScope !== null || log.entries.length === 0) return state;
+  const keys = log.entries.map(entryKey);
+  const current = log.selectedId === null ? 0 : keys.indexOf(log.selectedId);
+  const index = Math.min(keys.length - 1, Math.max(0, (current === -1 ? 0 : current) + delta));
+  return {...state, experimentLog: {...log, selectedId: keys[index] ?? null}};
+}
+
+/**
+ * Opens the rounds behind the selected hypothesis. The log keeps its selection
+ * so leaving the trajectory lands the operator back on the same row.
+ */
+export function enterExperimentDrilldown(state: SessionState): SessionState {
+  const entry = selectedExperiment(state);
+  if (entry === null || state.hypothesisScope !== null) return state;
+  const rounds = scopeRounds(entry);
+  if (rounds.length === 0) return state;
+  return {
+    ...state,
+    overlay: null,
+    hypothesisScope: {id: entry.hypothesis_id, label: hypothesisLabel(entry), rounds},
+    selectedRound: null,
+    selectedAgentKind: null,
+  };
+}
+
+/** Leaves the trajectory and returns to the table with the selection intact. */
+export function leaveExperimentDrilldown(state: SessionState): SessionState {
+  if (state.hypothesisScope === null) return state;
+  return {...state, hypothesisScope: null, selectedRound: null, selectedAgentKind: null};
+}
+
+/**
+ * Opens the hypothesis that owns a round number, landing on that round rather
+ * than on the whole trajectory. Returns null when no hypothesis claims it, so
+ * the caller can report the round rather than silently doing nothing.
+ */
+export function enterExperimentRound(
+  state: SessionState,
+  roundNumber: number,
+): SessionState | null {
+  const entry = (state.experimentLog?.entries ?? []).find(candidate =>
+    scopeRounds(candidate).includes(roundNumber),
+  );
+  if (entry === undefined) return null;
+  const scoped: SessionState = {
+    ...state,
+    overlay: null,
+    chatOpen: false,
+    hypothesisScope: {
+      id: entry.hypothesis_id,
+      label: hypothesisLabel(entry),
+      rounds: scopeRounds(entry),
+    },
+    selectedRound: roundNumber,
+    selectedAgentKind: null,
+    experimentLog:
+      state.experimentLog === null
+        ? null
+        : {...state.experimentLog, selectedId: entryKeyFor(state.experimentLog.entries, entry)},
+  };
+  return scoped;
+}
+
+function entryKeyFor(entries: HypothesisEntry[], entry: HypothesisEntry): string | null {
+  const index = entries.indexOf(entry);
+  return index === -1 ? null : entryKey(entry, index);
+}
+
+function scopeRounds(entry: HypothesisEntry): number[] {
+  const listed = (entry.rounds ?? []).map(round => round.round);
+  if (listed.length > 0) return [...listed].sort((a, b) => a - b);
+  // An active hypothesis whose first round has not finished has no round
+  // records yet, but its opening round is still worth showing.
+  return entry.first_round > 0 ? [entry.first_round] : [];
+}
+
+function hypothesisLabel(entry: HypothesisEntry): string {
+  const range =
+    entry.first_round === entry.last_round
+      ? `r${entry.first_round}`
+      : `r${entry.first_round}-${entry.last_round}`;
+  return `${entry.hypothesis_id} · ${range}`;
+}
+
+export function selectedExperiment(state: SessionState): HypothesisEntry | null {
+  const log = state.experimentLog;
+  if (log === null || log.selectedId === null) return null;
+  const index = log.entries.map(entryKey).indexOf(log.selectedId);
+  return index === -1 ? null : (log.entries[index] ?? null);
 }
 
 export function setTheme(state: SessionState, themeName: ThemeName): SessionState {
@@ -272,18 +445,20 @@ export function selectPreviousAgent(state: SessionState): SessionState {
 }
 
 export function selectNextRound(state: SessionState): SessionState {
-  if (state.rounds.length === 0) return state;
+  const rounds = scopedRounds(state);
+  if (rounds.length === 0) return state;
   const visible = visibleRoundNumber(state);
-  const index = visible === null ? -1 : state.rounds.findIndex(round => round.number === visible);
-  const next = state.rounds[(index + 1 + state.rounds.length) % state.rounds.length];
+  const index = visible === null ? -1 : rounds.findIndex(round => round.number === visible);
+  const next = rounds[(index + 1 + rounds.length) % rounds.length];
   return {...state, selectedRound: next?.number ?? null, selectedAgentKind: null, overlay: null};
 }
 
 export function selectPreviousRound(state: SessionState): SessionState {
-  if (state.rounds.length === 0) return state;
+  const rounds = scopedRounds(state);
+  if (rounds.length === 0) return state;
   const visible = visibleRoundNumber(state);
-  const index = visible === null ? 0 : state.rounds.findIndex(round => round.number === visible);
-  const previous = state.rounds[(index - 1 + state.rounds.length) % state.rounds.length];
+  const index = visible === null ? 0 : rounds.findIndex(round => round.number === visible);
+  const previous = rounds[(index - 1 + rounds.length) % rounds.length];
   return {
     ...state,
     selectedRound: previous?.number ?? null,
@@ -293,7 +468,7 @@ export function selectPreviousRound(state: SessionState): SessionState {
 }
 
 export function selectRound(state: SessionState, roundNumber: number): SessionState {
-  if (!state.rounds.some(round => round.number === roundNumber)) return state;
+  if (!scopedRounds(state).some(round => round.number === roundNumber)) return state;
   return {...state, selectedRound: roundNumber, selectedAgentKind: null, overlay: null};
 }
 
@@ -544,13 +719,25 @@ function mergeToolResult(call: ConversationEntry, result: ConversationEntry): Co
   };
 }
 
+/**
+ * Returns to the experiment log. Per-round output is reachable only by opening
+ * a hypothesis, so there is no unfiltered live view to fall back to and the
+ * log is never dismissed.
+ */
 export function showLive(state: SessionState): SessionState {
   return {
     ...state,
     overlay: null,
     chatOpen: false,
+    hypothesisScope: null,
     selectedRound: null,
     selectedAgentKind: null,
+    experimentLog: state.experimentLog ?? {
+      entries: [],
+      selectedId: null,
+      pending: true,
+      error: null,
+    },
   };
 }
 
@@ -580,6 +767,17 @@ function formatTokenCount(count: number): string {
 }
 
 export function visibleConversation(state: SessionState): ConversationEntry[] {
+  const scope = state.hypothesisScope;
+  // Inside a hypothesis with no round picked out, show the whole trajectory of
+  // that hypothesis rather than only its latest round.
+  if (scope !== null && state.selectedRound === null) {
+    return state.conversation.filter(entry => {
+      if (entry.roundNumber === undefined || !scope.rounds.includes(entry.roundNumber)) {
+        return false;
+      }
+      return state.selectedAgentKind === null || entry.agentKind === state.selectedAgentKind;
+    });
+  }
   const roundNumber = visibleRoundNumber(state);
   return state.conversation.filter(entry => {
     if (roundNumber !== null && entry.roundNumber !== roundNumber) return false;
@@ -632,7 +830,15 @@ export function visibleTodos(state: SessionState): TodoItem[] {
 }
 
 export function visibleRoundNumber(state: SessionState): number | null {
-  return visibleRunMapRoundNumber(state.rounds, state.selectedRound);
+  if (state.hypothesisScope !== null && state.selectedRound === null) return null;
+  return visibleRunMapRoundNumber(scopedRounds(state), state.selectedRound);
+}
+
+/** The rounds the strip and round navigation operate on for the current view. */
+export function scopedRounds(state: SessionState): RoundSummary[] {
+  const scope = state.hypothesisScope;
+  if (scope === null) return state.rounds;
+  return state.rounds.filter(round => scope.rounds.includes(round.number));
 }
 
 const MAX_TOOL_ARG_LEN = 80;

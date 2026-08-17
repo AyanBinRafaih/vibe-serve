@@ -2906,6 +2906,8 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     reviewed=reviewed,
                     hypothesis_id=plan.hypothesis_id,
                     hypothesis_outcome=hypothesis_outcome,
+                    hypothesis_claim=plan.hypothesis or None,
+                    hypothesis_task=plan.task or None,
                     hypothesis_parent_round=active_hypothesis.parent_round,
                     hypothesis_parent_commit=active_hypothesis.parent_commit,
                     metrics=accepted_metrics,
