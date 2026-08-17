@@ -1,6 +1,6 @@
+import {afterEach, describe, expect, it} from 'bun:test';
 import {InputRenderable, rgbToHex, ScrollBoxRenderable} from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
-import {afterEach, describe, expect, it} from 'bun:test';
 import type {HypothesisEntry} from '../protocol.js';
 import type {SessionController} from '../session-controller.js';
 import {
