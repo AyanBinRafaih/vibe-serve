@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, TextIO, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
     from langchain_core.callbacks import BaseCallbackHandler
 
 from vibesys.agents.callbacks import AgentLogger
