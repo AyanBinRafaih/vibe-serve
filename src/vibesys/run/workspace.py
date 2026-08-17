@@ -1,7 +1,7 @@
-"""Workspace materialization for experiment runs.
+"""Canonical project materialization for VibeSys runs.
 
-``Workspace`` owns the unified workspace directory and all of its setup
-logic: seed/input/evaluator/skills/profiler-harness copies, exclusion
+``Workspace`` owns the canonical project root and all of its setup
+logic: input/evaluator/skills/profiler-harness copies, exclusion
 rules, external-symlink handling, gitignore-respecting copies, collision
 rejection, and resume behavior.  The per-source copy policies are built as
 declarative :class:`CopySpec` / :class:`InputProjectSpec` records first
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from vibesys.constants import ComputeBackend
     from vibesys.sandbox.run_environment import RunEnvironment
 
-# Dirs excluded from workspace copy, git tracking, and the
+# Directories excluded from project materialization, Git tracking, and the
 # Modal-side tar download. ``_auth`` and ``_opt_vibesys`` are
 # our own "bind-mount redirect" dirs under --modal (host auth +
 # vibesys pkg uploaded into /workspace/_auth and
@@ -67,7 +67,7 @@ _CLI_SKILL_DIRS: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class CopySpec:
-    """One planned directory copy into the workspace."""
+    """One planned directory copy into the project root."""
 
     src: Path
     dest: Path
@@ -94,7 +94,7 @@ class InputProjectSpec:
 
 @dataclass(frozen=True)
 class GitSourceSpec:
-    """Materialize a pinned git source into the candidate workspace."""
+    """Materialize a pinned Git source into the candidate project."""
 
     source: WorkspaceSource
 
@@ -103,7 +103,7 @@ WorkspaceStep = CopySpec | InputProjectSpec | GitSourceSpec
 
 
 class Workspace:
-    """The unified run workspace and every rule for populating it."""
+    """The canonical project root and every rule for populating it."""
 
     def __init__(  # noqa: D107, PLR0913  # tracked: #288
         self,
@@ -130,8 +130,8 @@ class Workspace:
     def repair(self) -> None:
         """Fix ownership of files a previous root-running sandbox left behind.
 
-        Used when resuming an existing run so the agent can write to
-        workspace files that may have been created as root by Docker.
+        Used when resuming an existing run so the agent can write project files
+        that may have been created as root by Docker.
         """
         self._run_environment.repair_workspace(
             self.root,
@@ -145,7 +145,6 @@ class Workspace:
         self,
         *,
         existing: bool,
-        seed: Path | None,
         input_dir: Path,
         evaluator_source: Path | None,
         skill_sources: list[Path],
@@ -157,17 +156,17 @@ class Workspace:
     ) -> tuple[WorkspaceStep, ...]:
         """Build the ordered copy plan for ``setup``.
 
-        On resume (``existing=True``) the workspace already contains
+        On resume (``existing=True``) the project already contains
         reference files, skills, etc. from the previous run, so the full
         copy is skipped: only the always-refresh and ensure-present steps
         below are planned.
         """
         steps: list[WorkspaceStep] = []
 
-        # Always refresh skills into the workspace (even on --resume). Skill
+        # Always refresh skills into the project (even on --resume). Skill
         # source is tiny (MB) and copying is cheap; without this, an
         # interrupted run leaves stale skills from the previous CLI version
-        # in the host workspace, which Modal then uploads verbatim into the
+        # in the host project, which Modal then uploads verbatim into the
         # fresh sandbox volume at start, and codex-cli fails to load them
         # (e.g. skill description exceeds a newer CLI's length limit).
         # Mirrors _materialize_skills destinations inside cli_runner.
@@ -181,15 +180,13 @@ class Workspace:
                     steps.append(CopySpec(src=src, dest=cli_target, prune_platforms=True))
 
         if not existing:
-            if seed is not None:
-                steps.append(CopySpec(src=seed, dest=self.root, respect_gitignore=True))
             for source in workspace_sources:
                 steps.append(GitSourceSpec(source=source))  # noqa: PERF401  # tracked: #288
-            # When the workspace is pre-populated (seed and/or git sources),
+            # When the project is pre-populated with Git sources,
             # the input copy must not clear existing children: copy_dir wipes
             # the destination unless collisions are rejected, which would
             # silently delete the just-materialized sources.
-            if seed is not None or workspace_sources:
+            if workspace_sources:
                 steps.append(
                     CopySpec(
                         src=input_dir,
@@ -230,7 +227,7 @@ class Workspace:
                     )
                 )
 
-        # Always ensure profiler harnesses are present in the workspace, even
+        # Always ensure profiler harnesses are present in the project, even
         # when resuming — the original run may not have had them.
         if existing and profiler_support_path and profiler_support_name:
             destination = self.root / profiler_support_name
@@ -422,7 +419,9 @@ class Workspace:
             )
             if collisions:
                 paths = ", ".join(collisions)
-                raise ValueError(f"workspace seed and input bundle contain the same paths: {paths}")  # noqa: TRY003  # tracked: #288
+                raise ValueError(  # noqa: TRY003  # tracked: #288
+                    f"workspace source and input bundle contain the same paths: {paths}"
+                )
 
         if dst.exists() and not reject_collisions:
             # Remove children individually so we can skip mount points and
@@ -494,7 +493,7 @@ class Workspace:
         )
         if result.returncode != 0:
             detail = result.stderr.decode(errors="replace").strip()
-            raise RuntimeError(f"could not evaluate Git ignores for workspace.seed: {detail}")  # noqa: TRY003  # tracked: #288
+            raise RuntimeError(f"could not evaluate source Git ignores: {detail}")  # noqa: TRY003  # tracked: #288
         return frozenset(
             Path(os.fsdecode(raw).rstrip("/")).parts for raw in result.stdout.split(b"\0") if raw
         )

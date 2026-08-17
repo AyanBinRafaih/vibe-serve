@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 import tomllib
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from vibesys.constants import PROJECT_ROOT
 from vibesys.domains.base import DomainName
+from vibesys.evaluators import (
+    EvaluatorPackageRequirement,
+    load_evaluator_package_lock,
+    resolve_evaluator_package,
+)
+
+if TYPE_CHECKING:
+    from vs_project import Project, TaskDirectory
 
 MANIFEST_NAME = "vibesys.input.toml"
 
@@ -21,40 +29,56 @@ class InputCommand(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    command: tuple[str, ...]
+    command: tuple[str, ...] | None = None
+    entrypoint: str | None = None
+    args: tuple[str, ...] = ()
     timeout_seconds: int | None = Field(default=None, gt=0)
 
     @field_validator("command")
     @classmethod
-    def _non_empty_command(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
+    def _non_empty_command(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is not None and not value:
             raise ValueError("command must contain at least one argv element")  # noqa: TRY003  # tracked: #288
-        if any(not part for part in value):
+        if value is not None and any(not part for part in value):
             raise ValueError("command elements must be non-empty strings")  # noqa: TRY003  # tracked: #288
         return value
 
-    def display(self) -> str:  # noqa: D102  # tracked: #288
-        return " ".join(shlex.quote(part) for part in self.command)
+    @field_validator("entrypoint")
+    @classmethod
+    def _non_empty_entrypoint(cls, value: str | None) -> str | None:
+        if value is not None and (not value or any(character.isspace() for character in value)):
+            raise ValueError("entrypoint must be a non-empty name without whitespace")  # noqa: TRY003
+        return value
+
+    @field_validator("args")
+    @classmethod
+    def _non_empty_arguments(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not part for part in value):
+            raise ValueError("args elements must be non-empty strings")  # noqa: TRY003
+        return value
+
+    @model_validator(mode="after")
+    def _one_command_source(self) -> InputCommand:
+        if (self.command is None) == (self.entrypoint is None):
+            raise ValueError("declare exactly one of command or entrypoint")  # noqa: TRY003
+        if self.command is not None and self.args:
+            raise ValueError("args may only be used with an evaluator entrypoint")  # noqa: TRY003
+        return self
+
+    def display(self, *, resolved_command: tuple[str, ...] | None = None) -> str:
+        """Render the resolved argv used by the evaluator."""
+        command = resolved_command or self.command
+        if command is None:
+            raise ValueError("entrypoint commands must be resolved before display")  # noqa: TRY003
+        return " ".join(shlex.quote(part) for part in command)
 
 
 class WorkspaceInput(BaseModel):
-    """Optional starter content copied into a fresh candidate workspace."""
+    """Pinned source repositories copied into a fresh candidate workspace."""
 
     model_config = ConfigDict(extra="forbid")
 
-    seed: str | None = None
     sources: tuple[WorkspaceSource, ...] = ()
-
-    @field_validator("seed")
-    @classmethod
-    def _relative_seed(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if not value.strip():
-            raise ValueError("seed must be a non-empty path")  # noqa: TRY003  # tracked: #288
-        if Path(value).is_absolute():
-            raise ValueError("seed must be relative to the input bundle")  # noqa: TRY003  # tracked: #288
-        return value
 
 
 class WorkspaceSource(BaseModel):
@@ -110,37 +134,45 @@ class WorkspaceSource(BaseModel):
 
 
 class EvaluatorInput(BaseModel):
-    """Trusted evaluator source copied into a fresh candidate workspace."""
+    """A legacy source tree or an exact reusable evaluator package."""
 
     model_config = ConfigDict(extra="forbid")
 
-    source: str
+    source: str | None = None
+    name: str | None = None
+    version: str | None = None
 
     @field_validator("source")
     @classmethod
-    def _relative_source(cls, value: str) -> str:
+    def _relative_source(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not value.strip():
             raise ValueError("source must be a non-empty path")  # noqa: TRY003  # tracked: #288
         if Path(value).is_absolute():
             raise ValueError("source must be relative to the input bundle")  # noqa: TRY003  # tracked: #288
         return value
 
+    @model_validator(mode="after")
+    def _one_evaluator_source(self) -> EvaluatorInput:
+        package_values = (self.name, self.version)
+        if self.source is not None:
+            if any(value is not None for value in package_values):
+                raise ValueError(  # noqa: TRY003
+                    "evaluator source cannot be combined with name or version"
+                )
+            return self
+        if any(value is None for value in package_values):
+            raise ValueError("a packaged evaluator requires both name and version")  # noqa: TRY003
+        EvaluatorPackageRequirement(name=self.name, version=self.version)  # type: ignore[arg-type]
+        return self
 
-class HiddenEvaluatorInput(BaseModel):
-    """Trusted evaluator source available only to framework-owned commands."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    source: str
-
-    @field_validator("source")
-    @classmethod
-    def _relative_source(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("source must be a non-empty path")  # noqa: TRY003  # tracked: #288
-        if Path(value).is_absolute():
-            raise ValueError("source must be relative to the input bundle")  # noqa: TRY003  # tracked: #288
-        return value
+    @property
+    def package_requirement(self) -> EvaluatorPackageRequirement | None:
+        """Return the exact package requirement, if this is not a legacy source."""
+        if self.name is None or self.version is None:
+            return None
+        return EvaluatorPackageRequirement(name=self.name, version=self.version)
 
 
 class BenchmarkResult(BaseModel):
@@ -180,6 +212,36 @@ class AgentInput(BaseModel):
     domain: DomainName
 
 
+class ModalEnvironmentInput(BaseModel):
+    """Task-owned settings for a Modal run environment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint: str
+
+    @field_validator("entrypoint")
+    @classmethod
+    def _relative_entrypoint(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("entrypoint must be a non-empty path")  # noqa: TRY003
+        path = Path(value)
+        if path.is_absolute():
+            raise ValueError("entrypoint must be relative to the project root")  # noqa: TRY003
+        if not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError(  # noqa: TRY003
+                "entrypoint must not contain empty, current, or parent path components"
+            )
+        return value
+
+
+class EnvironmentInput(BaseModel):
+    """Optional task settings for concrete run environments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    modal: ModalEnvironmentInput | None = None
+
+
 class InputManifest(BaseModel):
     """Versioned evaluator-command manifest for an input bundle."""
 
@@ -189,12 +251,22 @@ class InputManifest(BaseModel):
     agent: AgentInput
     accuracy: InputCommand
     benchmark: BenchmarkCommand
+    environment: EnvironmentInput | None = None
     workspace: WorkspaceInput | None = None
     evaluator: EvaluatorInput | None = None
-    hidden_evaluator: HiddenEvaluatorInput | None = None
 
     @model_validator(mode="after")
-    def _unique_workspace_source_destinations(self) -> InputManifest:
+    def _validate_cross_references(self) -> InputManifest:
+        uses_entrypoint = any(
+            command.entrypoint is not None for command in (self.accuracy, self.benchmark)
+        )
+        package = self.evaluator.package_requirement if self.evaluator is not None else None
+        if uses_entrypoint and package is None:
+            raise ValueError("evaluator entrypoints require a packaged [evaluator]")  # noqa: TRY003
+        if not uses_entrypoint and package is not None:
+            raise ValueError(  # noqa: TRY003
+                "a packaged [evaluator] requires evaluator entrypoint commands"
+            )
         if self.workspace is None:
             return self
         seen_names: set[str] = set()
@@ -209,18 +281,126 @@ class InputManifest(BaseModel):
         return self
 
 
+def render_input_manifest(manifest: InputManifest) -> str:  # noqa: C901
+    """Serialize a validated input manifest as deterministic TOML."""
+
+    def toml_string(value: str) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
+    def toml_array(values: tuple[str, ...]) -> str:
+        return "[" + ", ".join(toml_string(value) for value in values) + "]"
+
+    lines = [
+        f"version = {manifest.version}",
+        "",
+        "[agent]",
+        f"domain = {toml_string(manifest.agent.domain.value)}",
+        "",
+        "[accuracy]",
+    ]
+    if manifest.accuracy.command is not None:
+        lines.append(f"command = {toml_array(manifest.accuracy.command)}")
+    else:
+        assert manifest.accuracy.entrypoint is not None  # noqa: S101
+        lines.extend(
+            [
+                f"entrypoint = {toml_string(manifest.accuracy.entrypoint)}",
+                f"args = {toml_array(manifest.accuracy.args)}",
+            ]
+        )
+    if manifest.accuracy.timeout_seconds is not None:
+        lines.append(f"timeout_seconds = {manifest.accuracy.timeout_seconds}")
+
+    if manifest.environment is not None and manifest.environment.modal is not None:
+        lines.extend(
+            [
+                "",
+                "[environment.modal]",
+                f"entrypoint = {toml_string(manifest.environment.modal.entrypoint)}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "[benchmark]",
+        ]
+    )
+    if manifest.benchmark.command is not None:
+        lines.append(f"command = {toml_array(manifest.benchmark.command)}")
+    else:
+        assert manifest.benchmark.entrypoint is not None  # noqa: S101
+        lines.extend(
+            [
+                f"entrypoint = {toml_string(manifest.benchmark.entrypoint)}",
+                f"args = {toml_array(manifest.benchmark.args)}",
+            ]
+        )
+    if manifest.benchmark.timeout_seconds is not None:
+        lines.append(f"timeout_seconds = {manifest.benchmark.timeout_seconds}")
+    if manifest.benchmark.result is not None:
+        lines.extend(
+            [
+                "",
+                "[benchmark.result]",
+                f"json_argument = {toml_string(manifest.benchmark.result.json_argument)}",
+                f"metric = {toml_string(manifest.benchmark.result.metric)}",
+            ]
+        )
+
+    if manifest.workspace is not None:
+        for source in manifest.workspace.sources:
+            lines.extend(
+                [
+                    "",
+                    "[[workspace.sources]]",
+                    f"name = {toml_string(source.name)}",
+                    f"repo = {toml_string(source.repo)}",
+                    f"commit = {toml_string(source.commit)}",
+                    f"dest = {toml_string(source.dest)}",
+                    f"strip_git = {str(source.strip_git).lower()}",
+                ]
+            )
+
+    if manifest.evaluator is not None and manifest.evaluator.source is not None:
+        lines.extend(
+            [
+                "",
+                "[evaluator]",
+                f"source = {toml_string(manifest.evaluator.source)}",
+            ]
+        )
+    elif manifest.evaluator is not None:
+        assert manifest.evaluator.name is not None  # noqa: S101
+        assert manifest.evaluator.version is not None  # noqa: S101
+        lines.extend(
+            [
+                "",
+                "[evaluator]",
+                f"name = {toml_string(manifest.evaluator.name)}",
+                f"version = {toml_string(manifest.evaluator.version)}",
+            ]
+        )
+
+    return "\n".join(lines) + "\n"
+
+
 class InputBundle(BaseModel):
     """Resolved input bundle with manifest commands and conventional files."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     root: Path
+    task_root: Path
+    task_name: str | None = None
     manifest_path: Path
     objective_path: Path
     reference_path: Path | None
-    workspace_seed_path: Path | None
     evaluator_path: Path | None
-    hidden_evaluator_path: Path | None
+    evaluator_package_digest: str | None = None
+    evaluator_package_root: Path | None = None
+    resolved_accuracy_command: tuple[str, ...]
+    resolved_benchmark_command: tuple[str, ...]
     manifest: InputManifest
 
     @property
@@ -229,11 +409,11 @@ class InputBundle(BaseModel):
 
     @property
     def accuracy_command(self) -> tuple[str, ...]:  # noqa: D102  # tracked: #288
-        return self.manifest.accuracy.command
+        return self.resolved_accuracy_command
 
     @property
     def benchmark_command(self) -> tuple[str, ...]:  # noqa: D102  # tracked: #288
-        return self.manifest.benchmark.command
+        return self.resolved_benchmark_command
 
     @property
     def domain(self) -> DomainName:  # noqa: D102  # tracked: #288
@@ -241,15 +421,23 @@ class InputBundle(BaseModel):
 
     @property
     def accuracy_command_display(self) -> str:  # noqa: D102  # tracked: #288
-        return self.manifest.accuracy.display()
+        return self.manifest.accuracy.display(resolved_command=self.resolved_accuracy_command)
 
     @property
     def benchmark_command_display(self) -> str:  # noqa: D102  # tracked: #288
-        return self.manifest.benchmark.display()
+        return self.manifest.benchmark.display(resolved_command=self.resolved_benchmark_command)
 
     @property
     def benchmark_result(self) -> BenchmarkResult | None:  # noqa: D102  # tracked: #288
         return self.manifest.benchmark.result
+
+    @property
+    def modal_entrypoint(self) -> str | None:
+        """Return the task's project-relative Modal deployment file, if declared."""
+        environment = self.manifest.environment
+        if environment is None or environment.modal is None:
+            return None
+        return environment.modal.entrypoint
 
     @property
     def workspace_sources(self) -> tuple[WorkspaceSource, ...]:  # noqa: D102  # tracked: #288
@@ -258,45 +446,56 @@ class InputBundle(BaseModel):
         return self.manifest.workspace.sources
 
 
-def _within(child: Path, parent: Path) -> bool:
-    """Return whether ``child`` resolves inside ``parent`` (or equals it)."""
-    try:
-        child.relative_to(parent)
-    except ValueError:
-        return False
-    return True
-
-
-def load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
-    path: Path,
-    *,
-    project_root: Path | None = None,
-    allow_materialized_sources: bool = False,
-    allow_bundle_local_sources: bool = False,
-) -> InputBundle:
+def load_input_bundle(path: Path) -> InputBundle:
     """Load and validate a command-based input bundle.
 
-    ``allow_materialized_sources`` is used only when resuming an experiment
-    from its copied workspace. Starter and evaluator sources may have lived
-    outside the original bundle and are no longer needed once materialized.
-
-    ``allow_bundle_local_sources`` additionally permits workspace seed and
-    evaluator sources to resolve inside the bundle root itself, not only under
-    the repository ``examples/`` trees. It is used for bundles synthesized from
-    standalone CLI flags, which stage their trusted sources inside the bundle.
+    Evaluators are resolved exactly once relative to the manifest directory.
+    They may be siblings of the bundle when the author uses ``..`` components,
+    which lets a collection share large inputs without tying resolution to a
+    VibeSys source checkout.
     """
-    project_root = (project_root or PROJECT_ROOT).resolve()
     root = path.expanduser().resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"--input path does not exist: {path}")  # noqa: TRY003  # tracked: #288
-    if not root.is_dir():
-        raise ValueError(f"--input path is not a directory: {path}")  # noqa: TRY003  # tracked: #288
+    return _load_input_bundle(project_root=root, task_root=root, task_name=None)
 
-    manifest_path = root / MANIFEST_NAME
+
+def load_project_task(project: Project, task: TaskDirectory) -> InputBundle:
+    """Load one repository-native task against its candidate project root."""
+    return _load_input_bundle(
+        project_root=project.root,
+        task_root=task.path,
+        task_name=str(task.name),
+        evaluator_lock_path=project.evaluator_lock().path,
+        task_directory=task,
+    )
+
+
+def _load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
+    *,
+    project_root: Path,
+    task_root: Path,
+    task_name: str | None,
+    evaluator_lock_path: Path | None = None,
+    task_directory: TaskDirectory | None = None,
+) -> InputBundle:
+    """Load a manifest and resolve its commands for project-root execution."""
+    root = project_root.expanduser().resolve()
+    bundle_root = task_root.expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"--input path does not exist: {root}")  # noqa: TRY003  # tracked: #288
+    if not root.is_dir():
+        raise ValueError(f"--input path is not a directory: {root}")  # noqa: TRY003  # tracked: #288
+
+    manifest_path = (
+        task_directory.manifest_path if task_directory is not None else bundle_root / MANIFEST_NAME
+    )
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Input manifest not found: {manifest_path}")  # noqa: TRY003  # tracked: #288
 
-    objective_path = root / "OBJECTIVE.md"
+    objective_path = (
+        task_directory.objective_path
+        if task_directory is not None
+        else bundle_root / "OBJECTIVE.md"
+    )
     if not objective_path.is_file():
         raise FileNotFoundError(f"OBJECTIVE.md not found: {objective_path}")  # noqa: TRY003  # tracked: #288
 
@@ -305,98 +504,110 @@ def load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
     except ValidationError as exc:
         raise ValueError(f"Invalid input manifest {manifest_path}: {exc}") from exc  # noqa: TRY003  # tracked: #288
 
-    for label, command in (
-        ("accuracy.command", manifest.accuracy.command),
-        ("benchmark.command", manifest.benchmark.command),
+    environment = manifest.environment
+    modal = environment.modal if environment is not None else None
+    if modal is not None:
+        modal_entrypoint = (root / modal.entrypoint).resolve()
+        try:
+            modal_entrypoint.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(  # noqa: TRY003
+                f"environment.modal.entrypoint escapes the project: {modal.entrypoint}"
+            ) from exc
+        if not modal_entrypoint.exists():
+            raise FileNotFoundError(  # noqa: TRY003
+                f"environment.modal.entrypoint does not exist: {modal_entrypoint}"
+            )
+        if not modal_entrypoint.is_file():
+            raise ValueError(  # noqa: TRY003
+                f"environment.modal.entrypoint is not a file: {modal_entrypoint}"
+            )
+
+    evaluator_package = None
+    requirement = manifest.evaluator.package_requirement if manifest.evaluator is not None else None
+    if requirement is not None:
+        if evaluator_lock_path is not None and not evaluator_lock_path.is_file():
+            raise FileNotFoundError(  # noqa: TRY003
+                "Repository tasks that use evaluator packages require "
+                f"an evaluator lock file: {evaluator_lock_path}"
+            )
+        package_lock = (
+            load_evaluator_package_lock(evaluator_lock_path)
+            if evaluator_lock_path is not None and evaluator_lock_path.is_file()
+            else None
+        )
+        evaluator_package = resolve_evaluator_package(requirement, lock=package_lock)
+
+    resolved_commands: list[tuple[str, ...]] = []
+    for label, command_spec in (
+        ("accuracy.command", manifest.accuracy),
+        ("benchmark.command", manifest.benchmark),
     ):
+        if command_spec.entrypoint is not None:
+            assert evaluator_package is not None  # noqa: S101
+            resolved_commands.append(
+                evaluator_package.command(
+                    command_spec.entrypoint,
+                    *command_spec.args,
+                )
+            )
+            continue
+        command = command_spec.command
+        assert command is not None  # noqa: S101
         executable = Path(command[0])
         if executable.is_absolute():
             raise ValueError(  # noqa: TRY003  # tracked: #288
-                f"{label} executable must be relative to the input bundle: {command[0]}"
+                f"{label} executable must be relative to the project: {command[0]}"
             )
         if "/" not in command[0]:
+            resolved_commands.append(command)
             continue
         resolved = (root / executable).resolve()
         try:
             resolved.relative_to(root)
         except ValueError as exc:
-            raise ValueError(f"{label} executable escapes the input bundle: {command[0]}") from exc  # noqa: TRY003  # tracked: #288
+            raise ValueError(f"{label} executable escapes the project: {command[0]}") from exc  # noqa: TRY003  # tracked: #288
         if not resolved.exists():
             raise FileNotFoundError(f"{label} executable does not exist: {resolved}")  # noqa: TRY003  # tracked: #288
         if not resolved.is_file():
             raise ValueError(f"{label} executable is not a file: {resolved}")  # noqa: TRY003  # tracked: #288
+        resolved_commands.append(command)
 
-    reference_path = root / "reference"
+    reference_path = bundle_root / "reference"
+    if reference_path.exists() or reference_path.is_symlink():
+        reference_path = (
+            task_directory.resolve("reference") if task_directory is not None else reference_path
+        )
     if reference_path.exists() and not reference_path.is_dir():
         raise ValueError(f"reference path is not a directory: {reference_path}")  # noqa: TRY003  # tracked: #288
     if not reference_path.exists():
         reference_path = None
 
-    workspace_seed_path = None
-    if (
-        manifest.workspace is not None
-        and manifest.workspace.seed is not None
-        and not allow_materialized_sources
-    ):
-        starters_root = (project_root / "examples" / "starters").resolve()
-        allowed_seed_roots = (
-            (root, starters_root) if allow_bundle_local_sources else (starters_root,)
-        )
-        workspace_seed_path = (root / manifest.workspace.seed).resolve()
-        if not any(_within(workspace_seed_path, allowed) for allowed in allowed_seed_roots):
-            raise ValueError(  # noqa: TRY003  # tracked: #288
-                f"workspace.seed must resolve inside {starters_root}: {manifest.workspace.seed}"
-            )
-        if not workspace_seed_path.exists():
-            raise FileNotFoundError(f"workspace.seed path does not exist: {workspace_seed_path}")  # noqa: TRY003  # tracked: #288
-        if not workspace_seed_path.is_dir():
-            raise ValueError(f"workspace.seed path is not a directory: {workspace_seed_path}")  # noqa: TRY003  # tracked: #288
-
     evaluator_path = None
-    if manifest.evaluator is not None and not allow_materialized_sources:
-        evaluators_root = (project_root / "examples" / "evaluators").resolve()
-        allowed_eval_roots = (
-            (root, evaluators_root) if allow_bundle_local_sources else (evaluators_root,)
+    if manifest.evaluator is not None and manifest.evaluator.source is not None:
+        evaluator_path = (
+            task_directory.resolve(manifest.evaluator.source)
+            if task_directory is not None
+            else (bundle_root / manifest.evaluator.source).resolve()
         )
-        evaluator_path = (root / manifest.evaluator.source).resolve()
-        if not any(_within(evaluator_path, allowed) for allowed in allowed_eval_roots):
-            raise ValueError(  # noqa: TRY003  # tracked: #288
-                f"evaluator.source must resolve inside {evaluators_root}: "
-                f"{manifest.evaluator.source}"
-            )
         if not evaluator_path.exists():
             raise FileNotFoundError(f"evaluator.source path does not exist: {evaluator_path}")  # noqa: TRY003  # tracked: #288
         if not evaluator_path.is_dir():
             raise ValueError(f"evaluator.source path is not a directory: {evaluator_path}")  # noqa: TRY003  # tracked: #288
 
-    hidden_evaluator_path = None
-    if manifest.hidden_evaluator is not None and not allow_materialized_sources:
-        evaluators_root = (project_root / "examples" / "evaluators").resolve()
-        allowed_hidden_roots = (
-            (root, evaluators_root) if allow_bundle_local_sources else (evaluators_root,)
-        )
-        hidden_evaluator_path = (root / manifest.hidden_evaluator.source).resolve()
-        if not any(_within(hidden_evaluator_path, allowed) for allowed in allowed_hidden_roots):
-            raise ValueError(  # noqa: TRY003  # tracked: #288
-                f"hidden_evaluator.source must resolve inside {evaluators_root}: "
-                f"{manifest.hidden_evaluator.source}"
-            )
-        if not hidden_evaluator_path.exists():
-            raise FileNotFoundError(  # noqa: TRY003  # tracked: #288
-                f"hidden_evaluator.source path does not exist: {hidden_evaluator_path}"
-            )
-        if not hidden_evaluator_path.is_dir():
-            raise ValueError(  # noqa: TRY003  # tracked: #288
-                f"hidden_evaluator.source path is not a directory: {hidden_evaluator_path}"
-            )
-
     return InputBundle(
         root=root,
+        task_root=bundle_root,
+        task_name=task_name,
         manifest_path=manifest_path,
         objective_path=objective_path,
         reference_path=reference_path,
-        workspace_seed_path=workspace_seed_path,
         evaluator_path=evaluator_path,
-        hidden_evaluator_path=hidden_evaluator_path,
+        evaluator_package_digest=(
+            evaluator_package.digest if evaluator_package is not None else None
+        ),
+        evaluator_package_root=(evaluator_package.root if evaluator_package is not None else None),
+        resolved_accuracy_command=resolved_commands[0],
+        resolved_benchmark_command=resolved_commands[1],
         manifest=manifest,
     )

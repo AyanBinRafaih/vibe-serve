@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-import json
-
+from vibesys.loops.agent.model import ActiveHypothesis  # noqa: TC001  # tracked: #288
+from vibesys.loops.agent.state import AgentStateStore
 from vibesys.server.events import EventType, RunEvent
+from vibesys.server.experiments import apply_baselines, build_experiment_log
 from vibesys.server.inspector import RunInspector
 from vibesys.server.protocol import (
     ChatQuery,
     ChatResult,
     CommandAck,
     EventsQuery,
+    ExperimentQuery,
     HistoryQuery,
+    HypothesisEntry,
     PauseCommand,
     PerformanceQuery,
     PerformanceRound,
@@ -22,7 +25,7 @@ from vibesys.server.protocol import (
     SnapshotQuery,
     SteerCommand,
 )
-from vibesys.server.supervisor import RunSupervisor  # noqa: TC001  # tracked: #288
+from vibesys.server.supervisor import ProjectRunState, RunSupervisor  # noqa: TC001  # tracked: #288
 
 
 class SupervisionService:
@@ -65,6 +68,9 @@ class SupervisionService:
         if isinstance(request, PerformanceQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/perf")
             return Response(request_id=request.request_id, performance=self.performance_rounds())
+        if isinstance(request, ExperimentQuery):
+            self.supervisor.record(EventType.STATUS_QUERY, "/experiments")
+            return Response(request_id=request.request_id, experiments=self.experiments())
         if isinstance(request, SnapshotQuery):
             return Response(request_id=request.request_id, snapshot=self.snapshot())
         if isinstance(request, EventsQuery):
@@ -87,28 +93,61 @@ class SupervisionService:
         return self.supervisor.read_history_events()
 
     def performance_rounds(self) -> list[PerformanceRound]:  # noqa: D102  # tracked: #288
-        log_dir = self.supervisor.log_dir
-        if log_dir is None:
+        project_run = self.supervisor.project_run
+        if project_run is None:
             return []
-        rounds_path = log_dir / "rounds.json"
-        if not rounds_path.is_file():
+        manifest = project_run.project.state.load_run(project_run.run_id)
+        if manifest.configuration.outer_loop != "agent":
             return []
         rounds: list[PerformanceRound] = []
-        for item in json.loads(rounds_path.read_text(encoding="utf-8")):
-            metric = item.get("perf_metric")
-            unit = item.get("perf_unit")
-            if not isinstance(metric, int | float) or not isinstance(unit, str) or not unit:
+        for record in project_run.project.state.load_rounds(project_run.run_id):
+            if record.perf_metric is None or record.perf_unit is None:
                 continue
             rounds.append(
                 PerformanceRound(
-                    round=int(item["round"]),
-                    perf_metric=float(metric),
-                    perf_unit=unit,
-                    passed=bool(item.get("passed", False)),
-                    profile_skipped=bool(item.get("profile_skipped", False)),
+                    round=record.round_number,
+                    perf_metric=record.perf_metric,
+                    perf_unit=record.perf_unit,
+                    passed=record.passed,
+                    profile_skipped=record.profile_skipped,
                 )
             )
         return rounds
+
+    def experiments(self) -> list[HypothesisEntry]:
+        """Group persisted round state into one entry per hypothesis.
+
+        Both inputs come from the project store rather than from files this
+        module names itself, so a change to the on-disk layout is absorbed by
+        the store and its typed adapters. This mirrors ``performance_rounds``.
+        """
+        project_run = self.supervisor.project_run
+        if project_run is None:
+            return []
+        manifest = project_run.project.state.load_run(project_run.run_id)
+        if manifest.configuration.outer_loop != "agent":
+            return []
+        rounds = project_run.project.state.load_rounds(project_run.run_id)
+        entries = build_experiment_log(rounds, self._active_hypothesis(project_run))
+        apply_baselines(entries, rounds)
+        return entries
+
+    @staticmethod
+    def _active_hypothesis(project_run: ProjectRunState) -> ActiveHypothesis | None:
+        """Load the live plan, or ``None`` when no hypothesis is open.
+
+        The active plan is machine-local rather than portable, and
+        ``AgentStateStore`` owns where it lives, so the file is never named
+        here.
+        """
+        # Deferred: ``vibesys.run`` re-enters this module through its logger,
+        # so importing the namespace enum at module scope is a cycle.
+        from vibesys.run.state import RunStateNamespace  # noqa: PLC0415  # tracked: #288
+
+        namespace = project_run.project.state.local_namespace(
+            project_run.run_id, RunStateNamespace.AGENT
+        )
+        return AgentStateStore(namespace).load_active()
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.wait_for_events(after_sequence, timeout)

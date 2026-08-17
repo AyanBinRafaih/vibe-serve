@@ -300,20 +300,54 @@ describe('session controller', () => {
     ).toBe('catppuccin-latte');
   });
 
-  it('lists themes locally and marks the active one', async () => {
+  it('opens the theme list as a selection starting on the active theme', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport, 'solarized-dark');
 
     await controller.submit('/theme');
 
-    expect(controller.state.overlay?.kind).toBe('help');
-    expect(controller.state.overlay?.content).toContain('› solarized-dark');
-    expect(controller.state.overlay?.content).toContain('high-contrast-light');
+    expect(controller.state.themePicker?.selected).toBe('solarized-dark');
+    // The list is a selection, not a text overlay.
+    expect(controller.state.overlay).toBeNull();
     expect(controller.state.themeName).toBe('solarized-dark');
     expect(transport.requests).toEqual([]);
   });
 
-  it('switches theme locally and closes the listing overlay', async () => {
+  it('applies the selected theme and closes the picker', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submit('/theme');
+    controller.moveThemeSelection(2);
+    controller.applySelectedTheme();
+
+    expect(controller.state.themeName).toBe('solarized-dark');
+    expect(controller.state.themePicker).toBeNull();
+    expect(transport.requests).toEqual([]);
+  });
+
+  it('closes the picker without switching when it is dismissed', async () => {
+    const controller = new SocketSessionController(new FakeTransport(), 'light');
+
+    await controller.submit('/theme');
+    controller.moveThemeSelection(1);
+    controller.closeThemePicker();
+
+    expect(controller.state.themeName).toBe('light');
+    expect(controller.state.themePicker).toBeNull();
+  });
+
+  it('closes the picker when the selection is the theme already in use', async () => {
+    const controller = new SocketSessionController(new FakeTransport(), 'light');
+
+    await controller.submit('/theme');
+    controller.applySelectedTheme();
+
+    expect(controller.state.themeName).toBe('light');
+    expect(controller.state.themePicker).toBeNull();
+  });
+
+  it('switches theme locally and closes the picker', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
@@ -321,8 +355,242 @@ describe('session controller', () => {
     await controller.submit('/theme high-contrast-dark');
 
     expect(controller.state.themeName).toBe('high-contrast-dark');
+    expect(controller.state.themePicker).toBeNull();
     expect(controller.state.overlay).toBeNull();
     expect(transport.requests).toEqual([]);
+  });
+
+  it('makes the experiment log the default view of run history', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const controller = new SocketSessionController(transport);
+
+    await controller.submit('/history');
+
+    expect(transport.requests).toEqual([{type: 'query.experiments'}]);
+    expect(controller.state.experimentLog?.entries).toHaveLength(1);
+    expect(controller.state.experimentLog?.selectedId).toBe('H-01');
+    expect(controller.state.overlay).toBeNull();
+  });
+
+  it('keeps the flat round list reachable as /history rounds', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submit('/history rounds');
+
+    expect(transport.requests).toEqual([{type: 'query.history'}]);
+    expect(controller.state.overlay?.content).toContain('No rounds have started yet.');
+    expect(controller.state.hypothesisScope).toBeNull();
+  });
+
+  it('refetches the log when a round finishes and keeps the selected row', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {resolved_outcome: 'proven'}),
+      entry('H-02', 2, 2, {active: true}),
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    controller.moveExperimentSelection(1);
+    expect(controller.state.experimentLog?.selectedId).toBe('H-02');
+    const before = transport.requests.length;
+
+    // The active hypothesis resolves and a new one opens above nothing.
+    transport.experiments = [
+      entry('H-01', 1, 1, {resolved_outcome: 'proven'}),
+      entry('H-02', 2, 3, {resolved_outcome: 'rejected'}),
+      entry('H-03', 4, 4, {active: true}),
+    ];
+    transport.emit({type: 'event', event: event(9, 'round_finished')});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(transport.requests.length - before).toBe(1);
+    expect(controller.state.experimentLog?.entries).toHaveLength(3);
+    expect(controller.state.experimentLog?.selectedId).toBe('H-02');
+    expect(controller.state.experimentLog?.entries[1]?.resolved_outcome).toBe('rejected');
+  });
+
+  it('does not refetch the log for events that cannot change it', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    const before = transport.requests.length;
+
+    transport.emit({type: 'event', event: event(1, 'agent_output_chunk', 'noise\n')});
+    transport.emit({type: 'event', event: event(2, 'tool_call')});
+    await Promise.resolve();
+
+    expect(transport.requests).toHaveLength(before);
+  });
+
+  it('keeps the log as the root view, with no way to dismiss it', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 2, {
+        resolved_outcome: 'proven',
+        rounds: [
+          {round: 1, passed: true, reviewed: true},
+          {round: 2, passed: true, reviewed: true},
+        ],
+      }),
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    // Per-round output is reachable only by opening a hypothesis.
+    controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisScope).not.toBeNull();
+
+    // live() is the Ctrl+L path; it returns to the table rather than to an
+    // unfiltered transcript.
+    controller.live();
+    expect(controller.state.hypothesisScope).toBeNull();
+    expect(controller.state.experimentLog?.selectedId).toBe('H-01');
+  });
+
+  it('opens a hypothesis trajectory and returns with the selection intact', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {
+        resolved_outcome: 'proven',
+        rounds: [{round: 1, passed: true, reviewed: true}],
+      }),
+      entry('H-02', 2, 3, {
+        resolved_outcome: 'rejected',
+        rounds: [
+          {round: 2, passed: false, reviewed: false},
+          {round: 3, passed: false, reviewed: true},
+        ],
+      }),
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.openExperimentLog();
+    controller.moveExperimentSelection(1);
+
+    controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
+    expect(controller.state.hypothesisScope?.label).toBe('H-02 · r2-3');
+
+    controller.leaveExperimentDrilldown();
+    expect(controller.state.hypothesisScope).toBeNull();
+    expect(controller.state.experimentLog?.selectedId).toBe('H-02');
+  });
+
+  it('loads the log before the first frame so it can be the landing view', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const controller = new SocketSessionController(transport);
+
+    expect(controller.state.experimentLog?.pending).toBe(true);
+    await controller.start();
+
+    expect(transport.requests).toEqual([{type: 'query.snapshot'}, {type: 'query.experiments'}]);
+    expect(controller.state.experimentLog?.pending).toBe(false);
+    expect(controller.state.experimentLog?.selectedId).toBe('H-01');
+  });
+
+  it('coalesces refetches when a burst of phase events lands', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    const before = transport.requests.length;
+
+    transport.emit({
+      type: 'event_batch',
+      events: [event(1, 'phase_finished'), event(2, 'phase_finished'), event(3, 'round_finished')],
+    });
+    transport.emit({type: 'event', event: event(4, 'phase_finished')});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(transport.requests.length - before).toBe(1);
+  });
+
+  it('opens the selected hypothesis with /open-round', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {rounds: [{round: 1, passed: true, reviewed: true}]}),
+      entry('H-02', 2, 3, {
+        rounds: [
+          {round: 2, passed: false, reviewed: false},
+          {round: 3, passed: false, reviewed: true},
+        ],
+      }),
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    controller.moveExperimentSelection(1);
+
+    await controller.submit('/open-round');
+
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
+    expect(controller.state.selectedRound).toBeNull();
+  });
+
+  it('opens the hypothesis owning a round with /open-round --N', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {rounds: [{round: 1, passed: true, reviewed: true}]}),
+      entry('H-02', 2, 3, {
+        rounds: [
+          {round: 2, passed: false, reviewed: false},
+          {round: 3, passed: false, reviewed: true},
+        ],
+      }),
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submit('/open-round --3');
+
+    // Lands on the requested round, inside the hypothesis that owns it, and
+    // moves the table selection to match.
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
+    expect(controller.state.selectedRound).toBe(3);
+    expect(controller.state.experimentLog?.selectedId).toBe('H-02');
+  });
+
+  it('reports a round that belongs to no hypothesis', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {rounds: [{round: 1, passed: true, reviewed: true}]}),
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submit('/open-round --9');
+
+    expect(controller.state.overlay?.content).toContain(
+      'Round 9 is not in any recorded hypothesis.',
+    );
+    expect(controller.state.hypothesisScope).toBeNull();
+  });
+
+  it('says where it already is when /open-round runs inside a hypothesis', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {rounds: [{round: 1, passed: true, reviewed: true}]}),
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submit('/open-round');
+
+    await controller.submit('/open-round');
+
+    expect(controller.state.overlay?.content).toContain('Already inside H-01');
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'H-01'});
+  });
+
+  it('surfaces a failed experiment query without closing the view', async () => {
+    const transport = new FakeTransport([], [], undefined, new Error('socket closed'));
+    const controller = new SocketSessionController(transport);
+
+    await controller.openExperimentLog();
+
+    expect(controller.state.experimentLog?.error).toContain('socket closed');
+    expect(controller.state.experimentLog?.pending).toBe(false);
   });
 
   it('runs a slash command typed in the chat through the main input path', async () => {
@@ -331,7 +599,9 @@ describe('session controller', () => {
     await controller.submit('/chat');
     const before = transport.requests.length;
 
-    await controller.submitChat('/history');
+    // The flat round list, which is the command that still answers with an
+    // overlay now that bare /history returns to the experiment log.
+    await controller.submitChat('/history rounds');
 
     // Handled as a command, not forwarded to the chat agent.
     expect(transport.requests.slice(before)).toEqual([{type: 'query.history'}]);
@@ -401,6 +671,8 @@ describe('session controller', () => {
 
 class FakeTransport implements SupervisionTransport {
   closed = false;
+  /** Mutable so a test can change what a refetch returns mid-run. */
+  experiments: NonNullable<ProtocolResponse['experiments']> = [];
   readonly requests: RequestInput[] = [];
   #message: ((message: ServerMessage) => void) | null = null;
   #disconnect: ((error: Error) => void) | null = null;
@@ -422,6 +694,7 @@ class FakeTransport implements SupervisionTransport {
       ok: true,
       events: this.responseEvents,
       performance: this.responsePerformance,
+      experiments: this.experiments,
       ...(input.type === 'query.chat'
         ? {
             chat: this.responseChat ?? {
@@ -495,6 +768,24 @@ class DeferredChatTransport implements SupervisionTransport {
   close(): Promise<void> {
     return Promise.resolve();
   }
+}
+
+function entry(
+  id: string,
+  firstRound: number,
+  lastRound: number,
+  overrides: Partial<NonNullable<ProtocolResponse['experiments']>[number]> = {},
+): NonNullable<ProtocolResponse['experiments']>[number] {
+  return {
+    hypothesis_id: id,
+    identified: true,
+    first_round: firstRound,
+    last_round: lastRound,
+    rounds: [],
+    kept: false,
+    active: false,
+    ...overrides,
+  };
 }
 
 function event(sequence: number, type: RunEvent['type'], content?: string): RunEvent {

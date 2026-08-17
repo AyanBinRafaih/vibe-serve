@@ -34,14 +34,13 @@ def _minimal_spec(**overrides: object) -> SynthesizedInputSpec:
 def test_synthesize_minimal_bundle_round_trips(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     root = synthesize_input_bundle(_minimal_spec(), tmp_path / "bundle")
 
-    bundle = load_input_bundle(root, allow_bundle_local_sources=True)
+    bundle = load_input_bundle(root)
 
     assert bundle.domain == DomainName.LLM_SERVING
     assert bundle.objective == "Serve the model quickly.\n"
     assert bundle.accuracy_command == ("python", "checker.py")
     assert bundle.benchmark_command == ("python", "benchmark.py")
     assert bundle.reference_path is None
-    assert bundle.workspace_seed_path is None
     assert bundle.benchmark_result is None
 
 
@@ -49,9 +48,6 @@ def test_synthesize_populates_optional_fields(tmp_path):  # noqa: ANN001, ANN201
     reference = tmp_path / "ref"
     reference.mkdir()
     (reference / "golden.txt").write_text("42\n")
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    (seed / "main.py").write_text("# candidate\n")
 
     spec = _minimal_spec(
         accuracy_timeout_seconds=120,
@@ -59,11 +55,10 @@ def test_synthesize_populates_optional_fields(tmp_path):  # noqa: ANN001, ANN201
         benchmark_metric="latency_ms",
         benchmark_result_arg="--result-json",
         reference_dir=reference,
-        workspace_seed_dir=seed,
     )
     root = synthesize_input_bundle(spec, tmp_path / "bundle")
 
-    bundle = load_input_bundle(root, allow_bundle_local_sources=True)
+    bundle = load_input_bundle(root)
 
     assert bundle.manifest.accuracy.timeout_seconds == 120
     assert bundle.manifest.benchmark.timeout_seconds == 300
@@ -73,7 +68,6 @@ def test_synthesize_populates_optional_fields(tmp_path):  # noqa: ANN001, ANN201
     assert bundle.reference_path == (root / "reference").resolve()
     assert bundle.reference_path is not None
     assert (bundle.reference_path / "golden.txt").read_text() == "42\n"
-    assert bundle.workspace_seed_path == (root / "_seed").resolve()
 
 
 def test_synthesize_copies_evaluator_dir_contents_into_root(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -87,7 +81,7 @@ def test_synthesize_copies_evaluator_dir_contents_into_root(tmp_path):  # noqa: 
     assert (root / "checker.py").read_text() == "print('ok')\n"
     assert (root / "pkg" / "helper.py").read_text() == "X = 1\n"
     # The manifest and objective the synthesizer owns are still intact.
-    load_input_bundle(root, allow_bundle_local_sources=True)
+    load_input_bundle(root)
 
 
 def test_synthesize_rejects_evaluator_dir_reserved_name_collision(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -123,7 +117,7 @@ def test_synthesize_escapes_special_characters_in_commands(tmp_path):  # noqa: A
     )
     root = synthesize_input_bundle(spec, tmp_path / "bundle")
 
-    bundle = load_input_bundle(root, allow_bundle_local_sources=True)
+    bundle = load_input_bundle(root)
     assert bundle.accuracy_command == ("python", "-c", 'print("hi")')
     assert bundle.objective == 'Handle "quotes" and\nnewlines.\n'
 
@@ -245,12 +239,30 @@ def test_input_conflicts_with_standalone_flags(tmp_path):  # noqa: ANN001, ANN20
         cli._validate_target_inputs(args)  # noqa: SLF001  # tracked: #288
 
 
-def test_missing_input_and_standalone_flags_errors():  # noqa: ANN201  # tracked: #288
+def test_removed_hidden_evaluator_flag_is_rejected() -> None:
+    with pytest.raises(ConfigurationError) as exc:
+        _agent_args(["--input-hidden-evaluator-source", "evaluator"])
+
+    assert exc.value.diagnostic.code == "invalid_arguments"
+
+
+def test_removed_workspace_seed_flag_is_rejected() -> None:
+    with pytest.raises(ConfigurationError) as exc:
+        _agent_args(["--input-workspace-seed", "candidate"])
+
+    assert exc.value.diagnostic.code == "invalid_arguments"
+
+
+def test_missing_current_project_and_standalone_flags_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
     args = _agent_args([])
 
     import vibesys.main as cli  # noqa: PLC0415  # tracked: #288
 
-    with pytest.raises(ConfigurationError, match="missing required target input"):
+    with pytest.raises(ConfigurationError, match="Current directory is not a VibeSys project"):
         cli._validate_target_inputs(args)  # noqa: SLF001  # tracked: #288
 
 

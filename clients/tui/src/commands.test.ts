@@ -3,7 +3,17 @@ import {parseInput, slashCommandRange, suggestSlashCommands} from './commands.js
 
 describe('parseInput', () => {
   it('accepts the intentionally small slash-command surface', () => {
-    expect(parseInput('/history').request?.type).toBe('query.history');
+    expect(parseInput('/history')).toEqual({experimentLog: true});
+    expect(parseInput('/experiments')).toEqual({experimentLog: true});
+    expect(parseInput('/history rounds')).toMatchObject({
+      request: {type: 'query.history'},
+      responseView: 'history',
+    });
+    expect(parseInput('/history agents').error).toContain('Unknown history scope: agents');
+    expect(parseInput('/open-round')).toEqual({openRound: {}});
+    expect(parseInput('/open-round --3')).toEqual({openRound: {round: 3}});
+    expect(parseInput('/open-round 3')).toEqual({openRound: {round: 3}});
+    expect(parseInput('/open-round latest').error).toContain('Unknown round: latest');
     expect(parseInput('/perf')).toMatchObject({
       request: {type: 'query.performance'},
       responseView: 'perf',
@@ -75,10 +85,14 @@ describe('slash-command input helpers', () => {
       '/resume',
       '/steer',
       '/history',
+      '/experiments',
+      '/open-round',
       '/perf',
       '/theme',
     ]);
     expect(suggestSlashCommands('/hi').map(command => command.name)).toEqual(['/history']);
+    expect(suggestSlashCommands('/e').map(command => command.name)).toEqual(['/experiments']);
+    expect(suggestSlashCommands('/open').map(command => command.name)).toEqual(['/open-round']);
     expect(suggestSlashCommands('/history ')).toEqual([]);
     expect(suggestSlashCommands('history')).toEqual([]);
   });

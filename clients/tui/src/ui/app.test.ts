@@ -1,8 +1,21 @@
 import {afterEach, describe, expect, it} from 'bun:test';
-import {InputRenderable, rgbToHex} from '@opentui/core';
+import {InputRenderable, rgbToHex, ScrollBoxRenderable} from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
+import type {HypothesisEntry} from '../protocol.js';
 import type {SessionController} from '../session-controller.js';
-import {initialSessionState, type SessionState} from '../session-model.js';
+import {
+  closeThemePicker,
+  enterExperimentDrilldown,
+  enterExperimentRound,
+  initialSessionState,
+  leaveExperimentDrilldown,
+  moveExperimentSelection,
+  moveThemeSelection,
+  openExperimentLog,
+  type SessionState,
+  setExperiments,
+  setTheme,
+} from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import {resolveTheme, type ThemeName} from './theme.js';
 
@@ -554,6 +567,120 @@ describe('theming', () => {
     expect(body?.bg).toBe(solarized.conversation.assistant.background);
   });
 
+  it('navigates the theme list with the keyboard and applies on Enter', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [
+        {number: 1, status: 'completed'},
+        {number: 2, status: 'active'},
+      ],
+      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/theme');
+    testRenderer.mockInput.pressEnter();
+    const opened = await testRenderer.waitForFrame(value => value.includes('Themes'));
+    // The view opens on the theme in use.
+    expect(opened).toContain('\u203a dark');
+    expect(opened).toContain('active');
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    const moved = await testRenderer.waitForFrame(value => value.includes('\u203a light'));
+    expect(moved).not.toContain('\u203a dark');
+    // Navigating the list leaves the view behind it alone.
+    expect(controller.state.selectedRound).toBeNull();
+    expect(controller.state.selectedAgentKind).toBeNull();
+    expect(controller.state.themeName).toBe('dark');
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForVisualIdle();
+
+    expect(controller.state.themeName).toBe('light');
+    expect(controller.state.themePicker).toBeNull();
+    expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(resolveTheme('light').accent);
+  });
+
+  it('closes the theme list on Escape without switching theme', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/theme');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Themes'));
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('\u203a light'));
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    // A bare ESC is held by the stdin parser until its escape-sequence
+    // timeout expires, so the key lands a beat after it is pressed.
+    await new Promise(resolve => setTimeout(resolve, 40));
+    await testRenderer.flush();
+    const closed = testRenderer.captureCharFrame();
+
+    expect(closed).not.toContain('\u203a light');
+    expect(closed).toContain('live output');
+    expect(controller.state.themePicker).toBeNull();
+    expect(controller.state.themeName).toBe('dark');
+    // Escape closed the picker rather than resetting the view behind it.
+    expect(controller.liveCalls).toBe(0);
+  });
+
+  it('leaves Enter to a typed command while the theme list is open', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 24});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/theme');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Themes'));
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('\u203a light'));
+
+    await testRenderer.mockInput.typeText('/help');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 2);
+
+    // The command ran; the highlighted theme was not applied by its Enter.
+    expect(controller.submissions).toEqual(['/theme', '/help']);
+    expect(controller.state.themeName).toBe('dark');
+    expect(controller.state.themePicker?.selected).toBe('light');
+  });
+
+  it('owns its keys over the chat it was opened from', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController({...initialSessionState(), chatOpen: true});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Ask a question about'));
+
+    await controller.submitChat('/theme');
+    await testRenderer.waitForFrame(value => value.includes('Themes'));
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('\u203a light'));
+
+    // The chat is still open behind the picker, and neither the arrows nor
+    // Escape reached it.
+    expect(controller.state.chatOpen).toBe(true);
+    testRenderer.mockInput.pressKey('ESCAPE');
+    // A bare ESC is held by the stdin parser until its escape-sequence
+    // timeout expires, so the key lands a beat after it is pressed.
+    await new Promise(resolve => setTimeout(resolve, 40));
+    await testRenderer.flush();
+    expect(testRenderer.captureCharFrame()).not.toContain('\u203a light');
+    expect(controller.state.themePicker).toBeNull();
+    expect(controller.state.chatOpen).toBe(true);
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
   it('themes the overlay and the chat panel from the same theme', async () => {
     const latte = resolveTheme('catppuccin-latte');
     const testRenderer = await createTestRenderer({width: 90, height: 30});
@@ -608,7 +735,315 @@ describe('theming', () => {
     expect(frame).toContain('✓ write the kernel');
     expect(frame).toContain('▶ benchmark it');
   });
+  it('lands on the experiment log instead of the per-round transcript', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 22});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 41, status: 'completed'}],
+      conversation: [
+        {
+          id: 'a',
+          kind: 'assistant',
+          label: 'implementer',
+          content: 'round 41 detail',
+          roundNumber: 41,
+        },
+      ],
+    });
+    // The landing view is what a fresh client starts on.
+    controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {
+        claim: 'batch the prefill step',
+        resolved_outcome: 'proven',
+        judge_verdict: 'pass',
+        rounds: [{round: 41, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const landing = await frameAfter(testRenderer);
+    expect(landing).toContain('Experiments');
+    expect(landing).toContain('Implementation Details');
+    expect(landing).toContain('H-07');
+    // Per-round detail is what the operator opts into, not what greets them.
+    expect(landing).not.toContain('round 41 detail');
+    // The rounds strip and agent map are per-round chrome; neither is drawn.
+    expect(landing).not.toContain('─ Rounds ─');
+    expect(landing).not.toContain('Agents');
+  });
+
+  it('opens the round trajectory behind a hypothesis and steps back out', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [
+        {number: 41, status: 'completed'},
+        {number: 42, status: 'completed'},
+        {number: 43, status: 'completed'},
+      ],
+      conversation: [
+        {
+          id: 'a',
+          kind: 'assistant',
+          label: 'implementer',
+          content: 'unrelated round 41',
+          roundNumber: 41,
+        },
+        {
+          id: 'b',
+          kind: 'assistant',
+          label: 'implementer',
+          content: 'grew the block',
+          roundNumber: 42,
+        },
+        {id: 'c', kind: 'assistant', label: 'judge', content: 'regression found', roundNumber: 43},
+      ],
+    });
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {
+        claim: 'batch the prefill step',
+        resolved_outcome: 'proven',
+        rounds: [{round: 41, passed: true, reviewed: true}],
+      }),
+      logEntry('H-08', 42, 43, {
+        claim: 'bigger KV cache block',
+        resolved_outcome: 'rejected',
+        rounds: [
+          {round: 42, passed: false, reviewed: false},
+          {round: 43, passed: false, reviewed: true},
+        ],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    const table = await frameAfter(testRenderer);
+    expect(table).toContain('42-43');
+    expect(table).not.toContain('grew the block');
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    testRenderer.mockInput.pressEnter();
+    const trajectory = await frameAfter(testRenderer);
+
+    // Every round of that hypothesis, and only those rounds.
+    expect(trajectory).toContain('grew the block');
+    expect(trajectory).toContain('regression found');
+    expect(trajectory).not.toContain('unrelated round 41');
+    expect(trajectory).toContain('H-08 · r42-43');
+    expect(trajectory).toContain('r42');
+    expect(trajectory).toContain('r43');
+    expect(trajectory).not.toContain('r41');
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'H-08', rounds: [42, 43]});
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const back = await frameAfterEscape(testRenderer);
+    expect(back).toContain('Implementation Details');
+    expect(back).not.toContain('grew the block');
+    expect(controller.state.experimentLog?.selectedId).toBe('H-08');
+  });
+
+  it('runs a typed command from the log on the first Enter', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = new FakeController(initialSessionState());
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {
+        claim: 'batch the prefill step',
+        resolved_outcome: 'proven',
+        rounds: [{round: 41, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/help');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+
+    // One Enter runs the command; the table is still the view behind it.
+    expect(controller.submissions).toEqual(['/help']);
+    expect(controller.state.hypothesisScope).toBeNull();
+    expect(await frameAfter(testRenderer)).toContain('Implementation Details');
+  });
+
+  it('opens a command overlay on the log and leaves the table behind it', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController(initialSessionState());
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {
+        claim: 'batch the prefill step',
+        resolved_outcome: 'proven',
+        rounds: [{round: 41, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      overlay: {kind: 'help', content: 'Available commands'},
+    });
+
+    const overlaid = await frameAfter(testRenderer);
+    expect(overlaid).toContain('Available commands');
+    expect(controller.state.experimentLog).not.toBeNull();
+
+    // Enter behind an overlay must not move the operator somewhere unseen.
+    testRenderer.mockInput.pressEnter();
+    await frameAfter(testRenderer);
+    expect(controller.state.hypothesisScope).toBeNull();
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const back = await frameAfterEscape(testRenderer);
+    expect(back).toContain('Implementation Details');
+    expect(back).not.toContain('Available commands');
+  });
+
+  it('colors the outcome cell from the active theme in light and dark', async () => {
+    for (const name of ['dark', 'light'] as const) {
+      const theme = resolveTheme(name);
+      const testRenderer = await createTestRenderer({width: 120, height: 18});
+      const controller = new FakeController(initialSessionState(name));
+      controller.experiments = [
+        logEntry('H-07', 41, 41, {claim: 'batch the prefill step', resolved_outcome: 'proven'}),
+        logEntry('H-08', 42, 43, {claim: 'bigger KV cache block', resolved_outcome: 'disproven'}),
+        logEntry('H-09', 44, 44, {
+          claim: 'retry with tuning',
+          resolved_outcome: null,
+          active: true,
+        }),
+      ];
+      const app = createOpenTuiApp(testRenderer.renderer, controller);
+      registerCleanup(testRenderer.renderer, app);
+      await controller.openExperimentLog();
+      await frameAfter(testRenderer);
+
+      expect(spanColors(testRenderer, 'Proven')?.fg).toBe(theme.success);
+      expect(spanColors(testRenderer, 'Disproven')?.fg).toBe(theme.error);
+      expect(spanColors(testRenderer, 'Active')?.fg).toBe(theme.warning);
+      // The claim keeps body text: only the resolution is colored.
+      expect(spanColors(testRenderer, 'Batch the prefill step')?.fg).toBe(theme.textPrimary);
+    }
+  });
+
+  it('scrolls a log taller than the panel and keeps ordering stable', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = new FakeController(initialSessionState());
+    controller.experiments = Array.from({length: 120}, (_, index) =>
+      logEntry(`H-${String(index + 1).padStart(3, '0')}`, index + 1, index + 1, {
+        resolved_outcome: index % 2 === 0 ? 'proven' : 'rejected',
+      }),
+    );
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const first = await frameAfter(testRenderer);
+    expect(first).toContain('1/120');
+    expect(first).not.toContain('H-120');
+
+    // No named page key in the mock input; send the raw terminal sequence.
+    for (let index = 0; index < 12; index += 1) testRenderer.mockInput.pressKey('\x1B[6~');
+    const scrolled = await frameAfter(testRenderer);
+    expect(scrolled).toContain('120/120');
+    expect(scrolled).not.toContain('H-001');
+  });
+
+  it('scrolls the log with the wheel, independently of the selection', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 18});
+    const controller = new FakeController(initialSessionState());
+    controller.experiments = Array.from({length: 60}, (_, index) =>
+      logEntry(`H-${String(index + 1).padStart(3, '0')}`, index + 1, index + 1, {
+        resolved_outcome: 'proven',
+      }),
+    );
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    const top = await frameAfter(testRenderer);
+    expect(top).toContain('H-001');
+
+    const rows = testRenderer.renderer.root.findDescendantById('experiment-rows');
+    if (!(rows instanceof ScrollBoxRenderable)) throw new Error('rows were not a scroll box');
+    for (let index = 0; index < 20; index += 1) {
+      await testRenderer.mockMouse.scroll(60, 8, 'down');
+    }
+    const scrolled = await frameAfter(testRenderer);
+
+    expect(rows.scrollTop).toBeGreaterThan(0);
+    expect(scrolled).not.toContain('H-001');
+    // The wheel moves the viewport, not the cursor.
+    expect(controller.state.experimentLog?.selectedId).toBe('H-001');
+  });
+
+  it('shows an explicit placeholder for records with no hypothesis id', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 16});
+    const controller = new FakeController(initialSessionState());
+    controller.experiments = [
+      logEntry('(unidentified)', 1, 1, {identified: false, claim: null, resolved_outcome: null}),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const frame = await frameAfter(testRenderer);
+    expect(frame).toContain('—');
+  });
+
+  it('says so plainly when a run has no hypotheses yet', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 16});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const frame = await frameAfter(testRenderer);
+    expect(frame).toContain('No hypotheses have been recorded yet.');
+    expect(frame).toContain('once the orchestrator has planned a round');
+    // The log is the root view: nothing offers a way out of it.
+    expect(frame).not.toContain('Esc');
+  });
 });
+
+/**
+ * The experiment log settles synchronously, so there is no later frame to wait
+ * for. Flush pending work, then read the single settled frame.
+ */
+async function frameAfter(testRenderer: TestRendererSetup): Promise<string> {
+  await testRenderer.flush();
+  return testRenderer.captureCharFrame();
+}
+
+/**
+ * A bare ESC is held by the stdin parser until its escape-sequence timeout
+ * expires, so the key lands a beat after it is pressed.
+ */
+async function frameAfterEscape(testRenderer: TestRendererSetup): Promise<string> {
+  await new Promise(resolve => setTimeout(resolve, 40));
+  return frameAfter(testRenderer);
+}
+
+function logEntry(
+  id: string,
+  firstRound: number,
+  lastRound: number,
+  overrides: Partial<HypothesisEntry> = {},
+): HypothesisEntry {
+  return {
+    hypothesis_id: id,
+    identified: true,
+    first_round: firstRound,
+    last_round: lastRound,
+    rounds: [],
+    kept: false,
+    active: false,
+    ...overrides,
+  };
+}
 
 function spanColors(
   testRenderer: TestRendererSetup,
@@ -640,7 +1075,15 @@ class FakeController implements SessionController {
   readonly chatSubmissions: string[] = [];
   liveCalls = 0;
 
-  constructor(public state: SessionState) {}
+  /**
+   * Tests that exercise the transcript start past the landing view. The
+   * experiment log has its own tests that open it explicitly.
+   */
+  constructor(state: SessionState) {
+    this.state = {...state, experimentLog: null};
+  }
+
+  state: SessionState;
 
   publish(state: SessionState): void {
     this.state = state;
@@ -659,6 +1102,7 @@ class FakeController implements SessionController {
       this.state = {...this.state, chatOpen: true, overlay: null};
       this.#notify();
     }
+    if (value.trim() === '/theme') this.openThemePicker();
     return Promise.resolve();
   }
   closeChat(): void {
@@ -668,6 +1112,19 @@ class FakeController implements SessionController {
   setTheme(themeName: ThemeName): void {
     this.state = {...this.state, themeName};
     this.#notify();
+  }
+  openThemePicker(): void {
+    this.publish({...this.state, overlay: null, themePicker: {selected: this.state.themeName}});
+  }
+  moveThemeSelection(delta: number): void {
+    this.publish(moveThemeSelection(this.state, delta));
+  }
+  applySelectedTheme(): void {
+    const picker = this.state.themePicker;
+    if (picker !== null) this.publish(setTheme(this.state, picker.selected));
+  }
+  closeThemePicker(): void {
+    this.publish(closeThemePicker(this.state));
   }
   submitChat(value: string): Promise<void> {
     const text = value.trim();
@@ -744,6 +1201,31 @@ class FakeController implements SessionController {
   toggleTodos(): void {
     this.state = {...this.state, todosExpanded: !this.state.todosExpanded};
     for (const listener of this.#listeners) listener(this.state);
+  }
+
+  /** Rows the fake server returns for query.experiments. */
+  experiments: HypothesisEntry[] = [];
+
+  openExperimentLog(): Promise<void> {
+    this.publish(setExperiments(openExperimentLog(this.state), this.experiments));
+    return Promise.resolve();
+  }
+  moveExperimentSelection(delta: number): void {
+    this.publish(moveExperimentSelection(this.state, delta));
+  }
+  enterExperimentDrilldown(): void {
+    this.publish(enterExperimentDrilldown(this.state));
+  }
+  openRound(roundNumber?: number): void {
+    if (roundNumber === undefined) {
+      this.enterExperimentDrilldown();
+      return;
+    }
+    const scoped = enterExperimentRound(this.state, roundNumber);
+    if (scoped !== null) this.publish(scoped);
+  }
+  leaveExperimentDrilldown(): void {
+    this.publish(leaveExperimentDrilldown(this.state));
   }
 
   subscribe(listener: (state: SessionState) => void): () => void {

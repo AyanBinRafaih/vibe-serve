@@ -17,7 +17,8 @@ bundles, and the TUI.
 src/vibesys/             Python framework and loop implementation
 clients/tui/             TypeScript terminal client and launcher
 libs/                    Reusable standalone libraries
-examples/                Input bundles, evaluators, and candidate contracts
+examples/                Candidate repositories, tasks, and legacy input bundles
+resources/evaluators/    Reusable versioned evaluator packages
 resources/skills/        Bundled Agent Skills and reference material
 resources/profilers/     Profiler MCP servers and support packages
 docs/                    Contributor and subsystem guides
@@ -30,10 +31,47 @@ The main framework boundaries are:
 - `src/vibesys/agents/` owns the agent-runner abstraction and integrations.
 - `src/vibesys/domains/` owns domain-specific prompt context and hooks.
 - `src/vibesys/backends/` owns compute and execution backends.
-- `examples/` owns target-specific objectives, manifests, evaluators, and
-  candidate contracts.
+- Candidate repositories own target-specific tasks and candidate contracts
+  below `.vibesys/tasks/`. Legacy input bundles remain under `examples/`.
+- `resources/evaluators/` owns reusable versioned evaluator packages.
 
 ## Local development
+
+### Work from a source checkout
+
+Install Python 3.12+, Git, and [uv](https://docs.astral.sh/uv/), then clone the
+repository. Optional local credentials and configuration can be copied from the
+provided examples:
+
+```bash
+cp .env.example .env
+cp agent.toml.example agent.toml
+```
+
+`uv run` creates the Python environment automatically, so `uv sync` is not
+required before running commands. For example:
+
+```bash
+uv run vibesys --help
+uv run vibesys validate examples/data-structures/repositories/queue-rs --task spsc
+uv run pytest
+```
+
+To use the interactive TUI from a checkout, install Node.js 20+, Bun, and pnpm
+11 (or enable Corepack). The launcher installs frontend dependencies and builds
+the client when needed.
+
+For a headless installation directly from GitHub without a checkout:
+
+```bash
+python -m pip install "git+https://github.com/uw-syfi/vibesys.git"
+```
+
+GitHub source installs skip optional submodules and do not build the native TUI.
+Pass `--headless` to suppress the fallback notice. Use a supported PyPI wheel
+when you need the bundled TUI.
+
+### Tests and submodules
 
 Repository submodules are opt-in. Initialize them only when your work needs the
 vendored sources, using `--checkout` to override their default update policy:
@@ -106,8 +144,6 @@ Use the guide that matches the surface you are adding:
   backend or domain.
 - [Extend profilers](extending-profilers.md) for profiler support packages,
   MCP tools, and profiler prompts.
-- [Create a model-serving input bundle](../.agents/skills/vs-init/SKILL.md)
-  for a new model, hardware target, or workload.
 - [Update CLI flags and combinations](cli-flags.md) when changing the user
   facing command contract.
 - [Update feature flags](../src/vibesys/FEATURE_FLAGS.md) for opt-in
@@ -118,8 +154,8 @@ standard CLI adapter. It currently supports Claude and Codex on the host path
 only; see the feature-flag guide before enabling it.
 
 Keep target-specific APIs, ABIs, ownership rules, and service protocols in the
-input bundle's `CANDIDATE_CONTRACT.md` or design documentation rather than in
-the neutral framework prompts.
+task's `CANDIDATE_CONTRACT.md` or design documentation rather than in the
+neutral framework prompts.
 
 ## Internal tools and workflows
 
@@ -173,7 +209,8 @@ The test job enforces two independent coverage floors:
 **Repo-wide floor — 75 %**  
 `uv run pytest` (with `--cov` already wired in via `pyproject.toml`) must
 reach 75 % combined statement + branch coverage across the tracked packages
-(`vibesys`, `vs_feature_flags`, `vs_github`, `vs_issue_board`, `vs_sandbox`).
+(`vibesys`, `vs_feature_flags`, `vs_github`, `vs_issue_board`, `vs_loop_state`,
+`vs_project`, `vs_sandbox`, and `vs_bench`).
 
 **Per-module floor — 40 %**  
 `scripts/check_coverage_floor.py` reads `coverage.json` and rejects any

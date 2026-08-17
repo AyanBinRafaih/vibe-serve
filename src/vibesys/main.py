@@ -17,9 +17,7 @@ Python-side argument parsing, validation, server supervision, and loop dispatch.
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
 import shlex
 import subprocess
 import sys
@@ -37,7 +35,7 @@ from vibesys.constants import (
 )
 from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
-from vibesys.input_manifest import InputBundle, load_input_bundle
+from vibesys.input_manifest import InputBundle, load_input_bundle, load_project_task
 from vibesys.profilers import CLI_PROFILER_CHOICES, ProfilerKind, coerce_profiler_kind
 from vibesys.repository import (
     REPOSITORY_SLUG,
@@ -48,18 +46,32 @@ from vibesys.repository import (
     validate_experiment_name,
 )
 from vibesys.resource_paths import default_skill_roots
+from vibesys.run.experiment_repo import ExperimentRepository
+from vibesys.run.git_tracker import GitTracker
 from vibesys.sandbox.run_environment import (
     RunEnvironmentSpec,
     build_run_environment,
     make_run_environment_spec,
+    run_environment_record,
 )
 from vibesys.skills import resolve_skill_source_dirs
 from vibesys.tui import KNOWN_TUI_THEMES, TuiTheme
 from vs_github import GitHubCLI, GitHubCLIError
+from vs_project import (
+    AgentRunConfiguration,
+    PlainRunConfiguration,
+    Project,
+    ProjectLayoutError,
+    ProjectStateError,
+    RunConfiguration,
+    RunSchemaMigrationRequiredError,
+)
 
 if TYPE_CHECKING:
     from vibesys.loops.evolve.population import Objective
     from vibesys.loops.evolve.search_policy import OpenEvolveSearchConfig
+
+__all__ = ["PROJECT_ROOT"]
 
 _OUTER_LOOPS = ("agent", "plain", "evolve")
 _MODALITIES = (
@@ -72,8 +84,7 @@ _MODALITIES = (
     "kv_store",
 )
 
-_STUB_AGENT_DEFAULT_INPUT = PROJECT_ROOT / "examples" / "data-structures" / "queue-spsc"
-_STUB_AGENT_DEFAULT_CONFIG_TEXT = '[model]\nname = "gpt-5.5"\n'
+_DEFAULT_CONFIG_TEXT = '[model]\nname = "gpt-5.4"\n'
 
 
 class _RunArgumentParser(argparse.ArgumentParser):
@@ -91,9 +102,60 @@ class _RunArgumentParser(argparse.ArgumentParser):
 
 
 @dataclass(frozen=True)
-class CliInvocation:  # noqa: D101  # tracked: #288
+class CliInvocation:  # tracked: #288
     loop_kind: str
     args: argparse.Namespace
+
+
+_COMMON_RESUME_CLI_FIELDS: dict[str, str] = {
+    "agent_backend": "agent_backend",
+    "cli_provider": "cli_provider",
+    "backend": "compute_backend",
+    "profiler": "profiler",
+    "modality": "modality",
+}
+
+# CLI destination -> ``RunEnvironmentRecord`` field for the runtime-environment
+# options. The environment kind itself comes from the ``--docker`` / ``--modal``
+# store-true flags and is handled separately.
+_RUN_ENVIRONMENT_OPTION_CLI_FIELDS: dict[str, str] = {
+    "docker_image": "image",
+    "modal_gpu": "gpu",
+    "modal_model_volume": "model_volume",
+    "modal_app": "app",
+}
+
+_AGENT_RESUME_CLI_FIELDS: dict[str, str] = {
+    "inner_loop": "inner_loop",
+    "interface": "interface",
+    "max_retries_per_round": "max_retries_per_round",
+    "judge_every": "judge_every",
+    "official_eval_every": "official_eval_every",
+    "memory_layout": "memory_layout",
+}
+
+_PLAIN_RESUME_CLI_FIELDS: dict[str, str] = {
+    "max_attempts_per_issue": "max_attempts_per_issue",
+    "max_issues_per_perf_eval": "max_issues_per_perf_eval",
+}
+
+_EVOLVE_RESUME_CLI_FIELDS: dict[str, str] = {
+    "children_per_generation": "children_per_generation",
+    "k_top_inspirations": "k_top_inspirations",
+    "k_random_inspirations": "k_random_inspirations",
+    "selection_temperature": "selection_temperature",
+    "seed": "seed",
+    "search_policy": "search_policy",
+    "openevolve_population_size": "openevolve_population_size",
+    "openevolve_archive_size": "openevolve_archive_size",
+    "openevolve_num_islands": "openevolve_num_islands",
+    "openevolve_migration_interval": "openevolve_migration_interval",
+    "openevolve_migration_rate": "openevolve_migration_rate",
+    "frontier_bias": "frontier_bias",
+    "bootstrap_max_attempts": "bootstrap_max_attempts",
+    "keep_deployments": "keep_deployments",
+    "max_parallelism": "max_parallelism",
+}
 
 
 def _configuration_error(
@@ -208,9 +270,7 @@ _STANDALONE_INPUT_DESTS = (
     "input_benchmark_result_arg",
     "input_reference",
     "input_evaluator_dir",
-    "input_workspace_seed",
     "input_evaluator_source",
-    "input_hidden_evaluator_source",
 )
 
 
@@ -311,45 +371,42 @@ def _add_standalone_input_args(parser: argparse.ArgumentParser) -> None:
         help="Directory whose contents are copied into the bundle root (evaluator scripts, etc.).",
     )
     group.add_argument(
-        "--input-workspace-seed",
-        type=Path,
-        default=None,
-        metavar="DIR",
-        help="Directory copied in as the candidate workspace seed (manifest [workspace].seed).",
-    )
-    group.add_argument(
         "--input-evaluator-source",
         type=Path,
         default=None,
         metavar="DIR",
         help="Trusted evaluator source directory (manifest [evaluator].source).",
     )
-    group.add_argument(
-        "--input-hidden-evaluator-source",
-        type=Path,
-        default=None,
-        metavar="DIR",
-        help="Hidden evaluator source directory (manifest [hidden_evaluator].source).",
-    )
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments shared across every outer-loop parser."""
     parser.add_argument(
+        "--project",
         "--input",
+        dest="input",
         type=Path,
         default=None,
         help=(
-            "Path to a target input bundle containing OBJECTIVE.md and "
-            "vibesys.input.toml with accuracy and benchmark commands."
+            "Candidate repository containing .vibesys/tasks. --input remains as a "
+            "compatibility alias. Defaults to the launch working directory."
         ),
+    )
+    parser.add_argument(
+        "--task",
+        default=None,
+        metavar="NAME",
+        help="Task under .vibesys/tasks. May be omitted when the project defines one task.",
     )
     parser.add_argument(
         "--runs-dir",
         type=_parse_runs_dir,
         default=None,
         metavar="PATH",
-        help="Directory that owns run directories, synthesized inputs, and shared caches.",
+        help=(
+            "Materialize each run in an experiment collection under PATH. When omitted, "
+            "VibeSys optimizes the input project in place and stores run state alongside it."
+        ),
     )
     _add_standalone_input_args(parser)
     parser.add_argument(
@@ -361,8 +418,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=PROJECT_ROOT / "agent.toml",
-        help="Path to agent TOML config file (default: agent.toml)",
+        default=None,
+        help=(
+            "Path to agent TOML config file. When omitted, VibeSys reads agent.toml "
+            "from the launch directory if present, otherwise uses built-in CLI defaults."
+        ),
     )
     parser.add_argument(
         "--profiler",
@@ -425,7 +485,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--docker",
         action="store_true",
-        help="Run agent operations inside a Docker container.",
+        help=(
+            "Run agent operations inside a Docker container. On --resume the "
+            "recorded runtime environment is restored when no runtime-environment "
+            "flag is given, and a flag that contradicts the recording is rejected."
+        ),
     )
     parser.add_argument(
         "--docker-image",
@@ -443,7 +507,10 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "Use Modal for remote GPU dispatch. The agent (codex) still runs "
             "locally inside a Docker container for editing; GPU-bound code "
             "the implementer writes (decorated with `@app.cls` / `@app.function`) "
-            "is dispatched via `modal run`. Mutually exclusive with --docker."
+            "is dispatched via `modal run`. Mutually exclusive with --docker. "
+            "On --resume the recorded runtime environment is restored when no "
+            "runtime-environment flag is given, and a flag that contradicts the "
+            "recording is rejected."
         ),
     )
     parser.add_argument(
@@ -475,11 +542,6 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         "--debug",
         action="store_true",
         help="Pause for Enter at each step in loop mode.",
-    )
-    parser.add_argument(
-        "--git-tracking",
-        action="store_true",
-        help="Track workspace versions via git commits instead of directory snapshots.",
     )
     parser.add_argument(
         "--repo",
@@ -541,10 +603,125 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="NAME",
         help=(
-            "Theme for the interactive client. Overrides [tui].theme in "
-            f"agent.toml. Defaults to 'dark'. Supported: {', '.join(KNOWN_TUI_THEMES)}. "
+            "Theme for the interactive client. "
+            f"Defaults to 'dark'. Supported: {', '.join(KNOWN_TUI_THEMES)}. "
             "Ignored in headless mode."
         ),
+    )
+
+
+def _project_resume_mismatch(fields: list[str]) -> NoReturn:
+    _configuration_error(
+        "Resuming a run cannot change its recorded configuration fields: "
+        + ", ".join(sorted(fields)),
+        code="project_resume_configuration_mismatch",
+        stage="resume_resolution",
+    )
+
+
+def _explicit_config_value(raw: object, path: tuple[str, ...]) -> tuple[bool, object]:
+    current = raw
+    for component in path:
+        if not isinstance(current, dict) or component not in current:
+            return False, None
+        current = current[component]
+    return True, current
+
+
+def _restore_project_config(
+    args: argparse.Namespace,
+    config: Config,
+    recorded: RunConfiguration,
+) -> Config:
+    """Restore persisted model settings, rejecting explicit config changes."""
+    raw: object = {}
+    if args.config is not None:
+        with args.config.open("rb") as config_file:
+            raw = tomllib.load(config_file)
+
+    explicit_cli = getattr(args, "explicit_cli_dests", frozenset())
+    specs = (
+        (("model", "name"), recorded.model, frozenset(), "model"),
+        (
+            ("backend", "name"),
+            recorded.compute_backend,
+            frozenset({"backend"}),
+            "compute_backend",
+        ),
+        (
+            ("agent", "backend"),
+            recorded.agent_backend,
+            frozenset({"agent_backend", "stub_agent"}),
+            "agent_backend",
+        ),
+        (
+            ("agent", "cli_provider"),
+            recorded.cli_provider,
+            frozenset({"cli_provider", "stub_agent"}),
+            "cli_provider",
+        ),
+        (("agent", "cli_timeout"), recorded.cli_timeout, frozenset(), "cli_timeout"),
+        (
+            ("thinking", "level"),
+            recorded.default_reasoning_effort,
+            frozenset(),
+            "default_reasoning_effort",
+        ),
+        (("agent", "outer", "model"), recorded.outer_model, frozenset(), "outer_model"),
+        (
+            ("agent", "outer", "reasoning_effort"),
+            recorded.outer_reasoning_effort,
+            frozenset(),
+            "outer_reasoning_effort",
+        ),
+        (("agent", "inner", "model"), recorded.inner_model, frozenset(), "inner_model"),
+        (
+            ("agent", "inner", "reasoning_effort"),
+            recorded.inner_reasoning_effort,
+            frozenset(),
+            "inner_reasoning_effort",
+        ),
+    )
+    changed: list[str] = []
+    for path, expected, cli_overrides, field in specs:
+        supplied, value = _explicit_config_value(raw, path)
+        if supplied and not cli_overrides.intersection(explicit_cli) and value != expected:
+            changed.append(field)
+    if changed:
+        _project_resume_mismatch(changed)
+
+    outer = config.agent.outer.model_copy(
+        update={
+            "model": recorded.outer_model,
+            "reasoning_effort": recorded.outer_reasoning_effort,
+        }
+    )
+    inner = config.agent.inner.model_copy(
+        update={
+            "model": recorded.inner_model,
+            "reasoning_effort": recorded.inner_reasoning_effort,
+        }
+    )
+    agent = config.agent.model_copy(
+        update={
+            "backend": None if recorded.agent_backend == "stub" else recorded.agent_backend,
+            "cli_provider": recorded.cli_provider,
+            "cli_timeout": recorded.cli_timeout,
+            "outer": outer,
+            "inner": inner,
+        }
+    )
+    return config.model_copy(
+        update={
+            "model": config.model.model_copy(update={"name": recorded.model or config.model.name}),
+            "thinking": config.thinking.model_copy(
+                update={"level": recorded.default_reasoning_effort, "budget": None}
+            ),
+            "backend": config.backend.model_copy(
+                update={"name": ComputeBackend(recorded.compute_backend)}
+            ),
+            "agent": agent,
+        }
     )
 
 
@@ -554,13 +731,7 @@ def load_config_and_skills(
     domain: DomainName,
 ) -> tuple[Config, list[str] | None, ComputeBackend]:
     """Load config, resolve the backend, and select compatible skills."""
-    if getattr(args, "stub_agent", False) and not Path(args.config).is_file():
-        config = Config.model_validate(tomllib.loads(_STUB_AGENT_DEFAULT_CONFIG_TEXT))
-    else:
-        try:
-            config = load_config(args.config)
-        except (ValueError, FileNotFoundError) as e:
-            _configuration_error(str(e), code="config_load_failed", stage="config_loading")
+    config = _load_effective_config(args)
 
     repository = getattr(args, "repo", None)
     if getattr(args, "local", False) and repository is not None:
@@ -598,6 +769,22 @@ def load_config_and_skills(
     return config, skills, backend
 
 
+def _load_effective_config(args: argparse.Namespace) -> Config:
+    """Load configuration and restore persisted settings for project resumes."""
+    try:
+        config = _load_config_or_stub_default(
+            args.config,
+            stub_agent=getattr(args, "stub_agent", False),
+        )
+    except (ValueError, FileNotFoundError) as e:
+        _configuration_error(str(e), code="config_load_failed", stage="config_loading")
+
+    recorded = getattr(args, "project_run_configuration", None)
+    if recorded is not None:
+        config = _restore_project_config(args, config, recorded)
+    return config
+
+
 def _resolve_repository_owner(config: Config) -> str:
     """Resolve the configured repository owner or the authenticated ``gh`` user."""
     if config.repository.owner is not None:
@@ -612,6 +799,31 @@ def _resolve_repository_owner(config: Config) -> str:
         )
 
 
+def _suggest_repository_owner(config: Config) -> str | None:
+    """Return a setup-form owner suggestion without requiring GitHub access."""
+    if config.repository.owner is not None:
+        return config.repository.owner
+    try:
+        return GitHubCLI().current_user()
+    except GitHubCLIError:
+        return None
+
+
+def _load_config_or_stub_default(
+    config_path: Path | None,
+    *,
+    stub_agent: bool,
+) -> Config:
+    """Load explicit or launch-directory config, then use safe built-in defaults."""
+    if config_path is not None:
+        return load_config(config_path)
+    selected_path = Path.cwd() / "agent.toml"
+    if selected_path.is_file():
+        return load_config(selected_path)
+    del stub_agent
+    return Config.model_validate(tomllib.loads(_DEFAULT_CONFIG_TEXT))
+
+
 def _prepare_experiment_repository(args: argparse.Namespace, config: Config) -> None:
     """Resolve fresh-run naming and remote selection before entering a loop."""
     if args.resume is not None:
@@ -619,6 +831,12 @@ def _prepare_experiment_repository(args: argparse.Namespace, config: Config) -> 
 
     if args.exp_name is None:
         args.exp_name = generate_experiment_name(args.input_bundle.root)
+
+    # A direct project run stays local unless publication was requested
+    # explicitly. Copied projects retain the convenient generated remote.
+    if args.runs_dir is None and args.repo is None:
+        args.local = True
+        return
 
     if args.local:
         return
@@ -629,21 +847,12 @@ def _prepare_experiment_repository(args: argparse.Namespace, config: Config) -> 
 
 
 def _prepare_stub_agent_smoke_defaults(argv: list[str]) -> list[str]:
-    if "--stub-agent" not in argv or any(
-        token == "--input" or token.startswith("--input=")  # noqa: S105  # tracked: #288
-        for token in argv  # noqa: RUF100, S105  # tracked: #288
-    ):
-        return argv
-    return [
-        "--input",
-        str(_STUB_AGENT_DEFAULT_INPUT),
-        "--exp-name",
-        f"stub-smoke-{os.getpid()}",
-        *argv,
-    ]
+    """Keep stub invocations on the same cwd-input path as real users."""
+    return argv
 
 
-def run_environment_spec_from_args(args: argparse.Namespace) -> RunEnvironmentSpec:  # noqa: D103  # tracked: #288
+def run_environment_spec_from_args(args: argparse.Namespace) -> RunEnvironmentSpec:  # tracked: #288
+    bundle = getattr(args, "input_bundle", None)
     return make_run_environment_spec(
         use_docker=args.docker,
         docker_image=args.docker_image,
@@ -651,6 +860,7 @@ def run_environment_spec_from_args(args: argparse.Namespace) -> RunEnvironmentSp
         modal_gpu=args.modal_gpu,
         modal_model_volume=args.modal_model_volume,
         modal_app=args.modal_app,
+        modal_entrypoint=bundle.modal_entrypoint if bundle is not None else None,
     )
 
 
@@ -670,11 +880,15 @@ def _validate_run_environment_profiler(args: argparse.Namespace) -> None:
 def _normalize_runs_dir(args: argparse.Namespace) -> None:
     raw = getattr(args, "runs_dir", None)
     if raw is None:
-        _configuration_error(
-            "--runs-dir PATH is required for run commands.",
-            code="missing_runs_dir",
-            stage="argument_parsing",
-        )
+        if _standalone_input_dests_set(args):
+            _configuration_error(
+                "Standalone --input-* flags require --runs-dir because they synthesize "
+                "a new input bundle. Use a self-contained project directory for a direct run.",
+                code="missing_runs_dir",
+                stage="argument_parsing",
+            )
+        args.runs_dir = None
+        return
     runs_dir = raw.expanduser().resolve()
     prefix = Path(sys.prefix).resolve()
     if runs_dir.is_relative_to(prefix):
@@ -692,173 +906,492 @@ def _normalize_runs_dir(args: argparse.Namespace) -> None:
     args.runs_dir = runs_dir
 
 
-def _resolve_run_dir(run_dir_arg: str, runs_dir: Path) -> str:
-    """Resolve a run directory name.
+def _resolve_project_root(project_arg: str, runs_dir: Path) -> Path:
+    """Resolve one canonical project from a local collection or remote URL."""
+    if project_arg != "latest":
+        explicit = Path(project_arg).expanduser()
+        if explicit.is_dir():
+            project_root = explicit.resolve()
+            if Project.is_state_initialized(project_root):
+                return project_root
+            _configuration_error(
+                f"Directory is not a VibeSys project: {project_root}",
+                code="resume_not_found",
+                stage="resume_resolution",
+            )
 
-    If *run_dir_arg* is ``"latest"``, find the most recent experiment
-    directory in *runs_dir*. Otherwise accept either a bare run directory
-    name or an existing run directory path.
-    """
-    if run_dir_arg != "latest":
-        run_dir_path = Path(run_dir_arg).expanduser()
-        if run_dir_path.is_dir():
-            resolved = run_dir_path.resolve()
-            if resolved.parent == runs_dir:
-                return resolved.name
-            return str(resolved)
-
-        collection_path = runs_dir / run_dir_arg
+        collection_path = runs_dir / project_arg
         if collection_path.is_dir():
-            return run_dir_arg
+            project_root = collection_path.resolve()
+            if Project.is_state_initialized(project_root):
+                return project_root
+            _configuration_error(
+                f"Directory is not a VibeSys project: {project_root}",
+                code="resume_not_found",
+                stage="resume_resolution",
+            )
 
-        if _is_remote_experiment(run_dir_arg):
-            return _clone_experiment(run_dir_arg, runs_dir)
-        return run_dir_arg
+        if _is_remote_project(project_arg):
+            return _clone_project(project_arg, runs_dir)
+        _configuration_error(
+            f"Project directory does not exist: {collection_path}",
+            code="resume_not_found",
+            stage="resume_resolution",
+        )
+
     if not runs_dir.is_dir():
         _configuration_error(
             f"Runs directory does not exist: {runs_dir}",
             code="resume_not_found",
             stage="resume_resolution",
         )
-    dirs = sorted(
-        d.name for d in runs_dir.iterdir() if d.is_dir() and not d.name.startswith((".", "_"))
-    )
-    if not dirs:
+    projects = Project.find_state_projects(runs_dir)
+    if not projects:
         _configuration_error(
-            f"No experiment directories found in {runs_dir}.",
+            f"No VibeSys projects found in {runs_dir}.",
             code="resume_not_found",
             stage="resume_resolution",
         )
-    return dirs[-1]
+    return projects[-1].resolve()
 
 
-def _is_remote_experiment(value: str) -> bool:
+def _is_remote_project(value: str) -> bool:
     return bool(
-        REPOSITORY_SLUG.fullmatch(value) or value.startswith(("https://", "ssh://", "git@"))
+        REPOSITORY_SLUG.fullmatch(value)
+        or value.startswith(("file://", "https://", "ssh://", "git@"))
     )
 
 
-def _clone_experiment(remote: str, runs_dir: Path) -> str:
-    """Clone a remote experiment into *runs_dir* and return its run key."""
+@dataclass(frozen=True)
+class _RemoteRunBranch:
+    created_at: float
+    run_id: str
+    remote_branch: str
+    branch: str
+
+
+def _clone_project(remote: str, runs_dir: Path) -> Path:
+    """Clone a remote project into *runs_dir* and return its root."""
+    destination = runs_dir / _remote_repository_name(remote)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        return _reuse_cloned_project(remote, destination)
+    if REPOSITORY_SLUG.fullmatch(remote):
+        try:
+            GitHubCLI().clone_repository(remote, destination)
+        except GitHubCLIError as exc:
+            _configuration_error(
+                f"Cannot clone project repository {remote!r}: {exc}",
+                code="resume_clone_failed",
+                stage="resume_resolution",
+            )
+        return _select_cloned_run_branch(destination.resolve())
+
+    try:
+        result = _resume_git(runs_dir, "clone", remote, str(destination))
+    except FileNotFoundError as exc:
+        _configuration_error(
+            f"Cannot clone {remote!r}: required command 'git' is not installed ({exc})",
+            code="resume_clone_failed",
+            stage="resume_resolution",
+        )
+    _require_resume_git(result, f"Cannot clone project repository {remote!r}")
+    return _select_cloned_run_branch(destination.resolve())
+
+
+def _remote_repository_name(remote: str) -> str:
     repository_name = remote.rstrip("/").rsplit("/", 1)[-1]
     if ":" in repository_name:
         repository_name = repository_name.rsplit(":", 1)[-1]
     repository_name = repository_name.removesuffix(".git")
-    if not repository_name:
+    if repository_name in {"", ".", ".."}:
         _configuration_error(
-            f"Cannot determine a local directory name from --resume {remote!r}",
+            f"Cannot determine a safe local directory name from --resume {remote!r}",
             code="resume_clone_failed",
             stage="resume_resolution",
         )
+    return repository_name
 
-    destination = runs_dir / repository_name
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        if not destination.is_dir():
-            _configuration_error(
-                f"Cannot clone experiment: destination is not a directory: {destination}",
-                code="resume_clone_failed",
-                stage="resume_resolution",
-            )
-        existing_origin = subprocess.run(  # noqa: PLW1510  # tracked: #288
-            ["git", "remote", "get-url", "origin"],  # noqa: S607  # tracked: #288
-            cwd=destination,
-            capture_output=True,
-            text=True,
+
+def _reuse_cloned_project(remote: str, destination: Path) -> Path:
+    if not destination.is_dir():
+        _configuration_error(
+            f"Cannot clone project: destination is not a directory: {destination}",
+            code="resume_clone_failed",
+            stage="resume_resolution",
         )
-        expected_suffix = remote.removesuffix(".git").rstrip("/")
-        origin = existing_origin.stdout.strip().removesuffix(".git").rstrip("/")
-        if existing_origin.returncode == 0 and (
-            origin == expected_suffix  # noqa: PIE810  # tracked: #288
-            or origin.endswith(f"/{expected_suffix}")
-            or origin.endswith(f":{expected_suffix}")
-        ):
-            return destination.name
+    existing_origin = _resume_git(destination, "remote", "get-url", "origin")
+    expected_origin = remote.removesuffix(".git").rstrip("/")
+    actual_origin = existing_origin.stdout.strip().removesuffix(".git").rstrip("/")
+    origin_matches = existing_origin.returncode == 0 and (
+        ExperimentRepository(destination, lambda _message: None).origin_matches(remote)
+        if REPOSITORY_SLUG.fullmatch(remote)
+        else actual_origin == expected_origin
+    )
+    if not origin_matches:
         _configuration_error(
             f"Cannot clone {remote!r}: destination already exists with a different origin: "
             f"{destination}",
             code="resume_clone_failed",
             stage="resume_resolution",
         )
-    if REPOSITORY_SLUG.fullmatch(remote):
-        try:
-            GitHubCLI().clone_repository(remote, destination)
-        except GitHubCLIError as exc:
-            _configuration_error(
-                f"Cannot clone experiment repository {remote!r}: {exc}",
-                code="resume_clone_failed",
-                stage="resume_resolution",
-            )
-        return destination.name
+    fetched = _resume_git(destination, "fetch", "--prune", "origin")
+    _require_resume_git(fetched, f"Cannot update cloned project {destination}")
+    return _select_cloned_run_branch(destination.resolve())
 
-    command = ["git", "clone", remote, str(destination)]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True)  # noqa: PLW1510, S603  # tracked: #288
-    except FileNotFoundError as exc:
-        tool = command[0]
+
+def _select_cloned_run_branch(project_root: Path) -> Path:
+    """Select the newest valid portable run after cloning its repository."""
+    listed = _resume_git(
+        project_root,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/remotes/origin/vibesys-runs/",
+        "refs/remotes/origin/vibesys/",
+    )
+    _require_resume_git(listed, f"Cannot inspect VibeSys run branches in {project_root}")
+    candidates = _remote_run_candidates(project_root, listed.stdout.splitlines())
+    if not candidates:
         _configuration_error(
-            f"Cannot clone {remote!r}: required command {tool!r} is not installed ({exc})",
-            code="resume_clone_failed",
-            stage="resume_resolution",
-        )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
-        _configuration_error(
-            f"Cannot clone experiment repository {remote!r}: {detail}",
-            code="resume_clone_failed",
-            stage="resume_resolution",
-        )
-    return destination.name
-
-
-def _resume_exp_dir(run_dir_name: str, runs_dir: Path) -> Path:
-    return runs_dir / run_dir_name
-
-
-def _infer_resume_input(exp_dir: Path) -> Path:
-    materialized_input = exp_dir / "workspace"
-    if (materialized_input / "vibesys.input.toml").is_file() and (
-        materialized_input / "OBJECTIVE.md"
-    ).is_file():
-        return materialized_input
-
-    events_path = exp_dir / "logs" / "run-events.jsonl"
-    if not events_path.is_file():
-        _configuration_error(
-            f"Cannot infer --input because resume metadata is missing: {events_path}",
-            code="resume_input_not_found",
+            f"No valid VibeSys run branches were found in cloned project {project_root}.",
+            code="resume_not_found",
             stage="resume_resolution",
         )
 
-    for line_number, line in enumerate(events_path.read_text().splitlines(), start=1):
-        if not line.strip():
+    selected = max(candidates, key=lambda candidate: (candidate.created_at, candidate.run_id))
+    _checkout_remote_run_branch(project_root, selected)
+    Project.open(project_root).state.set_current_run(selected.run_id)
+    return project_root
+
+
+def _remote_run_candidates(
+    project_root: Path,
+    remote_branches: list[str],
+) -> list[_RemoteRunBranch]:
+    candidates: list[_RemoteRunBranch] = []
+    for remote_branch in remote_branches:
+        identity = _remote_run_identity(remote_branch)
+        if identity is None:
+            continue
+        branch, run_id = identity
+        switched = _resume_git(project_root, "switch", "--detach", "--quiet", remote_branch)
+        if switched.returncode != 0 or not Project.is_state_initialized(project_root):
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            _configuration_error(
-                f"Cannot infer --input because {events_path}:{line_number} is invalid JSON: {exc}",
-                code="resume_input_invalid",
-                stage="resume_resolution",
-            )
-        if event.get("type") != "run_started":
+            manifest = Project.open(project_root).state.load_run(run_id)
+        except ProjectStateError:
             continue
-        data = event.get("data")
-        if not isinstance(data, dict):
-            break
-        input_path = data.get("input")
-        if isinstance(input_path, str) and input_path:
-            return Path(input_path)
-        break
+        if manifest.branch == branch:
+            candidates.append(
+                _RemoteRunBranch(
+                    created_at=manifest.created_at.timestamp(),
+                    run_id=manifest.run_id,
+                    remote_branch=remote_branch,
+                    branch=branch,
+                )
+            )
+    return candidates
 
+
+def _remote_run_identity(remote_branch: str) -> tuple[str, str] | None:
+    branch = remote_branch.removeprefix("origin/")
+    for prefix in ("vibesys-runs/", "vibesys/"):
+        if branch.startswith(prefix) and (run_id := branch.removeprefix(prefix)):
+            return branch, run_id
+    return None
+
+
+def _checkout_remote_run_branch(project_root: Path, selected: _RemoteRunBranch) -> None:
+    local_exists = _resume_git(
+        project_root,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{selected.branch}",
+    )
+    switch_arguments = (
+        ("switch", "--quiet", selected.branch)
+        if local_exists.returncode == 0
+        else (
+            "switch",
+            "--quiet",
+            "--track",
+            "-c",
+            selected.branch,
+            selected.remote_branch,
+        )
+    )
+    switched = _resume_git(project_root, *switch_arguments)
+    _require_resume_git(switched, f"Cannot select VibeSys run branch {selected.branch!r}")
+    if local_exists.returncode == 0:
+        advanced = _resume_git(
+            project_root,
+            "merge",
+            "--quiet",
+            "--ff-only",
+            selected.remote_branch,
+        )
+        _require_resume_git(
+            advanced,
+            f"Cannot fast-forward VibeSys run branch {selected.branch!r}",
+        )
+    upstream = _resume_git(project_root, "rev-parse", "--abbrev-ref", "@{upstream}")
+    if upstream.returncode == 0 and upstream.stdout.strip() == selected.remote_branch:
+        return
+    tracked = _resume_git(
+        project_root,
+        "branch",
+        "--set-upstream-to",
+        selected.remote_branch,
+        selected.branch,
+    )
+    _require_resume_git(tracked, f"Cannot track VibeSys run branch {selected.remote_branch!r}")
+
+
+def _resume_git(project_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run a non-shell Git command during remote resume resolution."""
+    return subprocess.run(  # noqa: PLW1510, S603  # tracked: #288
+        ["git", *arguments],  # noqa: S607  # tracked: #288
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _require_resume_git(
+    result: subprocess.CompletedProcess[str],
+    message: str,
+) -> None:
+    if result.returncode == 0:
+        return
+    detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
     _configuration_error(
-        f"Cannot infer --input because no run_started input was found in {events_path}",
-        code="resume_input_not_found",
+        f"{message}: {detail}",
+        code="resume_clone_failed",
         stage="resume_resolution",
     )
 
 
-def _resolve_resume_args(args: argparse.Namespace) -> None:
+def _restore_resume_budget(
+    args: argparse.Namespace,
+    *,
+    destination: str,
+    recorded_value: int,
+    explicit: frozenset[str],
+) -> None:
+    if destination not in explicit:
+        setattr(args, destination, recorded_value)
+        return
+    requested = getattr(args, destination)
+    if requested < recorded_value:
+        option = "--" + destination.replace("_", "-")
+        _configuration_error(
+            f"{option} is the run's total limit and cannot decrease when resuming "
+            f"(recorded {recorded_value}, requested {requested})",
+            code="project_resume_configuration_mismatch",
+            stage="resume_resolution",
+        )
+
+
+def _restore_resume_agent_backend(
+    args: argparse.Namespace,
+    recorded: AgentRunConfiguration,
+    explicit: frozenset[str],
+) -> bool:
+    """Restore the backend and return whether an explicit value mismatched."""
+    if not {"stub_agent", "agent_backend"}.intersection(explicit):
+        args.stub_agent = recorded.agent_backend == "stub"
+        args.agent_backend = None if args.stub_agent else recorded.agent_backend
+        return False
+    requested = "stub" if args.stub_agent else args.agent_backend
+    return requested != recorded.agent_backend
+
+
+def _restore_resume_constraints(
+    args: argparse.Namespace,
+    recorded: AgentRunConfiguration,
+    explicit: frozenset[str],
+) -> bool:
+    """Restore constraints and return whether an explicit value mismatched."""
+    if "constraint" not in explicit:
+        args.constraint = list(recorded.operator_constraints)
+        return False
+    requested = tuple(constraint.strip() for constraint in args.constraint if constraint.strip())
+    return requested != recorded.operator_constraints
+
+
+def _restore_resume_run_environment(
+    args: argparse.Namespace,
+    recorded: RunConfiguration,
+    explicit: frozenset[str],
+) -> list[str]:
+    """Restore the recorded runtime environment and reject contradictions.
+
+    ``--docker`` and ``--modal`` are store-true flags, so an omitted flag is
+    indistinguishable from ``--flag false``. The recorded environment therefore
+    wins whenever the resume invocation says nothing about it, and only an
+    explicitly passed flag that contradicts the recording is an error.
+    """
+    record = recorded.run_environment
+    changed: list[str] = []
+    if not hasattr(args, "docker") or not hasattr(args, "modal"):
+        return changed
+    if {"docker", "modal"} & explicit:
+        requested = "modal" if args.modal else "docker" if args.docker else "local"
+        if requested != record.name:
+            changed.append("run_environment")
+    else:
+        args.docker = record.name == "docker"
+        args.modal = record.name == "modal"
+
+    for destination, field in _RUN_ENVIRONMENT_OPTION_CLI_FIELDS.items():
+        if not hasattr(args, destination):
+            continue
+        expected = getattr(record, field)
+        if destination in explicit:
+            if getattr(args, destination) != expected:
+                changed.append(f"run_environment.{field}")
+        elif expected is not None:
+            setattr(args, destination, expected)
+    return changed
+
+
+def _normalized_resume_cli_value(destination: str, value: object) -> object:
+    if destination == "backend" and value is not None:
+        assert isinstance(value, ComputeBackend)  # noqa: S101  # argparse contract
+        return value.value
+    if destination == "profiler":
+        assert isinstance(value, ProfilerKind)  # noqa: S101  # argparse contract
+        return ProfilerKind.NONE.value if value is ProfilerKind.AUTO else value.value
+    return value
+
+
+def _set_resume_cli_value(
+    args: argparse.Namespace,
+    destination: str,
+    value: object,
+) -> None:
+    if destination == "backend":
+        try:
+            value = ComputeBackend(value)
+        except ValueError:
+            _configuration_error(
+                f"Run metadata records unknown compute backend {value!r}",
+                code="project_resume_configuration_invalid",
+                stage="resume_resolution",
+            )
+    elif destination == "profiler":
+        try:
+            value = coerce_profiler_kind(value or ProfilerKind.AUTO.value)  # type: ignore[arg-type]
+        except ValueError:
+            _configuration_error(
+                f"Run metadata records unknown profiler {value!r}",
+                code="project_resume_configuration_invalid",
+                stage="resume_resolution",
+            )
+    setattr(args, destination, value)
+
+
+def _restore_project_resume_cli_args(
+    args: argparse.Namespace,
+    recorded: RunConfiguration,
+    *,
+    loop_kind: str,
+) -> None:
+    """Restore omitted run flags and reject explicit changes on resume."""
+    if recorded.outer_loop != loop_kind:
+        _configuration_error(
+            f"Run uses --outer-loop {recorded.outer_loop}, not {loop_kind}",
+            code="project_resume_configuration_mismatch",
+            stage="resume_resolution",
+        )
+
+    explicit = getattr(args, "explicit_cli_dests", frozenset())
+    fields, changed = _restore_loop_resume_fields(args, recorded, explicit)
+
+    for destination, field in fields.items():
+        if not hasattr(args, destination):
+            continue
+        expected = getattr(recorded, field)
+        if destination in explicit:
+            requested = _normalized_resume_cli_value(destination, getattr(args, destination))
+            if requested != expected:
+                changed.append(field)
+            continue
+        _set_resume_cli_value(args, destination, expected)
+
+    if changed:
+        _project_resume_mismatch(changed)
+
+
+def _restore_loop_resume_fields(
+    args: argparse.Namespace,
+    recorded: RunConfiguration,
+    explicit: frozenset[str],
+) -> tuple[dict[str, str], list[str]]:
+    """Restore a loop's budget and return its immutable CLI field map."""
+    fields = dict(_COMMON_RESUME_CLI_FIELDS)
+    changed: list[str] = _restore_resume_run_environment(args, recorded, explicit)
+    if isinstance(recorded, AgentRunConfiguration):
+        _restore_resume_budget(
+            args,
+            destination="max_rounds",
+            recorded_value=recorded.max_rounds,
+            explicit=explicit,
+        )
+        fields.update(_AGENT_RESUME_CLI_FIELDS)
+        if _restore_resume_agent_backend(args, recorded, explicit):
+            changed.append("agent_backend")
+        if _restore_resume_constraints(args, recorded, explicit):
+            changed.append("operator_constraints")
+        fields.pop("agent_backend", None)
+    elif isinstance(recorded, PlainRunConfiguration):
+        _restore_resume_budget(
+            args,
+            destination="max_rounds",
+            recorded_value=recorded.max_rounds,
+            explicit=explicit,
+        )
+        fields.update(_PLAIN_RESUME_CLI_FIELDS)
+    else:
+        _restore_resume_budget(
+            args,
+            destination="max_generations",
+            recorded_value=recorded.max_generations,
+            explicit=explicit,
+        )
+        fields.update(_EVOLVE_RESUME_CLI_FIELDS)
+        if "objective" in explicit:
+            requested = tuple(f"{item.name}:{item.direction}" for item in args.objective)
+            if requested != recorded.objectives:
+                changed.append("objectives")
+        else:
+            args.objective = [_parse_cli_objective(item) for item in recorded.objectives]
+    return fields, changed
+
+
+def _switch_project_resume_branch(project_root: Path, run_id: str) -> None:
+    """Select the run branch before callers read committed project files."""
+    # Store-only fixtures and corrupt partial initializations are diagnosed by
+    # context creation. Real runs always have a repository here.
+    if not (project_root / ".git").exists():
+        return
+    tracker = GitTracker(
+        project_root,
+        log=lambda _message: None,
+        run_id=run_id,
+    )
+    try:
+        tracker.init(existing=True)
+    except (subprocess.SubprocessError, ValueError) as exc:
+        _configuration_error(
+            f"Cannot resume project run {run_id!r}: {exc}",
+            code="resume_not_found",
+            stage="resume_resolution",
+        )
+
+
+def _resolve_resume_args(args: argparse.Namespace, *, loop_kind: str) -> None:
     if args.resume is None:
         return
     if args.repo is not None:
@@ -868,19 +1401,47 @@ def _resolve_resume_args(args: argparse.Namespace) -> None:
             stage="argument_parsing",
         )
 
-    run_dir_name = _resolve_run_dir(args.resume, args.runs_dir)
-    args.resume = run_dir_name
-    if args.input is not None:
-        return
-
-    exp_dir = _resume_exp_dir(run_dir_name, args.runs_dir)
-    if not exp_dir.is_dir():
+    direct = args.runs_dir is None
+    project_root = (
+        (args.input or Path.cwd()).expanduser().resolve()
+        if direct
+        else _resolve_project_root(args.resume, args.runs_dir)
+    )
+    try:
+        store = Project.open(project_root).state
+        if direct and args.resume != "latest":
+            run_id = args.resume
+        else:
+            run_id = store.current_run_id()
+            if run_id is None:
+                run_id = store.resolve_run().run_id
+        _switch_project_resume_branch(project_root, run_id)
+        run_manifest = store.load_run(run_id)
+    except RunSchemaMigrationRequiredError as exc:
         _configuration_error(
-            f"Run directory does not exist: {exp_dir}",
+            f"{exc} Run: {_migrate_run_environment_command(project_root, exc.run_id)}",
+            code="project_run_schema_migration_required",
+            stage="resume_resolution",
+        )
+    except ProjectStateError as exc:
+        _configuration_error(
+            f"Cannot resume project run: {exc}",
             code="resume_not_found",
             stage="resume_resolution",
         )
-    args.input = _infer_resume_input(exp_dir)
+    args.resume = run_id
+    args.exp_name = run_id
+    args.input = project_root
+    if run_manifest.task_name is not None:
+        if args.task is not None and args.task != run_manifest.task_name:
+            _configuration_error(
+                f"Run uses task {run_manifest.task_name!r}, not {args.task!r}",
+                code="project_resume_configuration_mismatch",
+                stage="resume_resolution",
+            )
+        args.task = run_manifest.task_name
+    args.project_run_configuration = run_manifest.configuration
+    _restore_project_resume_cli_args(args, run_manifest.configuration, loop_kind=loop_kind)
 
 
 def _apply_common_args(parser: argparse.ArgumentParser) -> None:
@@ -897,8 +1458,8 @@ def _apply_common_args(parser: argparse.ArgumentParser) -> None:
         nargs="?",
         const="latest",
         default=None,
-        metavar="RUN_DIR",
-        help="Resume a previous run (default: latest).",
+        metavar="RUN",
+        help="Resume a run; omit RUN to select the current or latest run.",
     )
 
 
@@ -909,6 +1470,111 @@ def _make_parser(prog: str, description: str) -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
+# Run metadata migration command
+# ---------------------------------------------------------------------------
+
+_MIGRATE_RUN_ENVIRONMENT_COMMAND = "migrate-run-environment"
+
+
+def _migrate_run_environment_command(project_root: Path, run_id: str) -> str:
+    """Render the operator command that migrates one run's recorded metadata."""
+    return shlex.join(
+        [
+            "vibesys",
+            _MIGRATE_RUN_ENVIRONMENT_COMMAND,
+            "--project",
+            str(project_root),
+            "--run",
+            run_id,
+            "--run-environment",
+            "local|docker|modal",
+        ]
+    )
+
+
+def _build_migrate_run_environment_parser() -> argparse.ArgumentParser:
+    parser = _RunArgumentParser(
+        prog=f"vibesys {_MIGRATE_RUN_ENVIRONMENT_COMMAND}",
+        description=(
+            "Record the runtime environment an existing run executes in. Run "
+            "metadata written before run schema version 2 never captured it, so "
+            "the operator supplies the environment the run was launched with. "
+            "The migration is one-way."
+        ),
+    )
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=None,
+        help="Project directory holding the run metadata. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--run",
+        default=None,
+        help="Run ID to migrate. Defaults to the project's current run.",
+    )
+    parser.add_argument(
+        "--run-environment",
+        choices=["local", "docker", "modal"],
+        required=True,
+        help="Runtime environment the run was launched with.",
+    )
+    # These mirror the run flags, defaults included, so a migrated recording is
+    # identical to what the same launch would have written today.
+    parser.add_argument("--docker-image", default=None, help="Recorded --docker-image value.")
+    parser.add_argument("--modal-gpu", default="H100!", help="Recorded --modal-gpu value.")
+    parser.add_argument(
+        "--modal-model-volume",
+        default=None,
+        help="Recorded --modal-model-volume value.",
+    )
+    parser.add_argument("--modal-app", default="vibesys", help="Recorded --modal-app value.")
+    return parser
+
+
+def _run_migrate_run_environment(argv: list[str]) -> None:
+    """Stamp an explicit runtime environment into one pre-version-2 run."""
+    args = _build_migrate_run_environment_parser().parse_args(argv)
+    project_root = (args.project or Path.cwd()).expanduser().resolve()
+    # Build the record through the same producer a fresh run uses so a migrated
+    # recording matches what the CLI would have written for those flags.
+    spec = make_run_environment_spec(
+        use_docker=args.run_environment == "docker",
+        use_modal=args.run_environment == "modal",
+        docker_image=args.docker_image,
+        modal_gpu=args.modal_gpu,
+        modal_model_volume=args.modal_model_volume,
+        modal_app=args.modal_app,
+    )
+    try:
+        store = Project.open(project_root).state
+        run_id = args.run or store.current_run_id()
+        if run_id is None:
+            _configuration_error(
+                f"No current run in {project_root}; pass --run RUN_ID",
+                code="migration_failed",
+                stage="run_migration",
+                exit_code=1,
+            )
+        manifest = store.migrate_run_environment(run_id, run_environment_record(spec))
+    except (ProjectLayoutError, ProjectStateError, ValueError) as exc:
+        _configuration_error(
+            f"Migration failed for VibeSys run in {project_root}: {exc}",
+            code="migration_failed",
+            stage="run_migration",
+            exit_code=1,
+        )
+
+    print(  # noqa: T201  # tracked: #288
+        f"Migrated run {manifest.run_id} to run schema version "
+        f"{manifest.schema_version}: run environment "
+        f"{manifest.configuration.run_environment.name}"
+    )
+    print(f"  metadata: {project_root}")  # noqa: T201  # tracked: #288
+    print("  commit the updated run metadata to keep the run branch clean.")  # noqa: T201  # tracked: #288
+
+
+# ---------------------------------------------------------------------------
 # Interactive setup defaults command
 # ---------------------------------------------------------------------------
 
@@ -916,9 +1582,9 @@ def _make_parser(prog: str, description: str) -> argparse.ArgumentParser:
 def _build_tui_defaults_parser() -> argparse.ArgumentParser:
     parser = _RunArgumentParser(
         prog="vibesys tui-defaults",
-        description="Resolve configuration defaults for the pre-launch TUI.",
+        description="Resolve configuration defaults for a TUI launcher.",
     )
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "agent.toml")
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--input", type=Path, default=None)
     parser.add_argument("--runs-dir", type=_parse_runs_dir, default=None)
     parser.add_argument("--exp-name", default=None)
@@ -930,18 +1596,15 @@ def _build_tui_defaults_parser() -> argparse.ArgumentParser:
 
 def _run_tui_defaults(argv: list[str]) -> None:
     args = _build_tui_defaults_parser().parse_args(argv)
-    if args.stub_agent and not args.config.is_file():
-        config = Config.model_validate(tomllib.loads(_STUB_AGENT_DEFAULT_CONFIG_TEXT))
-    else:
-        try:
-            config = load_config(args.config)
-        except (ValueError, FileNotFoundError) as exc:
-            _configuration_error(str(exc), code="config_load_failed", stage="config_loading")
+    try:
+        config = _load_config_or_stub_default(args.config, stub_agent=args.stub_agent)
+    except (ValueError, FileNotFoundError) as exc:
+        _configuration_error(str(exc), code="config_load_failed", stage="config_loading")
 
     input_path = args.input.expanduser().resolve() if args.input is not None else None
     runs_dir = (args.runs_dir or Path.cwd() / "exp_env").expanduser().resolve()
     experiment_name = args.exp_name or generate_experiment_name(input_path)
-    repository_owner = None if args.directory_only else _resolve_repository_owner(config)
+    repository_owner = None if args.directory_only else _suggest_repository_owner(config)
     defaults = InteractiveSetupDefaults(
         runs_dir=str(runs_dir),
         input_path=str(input_path) if input_path is not None else "",
@@ -962,14 +1625,20 @@ def _run_tui_defaults(argv: list[str]) -> None:
 def _build_validate_parser() -> argparse.ArgumentParser:
     parser = _RunArgumentParser(
         prog="vibesys validate",
-        description="Validate an input-bundle harness contract without starting a run.",
+        description="Validate a repository-native VibeSys task without starting a run.",
     )
     parser.add_argument(
-        "input_bundle",
+        "project",
         type=Path,
         nargs="?",
         default=None,
-        help="Path to the input bundle (default: current directory).",
+        help="Path to the candidate repository (default: current directory).",
+    )
+    parser.add_argument(
+        "--task",
+        default=None,
+        metavar="NAME",
+        help="Task name; optional when the project defines exactly one task.",
     )
     return parser
 
@@ -977,31 +1646,29 @@ def _build_validate_parser() -> argparse.ArgumentParser:
 def _run_validate(argv: list[str]) -> None:
     """Validate one input-bundle contract, then report its resolved paths."""
     args = _build_validate_parser().parse_args(argv)
-    input_path = (args.input_bundle or Path.cwd()).expanduser().resolve()
+    input_path = (args.project or Path.cwd()).expanduser().resolve()
 
     try:
-        bundle = load_input_bundle(input_path)
-    except (FileNotFoundError, ValueError) as exc:
+        bundle = _load_selected_input(input_path, args.task)
+    except (FileNotFoundError, ProjectLayoutError, ValueError) as exc:
         _configuration_error(
-            f"Validation failed for input bundle {input_path}: {exc}",
+            f"Validation failed for VibeSys project {input_path}: {exc}",
             code="validation_failed",
             stage="input_validation",
             exit_code=1,
         )
 
-    print("VibeSys validation passed: input bundle is valid.")  # noqa: T201  # tracked: #288
-    print(f"  input bundle: {bundle.root}")  # noqa: T201  # tracked: #288
+    print("VibeSys validation passed: task is valid.")  # noqa: T201  # tracked: #288
+    print(f"  project: {bundle.root}")  # noqa: T201  # tracked: #288
+    if bundle.task_name is not None:
+        print(f"  task: {bundle.task_name}")  # noqa: T201  # tracked: #288
     print(f"  objective: {bundle.objective_path}")  # noqa: T201  # tracked: #288
     print(f"  accuracy command: {bundle.accuracy_command_display}")  # noqa: T201  # tracked: #288
     print(f"  benchmark command: {bundle.benchmark_command_display}")  # noqa: T201  # tracked: #288
-    if bundle.workspace_seed_path is not None:
-        print(f"  workspace seed: {bundle.workspace_seed_path}")  # noqa: T201  # tracked: #288
     for source in bundle.workspace_sources:
         print(f"  workspace source: {source.name} -> {source.dest} @ {source.commit}")  # noqa: T201  # tracked: #288
     if bundle.evaluator_path is not None:
         print(f"  evaluator source: {bundle.evaluator_path}")  # noqa: T201  # tracked: #288
-    if bundle.hidden_evaluator_path is not None:
-        print(f"  hidden evaluator source: {bundle.hidden_evaluator_path}")  # noqa: T201  # tracked: #288
     if bundle.benchmark_result is not None:
         print(f"  benchmark metric: {bundle.benchmark_result.metric}")  # noqa: T201  # tracked: #288
 
@@ -1009,6 +1676,16 @@ def _run_validate(argv: list[str]) -> None:
 # ---------------------------------------------------------------------------
 # Shared input-bundle discovery
 # ---------------------------------------------------------------------------
+
+
+def _load_selected_input(project_root: Path, task_name: str | None) -> InputBundle:
+    """Select repository-native input, with legacy bundle compatibility."""
+    project = Project.open(project_root)
+    if project.is_initialized():
+        return load_project_task(project, project.select_task(task_name))
+    if task_name is not None:
+        raise ValueError("--task requires a project with .vibesys/tasks")  # noqa: TRY003
+    return load_input_bundle(project_root)
 
 
 def _load_objective(bundle: InputBundle) -> str:
@@ -1028,37 +1705,6 @@ def _with_operator_constraints(objective: str, constraints: list[str]) -> str:
 # ===========================================================================
 # agent loop  (--outer-loop agent)
 # ===========================================================================
-
-
-def _detect_resume_round(exp_dir: Path) -> int:
-    """Infer the next round to run from ``logs/rounds.json`` (1-based)."""
-    rounds_json = exp_dir / "logs" / "rounds.json"
-    if not rounds_json.exists():
-        return 1
-    try:
-        data = json.loads(rounds_json.read_text())
-        return len(data) + 1
-    except Exception:  # noqa: BLE001  # tracked: #288
-        return 1
-
-
-def _prune_rounds_state(exp_dir: Path, keep_up_to: int) -> None:
-    """Trim rounds.json to entries with round < ``keep_up_to``."""
-    # An explicit rewind invalidates continuation state from the discarded
-    # rounds. The next run must ask the designer for a fresh hypothesis.
-    active_hypothesis = exp_dir / "logs" / "active_hypothesis.json"
-    if active_hypothesis.exists():
-        active_hypothesis.unlink()
-
-    rounds_json = exp_dir / "logs" / "rounds.json"
-    if not rounds_json.exists():
-        return
-    try:
-        data = json.loads(rounds_json.read_text())
-    except Exception:  # noqa: BLE001  # tracked: #288
-        return
-    kept = [d for d in data if int(d.get("round", 0)) < keep_up_to]
-    rounds_json.write_text(json.dumps(kept, indent=2))
 
 
 def _build_agent_parser() -> argparse.ArgumentParser:
@@ -1112,16 +1758,6 @@ def _build_agent_parser() -> argparse.ArgumentParser:
         "--stub-agent",
         action="store_true",
         help="Use deterministic local agent responses for fast TUI smoke tests.",
-    )
-    parser.add_argument("--start-round", type=int, default=None, metavar="N")
-    parser.add_argument(
-        "--trusted-input-baseline",
-        default=None,
-        metavar="REV",
-        help=(
-            "operator-authorized commit containing refreshed evaluator-owned inputs "
-            "for a resumed run; later trusted-input changes still fail closed"
-        ),
     )
     parser.add_argument("--modality", default=None, choices=_MODALITIES)
     parser.add_argument(
@@ -1241,9 +1877,7 @@ def _synthesize_standalone_input(args: argparse.Namespace) -> Path:
         benchmark_result_arg=args.input_benchmark_result_arg,
         reference_dir=args.input_reference,
         evaluator_dir=args.input_evaluator_dir,
-        workspace_seed_dir=args.input_workspace_seed,
         evaluator_source_dir=args.input_evaluator_source,
-        hidden_evaluator_source_dir=args.input_hidden_evaluator_source,
     )
 
     if args.exp_name is None:
@@ -1267,8 +1901,8 @@ def _validate_target_inputs(args: argparse.Namespace) -> None:
             )
 
     input_arg = getattr(args, "input", None)
+    task_name = getattr(args, "task", None)
     standalone = _standalone_input_dests_set(args)
-    synthesized = False
 
     if input_arg is not None and standalone:
         _configuration_error(
@@ -1279,27 +1913,43 @@ def _validate_target_inputs(args: argparse.Namespace) -> None:
         )
 
     if input_arg is None:
-        if not standalone:
-            _configuration_error(
-                "Error: missing required target input. Pass --input with a bundle "
-                "containing OBJECTIVE.md and vibesys.input.toml, or provide "
-                "--input-objective/--input-objective-file, --input-domain, "
-                "--input-accuracy-command, and --input-benchmark-command to synthesize one.",
-                code="missing_input",
-                stage="input_loading",
-            )
-        input_arg = _synthesize_standalone_input(args)
+        input_arg = _resolve_implicit_input(args, standalone)
         args.input = input_arg
-        synthesized = True
 
     try:
-        args.input_bundle = load_input_bundle(
-            input_arg,
-            allow_materialized_sources=getattr(args, "resume", None) is not None,
-            allow_bundle_local_sources=synthesized,
-        )
-    except (FileNotFoundError, ValueError) as exc:
+        args.input_bundle = _load_selected_input(input_arg, task_name)
+        args.task = args.input_bundle.task_name
+    except (FileNotFoundError, ProjectLayoutError, ValueError) as exc:
         _configuration_error(str(exc), code="invalid_input", stage="input_loading")
+
+    if args.resume is None and args.runs_dir is None:
+        workspace = args.input_bundle.manifest.workspace
+        if workspace is not None and workspace.sources:
+            _configuration_error(
+                "A direct project run requires candidate source at the project root. "
+                "Use --runs-dir to provision [workspace] inputs into a copied project.",
+                code="direct_project_materialization_unsupported",
+                stage="input_validation",
+            )
+
+
+def _resolve_implicit_input(args: argparse.Namespace, standalone: list[str]) -> Path:
+    """Resolve cwd project discovery or the legacy standalone synthesizer."""
+    if standalone:
+        return _synthesize_standalone_input(args)
+    current = Path.cwd().resolve()
+    legacy_markers = (current / "OBJECTIVE.md", current / "vibesys.input.toml")
+    repository_native = Project.open(current).is_initialized()
+    if repository_native or all(marker.is_file() for marker in legacy_markers):
+        return current
+    missing = ", ".join(marker.name for marker in legacy_markers if not marker.is_file())
+    _configuration_error(
+        "Current directory is not a VibeSys project "
+        f"({current}; missing .vibesys/tasks or legacy {missing}). "
+        "Launch VibeSys from the project or pass --project PATH.",
+        code="missing_input",
+        stage="input_loading",
+    )
 
 
 def _validate_agent(args: argparse.Namespace) -> None:
@@ -1310,12 +1960,6 @@ def _validate_agent(args: argparse.Namespace) -> None:
         _configuration_error("Error: --judge-every must be >= 1.")
     if args.official_eval_every < 1:
         _configuration_error("Error: --official-eval-every must be >= 1.")
-    if args.trusted_input_baseline is not None and args.resume is None:
-        _configuration_error(
-            "Error: --trusted-input-baseline requires --resume.",
-            code="invalid_arguments",
-            stage="argument_parsing",
-        )
     _validate_target_inputs(args)
 
 
@@ -1329,56 +1973,32 @@ def _run_agent(args: argparse.Namespace) -> None:
 
     existing = False
     exp_name = args.exp_name
-    start_round = args.start_round or 1
+    start_round = 1
 
     if args.resume is not None:
-        run_dir_name = _resolve_run_dir(args.resume, args.runs_dir)
-        exp_name = run_dir_name
+        exp_name = args.resume
         existing = True
-        exp_dir = _resume_exp_dir(run_dir_name, args.runs_dir)
-        print(f"Resuming agent run: {exp_dir}/")  # noqa: T201  # tracked: #288
-        if not exp_dir.is_dir():
-            _configuration_error(
-                f"Run directory does not exist: {exp_dir}",
-                code="resume_not_found",
-                stage="resume_resolution",
-            )
-        from vibesys.server.registry import active_supervisor  # noqa: PLC0415  # tracked: #288
-
-        supervisor = active_supervisor()
-        if supervisor is not None:
-            supervisor.attach(exp_dir / "logs")
-        if args.start_round is None:
-            start_round = _detect_resume_round(exp_dir)
-            print(f"Auto-detected next round: {start_round}")  # noqa: T201  # tracked: #288
-        else:
-            print(f"Resetting to round {start_round} (discarding later rounds).")  # noqa: T201  # tracked: #288
-            _prune_rounds_state(exp_dir, keep_up_to=start_round)
-        if start_round > args.max_rounds:
-            _configuration_error(
-                f"This run has completed {start_round - 1} rounds; --max-rounds is a total "
-                f"limit. Choose --max-rounds {start_round} or greater to continue.",
-                code="resume_limit_exhausted",
-                stage="resume_resolution",
-            )
+        start_round = None
+        print(f"Resuming VibeSys run {exp_name} in {bundle.root}/")  # noqa: T201  # tracked: #288
 
     success = run_agent_loop(
         config=config,
         exp_name=exp_name,
         runs_dir=args.runs_dir,
         input_path=str(bundle.root),
+        task_name=bundle.task_name,
+        task_root=bundle.task_root,
         accuracy_command=bundle.accuracy_command_display,
         benchmark_command=bundle.benchmark_command_display,
-        workspace_seed=bundle.workspace_seed_path,
         workspace_sources=bundle.workspace_sources,
         evaluator_path=bundle.evaluator_path,
-        hidden_evaluator_path=bundle.hidden_evaluator_path,
+        evaluator_package_root=bundle.evaluator_package_root,
         benchmark_result=bundle.benchmark_result,
         accuracy_timeout_seconds=bundle.manifest.accuracy.timeout_seconds,
         benchmark_timeout_seconds=bundle.manifest.benchmark.timeout_seconds,
         objective=objective,
-        objectives=_load_objectives_toml(bundle.root),
-        pareto_relative_noise=_load_pareto_relative_noise_toml(bundle.root),
+        objectives=_load_objectives_toml(bundle.task_root),
+        pareto_relative_noise=_load_pareto_relative_noise_toml(bundle.task_root),
         max_rounds=args.max_rounds,
         max_retries_per_round=args.max_retries_per_round,
         judge_every=args.judge_every,
@@ -1386,7 +2006,9 @@ def _run_agent(args: argparse.Namespace) -> None:
         memory_layout=args.memory_layout,
         start_round=start_round,
         existing=existing,
-        trusted_input_baseline=args.trusted_input_baseline,
+        operator_constraints=tuple(
+            constraint.strip() for constraint in args.constraint if constraint.strip()
+        ),
         debug=args.debug,
         profiler_kind=args.profiler,
         skills_dirs=skills,
@@ -1483,7 +2105,7 @@ def _load_pareto_relative_noise_toml(input_path: Path) -> float:
 def _resolve_objectives(args: argparse.Namespace) -> list[Objective]:
     if args.objective:
         return list(args.objective)
-    return _load_objectives_toml(args.input_bundle.root)
+    return _load_objectives_toml(args.input_bundle.task_root)
 
 
 def _build_evolve_parser() -> argparse.ArgumentParser:
@@ -1612,24 +2234,12 @@ def _validate_evolve(args: argparse.Namespace) -> None:  # noqa: C901  # tracked
 
 def _resolve_openevolve_options(
     args: argparse.Namespace,
-    *,
-    existing: bool,
-    exp_name: str,
-    runs_dir: Path,
 ) -> tuple[str | None, OpenEvolveSearchConfig | None]:
     from vibesys.loops.evolve.search_policy import (  # noqa: PLC0415  # tracked: #288
-        OpenEvolveSearchConfig,
-        OpenEvolveSearchPolicy,
+        OpenEvolveSearchConfig,  # tracked: #288
     )
 
     openevolve_defaults = OpenEvolveSearchConfig()
-    if existing:
-        openevolve_defaults = (
-            OpenEvolveSearchPolicy.persisted_config(
-                _resume_exp_dir(exp_name, runs_dir) / "logs" / "openevolve"
-            )
-            or openevolve_defaults
-        )
     openevolve_values = (
         args.openevolve_population_size,
         args.openevolve_archive_size,
@@ -1657,25 +2267,6 @@ def _resolve_openevolve_options(
     return search_policy, openevolve_config
 
 
-def _restore_openevolve_objectives(
-    objectives: list[Objective],
-    *,
-    existing: bool,
-    exp_name: str,
-    runs_dir: Path,
-) -> list[Objective]:
-    if not existing or objectives:
-        return objectives
-    from vibesys.loops.evolve.search_policy import (  # noqa: PLC0415  # tracked: #288
-        OpenEvolveSearchPolicy,
-    )
-
-    persisted = OpenEvolveSearchPolicy.persisted_objectives(
-        _resume_exp_dir(exp_name, runs_dir) / "logs" / "openevolve"
-    )
-    return objectives if persisted is None else persisted
-
-
 def _run_evolve(args: argparse.Namespace) -> None:
     bundle: InputBundle = args.input_bundle
     config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
@@ -1688,41 +2279,27 @@ def _run_evolve(args: argparse.Namespace) -> None:
     existing = False
     exp_name = args.exp_name
     if args.resume is not None:
-        run_dir_name = _resolve_run_dir(args.resume, args.runs_dir)
-        exp_name = run_dir_name
+        exp_name = args.resume
         existing = True
-        print(  # noqa: T201  # tracked: #288
-            f"Resuming evolve run: {_resume_exp_dir(run_dir_name, args.runs_dir)}/"
-        )
-
-    objectives = _restore_openevolve_objectives(
-        objectives,
-        existing=existing,
-        exp_name=exp_name,
-        runs_dir=args.runs_dir,
-    )
+        print(f"Resuming evolve run {exp_name} in {bundle.root}/")  # noqa: T201  # tracked: #288
     if objectives:
         spec = ", ".join(f"{o.name}({o.direction})" for o in objectives)
         print(f"Pareto mode active: [{spec}]; frontier_bias={args.frontier_bias}")  # noqa: T201  # tracked: #288
 
-    search_policy, openevolve_config = _resolve_openevolve_options(
-        args,
-        existing=existing,
-        exp_name=exp_name,
-        runs_dir=args.runs_dir,
-    )
+    search_policy, openevolve_config = _resolve_openevolve_options(args)
 
     success = run_evolve_loop(
         config=config,
         exp_name=exp_name,
         runs_dir=args.runs_dir,
         input_path=str(bundle.root),
+        task_name=bundle.task_name,
+        task_root=bundle.task_root,
         accuracy_command=bundle.accuracy_command_display,
         benchmark_command=bundle.benchmark_command_display,
-        workspace_seed=bundle.workspace_seed_path,
         workspace_sources=bundle.workspace_sources,
         evaluator_path=bundle.evaluator_path,
-        hidden_evaluator_path=bundle.hidden_evaluator_path,
+        evaluator_package_root=bundle.evaluator_package_root,
         accuracy_timeout_seconds=bundle.manifest.accuracy.timeout_seconds,
         objective=objective,
         max_generations=args.max_generations,
@@ -1778,7 +2355,6 @@ def _build_plain_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--max-attempts-per-issue", type=int, default=3)
     parser.add_argument("--max-issues-per-perf-eval", type=int, default=3)
-    parser.add_argument("--start-round", type=int, default=None, metavar="N")
     return parser
 
 
@@ -1791,64 +2367,31 @@ def _run_plain(args: argparse.Namespace) -> None:
     bundle: InputBundle = args.input_bundle
     config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
     _prepare_experiment_repository(args, config)
-    from vibesys.loops.plain.loop import (  # noqa: PLC0415  # tracked: #288
-        PlainLoopState,
-        load_state,
-        run_plain_loop,
-    )
+    from vibesys.loops.plain.loop import run_plain_loop  # noqa: PLC0415  # tracked: #288
 
     existing = False
     exp_name = args.exp_name
-    resume_state: PlainLoopState | None = None
-
     if args.resume is not None:
-        run_dir_name = _resolve_run_dir(args.resume, args.runs_dir)
-        exp_name = run_dir_name
+        exp_name = args.resume
         existing = True
-        exp_dir = _resume_exp_dir(run_dir_name, args.runs_dir)
-        print(f"Resuming from: {exp_dir}/")  # noqa: T201  # tracked: #288
-        log_dir = exp_dir / "logs"
-
-        if args.start_round is not None:
-            resume_state = PlainLoopState(
-                round_idx=args.start_round - 1,
-                bootstrap_done=True,
-            )
-        else:
-            resume_state = load_state(log_dir)
-            if resume_state is not None:
-                print(  # noqa: T201  # tracked: #288
-                    f"Auto-detected state: round {resume_state.round_idx + 1}, "
-                    f"phase '{resume_state.phase}'"
-                    + (
-                        f", current issue #{resume_state.current_issue_id}"
-                        if resume_state.current_issue_id
-                        else ""
-                    )
-                )
-            else:
-                resume_state = PlainLoopState(bootstrap_done=True)
-                print(  # noqa: T201  # tracked: #288
-                    "Warning: state.json not found. Starting fresh "
-                    "(bootstrap will be skipped because existing run)."
-                )
+        print(f"Resuming plain run {exp_name} in {bundle.root}/")  # noqa: T201  # tracked: #288
 
     success = run_plain_loop(
         config=config,
         exp_name=exp_name,
         runs_dir=args.runs_dir,
         input_path=str(bundle.root),
+        task_name=bundle.task_name,
+        task_root=bundle.task_root,
         accuracy_command=bundle.accuracy_command_display,
         benchmark_command=bundle.benchmark_command_display,
-        workspace_seed=bundle.workspace_seed_path,
         workspace_sources=bundle.workspace_sources,
         evaluator_path=bundle.evaluator_path,
-        hidden_evaluator_path=bundle.hidden_evaluator_path,
+        evaluator_package_root=bundle.evaluator_package_root,
         max_rounds=args.max_rounds,
         max_attempts_per_issue=args.max_attempts_per_issue,
         max_issues_per_perf_eval=args.max_issues_per_perf_eval,
         existing=existing,
-        resume_state=resume_state,
         debug=args.debug,
         profiler_kind=args.profiler,
         skills_dirs=skills,
@@ -1856,6 +2399,7 @@ def _run_plain(args: argparse.Namespace) -> None:
         agent_backend=args.agent_backend,
         cli_provider=args.cli_provider,
         backend=backend,
+        domain=bundle.domain,
         remote_repo=args.repo,
         repo_visibility=args.repo_visibility,
     )
@@ -1888,14 +2432,33 @@ _LOOP_COMMANDS: dict[str, _LoopCommand] = {
 }
 
 
+def _explicit_cli_dests(
+    parser: argparse.ArgumentParser,
+    argv: list[str],
+) -> frozenset[str]:
+    """Return parser destinations whose option strings occur in *argv*."""
+    destinations = {
+        option: action.dest
+        for action in parser._actions  # noqa: SLF001  # argparse exposes no public lookup
+        for option in action.option_strings
+    }
+    return frozenset(
+        destinations[option]
+        for token in argv
+        if token.startswith("-") and (option := token.partition("=")[0]) in destinations
+    )
+
+
 def parse_cli_invocation(argv: list[str]) -> CliInvocation:
     """Parse and validate one invocation without printing or exiting."""
     argv = _prepare_stub_agent_smoke_defaults(argv)
     loop_kind, remaining = _extract_loop_selection(argv)
     command = _LOOP_COMMANDS[loop_kind]
-    args = command.build_parser().parse_args(remaining)
+    parser = command.build_parser()
+    args = parser.parse_args(remaining)
+    args.explicit_cli_dests = _explicit_cli_dests(parser, remaining)
     _normalize_runs_dir(args)
-    _resolve_resume_args(args)
+    _resolve_resume_args(args, loop_kind=loop_kind)
     command.validate(args)
     return CliInvocation(loop_kind=loop_kind, args=args)
 
@@ -1906,6 +2469,9 @@ def _dispatch(argv: list[str]) -> None:
         return
     if argv and argv[0] == "validate":
         _run_validate(argv[1:])
+        return
+    if argv and argv[0] == _MIGRATE_RUN_ENVIRONMENT_COMMAND:
+        _run_migrate_run_environment(argv[1:])
         return
 
     invocation = parse_cli_invocation(argv)
@@ -1952,7 +2518,7 @@ def _render_configuration_error(error: ConfigurationError) -> NoReturn:
     raise SystemExit(diagnostic.exit_code)
 
 
-def main() -> None:  # noqa: D103  # tracked: #288
+def main() -> None:  # tracked: #288
     argv = sys.argv[1:]
     control_socket = _control_socket_from_argv(argv)
     if control_socket is not None:

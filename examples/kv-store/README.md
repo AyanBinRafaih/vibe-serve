@@ -16,30 +16,34 @@ correctness (candidate vs a real Redis oracle) and scored by real YCSB.
 ```bash
 uv sync
 uv pip install -r examples/kv-store/requirements.txt
-cp agent.toml.example agent.toml            # CLI credentials are managed by Claude Code
 ```
 
 The benchmark auto-downloads YCSB 0.17.0 (Redis binding) on first run; no manual setup.
+`agent.toml` is optional; the command below selects Claude Code explicitly.
 
 Verify the harness end-to-end against the seed: `examples/kv-store/run_test.sh`.
 
 ## Run
 
 ```bash
-./vs --outer-loop agent \
+vibesys --outer-loop agent \
+  --headless \
   --input examples/kv-store \
+  --runs-dir /work/vibesys-runs --local \
   --exp-name kv-store-opt \
   --backend cpu \
   --agent-backend cli --cli-provider claude \
   --max-rounds 6 \
   --modality kv_store \
   --interface service \
-  --no-skills --git-tracking
+  --no-skills
 ```
 
 `--interface service` judges the store only over its RESP2 socket, so the agent
-may implement it in any language. Each round is a git commit in
-`exp_env/<name>/workspace/`; only rounds that pass the accuracy checker advance.
+may implement it in any language. The copied project, including candidate
+source and `.vibesys/state/` state, is created at
+`/work/vibesys-runs/<run-id>/`. Its evolution is recorded in Git. Only rounds
+that pass the accuracy checker advance.
 
 ## Files
 

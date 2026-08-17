@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vibesys.agent_runner import log_json_and_print, log_prompt_markdown_and_print
-from vibesys.agents import build_agent_runner
+from vibesys.agents import ResponseFallback, build_agent_runner
 from vibesys.agents.callbacks import AgentLogger
 from vibesys.agents.cli_runner import CliAgentRunner
 from vibesys.agents.deepagents_runner import DeepAgentsRunner
@@ -18,16 +18,21 @@ from vibesys.agents.progress import RoundProgress
 from vibesys.config import Config
 from vibesys.constants import ComputeBackend
 from vibesys.schemas import (
+    ImplementerResponse,
     IssueJudgeResponse,
     JudgeResponse,
     Verdict,
 )
-from vs_sandbox import HostResource
+from vs_sandbox import HostResource, ProjectPathPolicy
 
 
 def _agent_config(**agent) -> Config:  # noqa: ANN003  # tracked: #288
     """Minimal valid Config carrying just an ``[agent]`` section for runner tests."""
     return Config.model_validate({"model": {"name": "m"}, "agent": agent})
+
+
+def _implementer_fallback() -> ImplementerResponse:
+    return ImplementerResponse(summary="fallback", expected_behavior="fallback")
 
 
 def _judge_fallback() -> JudgeResponse:
@@ -736,6 +741,51 @@ class TestCliAgentRunner:
         assert result.verdict == Verdict.PASS
         assert resource in builds[0]["resources"]
 
+    def test_cli_runner_forwards_required_project_path_policy(  # noqa: ANN201  # tracked: #288
+        self,
+        monkeypatch,  # noqa: ANN001  # tracked: #288
+        tmp_path,  # noqa: ANN001  # tracked: #288
+    ):
+        captured: list = []
+        fake_cls = _make_fake_agent_class(
+            generate_returns='{"analysis": "ok", "feedback": "", "verdict": "pass"}',
+            captured=captured,
+        )
+        cli_runner_module = __import__("vibesys.agents.cli_runner", fromlist=["_"])
+        monkeypatch.setitem(cli_runner_module._PROVIDER_CLASSES, "codex", fake_cls)  # noqa: SLF001  # tracked: #288
+        sandbox = MagicMock(name="project-sandbox")
+        build_sandbox = MagicMock(return_value=sandbox)
+        monkeypatch.setattr(cli_runner_module, "build_host_sandbox", build_sandbox)
+        policy = ProjectPathPolicy(
+            read_only_paths=(".state",),
+            hidden_paths=(".state/local",),
+        )
+        runner = CliAgentRunner(
+            provider="codex",
+            model="m",
+            project_path_policy=policy,
+            require_host_sandbox=True,
+            run_log_file=None,
+        )
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        result = runner.invoke(
+            kind="judge",
+            workspace=workspace,
+            system_prompt="sys",
+            user_prompt="usr",
+            response_cls=JudgeResponse,
+            fallback_factory=_judge_fallback,
+            round_label="judge #1",
+        )
+
+        assert result.verdict == Verdict.PASS
+        assert build_sandbox.call_args.args == (workspace,)
+        assert build_sandbox.call_args.kwargs["project_path_policy"] is policy
+        assert build_sandbox.call_args.kwargs["require_enforcement"] is True
+        assert captured[0].sandbox is sandbox
+
     def test_cli_runner_falls_back_on_unparseable_output(self, monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201  # tracked: #288
         captured: list = []
         fake_cls = _make_fake_agent_class(
@@ -777,6 +827,53 @@ class TestCliAgentRunner:
         assert "Failure" in stdout
         assert "# Failure" in stdout
         assert "**JSON**" in stdout
+
+    @pytest.mark.parametrize(
+        ("generate_returns", "expect_synthesized"),
+        [
+            ("not json at all", True),
+            ('{"analysis": "ok", "feedback": "", "verdict": "pass"}', False),
+        ],
+    )
+    def test_response_fallback_reports_who_authored_the_response(  # noqa: ANN201  # tracked: #288
+        self,
+        monkeypatch,  # noqa: ANN001  # tracked: #288
+        tmp_path,  # noqa: ANN001  # tracked: #288
+        generate_returns,  # noqa: ANN001  # tracked: #288
+        expect_synthesized,  # noqa: ANN001  # tracked: #288
+    ):
+        """Callers must be able to tell a synthesized response from a parsed one."""
+        captured: list = []
+        fake_cls = _make_fake_agent_class(
+            generate_returns=generate_returns,
+            captured=captured,
+        )
+        monkeypatch.setitem(
+            __import__(  # noqa: SLF001  # tracked: #288
+                "vibesys.agents.cli_runner",
+                fromlist=["_PROVIDER_CLASSES"],
+            )._PROVIDER_CLASSES,
+            "claude",
+            fake_cls,
+        )
+
+        runner = CliAgentRunner(provider="claude", model="m", run_log_file=None)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        fallback = ResponseFallback(_judge_fallback)
+        result = runner.invoke(
+            kind="judge",
+            workspace=workspace,
+            system_prompt="sys",
+            user_prompt="usr",
+            response_cls=JudgeResponse,
+            fallback_factory=fallback,
+            round_label="judge #1",
+        )
+
+        assert fallback.synthesized is expect_synthesized
+        assert (result.analysis == "fallback") is expect_synthesized
 
     def test_cli_runner_passes_progress_to_logger(self, monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         captured: list = []
@@ -1200,6 +1297,82 @@ class TestCliAgentRunner:
         assert Path(passed).is_file()
         assert Path(passed).parent == workspace / ".cache/vibesys/response-schemas"
         assert "Schema for JudgeResponse" not in agent.generate_calls[0]["prompt"]
+
+    def test_mapping_response_stays_native_on_a_permissive_provider(self, monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        """``ImplementerResponse.metrics`` is a ``dict[str, float]``; Claude's
+        ``--json-schema`` accepts that, so the native path must be kept."""
+        captured: list = []
+        fake_cls = _make_fake_agent_class(
+            generate_returns='{"summary": "ok", "expected_behavior": "faster"}',
+            captured=captured,
+        )
+        fake_cls.supports_native_output_schema = True
+        fake_cls.native_output_schema_wants_absolute_path = True
+        fake_cls.native_output_schema_allows_arbitrary_keys = True
+        monkeypatch.setitem(
+            __import__(  # noqa: SLF001  # tracked: #288
+                "vibesys.agents.cli_runner",
+                fromlist=["_PROVIDER_CLASSES"],
+            )._PROVIDER_CLASSES,
+            "claude",
+            fake_cls,
+        )
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        runner = CliAgentRunner(provider="claude", model="m", run_log_file=None)
+
+        runner.invoke(
+            kind="implementer",
+            workspace=workspace,
+            system_prompt="THE-SYSTEM-PROMPT",
+            user_prompt="usr",
+            response_cls=ImplementerResponse,
+            fallback_factory=_implementer_fallback,
+            round_label="implementer #1",
+        )
+
+        agent = captured[0]
+        passed = agent.output_schema_paths[-1]
+        assert passed is not None
+        schema = json.loads(Path(passed).read_text())
+        assert schema["properties"]["metrics"]["additionalProperties"] == {"type": "number"}
+        assert "Schema for ImplementerResponse" not in agent.generate_calls[0]["prompt"]
+
+    def test_mapping_response_falls_back_on_a_strict_provider(self, monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        """Codex's subset cannot express the mapping, so the prompt hint stays."""
+        captured: list = []
+        fake_cls = _make_fake_agent_class(
+            generate_returns='{"summary": "ok", "expected_behavior": "faster"}',
+            captured=captured,
+        )
+        fake_cls.supports_native_output_schema = True
+        monkeypatch.setitem(
+            __import__(  # noqa: SLF001  # tracked: #288
+                "vibesys.agents.cli_runner",
+                fromlist=["_PROVIDER_CLASSES"],
+            )._PROVIDER_CLASSES,
+            "codex",
+            fake_cls,
+        )
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        log = StringIO()
+        runner = CliAgentRunner(provider="codex", model="m", run_log_file=log)
+
+        runner.invoke(
+            kind="implementer",
+            workspace=workspace,
+            system_prompt="THE-SYSTEM-PROMPT",
+            user_prompt="usr",
+            response_cls=ImplementerResponse,
+            fallback_factory=_implementer_fallback,
+            round_label="implementer #1",
+        )
+
+        agent = captured[0]
+        assert agent.output_schema_paths == [None]
+        assert "Schema for ImplementerResponse" in agent.generate_calls[0]["prompt"]
+        assert "using prompt fallback" in log.getvalue()
 
     def test_cli_runner_chat_returns_plain_text_in_a_fresh_session_per_turn(  # noqa: ANN201  # tracked: #288
         self,
@@ -1965,6 +2138,88 @@ class TestBuildAgentRunner:
                 run_log_file=None,
                 use_docker=False,
             )
+
+    def test_required_project_enforcement_rejects_deepagents(self):  # noqa: ANN201  # tracked: #288
+        with pytest.raises(SystemExit, match="requires the CLI agent backend"):
+            build_agent_runner(
+                _agent_config(backend="deepagents"),
+                agent_backend=None,
+                cli_provider=None,
+                backends={"implementer": MagicMock()},
+                skills=[],
+                skill_source_dirs=[],
+                model="m",
+                model_name="m",
+                run_log_file=None,
+                use_docker=False,
+                require_host_sandbox=True,
+            )
+
+    def test_required_project_enforcement_rejects_omnigent(self):  # noqa: ANN201  # tracked: #288
+        config = Config.model_validate(
+            {
+                "model": {"name": "m"},
+                "agent": {"backend": "cli", "cli_provider": "codex"},
+                "feature_flags": {"omnigent_agent_backend": True},
+            }
+        )
+
+        with pytest.raises(SystemExit, match="does not yet support the Omnigent backend"):
+            build_agent_runner(
+                config,
+                agent_backend=None,
+                cli_provider=None,
+                backends=None,
+                skills=[],
+                skill_source_dirs=[],
+                model=None,
+                model_name="m",
+                run_log_file=None,
+                use_docker=False,
+                require_host_sandbox=True,
+            )
+
+    def test_required_project_enforcement_permits_stub(self):  # noqa: ANN201  # tracked: #288
+        runner = build_agent_runner(
+            _agent_config(backend="stub"),
+            agent_backend=None,
+            cli_provider=None,
+            backends=None,
+            skills=[],
+            skill_source_dirs=[],
+            model=None,
+            model_name="m",
+            run_log_file=None,
+            use_docker=False,
+            require_host_sandbox=True,
+        )
+
+        assert runner.backend_name == "stub"
+
+    def test_build_agent_runner_forwards_project_policy_to_cli(self):  # noqa: ANN201  # tracked: #288
+        policy = ProjectPathPolicy(
+            read_only_paths=(".state",),
+            hidden_paths=(".state/local",),
+        )
+
+        runner = build_agent_runner(
+            _agent_config(backend="cli", cli_provider="codex"),
+            agent_backend=None,
+            cli_provider=None,
+            backends=None,
+            skills=[],
+            skill_source_dirs=[],
+            model=None,
+            model_name="m",
+            run_log_file=None,
+            use_docker=False,
+            project_path_policy=policy,
+            require_host_sandbox=True,
+        )
+
+        assert isinstance(runner, CliAgentRunner)
+        assert runner._project_path_policy is policy  # noqa: SLF001  # tracked: #288
+        assert runner._require_host_sandbox is True  # noqa: SLF001  # tracked: #288
 
     # --- model resolution for the cli backend ---------------------------------
     #
