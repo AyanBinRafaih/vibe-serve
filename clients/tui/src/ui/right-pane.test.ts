@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it} from 'bun:test';
 import {MIN_SPLIT_WIDTH, rightPaneWidth, splitFits} from './right-pane.js';
 
 describe('split thresholds', () => {
