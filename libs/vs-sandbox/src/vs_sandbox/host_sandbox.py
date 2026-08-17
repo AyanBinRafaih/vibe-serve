@@ -91,6 +91,11 @@ _SYSTEM_READ_ROOTS: tuple[str, ...] = (
     "/etc",
     "/opt",
     "/run/systemd/resolve",  # DNS via systemd-resolved
+    # Accelerator runtimes discover devices through sysfs before they ever
+    # touch the device node: without it the AWS Neuron runtime aborts in
+    # ``nrt_init`` and ``neuron-ls`` exits fatal, and CUDA's device query
+    # fails the same way. Read-only, so it exposes topology, not control.
+    "/sys",
 )
 
 # Read-only system roots the macOS dynamic linker and command-line tools need to
