@@ -1,0 +1,138 @@
+import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
+import type {SessionState} from '../session-model.js';
+import type {Theme} from './theme.js';
+
+/**
+ * Terminal width below which two panes would both be too narrow to read. The
+ * widest thing the right pane shows is the performance chart, which needs the
+ * plot plus its axis; the left pane needs enough room for a conversation card.
+ * Under this the client stays single-pane and visualizations fall back to the
+ * modal they used before the split existed.
+ */
+export const MIN_SPLIT_WIDTH = 100;
+
+/** Chart plot width plus axis gutter, border, and padding. */
+const RIGHT_PANE_MIN = 62;
+const RIGHT_PANE_MAX = 84;
+const RIGHT_PANE_SHARE = 0.45;
+/** Columns the transcript needs to stay worth reading beside the pane. */
+const LEFT_PANE_MIN = 38;
+
+/** True when the terminal has room for the transcript and a visualization. */
+export function splitFits(terminalWidth: number): boolean {
+  return terminalWidth >= MIN_SPLIT_WIDTH;
+}
+
+/**
+ * Width in columns for the right pane. Derived from the terminal rather than a
+ * fixed percentage, so a wide terminal gives the visualization real room while
+ * the transcript keeps a readable floor.
+ */
+export function rightPaneWidth(terminalWidth: number): number {
+  const share = Math.round(terminalWidth * RIGHT_PANE_SHARE);
+  const capped = Math.min(RIGHT_PANE_MAX, Math.max(RIGHT_PANE_MIN, share));
+  return Math.min(capped, terminalWidth - LEFT_PANE_MIN);
+}
+
+export class RightPaneView {
+  readonly output: BoxRenderable;
+  readonly #scroll: ScrollBoxRenderable;
+  #theme: Theme;
+  #renderedState: SessionState | null = null;
+  #renderedWidth = 0;
+
+  constructor(
+    private readonly renderer: CliRenderer,
+    theme: Theme,
+  ) {
+    this.#theme = theme;
+    this.output = new BoxRenderable(renderer, {
+      id: 'right-pane',
+      height: '100%',
+      flexShrink: 0,
+      flexDirection: 'column',
+      paddingLeft: 1,
+      paddingRight: 1,
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: theme.border,
+      title: ' Pane ',
+      visible: false,
+    });
+    this.#scroll = new ScrollBoxRenderable(renderer, {
+      id: 'right-pane-scroll',
+      width: '100%',
+      flexGrow: 1,
+      stickyScroll: false,
+      viewportCulling: true,
+      verticalScrollbarOptions: {showArrows: false},
+    });
+    this.output.add(this.#scroll);
+  }
+
+  applyTheme(theme: Theme): void {
+    this.#theme = theme;
+    this.#renderedState = null;
+  }
+
+  /** Scrolled by Page Up/Page Down while this pane holds focus. */
+  scrollBy(delta: number): void {
+    this.#scroll.scrollBy(delta, 'viewport');
+  }
+
+  render(state: SessionState, visible: boolean): void {
+    const right = visible ? state.layout.right : null;
+    if (right === null) {
+      this.output.visible = false;
+      this.#renderedState = null;
+      return;
+    }
+    this.output.visible = true;
+    const width = rightPaneWidth(this.renderer.terminalWidth);
+    this.output.width = width;
+    // The focused pane is the one that takes keys, so it carries the focus
+    // border colour and says so in its title.
+    const focused = state.layout.focus === 'right';
+    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
+    this.output.title = focused ? ` ${right.title} · focused ` : ` ${right.title} `;
+    if (state === this.#renderedState && width === this.#renderedWidth) return;
+    this.#renderedState = state;
+    this.#renderedWidth = width;
+    this.#clear();
+
+    if (right.error !== null) {
+      this.#line(right.error, this.#theme.conversation.failure.content);
+      return;
+    }
+    if (right.pending && right.content === '') {
+      this.#line('Loading...', this.#theme.textSubtle);
+      return;
+    }
+    for (const line of right.content.split('\n')) {
+      this.#line(line, this.#theme.textPrimary);
+    }
+    this.#scroll.scrollTo(0);
+  }
+
+  #line(content: string, fg: string): void {
+    this.#scroll.add(
+      new TextRenderable(this.renderer, {
+        content,
+        fg,
+        width: '100%',
+        flexShrink: 0,
+        // Chart rows are drawn to fit the pane, but a summary line can run
+        // past it. Wrapping keeps the whole number readable; truncating it
+        // mid-value would be worse than a second row.
+        wrapMode: 'word',
+      }),
+    );
+  }
+
+  #clear(): void {
+    for (const child of [...this.#scroll.getChildren()]) {
+      this.#scroll.remove(child);
+      child.destroyRecursively();
+    }
+  }
+}

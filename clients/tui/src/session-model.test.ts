@@ -2,15 +2,20 @@ import {describe, expect, it} from 'bun:test';
 import type {RunEvent} from './protocol.js';
 import {
   applyEvent,
+  closePane,
   closeThemePicker,
+  failPane,
   initialSessionState,
   moveThemeSelection,
+  openPane,
   openThemePicker,
   selectNextAgent,
   selectNextRound,
   selectRound,
+  setPaneContent,
   setTheme,
   statusText,
+  togglePaneFocus,
   toggleTodos,
   visibleConversation,
   visiblePhases,
@@ -596,6 +601,84 @@ describe('session event model', () => {
     expect(visibleConversation(state).map(entry => entry.content)).toEqual([
       'round two judge output',
     ]);
+  });
+});
+
+describe('right pane layout', () => {
+  it('starts single-pane with focus on the transcript', () => {
+    const state = initialSessionState();
+
+    expect(state.layout.right).toBeNull();
+    expect(state.layout.focus).toBe('left');
+  });
+
+  it('opens a pane pending, titled, and focused', () => {
+    const state = openPane(initialSessionState(), 'perf');
+
+    expect(state.layout.right).toMatchObject({view: 'perf', title: 'Performance', pending: true});
+    expect(state.layout.focus).toBe('right');
+  });
+
+  it('replaces the pane contents when a second command runs, rather than stacking', () => {
+    const perf = setPaneContent(openPane(initialSessionState(), 'perf'), 'perf', 'chart');
+    const timeline = openPane(perf, 'timeline');
+
+    expect(timeline.layout.right?.view).toBe('timeline');
+    expect(timeline.layout.right?.title).toBe('Round timeline');
+    // The previous command's output must not sit under the new title.
+    expect(timeline.layout.right?.content).toBe('');
+  });
+
+  it('keeps the old chart on screen while the same view refreshes', () => {
+    const perf = setPaneContent(openPane(initialSessionState(), 'perf'), 'perf', 'chart');
+
+    expect(openPane(perf, 'perf').layout.right?.content).toBe('chart');
+  });
+
+  it('ignores a response for a pane the operator has since replaced', () => {
+    const timeline = openPane(openPane(initialSessionState(), 'perf'), 'timeline');
+
+    const stale = setPaneContent(timeline, 'perf', 'late chart');
+
+    expect(stale).toBe(timeline);
+    expect(failPane(timeline, 'perf', 'late failure')).toBe(timeline);
+  });
+
+  it('reports a failed query in the pane without closing it', () => {
+    const failed = failPane(openPane(initialSessionState(), 'perf'), 'perf', 'socket closed');
+
+    expect(failed.layout.right?.error).toBe('socket closed');
+    expect(failed.layout.right?.pending).toBe(false);
+  });
+
+  it('moves focus between panes and returns it on close', () => {
+    const open = openPane(initialSessionState(), 'perf');
+    expect(togglePaneFocus(open).layout.focus).toBe('left');
+    expect(togglePaneFocus(togglePaneFocus(open)).layout.focus).toBe('right');
+
+    const closed = closePane(open);
+    expect(closed.layout.right).toBeNull();
+    expect(closed.layout.focus).toBe('left');
+  });
+
+  it('does nothing to focus while single-pane', () => {
+    const single = initialSessionState();
+
+    expect(togglePaneFocus(single)).toBe(single);
+    expect(closePane(single)).toBe(single);
+  });
+
+  it('leaves the chat transcript untouched when the pane closes', () => {
+    const withChat = {
+      ...openPane(initialSessionState(), 'perf'),
+      chatOpen: true,
+      chatConversation: [{id: 'c1', kind: 'user' as const, content: 'why is r3 slower?'}],
+    };
+
+    const closed = closePane(withChat);
+
+    expect(closed.chatOpen).toBe(true);
+    expect(closed.chatConversation).toEqual(withChat.chatConversation);
   });
 });
 

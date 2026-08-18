@@ -12,6 +12,24 @@ import type {SessionState} from '../session-model.js';
 import {ConversationView} from './conversation.js';
 import type {Theme} from './theme.js';
 
+/** Screen rectangle the chat occupies when it shares the row with a pane. */
+export interface PaneBounds {
+  left: number;
+  width: number;
+  top: number;
+  height: number;
+}
+
+function samePaneBounds(left: PaneBounds | null, right: PaneBounds | null): boolean {
+  if (left === null || right === null) return left === right;
+  return (
+    left.left === right.left &&
+    left.width === right.width &&
+    left.top === right.top &&
+    left.height === right.height
+  );
+}
+
 export class ChatOverlayView {
   readonly output: BoxRenderable;
   readonly #transcript: ScrollBoxRenderable;
@@ -19,6 +37,7 @@ export class ChatOverlayView {
   readonly #input: InputRenderable;
   readonly #inputBox: BoxRenderable;
   readonly #hint: TextRenderable;
+  #bounds: PaneBounds | null = null;
 
   constructor(
     renderer: CliRenderer,
@@ -88,6 +107,27 @@ export class ChatOverlayView {
       width: '100%',
     });
     this.output.add(this.#hint);
+  }
+
+  /**
+   * Confines the chat to the left pane while a visualization is on screen, so
+   * the operator can ask about what they are looking at without covering it.
+   * ``null`` restores the centred modal geometry.
+   */
+  setPaneBounds(bounds: PaneBounds | null): void {
+    if (samePaneBounds(this.#bounds, bounds)) return;
+    this.#bounds = bounds;
+    if (bounds === null) {
+      this.output.left = '10%';
+      this.output.width = '80%';
+      this.output.top = '10%';
+      this.output.height = '76%';
+      return;
+    }
+    this.output.left = bounds.left;
+    this.output.width = Math.max(1, bounds.width);
+    this.output.top = bounds.top;
+    this.output.height = Math.max(3, bounds.height);
   }
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
