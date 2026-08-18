@@ -1,0 +1,130 @@
+.figure {
+  margin: 0;
+}
+
+.caption {
+  max-width: 720px;
+  margin: 0 auto 1.5rem;
+}
+
+.diagram {
+  width: 100%;
+  height: auto;
+  color: var(--ifm-font-color-base);
+}
+
+.zoneLabel {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 12.5px;
+  letter-spacing: 0.06em;
+  fill: currentColor;
+  opacity: 0.6;
+}
+
+.title {
+  font-family: var(--ifm-font-family-base);
+  font-weight: 700;
+  font-size: 23px;
+  fill: currentColor;
+}
+
+.cardTitle {
+  font-family: var(--ifm-font-family-base);
+  font-weight: 600;
+  font-size: 15px;
+  fill: currentColor;
+}
+
+.cardSubtitle {
+  font-family: var(--ifm-font-family-base);
+  font-size: 12.5px;
+  fill: currentColor;
+  opacity: 0.6;
+}
+
+.flowLabel {
+  font-family: var(--ifm-font-family-base);
+  font-weight: 600;
+  font-size: 12.5px;
+  fill: currentColor;
+  opacity: 0.85;
+}
+
+.errorLabel {
+  font-family: var(--ifm-font-family-base);
+  font-style: italic;
+  font-size: 12px;
+  fill: currentColor;
+  opacity: 0.55;
+}
+
+.mono {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 12.5px;
+  fill: currentColor;
+}
+
+.monoDim {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 12.5px;
+  fill: currentColor;
+  opacity: 0.6;
+}
+
+.regionOutline {
+  fill: none;
+  stroke: currentColor;
+  stroke-opacity: 0.32;
+  stroke-width: 1.4;
+}
+
+.zoneOutline {
+  fill: none;
+  stroke: currentColor;
+  stroke-opacity: 0.32;
+  stroke-width: 1.1;
+  stroke-dasharray: 3 3;
+}
+
+.card {
+  fill: currentColor;
+  fill-opacity: 0.04;
+  stroke: currentColor;
+  stroke-opacity: 0.55;
+  stroke-width: 1.1;
+}
+
+.arrow {
+  fill: none;
+  stroke: currentColor;
+  stroke-opacity: 0.75;
+  stroke-width: 1.4;
+}
+
+.arrowMuted {
+  fill: none;
+  stroke: currentColor;
+  stroke-opacity: 0.4;
+  stroke-width: 1.1;
+}
+
+.arrowDashed {
+  fill: none;
+  stroke: currentColor;
+  stroke-opacity: 0.5;
+  stroke-width: 1.1;
+  stroke-dasharray: 3 3;
+}
+
+.icon {
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.arrowHead {
+  fill: currentColor;
+  fill-opacity: 0.75;
+}

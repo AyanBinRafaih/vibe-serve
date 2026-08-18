@@ -29,6 +29,13 @@ const config: Config = {
     locales: ['en'],
   },
 
+  stylesheets: [
+    {
+      href: 'https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap',
+      type: 'text/css',
+    },
+  ],
+
   presets: [
     [
       'classic',
@@ -55,6 +62,11 @@ const config: Config = {
     },
     navbar: {
       title: 'VibeSys',
+      logo: {
+        alt: 'VibeSys',
+        src: 'img/logo.svg',
+        srcDark: 'img/logo-dark.svg',
+      },
       items: [
         {
           type: 'docSidebar',
@@ -106,8 +118,8 @@ const config: Config = {
       copyright: `Copyright © ${new Date().getFullYear()} University of Washington SyFI Lab. Built with Docusaurus.`,
     },
     prism: {
-      theme: prismThemes.github,
-      darkTheme: prismThemes.dracula,
+      theme: prismThemes.vsLight,
+      darkTheme: prismThemes.vsDark,
     },
   } satisfies Preset.ThemeConfig,
 };

@@ -10,6 +10,11 @@
   overflow: hidden;
 }
 
+.promptMark {
+  font-family: var(--ifm-font-family-monospace);
+  margin-right: 0.15em;
+}
+
 @media screen and (max-width: 996px) {
   .heroBanner {
     padding: 2rem;
@@ -33,14 +38,4 @@
 
 .architecture {
   padding: 2rem 0 4rem;
-}
-
-.architectureCaption {
-  max-width: 720px;
-  margin: 0 auto 1.5rem;
-}
-
-.architectureImg {
-  max-width: 100%;
-  height: auto;
 }
