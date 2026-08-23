@@ -161,11 +161,24 @@ over the view as before, carrying the same input at the foot of the modal. It
 is one conversation either way: the transcript survives docking, undocking, and
 the pane closing.
 
-Inside a hypothesis the footer shows keyboard navigation. `[` and `]` select rounds, Tab and
-Shift+Tab select agents, Page Up/Page Down scroll the transcript, Ctrl+T expands
-todos, Ctrl+P expands the latest prompt in the current selection, Ctrl+L and
-Escape return to the experiment log, and Ctrl+C exits. Commands listed under "Planned" in `/help`
-are not accepted yet.
+Inside a hypothesis the footer shows keyboard navigation. `[` and `]` select
+rounds, Tab and Shift+Tab select agents, the arrow keys move a cursor through
+the transcript's entries, Page Up/Page Down scroll it, and F2 (or Ctrl+T)
+expands the todo box, which then takes the arrow keys until Escape closes it.
+F3 (or Ctrl+P) expands the latest prompt in the current selection. Function keys
+are offered alongside the Control chords because a terminal is free to keep a
+Control chord for itself, and on macOS several do.
+
+Escape unwinds the round view one step at a time: the entry cursor, then the
+agent filter, then the hypothesis. Ctrl+L returns to the experiment log from
+anywhere, and Ctrl+C exits. Rounds and agents can also be clicked: a round chip
+selects its round, an agent node filters the transcript to that agent, and
+clicking the selected node clears the filter. Commands listed under "Planned" in
+`/help` are not accepted yet.
+
+The rounds strip covers the whole run, including rounds it has not reached yet,
+and windows onto the part that fits. The selected round is always in view, and
+`‹ n` and `n ›` say how many rounds sit past each edge.
 
 The launcher retains terminal results until the operator exits. If the backend
 fails to start, its log tail is printed before the temporary session directory

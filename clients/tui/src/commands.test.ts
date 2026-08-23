@@ -107,6 +107,13 @@ describe('command surface by view', () => {
     expect(suggestSlashCommands('/c').map(command => command.name)).toEqual(['/chat']);
   });
 
+  it('reaches the todo and prompt toggles by name', () => {
+    // macOS keeps the function keys for itself and a terminal may keep a
+    // Control chord, so both toggles have to be reachable without either.
+    expect(parseInput('/todos')).toEqual({toggle: 'todos'});
+    expect(parseInput('/prompt')).toEqual({toggle: 'prompt'});
+  });
+
   it('still accepts /chat when it is not offered, since the chat is the point', () => {
     // Hidden from the list, not removed from the client.
     expect(parseInput('/chat')).toEqual({localView: 'chat'});
@@ -123,6 +130,8 @@ describe('slash-command input helpers', () => {
       '/steer',
       '/open-round',
       '/perf',
+      '/todos',
+      '/prompt',
       '/theme',
     ]);
     expect(suggestSlashCommands('/h').map(command => command.name)).toEqual(['/help']);

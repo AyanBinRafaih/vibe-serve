@@ -2,8 +2,17 @@ import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
 import {hasActiveAgentTiming} from '../round-timing.js';
 import type {AgentPhase, RoundSummary} from '../run-map.js';
 import {roundAgentElapsedMs} from '../run-map.js';
+import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
-import {scopedRounds, visiblePhases, visibleRoundNumber} from '../session-model.js';
+import {scopedRounds, stripRounds, visiblePhases, visibleRoundNumber} from '../session-model.js';
+import {
+  type AgentGraph,
+  type EdgeTone,
+  graphPaneBounds,
+  layoutAgentGraph,
+  NODE_HEIGHT,
+  stageKinds,
+} from './agent-graph.js';
 import {elapsedLabel} from './previews.js';
 import type {Theme} from './theme.js';
 
@@ -14,6 +23,13 @@ const STATUS_MARKER: Record<AgentPhase['status'], string> = {
   failed: '×',
 };
 
+/** Width the stacked fallback uses, and the width this pane had before. */
+const STACKED_WIDTH = 30;
+/** Columns the transcript needs to stay worth reading beside the graph. */
+const TRANSCRIPT_MIN = 42;
+/** Share of the terminal the graph takes when there is room for it. */
+const GRAPH_SHARE = 0.55;
+
 function statusColor(theme: Theme, status: AgentPhase['status']): string {
   if (status === 'active') return theme.success;
   if (status === 'completed') return theme.info;
@@ -21,22 +37,49 @@ function statusColor(theme: Theme, status: AgentPhase['status']): string {
   return theme.textSubtle;
 }
 
+function edgeColor(theme: Theme, tone: EdgeTone): string {
+  if (tone === 'failed') return theme.error;
+  if (tone === 'live') return theme.accent;
+  if (tone === 'done') return theme.info;
+  return theme.borderStrong;
+}
+
+/**
+ * Width for the Agents pane, or null when the terminal cannot carry the graph
+ * beside a readable transcript. Derived from the terminal rather than fixed, so
+ * a wide terminal gives the graph room while the transcript keeps its floor.
+ */
+export function agentPaneWidth(terminalWidth: number, stageCount: number): number | null {
+  const bounds = graphPaneBounds(stageCount);
+  // Never narrower than the pane used to be: a one-stage round needs less room
+  // than the heading above it, and a wrapped heading reads worse than slack.
+  const floor = Math.max(bounds.min, STACKED_WIDTH);
+  const ceiling = Math.max(bounds.max, STACKED_WIDTH);
+  const room = terminalWidth - TRANSCRIPT_MIN;
+  if (room < floor) return null;
+  const share = Math.round(terminalWidth * GRAPH_SHARE);
+  return Math.min(ceiling, room, Math.max(floor, share));
+}
+
 export class AgentMapView {
   readonly output: BoxRenderable;
   #theme: Theme;
   #renderedState: SessionState | null = null;
+  #renderedWidth = 0;
   #elapsedTimer: ReturnType<typeof setInterval> | null = null;
   #runningRound: {round: RoundSummary; text: TextRenderable} | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
+    private readonly controller: SessionController,
     theme: Theme,
   ) {
     this.#theme = theme;
     this.output = new BoxRenderable(renderer, {
       id: 'agent-map',
-      width: 30,
+      width: STACKED_WIDTH,
       height: '100%',
+      flexShrink: 0,
       flexDirection: 'column',
       paddingLeft: 1,
       paddingRight: 1,
@@ -54,14 +97,37 @@ export class AgentMapView {
   }
 
   render(state: SessionState): void {
-    if (state === this.#renderedState) return;
-    this.#renderedState = state;
-    this.#clear();
     const phases = visiblePhases(state);
+    // The pane's width follows the terminal, so a resize has to redraw even
+    // when the state is unchanged.
+    const width = agentPaneWidth(this.renderer.terminalWidth, stageKinds(phases).length);
+    const paneWidth = width ?? STACKED_WIDTH;
+    if (state === this.#renderedState && paneWidth === this.#renderedWidth) return;
+    // Selection and focus are drawn into the nodes, so a change to either is a
+    // reason to redraw even when the phases are identical.
+    this.#renderedState = state;
+    this.#renderedWidth = paneWidth;
+    this.output.width = paneWidth;
+    // The pane that owns the arrow keys says so, the way every other focusable
+    // surface in the client does.
+    this.output.borderColor =
+      state.roundFocus === 'agents' ? this.#theme.borderFocus : this.#theme.border;
+    this.output.title = state.roundFocus === 'agents' ? ' ▸ Agents ' : ' Agents ';
+    this.#clear();
     if (phases.length === 0) {
+      // A round the run has not reached has no agents, and never will until it
+      // runs. "Waiting" would suggest something is on its way.
+      const roundNumber = visibleRoundNumber(state);
+      const round =
+        roundNumber === null
+          ? null
+          : (stripRounds(state).find(item => item.number === roundNumber) ?? null);
       this.output.add(
         new TextRenderable(this.renderer, {
-          content: 'Waiting for phases…',
+          content:
+            round?.status === 'planned'
+              ? `Round ${roundNumber} has not run yet.`
+              : 'Waiting for phases…',
           fg: this.#theme.textSubtle,
           width: '100%',
         }),
@@ -74,17 +140,136 @@ export class AgentMapView {
       roundNumber === null
         ? null
         : (scopedRounds(state).find(item => item.number === roundNumber) ?? null);
-    const heading = new TextRenderable(this.renderer, {
-      content: headingLabel(roundNumber, round),
-      fg: this.#theme.textPrimary,
+    const headingRow = new BoxRenderable(this.renderer, {
+      id: 'agent-map-heading',
       width: '100%',
+      flexDirection: 'row',
+      justifyContent: 'space-between',
     });
-    this.output.add(heading);
+    const headingText = headingLabel(roundNumber, round);
+    const heading = new TextRenderable(this.renderer, {
+      content: headingText,
+      fg: this.#theme.textPrimary,
+    });
+    headingRow.add(heading);
+    // What the round is made of, in one line. With one agent per stage it reads
+    // as a summary; with a dozen it is the only way to see the round's shape
+    // without counting nodes. It is the first thing to give up room, because a
+    // wrapped heading costs a row of graph and says less.
+    const summary = phaseSummary(phases);
+    if (headingText.length + summary.length + 2 <= paneWidth - 4) {
+      headingRow.add(
+        new TextRenderable(this.renderer, {
+          content: summary,
+          fg: this.#theme.textMuted,
+        }),
+      );
+    }
+    this.output.add(headingRow);
     // Elapsed time only advances while an agent is running, so the heading
     // ticks for exactly as long as one is.
     if (round !== null && hasActiveAgentTiming(round)) this.#runningRound = {round, text: heading};
+    if (width === null) this.#renderStacked(phases, state.selectedAgentKind);
+    else this.#renderGraph(phases, state.selectedAgentKind, width);
+    this.#syncElapsedTimer();
+  }
+
+  destroy(): void {
+    this.#stopElapsedTimer();
+  }
+
+  /**
+   * Stages left to right with the agents of a stage stacked inside their
+   * column, laid out by `agent-graph.ts` and positioned absolutely: a graph has
+   * no row-and-column structure for flex to follow.
+   */
+  #renderGraph(phases: AgentPhase[], selectedKind: string | null, paneWidth: number): void {
+    const graph = layoutAgentGraph(phases, paneWidth - 4);
+    // The graph sits in the middle of the pane rather than hugging the heading:
+    // a chain is a few rows tall and a pane is not. `area` centres, `canvas`
+    // gives the absolutely positioned cells their origin.
+    const area = new BoxRenderable(this.renderer, {
+      id: 'agent-graph',
+      width: '100%',
+      flexGrow: 1,
+      flexShrink: 1,
+      flexDirection: 'column',
+      justifyContent: 'center',
+    });
+    const canvas = new BoxRenderable(this.renderer, {
+      id: 'agent-graph-canvas',
+      width: '100%',
+      height: graph.height,
+      flexShrink: 0,
+    });
+    this.output.add(area);
+    area.add(canvas);
+    for (const run of edgeRuns(graph)) {
+      canvas.add(
+        new TextRenderable(this.renderer, {
+          content: run.glyphs,
+          fg: edgeColor(this.#theme, run.tone),
+          position: 'absolute',
+          left: run.x,
+          top: run.y,
+        }),
+      );
+    }
+    for (const node of graph.nodes) {
+      canvas.add(this.#renderNode(node.phase, node.phase.kind === selectedKind, node));
+    }
+  }
+
+  #renderNode(
+    phase: AgentPhase,
+    selected: boolean,
+    node: {x: number; y: number; width: number},
+  ): BoxRenderable {
+    const color = statusColor(this.#theme, phase.status);
+    const box = new BoxRenderable(this.renderer, {
+      id: `agent-${phase.kind}-${node.y}`,
+      position: 'absolute',
+      left: node.x,
+      top: node.y,
+      width: node.width,
+      height: NODE_HEIGHT,
+      flexDirection: 'column',
+      // No horizontal padding: two columns of it is the difference between
+      // "implementer" and "implement…" at the widths a four-stage round leaves.
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: selected
+        ? this.#theme.borderFocus
+        : phase.status === 'pending'
+          ? this.#theme.borderStrong
+          : color,
+      ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
+      // Clicking a node filters the transcript to it, and clicking the selected
+      // one clears the filter: the same toggle Tab and Esc give the keyboard.
+      onMouseUp: () => this.controller.selectAgent(phase.kind),
+    });
+    const inner = node.width - 2;
+    box.add(
+      new TextRenderable(this.renderer, {
+        content: truncate(`${STATUS_MARKER[phase.status]} ${phase.kind}`, inner),
+        fg: selected ? this.#theme.textStrong : color,
+        width: '100%',
+      }),
+    );
+    box.add(
+      new TextRenderable(this.renderer, {
+        content: truncate(phase.status, inner),
+        fg: color,
+        width: '100%',
+      }),
+    );
+    return box;
+  }
+
+  /** The pane before the graph: used when the terminal is too narrow for it. */
+  #renderStacked(phases: AgentPhase[], selectedKind: string | null): void {
     for (const [index, phase] of phases.entries()) {
-      this.output.add(this.#renderPhase(phase, state.selectedAgentKind === phase.kind));
+      this.output.add(this.#renderStackedPhase(phase, selectedKind === phase.kind));
       if (index < phases.length - 1) {
         this.output.add(
           new TextRenderable(this.renderer, {
@@ -95,38 +280,9 @@ export class AgentMapView {
         );
       }
     }
-    this.#syncElapsedTimer();
   }
 
-  destroy(): void {
-    this.#stopElapsedTimer();
-  }
-
-  #syncElapsedTimer(): void {
-    if (this.#runningRound === null || this.#elapsedTimer !== null) return;
-    this.#elapsedTimer = setInterval(() => {
-      if (this.#runningRound === null) return;
-      const {round, text} = this.#runningRound;
-      text.content = headingLabel(round.number, round);
-    }, 1000);
-  }
-
-  #stopElapsedTimer(): void {
-    if (this.#elapsedTimer === null) return;
-    clearInterval(this.#elapsedTimer);
-    this.#elapsedTimer = null;
-  }
-
-  #clear(): void {
-    this.#runningRound = null;
-    this.#stopElapsedTimer();
-    for (const child of [...this.output.getChildren()]) {
-      this.output.remove(child);
-      child.destroyRecursively();
-    }
-  }
-
-  #renderPhase(phase: AgentPhase, selected: boolean): BoxRenderable {
+  #renderStackedPhase(phase: AgentPhase, selected: boolean): BoxRenderable {
     const row = new BoxRenderable(this.renderer, {
       id: `agent-${phase.kind}`,
       width: '100%',
@@ -134,9 +290,15 @@ export class AgentMapView {
       marginTop: 1,
       paddingLeft: 1,
       paddingRight: 1,
-      border: selected,
-      borderStyle: 'rounded',
-      borderColor: selected ? this.#theme.borderFocus : this.#theme.border,
+      // Passing borderStyle without border draws a frame that the layout does
+      // not reserve rows for, and the phase's lines then overlap it.
+      ...(selected
+        ? {
+            border: true,
+            borderStyle: 'rounded' as const,
+            borderColor: this.#theme.borderFocus,
+          }
+        : {}),
       ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
     });
     const color = statusColor(this.#theme, phase.status);
@@ -165,6 +327,75 @@ export class AgentMapView {
     }
     return row;
   }
+
+  #syncElapsedTimer(): void {
+    if (this.#runningRound === null || this.#elapsedTimer !== null) return;
+    this.#elapsedTimer = setInterval(() => {
+      if (this.#runningRound === null) return;
+      const {round, text} = this.#runningRound;
+      text.content = headingLabel(round.number, round);
+    }, 1000);
+  }
+
+  #stopElapsedTimer(): void {
+    if (this.#elapsedTimer === null) return;
+    clearInterval(this.#elapsedTimer);
+    this.#elapsedTimer = null;
+  }
+
+  #clear(): void {
+    this.#runningRound = null;
+    this.#stopElapsedTimer();
+    for (const child of [...this.output.getChildren()]) {
+      this.output.remove(child);
+      child.destroyRecursively();
+    }
+  }
+}
+
+/**
+ * Edge cells grouped into horizontal runs of one tone, so a straight edge is
+ * one renderable rather than one per cell.
+ */
+export function edgeRuns(
+  graph: AgentGraph,
+): Array<{x: number; y: number; glyphs: string; tone: EdgeTone}> {
+  const sorted = [...graph.cells].sort((a, b) => a.y - b.y || a.x - b.x);
+  const runs: Array<{x: number; y: number; glyphs: string; tone: EdgeTone}> = [];
+  for (const cell of sorted) {
+    const open = runs.at(-1);
+    if (
+      open !== undefined &&
+      open.y === cell.y &&
+      open.tone === cell.tone &&
+      open.x + open.glyphs.length === cell.x
+    ) {
+      open.glyphs += cell.glyph;
+      continue;
+    }
+    runs.push({x: cell.x, y: cell.y, glyphs: cell.glyph, tone: cell.tone});
+  }
+  return runs;
+}
+
+/** `4 agents · 1 active · 2 done`, with failures and skips only when they exist. */
+export function phaseSummary(phases: AgentPhase[]): string {
+  const count = (status: AgentPhase['status']): number =>
+    phases.filter(phase => phase.status === status).length;
+  const parts = [
+    `${phases.length} ${phases.length === 1 ? 'agent' : 'agents'}`,
+    `${count('active')} active`,
+    `${count('completed')} done`,
+  ];
+  if (count('failed') > 0) parts.push(`${count('failed')} failed`);
+  const pending = count('pending');
+  if (pending > 0) parts.push(`${pending} waiting`);
+  return parts.join(' · ');
+}
+
+function truncate(text: string, width: number): string {
+  const room = Math.max(1, width);
+  return text.length <= room ? text : `${text.slice(0, room - 1)}…`;
 }
 
 /**

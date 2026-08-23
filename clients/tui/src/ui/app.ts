@@ -1,6 +1,12 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
-import {experimentLogVisible, type SessionState, statusText} from '../session-model.js';
+import {
+  experimentLogVisible,
+  type SessionState,
+  statusText,
+  stripRounds,
+  visibleRoundNumber,
+} from '../session-model.js';
 import {AgentMapView} from './agent-map.js';
 import {ChatOverlayView} from './chat-overlay.js';
 import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
@@ -14,7 +20,7 @@ import {RoundStripView} from './round-strip.js';
 import {createMarkdownStyle} from './styles.js';
 import {resolveTheme, type ThemeName} from './theme.js';
 import {ThemePickerView} from './theme-picker.js';
-import {TodoStripView} from './todo-strip.js';
+import {TodoStripView, todoStripWidth} from './todo-strip.js';
 
 export interface OpenTuiApp {
   destroy(): void;
@@ -23,10 +29,8 @@ export interface OpenTuiApp {
 /** Which of the client's inputs currently holds the cursor. */
 type FocusTarget = 'command' | 'chat' | 'modal';
 
-const KEY_HELP =
-  '[/]: round · Tab: agent · PgUp/PgDn · Ctrl+T: todos · Ctrl+P: prompt · Ctrl+L: live';
-const SCOPED_KEY_HELP =
-  '[/]: round · Tab: agent · PgUp/PgDn · Ctrl+T: todos · Ctrl+P: prompt · Esc: experiments';
+const KEY_HELP = '[/]: round · ←→: pane · ↑↓/Tab: within it · /todos · /prompt · Ctrl+L: live';
+const SCOPED_KEY_HELP = '[/]: round · ←→: pane · ↑↓/Tab: within it · /todos · /prompt · Esc: back';
 const LOG_KEY_HELP =
   '↑↓ or scroll: select · Enter or /open-round: open its rounds · /open-round --N';
 const LOG_CHAT_KEY_HELP =
@@ -42,6 +46,18 @@ const CHAT_INPUT_PENDING_HINT = 'Awaiting the agent';
 const CHAT_INPUT_BLURRED_HINT = 'Ctrl+W to type here';
 const SPLIT_KEY_HELP =
   'Ctrl+W: switch pane · PgUp/PgDn: scroll focused pane · Esc on the pane: close it';
+
+/**
+ * A round the run has not reached has no turns and never will until it runs.
+ * Saying so beats "waiting for run events", which reads as something broken.
+ */
+function emptyTranscriptMessage(state: SessionState): string {
+  const roundNumber = visibleRoundNumber(state);
+  if (roundNumber === null) return 'Waiting for run events…';
+  const round = stripRounds(state).find(item => item.number === roundNumber);
+  if (round?.status === 'planned') return `Round ${roundNumber} has not run yet.`;
+  return 'Waiting for run events…';
+}
 
 export function createOpenTuiApp(renderer: CliRenderer, controller: SessionController): OpenTuiApp {
   let themeName: ThemeName = controller.state.themeName;
@@ -86,19 +102,29 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   let markdownStyle = createMarkdownStyle(theme);
   const roundStrip = new RoundStripView(renderer, controller, theme);
   const todoStrip = new TodoStripView(renderer, controller, theme);
-  const agentMap = new AgentMapView(renderer, theme);
+  const agentMap = new AgentMapView(renderer, controller, theme);
   const overlay = new OverlayView(renderer, theme);
   const experimentLog = new ExperimentLogView(renderer, controller, theme);
   const rightPane = new RightPaneView(renderer, theme);
   const themePicker = new ThemePickerView(renderer, theme);
-  const conversation = new ConversationView(renderer, controller, markdownStyle, theme);
+  const conversation = new ConversationView(renderer, controller, markdownStyle, theme, {
+    showsSelection: true,
+  });
   const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme);
   const chatPane = new ChatPaneView(renderer, controller, markdownStyle, theme);
-  const input = createInputPanel(renderer, value => void controller.submit(value), theme);
+  // Clicking either box moves the pane focus to it, so the border, the hint,
+  // and the cursor never disagree about which surface is taking keystrokes.
+  const input = createInputPanel(
+    renderer,
+    value => void controller.submit(value),
+    theme,
+    () => controller.focusPane('left'),
+  );
   const chatInput = createChatInputPanel(
     renderer,
     value => void controller.submitChat(value),
     theme,
+    () => controller.focusPane('chat'),
   );
   // The two inputs share a row and split it on the same boundary as the panes
   // above them, so each box sits under the surface it writes to.
@@ -132,6 +158,9 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     flexDirection: 'column',
   });
 
+  // A slash command and a key toggle the same prompt: the controller routes the
+  // request, the transcript decides which prompt it applies to.
+  controller.onTogglePrompt(() => conversation.toggleLatestPrompt());
   viewport.add(conversation.output);
   main.add(agentMap.output);
   // The chat is the leftmost column of the landing view, so it is added before
@@ -238,15 +267,27 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     todoStrip.output.visible = !showLog;
     if (!showLog) {
       roundStrip.render(state);
-      todoStrip.render(state);
       agentMap.render(state);
+      // The todo box sits under the agent pane and stops where it stops: the
+      // todos belong to an agent, so running them under the transcript would
+      // attach them to the wrong thing.
+      conversation.setEmptyContent(emptyTranscriptMessage(state));
+      const agentWidth = agentMap.output.width;
+      todoStrip.render(
+        state,
+        typeof agentWidth === 'number' ? todoStripWidth(agentWidth, renderer.terminalWidth) : null,
+      );
       conversation.render(state);
     }
     // The agent map is the first thing to give up room: it is a summary the
     // visualization largely supersedes while the split is open.
     agentMap.output.visible = !showLog && !showSplit;
-    viewport.borderColor =
-      showSplit && state.layout.focus === 'left' ? theme.borderFocus : theme.border;
+    // Inside a round the transcript is one of two navigable panes, so it carries
+    // the focus border whenever the round view's keys are on it.
+    const transcriptFocused = showLog
+      ? showSplit && state.layout.focus === 'left'
+      : state.roundFocus === 'transcript';
+    viewport.borderColor = transcriptFocused ? theme.borderFocus : theme.border;
     // Match the chat to the left pane's rectangle so it sits beside the
     // visualization instead of over it. Bounds come from the siblings that
     // actually occupy those rows, so a taller todo strip still fits.
@@ -306,6 +347,10 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     inputIsEmpty: () => input.isEmpty() && chatInput.isEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
+    revealSelectedEntry: () => {
+      const card = conversation.selectedCard();
+      if (card !== null) viewport.scrollChildIntoView(card.id);
+    },
     selectNextAgent: () => controller.selectNextAgent(),
     selectPreviousAgent: () => controller.selectPreviousAgent(),
     selectNextRound: () => controller.selectNextRound(),
@@ -328,6 +373,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
       input.destroy();
       chatInput.destroy();
       chat.destroy();
+      conversation.destroy();
       roundStrip.destroy();
       agentMap.destroy();
       root.destroyRecursively();

@@ -8,7 +8,11 @@ import {
 } from './round-timing.js';
 
 export type AgentPhaseStatus = 'pending' | 'active' | 'completed' | 'failed';
-export type RoundStatus = 'active' | 'completed' | 'failed';
+/**
+ * ``planned`` is not an observed state: it stands for a round the run intends to
+ * reach, so the strip can show the whole run rather than only what has happened.
+ */
+export type RoundStatus = 'active' | 'completed' | 'failed' | 'planned';
 
 export interface RoundSummary extends RoundTimingState {
   number: number;

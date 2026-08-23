@@ -72,9 +72,13 @@ export class ChatPaneView {
       paddingRight: 1,
       border: true,
       borderStyle: 'rounded',
-      borderColor: theme.border,
+      borderColor: theme.info,
       title: ' Experiment chat ',
       visible: false,
+      // Clicking into the chat gives it the keys, the same thing Ctrl+W does.
+      // Without this the pane took the click but the focus border stayed on the
+      // table, so the operator could not tell where their keys were going.
+      onMouseUp: () => controller.focusPane('chat'),
     });
     this.#scroll = new ScrollBoxRenderable(renderer, {
       id: 'chat-pane-scroll',
@@ -84,6 +88,10 @@ export class ChatPaneView {
       stickyStart: 'bottom',
       viewportCulling: true,
       verticalScrollbarOptions: {showArrows: false},
+      // The pointer lands on whatever is innermost, so the outer box's handler
+      // never fires for a click on the conversation itself. Both surfaces ask
+      // for focus, and the border then agrees with where the keys go.
+      onMouseUp: () => controller.focusPane('chat'),
     });
     this.#conversation = new ConversationView(renderer, controller, markdownStyle, theme, {
       selectConversation: state => state.chatConversation,
@@ -96,7 +104,7 @@ export class ChatPaneView {
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.#theme = theme;
-    this.output.borderColor = theme.border;
+    this.output.borderColor = theme.info;
     this.#conversation.applyTheme(theme, markdownStyle);
     this.#renderedState = null;
   }
@@ -114,7 +122,10 @@ export class ChatPaneView {
     }
     this.output.width = width;
     const focused = chatPaneFocused(state);
-    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
+    // The chat keeps a colour of its own at rest, the way the command input
+    // keeps green: which box a keystroke lands in should be readable without
+    // moving focus around to find out.
+    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.info;
     // The column can be as narrow as its minimum, where a spelled-out "focused"
     // costs the title itself: a box with no title reads as nothing at all. The
     // marker is the one the table already uses for the row that has the keys.

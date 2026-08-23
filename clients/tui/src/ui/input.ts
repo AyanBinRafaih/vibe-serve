@@ -50,6 +50,14 @@ export function createChatInputPanel(
   renderer: CliRenderer,
   onSubmit: (value: string) => void,
   theme: Theme,
+  /**
+   * Called when the box is clicked. Clicking an input hands it the cursor at
+   * the renderer level, and that is invisible on its own: without telling the
+   * model, the pane focus stays where it was, the border and the hint keep
+   * pointing at the other box, and the operator types into a box that looks
+   * inert.
+   */
+  onFocusRequest: () => void = () => {},
 ): ChatInputPanel {
   const box = new BoxRenderable(renderer, {
     // The modal chat owns 'chat-input-box'; this is the docked one.
@@ -62,6 +70,7 @@ export function createChatInputPanel(
     title: ' Chat ',
     paddingLeft: 1,
     paddingRight: 1,
+    onMouseUp: onFocusRequest,
   });
   const input = new InputRenderable(renderer, {
     id: 'chat-dock-input',
@@ -69,6 +78,7 @@ export function createChatInputPanel(
     placeholder: 'Type a question',
     textColor: theme.textStrong,
     focusedTextColor: theme.textStrong,
+    onMouseUp: onFocusRequest,
   });
   const submit = (value: string): void => {
     input.value = '';
@@ -104,6 +114,8 @@ export function createInputPanel(
   renderer: CliRenderer,
   onSubmit: (value: string) => void,
   theme: Theme,
+  /** Called when the box is clicked, so the pane focus follows the cursor. */
+  onFocusRequest: () => void = () => {},
 ): InputPanel {
   const box = new BoxRenderable(renderer, {
     id: 'input-box',
@@ -115,6 +127,7 @@ export function createInputPanel(
     title: ' Ask or command ',
     paddingLeft: 1,
     paddingRight: 1,
+    onMouseUp: onFocusRequest,
   });
   let syntaxStyle = commandSyntaxStyle(theme);
   let commandStyleId = syntaxStyle.getStyleId('slash-command');
@@ -125,6 +138,7 @@ export function createInputPanel(
     textColor: theme.textStrong,
     focusedTextColor: theme.textStrong,
     syntaxStyle,
+    onMouseUp: onFocusRequest,
   });
   const suggestions = new BoxRenderable(renderer, {
     id: 'input-suggestions',

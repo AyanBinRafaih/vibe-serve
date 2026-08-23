@@ -1,5 +1,6 @@
-import {describe, expect, it} from 'bun:test';
+import {describe, expect, it, test} from 'bun:test';
 import type {RunEvent} from './protocol.js';
+import type {SessionState} from './session-model.js';
 import {
   applyEvent,
   chatDocked,
@@ -8,9 +9,11 @@ import {
   closeThemePicker,
   cyclePaneFocus,
   enterExperimentDrilldown,
+  enterExperimentRound,
   failPane,
   focusPane,
   initialSessionState,
+  leaveExperimentDrilldown,
   moveThemeSelection,
   openChat,
   openPane,
@@ -22,6 +25,7 @@ import {
   setExperiments,
   setPaneContent,
   setTheme,
+  showDetail,
   statusText,
   toggleTodos,
   visibleConversation,
@@ -148,15 +152,8 @@ describe('session event model', () => {
 
     expect(state.conversation).toEqual([]);
     expect(state.agentKind).toBeNull();
-    expect(state.chatConversation.map(entry => entry.kind)).toEqual([
-      'analysis',
-      'tool',
-      'assistant',
-    ]);
-    expect(state.chatConversation[1]).toMatchObject({
-      toolCall: '→ read_file(path="progress.md")\n',
-      toolResponse: 'Round 2 improved throughput.',
-    });
+    // Routed to the chat, and filtered there to the answer itself.
+    expect(state.chatConversation.map(entry => entry.kind)).toEqual(['assistant']);
     expect(state.chatConversation.at(-1)?.content).toBe('Round 2 improved throughput.');
   });
 
@@ -824,5 +821,86 @@ describe('theme picker', () => {
     expect(setTheme(opened, 'light').themeName).toBe('light');
     // Re-applying the active theme is still an answer to the picker.
     expect(setTheme(opened, 'dark').themePicker).toBeNull();
+  });
+});
+
+describe('re-entering a round after leaving it', () => {
+  const hypothesis = {
+    hypothesis_id: 'H1',
+    first_round: 1,
+    last_round: 2,
+    rounds: [{round: 1}, {round: 2}],
+  } as never;
+
+  function scoped() {
+    const base: SessionState = {
+      ...initialSessionState(),
+      rounds: [
+        {number: 1, status: 'completed'},
+        {number: 2, status: 'active'},
+      ],
+      phases: [
+        {
+          kind: 'implementer',
+          status: 'completed',
+          roundNumber: 1,
+          roundLabel: 'round-1-implementer',
+        },
+        {kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'},
+      ],
+      conversation: [
+        {id: 'a', kind: 'assistant', label: 'implementer', content: 'patched', roundNumber: 1},
+      ],
+    };
+    return setExperiments(base, [hypothesis]);
+  }
+
+  test('shows the round again after leaving and coming back through an error', () => {
+    const withLog = scoped();
+    const first = enterExperimentRound(withLog, 1);
+    expect(first).not.toBeNull();
+    expect(visiblePhases(first as SessionState)).toHaveLength(2);
+    expect(visibleConversation(first as SessionState)).toHaveLength(1);
+
+    const left = leaveExperimentDrilldown(first as SessionState);
+    const errored = showDetail(left, 'Unknown command: /nope. Use /help.');
+    const again = enterExperimentRound(errored, 1);
+    expect(again).not.toBeNull();
+    expect(visiblePhases(again as SessionState)).toHaveLength(2);
+    expect(visibleConversation(again as SessionState)).toHaveLength(1);
+  });
+});
+
+describe('a long run', () => {
+  test('keeps an earlier round openable after thousands of entries', () => {
+    let state: SessionState = initialSessionState();
+    // Two hundred rounds of chatter: far past any per-entry cap.
+    for (let round = 1; round <= 200; round += 1) {
+      for (let turn = 0; turn < 30; turn += 1) {
+        state = applyEvent(state, {
+          sequence: round * 100 + turn,
+          timestamp: '2026-01-01T00:00:00Z',
+          type: 'agent_output_chunk',
+          agent_kind: 'implementer',
+          round_label: `round-${round}-implementer`,
+          invocation_id: `impl-${round}-${turn}`,
+          data: {
+            kind: 'agent_output_chunk',
+            channel: 'assistant',
+            content: `round ${round} turn ${turn}`,
+          },
+        } as RunEvent);
+      }
+    }
+
+    // The round the operator opens still has its turns, whole.
+    const late = {...state, selectedRound: 200};
+    expect(visibleConversation(late).length).toBeGreaterThan(0);
+
+    // And a round from early in the run is either fully there or fully gone,
+    // never a fragment that reads as a round which barely ran.
+    const early = {...state, selectedRound: 150};
+    const entries = visibleConversation(early);
+    expect(entries.length === 0 || entries.length >= 30).toBe(true);
   });
 });

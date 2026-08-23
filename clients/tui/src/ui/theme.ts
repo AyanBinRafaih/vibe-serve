@@ -197,31 +197,25 @@ interface ThemeSpec {
   };
 }
 
-const TOOL_BAND_TINT: Record<Appearance, number> = {dark: 0.55, light: 0.22};
-
 const SUBTLE_TEXT_MIN_CONTRAST = 3;
 
-function readableBandBackground(
-  base: string,
-  accent: string,
-  tint: number,
-  foreground: string,
-  minRatio: number,
-): string {
-  for (let step = 0; step <= CONTRAST_STEPS; step += 1) {
-    const background = mix(base, accent, (tint * (CONTRAST_STEPS - step)) / CONTRAST_STEPS);
-    if (contrastRatio(foreground, background) >= minRatio) return background;
-  }
-  return base;
-}
+/**
+ * How far a card's label is pulled toward the theme's strongest text before the
+ * contrast floor is applied. The raw role accent reads as a border but is too
+ * close to the card fill to head it: lifting it keeps the role's hue while
+ * giving the label the presence a heading needs, in light themes as in dark.
+ */
+const LABEL_LIFT = 0.35;
 
 function buildConversationRole(spec: ThemeSpec, role: ConversationRole): ConversationRoleColors {
   const accent = spec.roleAccents[role];
+  // A low tint off the canvas: enough to group a card's lines together, not so
+  // much that a screen of cards becomes a field of blocks.
   const background = mix(spec.canvas, accent, spec.cardTint);
   const derived: ConversationRoleColors = {
     border: accent,
     background,
-    label: ensureContrast(accent, background, spec.minContrast),
+    label: ensureContrast(mix(accent, spec.textStrong, LABEL_LIFT), background, spec.minContrast),
     content: ensureContrast(spec.textPrimary, background, spec.minContrast),
   };
   return {...derived, ...spec.overrides?.conversation?.[role]};
@@ -231,18 +225,11 @@ function buildToolBands(
   spec: ThemeSpec,
   conversation: Record<ConversationRole, ConversationRoleColors>,
 ): {toolCall: BandColors; toolResult: BandColors} {
-  const callBackground = readableBandBackground(
-    spec.canvas,
-    spec.roleAccents.user,
-    TOOL_BAND_TINT[spec.appearance],
-    spec.textStrong,
-    spec.minContrast,
-  );
   const tool = conversation.tool;
   return {
     toolCall: {
-      background: callBackground,
-      foreground: ensureContrast(spec.textStrong, callBackground, spec.minContrast),
+      background: tool.background,
+      foreground: ensureContrast(spec.roleAccents.user, tool.background, spec.minContrast),
       ...spec.overrides?.toolCall,
     },
     toolResult: {
@@ -308,7 +295,9 @@ const DARK: ThemeSpec = {
   canvas: '#0f172a',
   surface: '#1e293b',
   elevatedSurface: '#020617',
-  selectedSurface: '#0f172a',
+  // Distinct from the canvas: a selection painted in the canvas colour is not a
+  // selection. Every other theme already differs here.
+  selectedSurface: '#1e293b',
   textPrimary: '#e2e8f0',
   textMuted: '#94a3b8',
   textSubtle: '#64748b',
@@ -327,25 +316,13 @@ const DARK: ThemeSpec = {
     assistant: '#0891b2',
     user: '#2563eb',
     prompt: '#3b82f6',
-    analysis: '#475569',
-    tool: '#3f3f46',
-    neutral: '#475569',
+    analysis: '#8b5cf6',
+    tool: '#64748b',
+    neutral: '#94a3b8',
     success: '#22c55e',
     failure: '#ef4444',
   },
   overrides: {
-    conversation: {
-      assistant: {background: '#0f1b24', label: '#67e8f9', content: '#e2e8f0'},
-      user: {background: '#102548', label: '#7dd3fc', content: '#e0f2fe'},
-      prompt: {background: '#102548', label: '#93c5fd', content: '#dbeafe'},
-      analysis: {background: '#171923', label: '#a78bfa', content: '#94a3b8'},
-      tool: {background: '#18181b', label: '#a1a1aa', content: '#a1a1aa'},
-      neutral: {background: '#111827', label: '#94a3b8', content: '#cbd5e1'},
-      success: {background: '#102018', label: '#4ade80', content: '#bbf7d0'},
-      failure: {background: '#1f1215', label: '#f87171', content: '#fecaca'},
-    },
-    toolCall: {foreground: '#dbeafe', background: '#1e3a8a'},
-    toolResult: {foreground: '#a1a1aa', background: '#18181b'},
     markdown: {
       default: '#e2e8f0',
       heading: '#67e8f9',

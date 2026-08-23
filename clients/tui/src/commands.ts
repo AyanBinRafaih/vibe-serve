@@ -4,6 +4,12 @@ import {isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export type ParsedInput = {
   localView?: 'chat' | 'help' | 'theme';
+  /**
+   * Surfaces that also have a key. macOS reserves the function keys for system
+   * controls and a terminal may keep a Control chord for itself, so every
+   * toggle is reachable by name as well.
+   */
+  toggle?: 'todos' | 'prompt';
   chatMessage?: string;
   themeName?: ThemeName;
   request?: RequestInput;
@@ -35,6 +41,8 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
     description: 'Open the selected hypothesis, or /open-round --N for round N',
   },
   {name: '/perf', description: 'Plot performance by round in the right pane'},
+  {name: '/todos', description: "Expand or collapse the visible agent's todo list"},
+  {name: '/prompt', description: 'Expand or collapse the latest prompt in view'},
   {name: '/theme', description: 'List themes, or switch with /theme <name>'},
 ];
 
@@ -116,6 +124,8 @@ export function parseInput(text: string): ParsedInput {
     }
     return {openRound: {round: Number(match[1])}};
   }
+  if (text === '/todos') return {toggle: 'todos'};
+  if (text === '/prompt') return {toggle: 'prompt'};
   if (text === '/perf') {
     return {request: {type: 'query.performance'}, responseView: 'perf', paneView: 'perf'};
   }

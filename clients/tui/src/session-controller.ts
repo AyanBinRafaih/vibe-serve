@@ -8,6 +8,9 @@ import {
   type ConversationEntry,
   chatDocked,
   chatPaneVisible,
+  clearAgentSelection,
+  clearEntrySelection,
+  closeOverlays,
   closePane,
   closeThemePicker,
   cyclePaneFocus,
@@ -16,19 +19,25 @@ import {
   failExperiments,
   failPane,
   focusPane,
+  focusRound,
   initialSessionState,
   leaveExperimentDrilldown,
   moveExperimentSelection,
   moveThemeSelection,
+  normalizeFocus,
   openChat,
   openExperimentLog,
   openPane,
   openThemePicker,
   type PaneFocus,
   type PaneView,
+  type RoundFocus,
   type SessionState,
+  selectAgent,
   selectNextAgent,
+  selectNextEntry,
   selectNextRound,
+  selectNextTodo,
   selectPreviousAgent,
   selectPreviousRound,
   selectRound,
@@ -56,12 +65,22 @@ export interface SessionController {
   selectNextRound(): void;
   selectPreviousRound(): void;
   selectRound(roundNumber: number): void;
+  selectAgent(kind: string): void;
+  selectNextEntry(delta: number, id?: string): void;
+  clearEntrySelection(): void;
+  clearAgentSelection(): void;
+  focusRound(focus: RoundFocus): void;
+  selectNextTodo(delta: number): void;
   toggleTodos(): void;
+  /** Expands the latest prompt in view; the view owns what "latest" means. */
+  togglePrompt(): void;
+  onTogglePrompt(handler: () => void): void;
   setTheme(themeName: ThemeName): void;
   openExperimentLog(): Promise<void>;
   openRound(roundNumber?: number): void;
   openPane(view: PaneView): Promise<void>;
   closePane(): void;
+  closeOverlays(): void;
   cyclePaneFocus(): void;
   focusPane(focus: PaneFocus): void;
   setChatDockFits(fits: boolean): void;
@@ -138,6 +157,30 @@ export class SocketSessionController implements SessionController {
     this.#setState(showLive(this.#state));
   }
 
+  selectAgent(kind: string): void {
+    this.#setState(selectAgent(this.#state, kind));
+  }
+
+  selectNextEntry(delta: number, id?: string): void {
+    this.#setState(selectNextEntry(this.#state, delta, id));
+  }
+
+  clearEntrySelection(): void {
+    this.#setState(clearEntrySelection(this.#state));
+  }
+
+  clearAgentSelection(): void {
+    this.#setState(clearAgentSelection(this.#state));
+  }
+
+  focusRound(focus: RoundFocus): void {
+    this.#setState(focusRound(this.#state, focus));
+  }
+
+  selectNextTodo(delta: number): void {
+    this.#setState(selectNextTodo(this.#state, delta));
+  }
+
   selectNextAgent(): void {
     this.#setState(selectNextAgent(this.#state));
   }
@@ -156,6 +199,21 @@ export class SocketSessionController implements SessionController {
 
   selectRound(roundNumber: number): void {
     this.#setState(selectRound(this.#state, roundNumber));
+  }
+
+  #promptToggle: (() => void) | null = null;
+
+  /**
+   * The prompt lives in the transcript, so the view performs the toggle; the
+   * controller only routes the request, which is what lets a slash command and
+   * a key do the same thing.
+   */
+  onTogglePrompt(handler: () => void): void {
+    this.#promptToggle = handler;
+  }
+
+  togglePrompt(): void {
+    this.#promptToggle?.();
   }
 
   toggleTodos(): void {
@@ -225,6 +283,10 @@ export class SocketSessionController implements SessionController {
 
   closePane(): void {
     this.#setState(closePane(this.#state));
+  }
+
+  closeOverlays(): void {
+    this.#setState(closeOverlays(this.#state));
   }
 
   cyclePaneFocus(): void {
@@ -415,6 +477,14 @@ export class SocketSessionController implements SessionController {
       if (parsed.chatMessage) await this.sendChat(parsed.chatMessage);
       return;
     }
+    if (parsed.toggle === 'todos') {
+      this.toggleTodos();
+      return;
+    }
+    if (parsed.toggle === 'prompt') {
+      this.togglePrompt();
+      return;
+    }
     if (parsed.openRound) {
       this.openRound(parsed.openRound.round);
       return;
@@ -475,8 +545,11 @@ export class SocketSessionController implements SessionController {
   }
 
   #setState(state: SessionState): void {
-    this.#state = state;
-    for (const listener of this.#listeners) listener(state);
+    // Every state change goes through here, which makes it the one place that
+    // can guarantee focus still names a column that exists. A pane that closes
+    // while it holds the keys would otherwise swallow every keystroke.
+    this.#state = normalizeFocus(state);
+    for (const listener of this.#listeners) listener(this.#state);
   }
 }
 

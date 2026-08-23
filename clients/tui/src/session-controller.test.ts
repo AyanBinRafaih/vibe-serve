@@ -132,17 +132,17 @@ describe('session controller', () => {
     await controller.sendChat('what changed?');
 
     expect(transport.requests).toEqual([{type: 'query.chat', text: 'what changed?'}]);
+    // The exchange, and only the exchange: the chat agent's own narration and
+    // tool turns belong in the transcript, not on top of the answer.
     expect(controller.state.chatConversation.map(entry => entry.kind)).toEqual([
       'user',
-      'analysis',
-      'tool',
       'assistant',
     ]);
     expect(controller.state.chatConversation.at(-1)?.content).toBe('Round 2 improved throughput.');
 
     controller.closeChat();
     expect(controller.state.chatOpen).toBe(false);
-    expect(controller.state.chatConversation).toHaveLength(4);
+    expect(controller.state.chatConversation).toHaveLength(2);
   });
 
   it('opens the chat as a modal where it cannot dock', async () => {
@@ -588,7 +588,9 @@ describe('session controller', () => {
     await controller.submit('/open-round');
 
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
-    expect(controller.state.selectedRound).toBeNull();
+    // Lands on the hypothesis's latest round: the round view is built around
+    // one round, and `[` walks back through the earlier ones.
+    expect(controller.state.selectedRound).toBe(3);
   });
 
   it('opens the hypothesis owning a round with /open-round --N', async () => {
