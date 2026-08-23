@@ -11,7 +11,10 @@ caught rather than silently assumed.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -380,5 +383,286 @@ class TestLinuxBackendSelection:
             host_sandbox.build(
                 workspace,
                 env={host_sandbox.DISABLE_ENV: "landlok"},
+                require_enforcement=True,
+            )
+
+
+class _FakeLibc:
+    """Stand-in for libc that records the Landlock syscalls ``restrict`` makes.
+
+    The kernel-backed suites above prove what the ruleset denies; this fake
+    exists to drive the error paths of the syscall layer, which a working
+    kernel never takes, and to inspect the structs handed to the kernel.
+    """
+
+    def __init__(
+        self,
+        *,
+        create_result: int | None = None,
+        add_rule_result: int = 0,
+        prctl_result: int = 0,
+        restrict_result: int = 0,
+    ) -> None:
+        self.create_result = create_result
+        self.add_rule_result = add_rule_result
+        self.prctl_result = prctl_result
+        self.restrict_result = restrict_result
+        self.ruleset_attr: ctypes.Structure | None = None
+        self.ruleset_size: int | None = None
+        self.rules: list[tuple[int, int]] = []
+        self.restricted = False
+
+    def prctl(self, *_args: object) -> int:
+        return self.prctl_result
+
+    def syscall(self, number: ctypes.c_long, *args: object) -> int:
+        create, add_rule, restrict_self = landlock._syscall_numbers()  # noqa: SLF001
+        if number.value == create:
+            if self.create_result is not None:
+                return self.create_result
+            self.ruleset_attr = args[0]._obj  # noqa: SLF001
+            self.ruleset_size = args[1].value
+            return os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+        if number.value == add_rule:
+            attr = args[2]._obj  # noqa: SLF001
+            self.rules.append((int(attr.allowed_access), int(attr.parent_fd)))
+            return self.add_rule_result
+        assert number.value == restrict_self
+        self.restricted = self.restrict_result == 0
+        return self.restrict_result
+
+
+@pytest.fixture
+def fake_libc(monkeypatch: pytest.MonkeyPatch) -> _FakeLibc:
+    libc = _FakeLibc()
+    monkeypatch.setattr(landlock, "_libc", lambda: libc)
+    monkeypatch.setattr(landlock, "_syscall_numbers", lambda: (444, 445, 446))
+    monkeypatch.setattr(landlock, "abi_version", lambda: landlock._ABI_SCOPED)  # noqa: SLF001
+    return libc
+
+
+class TestLandlockAbiProbe:
+    def test_unknown_architecture_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(landlock.platform, "machine", lambda: "mips")
+
+        with pytest.raises(landlock.LandlockUnavailableError, match="mips"):
+            landlock._syscall_numbers()  # noqa: SLF001
+        assert landlock.abi_version() is None
+
+    def test_non_linux_has_no_abi(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(landlock.sys, "platform", "darwin")
+
+        assert landlock.abi_version() is None
+
+    def test_syscall_failure_means_unsupported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(landlock, "_libc", lambda: _FakeLibc(create_result=-1))
+        monkeypatch.setattr(landlock, "_syscall_numbers", lambda: (444, 445, 446))
+
+        assert landlock.abi_version() is None
+
+    def test_scoping_needs_abi_six(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(landlock, "abi_version", lambda: 5)
+        assert landlock.supports_scoping() is False
+        monkeypatch.setattr(landlock, "abi_version", lambda: 6)
+        assert landlock.supports_scoping() is True
+        monkeypatch.setattr(landlock, "abi_version", lambda: None)
+        assert landlock.supports_scoping() is False
+
+    @pytest.mark.parametrize(
+        ("abi", "dropped"),
+        [
+            (1, landlock.AccessFS.TRUNCATE | landlock.AccessFS.REFER),
+            (2, landlock.AccessFS.TRUNCATE),
+            (3, landlock.AccessFS(0)),
+        ],
+    )
+    def test_handled_access_drops_rights_older_kernels_reject(
+        self,
+        abi: int,
+        dropped: landlock.AccessFS,
+    ) -> None:
+        handled = landlock._handled_access(abi)  # noqa: SLF001
+
+        assert handled & dropped == 0
+        assert handled | dropped == landlock._ACCESS_BITS[landlock.RuleAccess.FULL]  # noqa: SLF001
+
+
+class TestLandlockRestrictSyscalls:
+    def test_applies_every_rule_then_restricts(self, tmp_path: Path, fake_libc: _FakeLibc) -> None:
+        (tmp_path / "file.txt").write_text("x")
+        policy = landlock.policy_for(
+            read_paths=(tmp_path / "file.txt",),
+            write_paths=(tmp_path,),
+        )
+
+        abi = landlock.restrict(policy)
+
+        assert abi == landlock._ABI_SCOPED  # noqa: SLF001
+        assert fake_libc.restricted
+        full = int(landlock._ACCESS_BITS[landlock.RuleAccess.READ])  # noqa: SLF001
+        assert [access for access, _fd in fake_libc.rules] == [
+            full & int(landlock._FILE_BITS),  # noqa: SLF001
+            int(landlock._ACCESS_BITS[landlock.RuleAccess.FULL]),  # noqa: SLF001
+        ]
+
+    def test_abi_six_scopes_signals_and_abstract_sockets(self, fake_libc: _FakeLibc) -> None:
+        landlock.restrict(landlock.LandlockPolicy())
+
+        attr = fake_libc.ruleset_attr
+        assert isinstance(attr, landlock._ScopedRulesetAttr)  # noqa: SLF001
+        assert attr.scoped == (
+            landlock._LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | landlock._LANDLOCK_SCOPE_SIGNAL  # noqa: SLF001
+        )
+        assert attr.handled_access_net == 0
+        assert fake_libc.ruleset_size == ctypes.sizeof(attr)
+
+    def test_older_abi_uses_filesystem_only_struct(
+        self,
+        fake_libc: _FakeLibc,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(landlock, "abi_version", lambda: 1)
+
+        landlock.restrict(landlock.LandlockPolicy())
+
+        attr = fake_libc.ruleset_attr
+        assert isinstance(attr, landlock._RulesetAttr)  # noqa: SLF001
+        assert attr.handled_access_fs & landlock.AccessFS.TRUNCATE == 0
+        assert fake_libc.ruleset_size == ctypes.sizeof(ctypes.c_uint64)
+
+    def test_missing_rule_paths_are_skipped(self, tmp_path: Path, fake_libc: _FakeLibc) -> None:
+        policy = landlock.policy_for(read_paths=(tmp_path / "absent",), write_paths=())
+
+        landlock.restrict(policy)
+
+        assert fake_libc.rules == []
+        assert fake_libc.restricted
+
+    def test_unsupported_kernel_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(landlock, "abi_version", lambda: None)
+
+        with pytest.raises(landlock.LandlockUnavailableError, match="does not support"):
+            landlock.restrict(landlock.LandlockPolicy())
+
+    def test_create_ruleset_failure_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(landlock, "_libc", lambda: _FakeLibc(create_result=-1))
+        monkeypatch.setattr(landlock, "_syscall_numbers", lambda: (444, 445, 446))
+        monkeypatch.setattr(landlock, "abi_version", lambda: 1)
+
+        with pytest.raises(landlock.LandlockUnavailableError, match="create_ruleset"):
+            landlock.restrict(landlock.LandlockPolicy())
+
+    @pytest.mark.parametrize(
+        ("failure", "message"),
+        [
+            ({"add_rule_result": -1}, "add_rule"),
+            ({"prctl_result": -1}, "NO_NEW_PRIVS"),
+            ({"restrict_result": -1}, "restrict_self"),
+        ],
+    )
+    def test_later_syscall_failures_are_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: dict[str, int],
+        message: str,
+    ) -> None:
+        libc = _FakeLibc(**failure)
+        monkeypatch.setattr(landlock, "_libc", lambda: libc)
+        monkeypatch.setattr(landlock, "_syscall_numbers", lambda: (444, 445, 446))
+        monkeypatch.setattr(landlock, "abi_version", lambda: 1)
+        policy = landlock.policy_for(read_paths=(), write_paths=(tmp_path,))
+
+        with pytest.raises(landlock.LandlockUnavailableError, match=message):
+            landlock.restrict(policy)
+        assert not libc.restricted
+
+
+class TestLandlockEntryPoint:
+    """``main()`` driven in-process, so its branches are measurable."""
+
+    def test_usage_without_separator(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert landlock.main(["--policy", "{}"]) == 2
+        assert "usage:" in capsys.readouterr().err
+
+    def test_missing_command(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert landlock.main(["--policy", "{}", "--"]) == 2
+        assert "no command" in capsys.readouterr().err
+
+    def test_restricts_then_execs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        applied: list[landlock.LandlockPolicy] = []
+        execs: list[tuple[str, list[str]]] = []
+        monkeypatch.setattr(landlock, "restrict", lambda policy: applied.append(policy) or 1)
+        monkeypatch.setattr(landlock.os, "execvp", lambda file, args: execs.append((file, args)))
+        policy = landlock.policy_for(read_paths=(), write_paths=(tmp_path,), chdir=tmp_path)
+
+        result = landlock.main(["--policy", policy.model_dump_json(), "--", "agent", "--flag"])
+
+        assert result is None
+        assert applied == [policy]
+        assert execs == [("agent", ["agent", "--flag"])]
+        assert Path.cwd() == tmp_path.resolve()
+
+    def test_unavailable_landlock_fails_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def refuse(_policy: landlock.LandlockPolicy) -> int:
+            raise landlock.LandlockUnavailableError("nope")
+
+        monkeypatch.setattr(landlock, "restrict", refuse)
+        monkeypatch.setattr(landlock.os, "execvp", lambda *_args: pytest.fail("must not exec"))
+
+        assert landlock.main(["--policy", "{}", "--", "agent"]) == 125
+        assert "refusing to launch unconfined" in capsys.readouterr().err
+
+    def test_unexecutable_command(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(landlock, "restrict", lambda _policy: 1)
+
+        assert landlock.main(["--policy", "{}", "--", "/nonexistent/agent"]) == 127
+        assert "cannot execute" in capsys.readouterr().err
+
+    def test_module_entry_point_exits_with_main_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(sys, "argv", ["landlock", "--policy", "{}"])
+
+        with pytest.raises(SystemExit) as excinfo:
+            runpy.run_path(landlock.__file__, run_name="__main__")
+
+        assert excinfo.value.code == 2
+
+
+class TestLinuxBackendProbes:
+    def test_bwrap_that_cannot_launch_does_not_confine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def explode(*_args: object, **_kwargs: object) -> None:
+            raise OSError(errno.ENOEXEC, "Exec format error")
+
+        monkeypatch.setattr(host_sandbox.subprocess, "run", explode)
+
+        assert host_sandbox._bwrap_confines("/opt/bwrap") is False  # noqa: SLF001
+
+    def test_landlock_opt_in_without_kernel_support_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = _workspace(tmp_path)
+        monkeypatch.setattr(host_sandbox.sys, "platform", "linux")
+        monkeypatch.setattr(host_sandbox.landlock, "abi_version", lambda: None)
+
+        with pytest.raises(host_sandbox.SandboxUnavailableError, match="does not support Landlock"):
+            host_sandbox.build(
+                workspace,
+                env={host_sandbox.DISABLE_ENV: LinuxBackend.LANDLOCK.value},
                 require_enforcement=True,
             )
