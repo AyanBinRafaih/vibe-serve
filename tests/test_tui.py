@@ -20,7 +20,19 @@ from vibesys.server import (
     RunInspector,
     RunSupervisor,
 )
-from vibesys.server.events import ConfigurationFailedData
+from vibesys.server.diagnostics import (
+    DiagnosticRetryability,
+    DiagnosticScope,
+    DiagnosticSeverity,
+    exception_to_diagnostic,
+)
+from vibesys.server.events import (
+    ConfigurationFailedData,
+    EventStatus,
+    JudgeResultData,
+    PhaseData,
+    RoundFinishedData,
+)
 from vibesys.server.protocol import (
     ChatQuery,
     EventsQuery,
@@ -389,6 +401,207 @@ def test_chat_reports_structured_failed_invocation(tmp_path):  # noqa: ANN001, A
     assert "agent process exited" in answer
 
 
+def test_failure_events_share_and_promote_a_human_facing_diagnostic(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    error = RuntimeError("token=super-secret agent process exited")
+    supervisor.before_agent("implementer", "round 5", "prompt")
+    supervisor.after_agent("implementer", "round 5", error=error)
+    supervisor.finish(error)
+
+    invocation, phase, terminal = [
+        event
+        for event in supervisor.read_events()
+        if event.type
+        in {
+            EventType.INVOCATION_FINISHED,
+            EventType.PHASE_FINISHED,
+            EventType.RUN_FAILED,
+        }
+    ]
+    assert invocation.diagnostic is not None
+    assert phase.diagnostic == invocation.diagnostic
+    assert terminal.diagnostic is not None
+    assert terminal.diagnostic.id == invocation.diagnostic.id
+    assert terminal.diagnostic.scope is DiagnosticScope.INVOCATION
+    assert terminal.diagnostic.summary == invocation.diagnostic.summary
+    assert terminal.diagnostic.detail == invocation.diagnostic.detail
+    assert invocation.diagnostic.severity is DiagnosticSeverity.ERROR
+    assert terminal.diagnostic.severity is DiagnosticSeverity.FATAL
+    assert terminal.diagnostic.retryability is DiagnosticRetryability.UNKNOWN
+    assert invocation.data.error == "Agent invocation failed"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert terminal.text == "Agent invocation failed"
+    assert terminal.diagnostic.detail == "RuntimeError: token=[REDACTED] agent process exited"
+    assert "RuntimeError(" not in terminal.text
+
+
+def test_generic_run_failure_is_fatal_with_unknown_retryability(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.finish(RuntimeError("worker failed"))
+
+    terminal = next(
+        event for event in supervisor.read_events() if event.type is EventType.RUN_FAILED
+    )
+    assert terminal.diagnostic is not None
+    assert terminal.diagnostic.scope is DiagnosticScope.RUN
+    assert terminal.diagnostic.severity is DiagnosticSeverity.FATAL
+    assert terminal.diagnostic.retryability is DiagnosticRetryability.UNKNOWN
+    assert sum(event.type is EventType.RUN_FAILED for event in supervisor.read_events()) == 1
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.CONFIGURATION_FAILED,
+        EventType.INVOCATION_FINISHED,
+        EventType.PHASE_FINISHED,
+        EventType.RUN_FAILED,
+        EventType.RUN_INTERRUPTED,
+    ],
+)
+def test_operational_failure_events_require_diagnostics(tmp_path, event_type):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    for status in (EventStatus.FAILED, "failed"):
+        with pytest.raises(ValueError, match="must include a diagnostic"):
+            supervisor.record(event_type, status=status)
+
+
+def test_semantic_failure_events_remain_valid_without_diagnostics(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    judge = supervisor.record(
+        EventType.JUDGE_RESULT,
+        status=EventStatus.FAILED,
+        data=JudgeResultData(verdict="fail", feedback="incorrect", attempt=1),
+    )
+    round_finished = supervisor.record(
+        EventType.ROUND_FINISHED,
+        status=EventStatus.FAILED,
+        data=RoundFinishedData(attempts=1, judge_verdict="fail"),
+    )
+
+    assert judge is not None
+    assert judge.diagnostic is None
+    assert round_finished is not None
+    assert round_finished.diagnostic is None
+
+
+def test_capture_failure_emits_nothing_on_success(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    before = supervisor.read_events()
+
+    with supervisor.capture_failure(
+        event_type=EventType.PHASE_FINISHED,
+        scope=DiagnosticScope.PHASE,
+        operation="Background maintenance",
+    ):
+        pass
+
+    assert supervisor.read_events() == before
+    assert supervisor.snapshot().status == "running"
+
+
+def test_failure_helpers_reject_non_operational_and_terminal_events(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    before = supervisor.read_events()
+
+    with pytest.raises(ValueError, match="without owning run termination"):
+        supervisor.record_failure(
+            EventType.JUDGE_RESULT,
+            RuntimeError("incorrect result"),
+            scope=DiagnosticScope.PHASE,
+            operation="Judge",
+        )
+    error = RuntimeError("worker failed")
+    for event_type in (EventType.CONFIGURATION_FAILED, EventType.RUN_FAILED):
+        with (
+            pytest.raises(ValueError, match="without owning run termination"),
+            supervisor.capture_failure(
+                event_type=event_type,
+                scope=DiagnosticScope.RUN,
+                operation="Background maintenance",
+            ),
+        ):
+            raise error
+
+    assert supervisor.read_events() == before
+
+
+def test_finish_is_idempotent(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.finish(RuntimeError("first failure"))
+    supervisor.finish(RuntimeError("second failure"))
+
+    terminal = [event for event in supervisor.read_events() if event.type is EventType.RUN_FAILED]
+    assert len(terminal) == 1
+    assert terminal[0].diagnostic is not None
+    assert terminal[0].diagnostic.detail == "RuntimeError: first failure"
+
+
+def test_capture_failure_records_once_and_reraises_without_finishing(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    error = KeyboardInterrupt("background worker stopped")
+    before = supervisor.read_events()
+
+    with (
+        pytest.raises(KeyboardInterrupt) as raised,
+        supervisor.capture_failure(
+            event_type=EventType.PHASE_FINISHED,
+            scope=DiagnosticScope.PHASE,
+            operation="Background maintenance",
+            data=PhaseData(phase="maintenance", attempt=1),
+            agent_kind="maintenance",
+            round_label="round 1",
+        ),
+    ):
+        raise error
+
+    assert raised.value is error
+    events = supervisor.read_events()
+    assert len(events) == len(before) + 1
+    captured = events[-1]
+    assert captured.type is EventType.PHASE_FINISHED
+    assert captured.status is EventStatus.FAILED
+    assert captured.data == PhaseData(phase="maintenance", attempt=1)
+    assert captured.agent_kind == "maintenance"
+    assert captured.diagnostic is not None
+    assert captured.diagnostic.summary == "Background maintenance failed"
+    assert supervisor.snapshot().status == "running"
+    assert not any(event.type is EventType.RUN_FAILED for event in events)
+
+
+def test_terminal_wrapper_reuses_an_invocation_diagnostic(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    cause = RuntimeError("token=super-secret agent process exited")
+    supervisor.before_agent("implementer", "round 5", "prompt")
+    supervisor.after_agent("implementer", "round 5", error=cause)
+    wrapper = RuntimeError("run cleanup failed")
+    wrapper.__cause__ = cause
+    supervisor.finish(wrapper)
+
+    invocation, terminal = [
+        event
+        for event in supervisor.read_events()
+        if event.type in {EventType.INVOCATION_FINISHED, EventType.RUN_FAILED}
+    ]
+    assert invocation.diagnostic is not None
+    assert terminal.diagnostic is not None
+    assert terminal.diagnostic.id == invocation.diagnostic.id
+    assert terminal.diagnostic.detail == (
+        "RuntimeError: run cleanup failed <- RuntimeError: token=[REDACTED] agent process exited"
+    )
+
+
 def test_service_accepts_chat(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     (tmp_path / "logs").mkdir()
     supervisor = RunSupervisor()
@@ -471,6 +684,7 @@ def test_keyword_fallback_does_not_advertise_slash_commands(tmp_path):  # noqa: 
 def test_chat_explains_configuration_failure_without_a_run_context(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
+    error = RuntimeError("agent.toml was not found")
     supervisor.record(
         EventType.CONFIGURATION_FAILED,
         status="failed",
@@ -480,6 +694,11 @@ def test_chat_explains_configuration_failure_without_a_run_context(tmp_path):  #
             message="agent.toml was not found",
             usage=None,
             exit_code=2,
+        ),
+        diagnostic=exception_to_diagnostic(
+            error,
+            scope=DiagnosticScope.CONFIGURATION,
+            operation="Configuration",
         ),
     )
 
@@ -585,7 +804,9 @@ def test_socket_transport_returns_clear_chat_agent_errors(tmp_path):  # noqa: AN
     supervisor.attach(tmp_path / "logs")
 
     def fail_chat(question: str) -> str:
-        raise RuntimeError(f"Chat agent failed while answering: {question}")  # noqa: TRY003  # tracked: #288
+        raise RuntimeError(  # noqa: TRY003  # tracked: #288
+            f"token=super-secret Chat agent failed while answering: {question}"
+        )
 
     supervisor.set_chat_handler(fail_chat)
     socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108  # tracked: #288
@@ -599,7 +820,13 @@ def test_socket_transport_returns_clear_chat_agent_errors(tmp_path):  # noqa: AN
             response = json.loads(stream.readline())
 
     assert response["ok"] is False
-    assert response["error"] == "Chat agent failed while answering: what happened?"
+    assert response["error"] == "Request failed"
+    assert "super-secret" not in response["error"]
+    assert response["diagnostic"]["scope"] == "request"
+    assert response["diagnostic"]["summary"] == "Request failed"
+    assert response["diagnostic"]["detail"] == (
+        "RuntimeError: token=[REDACTED] Chat agent failed while answering: what happened?"
+    )
 
 
 def test_socket_subscription_replays_then_streams_new_events(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -625,6 +852,48 @@ def test_socket_subscription_replays_then_streams_new_events(tmp_path):  # noqa:
     assert replay["type"] == "event_batch"
     assert streamed["type"] == "event"
     assert streamed["event"]["type"] == "chat"
+
+
+def test_socket_subscription_reports_structured_stream_failures(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "logs")
+    service = SupervisionService(supervisor)
+    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108  # tracked: #288
+
+    def fail_replay(after_sequence: int):  # noqa: ANN202  # tracked: #288
+        del after_sequence
+        raise RuntimeError("event store is unavailable")  # noqa: TRY003  # tracked: #288
+
+    monkeypatch.setattr(service, "events", fail_replay)
+    with SupervisionSocketServer(socket_path, service):  # noqa: SIM117  # tracked: #288
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(str(socket_path))
+            stream = client.makefile("rwb")
+            stream.write(SubscribeRequest(after_sequence=0).model_dump_json().encode() + b"\n")
+            stream.flush()
+            subscribed = json.loads(stream.readline())
+            failure = json.loads(stream.readline())
+
+    assert subscribed["type"] == "subscribed"
+    assert failure == {
+        "type": "protocol_error",
+        "request_id": subscribed["request_id"],
+        "code": "stream_failed",
+        "message": "Event stream failed",
+        "diagnostic": {
+            "id": failure["diagnostic"]["id"],
+            "code": "stream_failed",
+            "summary": "Event stream failed",
+            "detail": "RuntimeError: event store is unavailable",
+            "hint": None,
+            "scope": "protocol",
+            "severity": "error",
+            "retryability": "unknown",
+            "cause_id": None,
+            "debug_ref": None,
+        },
+    }
 
 
 def test_cli_parse_failure_is_streamed_after_client_attaches():  # noqa: ANN201  # tracked: #288
@@ -696,7 +965,7 @@ def test_cli_parse_failure_is_streamed_after_client_attaches():  # noqa: ANN201 
     assert stderr == ""
 
 
-def test_supervision_runtime_streams_configuration_failure_before_exiting():  # noqa: ANN201  # tracked: #288
+def test_supervision_runtime_streams_configuration_failure_before_exiting():  # noqa: ANN201, PLR0915  # tracked: #288
     session_dir = Path("/tmp") / f"vs-runtime-test-{uuid.uuid4().hex}"  # noqa: S108  # tracked: #288
     socket_path = session_dir / "control.sock"
     received_events = []
@@ -738,8 +1007,8 @@ def test_supervision_runtime_streams_configuration_failure_before_exiting():  # 
         ConfigurationDiagnostic(
             code="invalid_arguments",
             stage="argument_parsing",
-            message="unknown option --bad",
-            usage="usage: vibesys ...",
+            message="unknown token=super-secret option --bad",
+            usage="usage: vibesys --token=super-secret",
         )
     )
     try:
@@ -755,13 +1024,21 @@ def test_supervision_runtime_streams_configuration_failure_before_exiting():  # 
             "kind": "configuration_failed",
             "code": "invalid_arguments",
             "stage": "argument_parsing",
-            "message": "unknown option --bad",
-            "usage": "usage: vibesys ...",
+            "message": "unknown token=[REDACTED] option --bad",
+            "usage": "usage: vibesys --token=[REDACTED]",
             "exit_code": 2,
         }
+        assert configuration_event["text"] == "unknown token=[REDACTED] option --bad"
+        assert (
+            configuration_event["diagnostic"]["summary"] == "unknown token=[REDACTED] option --bad"
+        )
+        assert configuration_event["diagnostic"]["detail"] == (
+            "Stage: argument_parsing\nExit code: 2"
+        )
+        assert configuration_event["diagnostic"]["hint"] == "usage: vibesys --token=[REDACTED]"
         assert not any(event["type"] == "run_failed" for event in received_events)
         assert chat_responses[0]["ok"] is True
-        assert "unknown option --bad" in chat_responses[0]["chat"]["answer"]
+        assert "unknown token=[REDACTED] option --bad" in chat_responses[0]["chat"]["answer"]
     finally:
         subscriber.join(timeout=5)
         shutil.rmtree(session_dir, ignore_errors=True)
