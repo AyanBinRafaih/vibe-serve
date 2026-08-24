@@ -16,6 +16,19 @@ const UNKNOWN_MARKER = '?';
 
 const MAX_EXPANDED_ITEMS = 10;
 
+/** Below this a todo line is all ellipsis, which is worse than crossing a pane edge. */
+const TODO_MIN_WIDTH = 48;
+
+/**
+ * The todo box follows the agent pane it belongs under, so it stops at the
+ * boundary with the transcript rather than running the width of the screen.
+ * A very narrow agent pane is the one exception: a strip too thin to read says
+ * nothing at all, so it keeps a readable floor.
+ */
+export function todoStripWidth(agentPaneWidth: number, terminalWidth: number): number {
+  return Math.min(terminalWidth, Math.max(agentPaneWidth, TODO_MIN_WIDTH));
+}
+
 export function todoMarker(status: string): string {
   return STATUS_MARKER[status] ?? UNKNOWN_MARKER;
 }
@@ -61,6 +74,8 @@ export class TodoStripView {
   #theme: Theme;
   #renderedTodos: TodoItem[] | null = null;
   #renderedExpanded = false;
+  #renderedSelection: number | null = null;
+  #renderedWidth: number | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
@@ -71,13 +86,11 @@ export class TodoStripView {
     this.output = new BoxRenderable(renderer, {
       id: 'todo-strip',
       width: '100%',
+      flexShrink: 0,
       height: 1,
       flexDirection: 'column',
       paddingLeft: 1,
       paddingRight: 1,
-      borderStyle: 'rounded',
-      borderColor: theme.borderStrong,
-      border: false,
       visible: false,
       onMouseUp: () => controller.toggleTodos(),
     });
@@ -85,11 +98,10 @@ export class TodoStripView {
 
   applyTheme(theme: Theme): void {
     this.#theme = theme;
-    this.output.borderColor = theme.borderStrong;
     this.#renderedTodos = null;
   }
 
-  render(state: SessionState): void {
+  render(state: SessionState, width: number | null = null): void {
     const todos = visibleTodos(state);
     if (todos.length === 0) {
       this.output.visible = false;
@@ -97,16 +109,27 @@ export class TodoStripView {
       return;
     }
     this.output.visible = true;
-    if (todos === this.#renderedTodos && state.todosExpanded === this.#renderedExpanded) return;
+    // The todos belong to the agent whose transcript is on the left, so the box
+    // stops where that pane stops rather than running under the right pane.
+    this.output.width = width ?? '100%';
+    if (
+      todos === this.#renderedTodos &&
+      state.todosExpanded === this.#renderedExpanded &&
+      state.selectedTodoIndex === this.#renderedSelection &&
+      width === this.#renderedWidth
+    ) {
+      return;
+    }
     this.#renderedTodos = todos;
     this.#renderedExpanded = state.todosExpanded;
+    this.#renderedSelection = state.selectedTodoIndex;
+    this.#renderedWidth = width;
     this.#clear();
-    if (state.todosExpanded) this.#renderExpanded(todos);
+    if (state.todosExpanded) this.#renderExpanded(todos, state.selectedTodoIndex);
     else this.#renderCollapsed(todos);
   }
 
   #renderCollapsed(todos: TodoItem[]): void {
-    this.output.border = false;
     this.output.height = 1;
     this.output.add(
       new TextRenderable(this.renderer, {
@@ -118,24 +141,43 @@ export class TodoStripView {
     );
   }
 
-  #renderExpanded(todos: TodoItem[]): void {
+  #renderExpanded(todos: TodoItem[], selected: number | null): void {
     const shown = todos.slice(0, MAX_EXPANDED_ITEMS);
     const hidden = todos.length - shown.length;
-    this.output.border = true;
-    this.output.title = ` ${todoTitle(todos)} `;
-    this.output.height = shown.length + (hidden > 0 ? 1 : 0) + 2;
-    for (const todo of shown) {
-      this.output.add(
+    const height = shown.length + (hidden > 0 ? 1 : 0) + 2;
+    this.output.height = height;
+    // The border belongs to a box that only exists while the list is open.
+    // Toggling a border on a live box leaves a frame the layout has no rows
+    // for, and the list then draws over it.
+    const list = new BoxRenderable(this.renderer, {
+      id: 'todo-list',
+      width: '100%',
+      height,
+      flexDirection: 'column',
+      paddingLeft: 1,
+      paddingRight: 1,
+      border: true,
+      borderStyle: 'rounded',
+      // The open list owns the arrow keys, so it carries the focus border: the
+      // operator can see where the keys are going without being told.
+      borderColor: this.#theme.borderFocus,
+      title: ` ${todoTitle(todos)} `,
+    });
+    this.output.add(list);
+    for (const [index, todo] of shown.entries()) {
+      const isSelected = index === selected;
+      list.add(
         new TextRenderable(this.renderer, {
-          content: todoItemLine(todo, this.#contentWidth()),
-          fg: todoColor(todo.status, this.#theme),
+          content: `${isSelected ? '▸' : ' '}${todoItemLine(todo, this.#contentWidth() - 1)}`,
+          fg: isSelected ? this.#theme.textStrong : todoColor(todo.status, this.#theme),
+          ...(isSelected ? {bg: this.#theme.selectedSurface} : {}),
           height: 1,
           width: '100%',
         }),
       );
     }
     if (hidden > 0) {
-      this.output.add(
+      list.add(
         new TextRenderable(this.renderer, {
           content: `… +${hidden} more`,
           fg: this.#theme.textSubtle,
@@ -147,7 +189,7 @@ export class TodoStripView {
   }
 
   #contentWidth(): number {
-    return this.renderer.terminalWidth - 6;
+    return (this.#renderedWidth ?? this.renderer.terminalWidth) - 6;
   }
 
   #clear(): void {

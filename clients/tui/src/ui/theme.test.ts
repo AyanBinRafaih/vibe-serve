@@ -52,7 +52,9 @@ describe('theme selection', () => {
     expect(dark.success).toBe('#22c55e');
     expect(dark.info).toBe('#38bdf8');
     expect(dark.textPrimary).toBe('#e2e8f0');
-    expect(dark.conversation.analysis.label).toBe('#a78bfa');
+    // Analysis keeps its violet; the exact shade is derived from the accent and
+    // the card fill rather than hand-set per theme.
+    expect(dark.conversation.analysis.label).toBe('#b193f8');
   });
 
   it('keeps the dark baseline pinned to the pre-theme appearance', () => {
@@ -62,14 +64,30 @@ describe('theme selection', () => {
     expect(dark.border).toBe('#475569');
     expect(dark.conversation.assistant).toEqual({
       border: '#0891b2',
-      background: '#0f1b24',
-      label: '#67e8f9',
+      background: '#0e283d',
+      label: '#5cb6cc',
       content: '#e2e8f0',
     });
-    expect(dark.conversation.failure.label).toBe('#f87171');
-    expect(dark.toolCall).toEqual({foreground: '#dbeafe', background: '#1e3a8a'});
+    expect(dark.conversation.failure.label).toBe('#f28484');
+    // A tool call is told apart by its text colour, not by a filled band: a
+    // block of background behind text reads as a selection.
+    expect(dark.toolCall.background).toBe(dark.conversation.tool.background);
+    expect(dark.toolResult.background).toBe(dark.conversation.tool.background);
+    expect(dark.toolCall.foreground).not.toBe(dark.toolResult.foreground);
     expect(dark.markdown.code).toBe('#a5f3fc');
     expect(dark.markdown.codeBackground).toBe('#1e293b');
+  });
+});
+
+describe('selection', () => {
+  it.each(
+    listThemes().map(theme => [theme.name, theme] as const),
+  )('%s paints a selection the operator can see', (_name, theme: Theme) => {
+    // A selected row, chip, or node is drawn on this surface. Equal to the
+    // canvas it marks nothing, which is how the dark theme lost its round
+    // marker to everything but the brackets.
+    expect(theme.selectedSurface).not.toBe(theme.canvas);
+    expect(contrastRatio(theme.textStrong, theme.selectedSurface)).toBeGreaterThanOrEqual(4.5);
   });
 });
 

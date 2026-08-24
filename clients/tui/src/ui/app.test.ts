@@ -4,22 +4,36 @@ import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing'
 import type {HypothesisEntry} from '../protocol.js';
 import type {SessionController} from '../session-controller.js';
 import {
+  clearAgentSelection,
+  clearEntrySelection,
+  closeOverlays,
   closePane,
   closeThemePicker,
+  cyclePaneFocus,
   enterExperimentDrilldown,
   enterExperimentRound,
+  focusPane,
+  focusRound,
   initialSessionState,
   leaveExperimentDrilldown,
   moveExperimentSelection,
   moveThemeSelection,
+  normalizeFocus,
   openExperimentLog,
   openPane,
+  type PaneFocus,
   type PaneView,
+  type RoundFocus,
   type SessionState,
+  selectAgent,
+  selectNextEntry,
+  selectNextRound,
+  selectNextTodo,
+  selectPreviousRound,
+  setChatDockFits,
   setExperiments,
   setPaneContent,
   setTheme,
-  togglePaneFocus,
 } from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import {resolveTheme, type ThemeName} from './theme.js';
@@ -124,6 +138,445 @@ describe('OpenTUI presentation', () => {
     const frame = await testRenderer.waitForFrame(value => value.includes('Round 2 flow'));
 
     expect(frame).toMatch(/Round 2 flow · 1m \d+s/);
+  });
+
+  it('draws the round as a left-to-right graph when the terminal has room', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      phases: [
+        {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
+        {kind: 'implementer', status: 'active', roundNumber: 1, roundLabel: 'round-1-implementer'},
+        {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+      ],
+      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    // Stages share a row and are joined by edges, rather than stacked with ↓.
+    const stageRow = frame
+      .split('\n')
+      .find(line => line.includes('orchestrator') && line.includes('implementer'));
+    expect(stageRow).toBeDefined();
+    expect(stageRow).toContain('judge');
+    expect(frame).toContain('▶');
+    // The stacked strip's connector, not the arrow glyphs in the key help.
+    expect(frame).not.toContain('        ↓');
+  });
+
+  it('walks the transcript with the arrow keys and filters it to a clicked agent', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 26});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      phases: [
+        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+      ],
+      selectedRound: 1,
+      conversation: [
+        {
+          id: 'e1',
+          kind: 'assistant',
+          label: 'implementer · round-1',
+          content: 'edited the kernel',
+          agentKind: 'implementer',
+          roundNumber: 1,
+        },
+        {
+          id: 'e2',
+          kind: 'assistant',
+          label: 'judge · round-1',
+          content: 'checking the diff',
+          agentKind: 'judge',
+          roundNumber: 1,
+        },
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    // A phase is running, so the newest entry is marked as still working.
+    const live = await testRenderer.waitForFrame(value => value.includes('checking the diff'));
+    expect(live).toContain('Working');
+
+    // Arrows put a cursor on an entry without touching the input.
+    testRenderer.mockInput.pressKey('ARROW_UP');
+    const cursored = await frameAfter(testRenderer);
+    expect(controller.state.selectedEntryId).not.toBeNull();
+    expect(cursored).toContain('▸');
+
+    // Selecting an agent filters the transcript to that agent's turns.
+    controller.selectAgent('implementer');
+    const filtered = await frameAfter(testRenderer);
+    expect(filtered).toContain('edited the kernel');
+    expect(filtered).not.toContain('checking the diff');
+  });
+
+  it('shows the whole run in the strip and keeps early rounds reachable', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      // A run that announced 100 rounds and has reached 12 of them.
+      maxRounds: 100,
+      rounds: Array.from({length: 12}, (_, index) => ({
+        number: index + 1,
+        status: index === 11 ? ('active' as const) : ('completed' as const),
+      })),
+      phases: [{kind: 'judge', status: 'active', roundNumber: 12, roundLabel: 'round-12-judge'}],
+      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('r12'));
+    // Rounds the run has not reached are still part of the strip, and the strip
+    // says how many it could not fit.
+    expect(frame).toMatch(/r1[34]/);
+    expect(frame).toMatch(/\d+ ›/);
+
+    // `[` walks back to the first round, and the strip follows the selection
+    // rather than leaving it hidden past the edge.
+    let early = frame;
+    for (let step = 0; step < 11; step += 1) {
+      testRenderer.mockInput.pressKey('[');
+      early = await frameAfter(testRenderer);
+    }
+    expect(controller.state.selectedRound).toBe(1);
+    expect(early).toContain('[ r1 ]');
+  });
+
+  it('filters the transcript to an agent node that is clicked', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      selectedRound: 1,
+      phases: [
+        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+      ],
+      conversation: [
+        {
+          id: 'e1',
+          kind: 'assistant',
+          label: 'implementer',
+          content: 'edited the kernel',
+          agentKind: 'implementer',
+          roundNumber: 1,
+        },
+        {
+          id: 'e2',
+          kind: 'assistant',
+          label: 'judge',
+          content: 'checking the diff',
+          agentKind: 'judge',
+          roundNumber: 1,
+        },
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    const frame = await testRenderer.waitForFrame(value => value.includes('implementer'));
+
+    // Click the node's own label, which is what a pointer lands on.
+    const lines = frame.split('\n');
+    const row = lines.findIndex(line => line.includes('✓ implementer'));
+    const column = (lines[row]?.indexOf('implementer') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    const filtered = await frameAfter(testRenderer);
+
+    expect(controller.state.selectedAgentKind).toBe('implementer');
+    expect(filtered).not.toContain('checking the diff');
+  });
+
+  it('moves the round view keys between the graph and the transcript', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      selectedRound: 1,
+      phases: [
+        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+      ],
+      conversation: [
+        {
+          id: 'e1',
+          kind: 'assistant',
+          label: 'implementer',
+          content: 'edited the kernel',
+          agentKind: 'implementer',
+          roundNumber: 1,
+        },
+        {
+          id: 'e2',
+          kind: 'assistant',
+          label: 'implementer',
+          content: 'guarded the tail tile',
+          agentKind: 'implementer',
+          roundNumber: 1,
+        },
+        {
+          id: 'e3',
+          kind: 'assistant',
+          label: 'judge',
+          content: 'checking the diff',
+          agentKind: 'judge',
+          roundNumber: 1,
+        },
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('implementer'));
+
+    // Left reaches the graph, and the pane says it holds the keys.
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    const onAgents = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(onAgents).toContain('▸ Agents');
+
+    // There, up and down walk the agents rather than the transcript.
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await frameAfter(testRenderer);
+    const firstAgent = controller.state.selectedAgentKind;
+    expect(firstAgent).not.toBeNull();
+    expect(controller.state.selectedEntryId).toBeNull();
+
+    // Right hands them to the transcript, where they walk its entries instead.
+    testRenderer.mockInput.pressKey('ARROW_RIGHT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+    testRenderer.mockInput.pressKey('ARROW_UP');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedEntryId).not.toBeNull();
+    // The agent picked on the left is still the filter: moving the keys is not
+    // the same as giving up the selection.
+    expect(controller.state.selectedAgentKind).toBe(firstAgent);
+
+    // And Tab still works after coming back, from where the operator left off.
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedAgentKind).not.toBe(firstAgent);
+  });
+
+  it('marks the chat input as focused when it is clicked', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 22});
+    const controller = new FakeController({...initialSessionState(), chatDockFits: true});
+    controller.experiments = [
+      logEntry('H-01', 1, 1, {
+        claim: 'fuse the epilogue',
+        rounds: [{round: 1, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    const docked = await testRenderer.waitForFrame(value => value.includes('Type a question'));
+    // The hint says the keys are elsewhere, which is the state being reported.
+    expect(docked).toContain('Ctrl+W to type here');
+
+    // Click the box the operator types into, not the conversation above it.
+    const lines = docked.split('\n');
+    const row = lines.findIndex(line => line.includes('Type a question'));
+    const column = (lines[row]?.indexOf('Type a question') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    const focused = await frameAfter(testRenderer);
+
+    expect(controller.state.layout.focus).toBe('chat');
+    // And the box says so: clicking must move the border, not only the cursor.
+    expect(focused).not.toContain('Ctrl+W to type here');
+    expect(spanColors(testRenderer, 'Chat')?.fg).toBe(resolveTheme('dark').borderFocus);
+  });
+
+  it('gives the chat the keys when it is clicked, not only on Ctrl+W', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 22});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      chatDockFits: true,
+      chatConversation: [
+        {id: 'a1', kind: 'assistant', label: 'Answer', content: 'the epilogue was fused'},
+      ],
+    });
+    controller.experiments = [
+      logEntry('H-01', 1, 1, {
+        claim: 'fuse the epilogue',
+        rounds: [{round: 1, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    const docked = await testRenderer.waitForFrame(value => value.includes('Experiment chat'));
+    expect(controller.state.layout.focus).toBe('left');
+
+    // Click inside the chat's body, which is where a pointer actually lands.
+    const row = docked.split('\n').findIndex(line => line.includes('the epilogue was fused'));
+    const column = docked.split('\n')[row]?.indexOf('the epilogue') ?? 0;
+    await testRenderer.mockMouse.click(column, row);
+    await frameAfter(testRenderer);
+
+    expect(controller.state.layout.focus).toBe('chat');
+  });
+
+  it('says so when a round has not run instead of looking broken', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      maxRounds: 20,
+      rounds: [{number: 1, status: 'completed'}],
+      phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
+      selectedRound: 9,
+      conversation: [
+        {id: 'e1', kind: 'assistant', label: 'judge', content: 'done', roundNumber: 1},
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('has not run yet'));
+    expect(frame).toContain('Round 9 has not run yet.');
+    // The strip still shows it as a round of this run, marked as the one open.
+    expect(frame).toContain('[ r9 ]');
+  });
+
+  it('closes a visualization and the chat together on one Escape', async () => {
+    const testRenderer = await createTestRenderer({width: 130, height: 22});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+      hypothesisScope: {id: 'H-01', label: 'H-01 · r1', rounds: [1]},
+      selectedRound: 1,
+      conversation: [
+        {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    controller.publish({...controller.state, chatOpen: true});
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+
+    // Back on the round in one press, not part way with the chat still over it.
+    expect(controller.state.chatOpen).toBe(false);
+    expect(controller.state.layout.right).toBeNull();
+    expect(controller.state.hypothesisScope).not.toBeNull();
+  });
+
+  it('hands the keys back when the pane holding them closes', async () => {
+    const testRenderer = await createTestRenderer({width: 130, height: 22});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+      selectedRound: 1,
+      conversation: [
+        {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    controller.focusPane('right');
+    await frameAfter(testRenderer);
+    controller.closePane();
+    await frameAfter(testRenderer);
+
+    // Focus cannot be left pointing at a pane that is gone, or every key after
+    // it goes nowhere and the client looks frozen.
+    expect(controller.state.layout.focus).toBe('left');
+    testRenderer.mockInput.pressKey(']');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedRound).toBe(1);
+  });
+
+  it('keeps the chat in one conversation across the log and a round', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 22});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      chatConversation: [
+        {id: 'q1', kind: 'user', label: 'You', content: 'what changed?'},
+        {id: 'a1', kind: 'assistant', label: 'Answer', content: 'the epilogue was fused'},
+      ],
+      rounds: [{number: 1, status: 'active'}],
+      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+      chatOpen: true,
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    // The same exchange is on screen inside a round, not only on the log.
+    const frame = await testRenderer.waitForFrame(value =>
+      value.includes('the epilogue was fused'),
+    );
+    expect(frame).toContain('what changed?');
+  });
+
+  it('draws a round with many agents per stage without overlap', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 34});
+    const phase = (kind: string, status: 'completed' | 'active' | 'pending', index: number) => ({
+      kind,
+      status,
+      roundNumber: 1,
+      roundLabel: `round-1-${kind}`,
+      invocationId: `${kind}-${index}`,
+    });
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      phases: [
+        phase('orchestrator', 'completed', 0),
+        phase('implementer', 'completed', 1),
+        phase('implementer', 'active', 2),
+        phase('implementer', 'active', 3),
+        phase('judge', 'pending', 4),
+        phase('judge', 'pending', 5),
+        phase('profiler', 'pending', 6),
+      ],
+      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    expect(frame).toContain('7 agents');
+    expect(frame).toContain('2 active');
+    // Every stage is drawn, and the fan-out rows do not collapse onto each other.
+    const nodeRows = frame.split('\n').filter(line => line.includes('implementer'));
+    expect(nodeRows.length).toBeGreaterThanOrEqual(3);
+    expect(frame).toContain('▶');
+  });
+
+  it('falls back to the stacked strip when the terminal is too narrow for a graph', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 30});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      phases: [
+        {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
+        {kind: 'implementer', status: 'active', roundNumber: 1, roundLabel: 'round-1-implementer'},
+        {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+      ],
+      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    expect(frame).toContain('        ↓');
+    expect(frame).not.toContain('▶');
   });
 
   it('holds the agent-active elapsed time of a finished round', async () => {
@@ -614,8 +1067,9 @@ describe('theming', () => {
     expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe('#22d3ee');
     const body = spanColors(testRenderer, 'themed body text');
     expect(body?.fg).toBe('#e2e8f0');
-    expect(body?.bg).toBe('#0f1b24');
-    expect(spanColors(testRenderer, 'implementer')?.fg).toBe('#67e8f9');
+    // Assistant cards derive their fill from the canvas and the role accent.
+    expect(body?.bg).toBe('#0e283d');
+    expect(spanColors(testRenderer, 'implementer')?.fg).toBe('#5cb6cc');
   });
 
   it('repaints live when the selected theme changes', async () => {
@@ -901,14 +1355,17 @@ describe('theming', () => {
     testRenderer.mockInput.pressEnter();
     const trajectory = await frameAfter(testRenderer);
 
-    // Every round of that hypothesis, and only those rounds.
-    expect(trajectory).toContain('grew the block');
+    // Opening a hypothesis lands on its latest round, and the earlier ones are
+    // one `[` away.
+    expect(trajectory).toContain('r43');
     expect(trajectory).toContain('regression found');
     expect(trajectory).not.toContain('unrelated round 41');
     expect(trajectory).toContain('H-08 · r42-43');
     expect(trajectory).toContain('r42');
     expect(trajectory).toContain('r43');
-    expect(trajectory).not.toContain('r41');
+    // The strip covers the whole run, so rounds outside this hypothesis are
+    // reachable from it; the transcript still shows only the selected round.
+    expect(trajectory).toContain('r41');
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-08', rounds: [42, 43]});
 
     testRenderer.mockInput.pressKey('ESCAPE');
@@ -1053,6 +1510,224 @@ describe('theming', () => {
     expect(controller.state.experimentLog?.selectedId).toBe('H-001');
   });
 
+  it('lands with the chat docked beside the hypothesis table', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const landing = await frameAfter(testRenderer);
+
+    // Both columns at once, and the table keeps the claim it came to show.
+    expect(landing).toContain('Experiment chat');
+    expect(landing).toContain('Experiments');
+    expect(landing).toContain('Implementation Details');
+    expect(landing).toContain('Batch the prefill step');
+
+    // Each column has its own input, under the surface it writes to, and the
+    // command box starts where the chat column ends rather than running under
+    // it.
+    // The cursor starts in the command box, and the chat says how to reach it.
+    expect(landing).toContain('Ctrl+W to type here');
+    const lines = landing.split('\n');
+    const paneTop = lines.find(line => line.includes('╭─ Experiment chat')) ?? '';
+    const inputTop = lines.find(line => line.includes('╭─ Chat ')) ?? '';
+    expect(inputTop).toContain('╭─ Ask or command');
+    expect(inputTop.indexOf('╭─ Ask or command')).toBe(paneTop.indexOf('╭─ Experiments'));
+  });
+
+  it('routes typing to whichever input Ctrl+W points at', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('why is r41 slow?');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+
+    // The chat's own box took it, not the command input.
+    expect(controller.chatSubmissions).toEqual(['why is r41 slow?']);
+    expect(controller.submissions).toEqual([]);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('/perf');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+
+    expect(controller.submissions).toEqual(['/perf']);
+    expect(controller.chatSubmissions).toHaveLength(1);
+  });
+
+  it('raises the command list out of the command input, clear of the chat', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/pe');
+    const frame = await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+
+    const lines = frame.split('\n');
+    const suggestion = lines.find(line => line.includes('/perf')) ?? '';
+    const commandInput = lines.find(line => line.includes('╭─ Ask or command')) ?? '';
+    // The list belongs to the box it completes, so it starts where that box
+    // starts rather than running back across the chat column.
+    expect(suggestion.indexOf('│')).toBe(commandInput.indexOf('╭─ Ask or command'));
+  });
+
+  it('drops /chat from the command surface while the chat is already docked', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/c');
+    const frame = await frameAfter(testRenderer);
+
+    // Nothing to open: the chat is the column beside the table.
+    expect(frame).not.toContain('/chat');
+  });
+
+  it('says when the docked chat is waiting on the agent', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    controller.publish({...controller.state, chatPending: true});
+
+    expect(await frameAfter(testRenderer)).toContain('Awaiting the agent');
+  });
+
+  it('answers in the docked chat without covering the table', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    await testRenderer.mockInput.typeText('why is r41 slow?');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    controller.publish({
+      ...controller.state,
+      chatConversation: [
+        {id: 'q', kind: 'user', label: 'You', content: 'why is r41 slow?'},
+        {id: 'a', kind: 'assistant', label: 'Answer', content: 'Prefill dominates.'},
+      ],
+    });
+
+    const answered = await frameAfter(testRenderer);
+
+    expect(answered).toContain('Prefill dominates.');
+    expect(answered).toContain('H-07');
+    expect(answered).toContain('Implementation Details');
+  });
+
+  it('keeps the chat, the table, and the visualization on screen together', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 20});
+    const controller = logController();
+    controller.paneContent = 'Performance · tok_s\n    1135 ┤   ●\nbest r7 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      chatConversation: [{id: 'a', kind: 'assistant', label: 'Answer', content: 'Prefill.'}],
+    });
+
+    await controller.openPane('perf');
+    const frame = await frameAfter(testRenderer);
+
+    // Three columns: chat, table, visualization. None replaced another.
+    expect(frame).toContain('Experiment chat');
+    expect(frame).toContain('H-07');
+    expect(frame).toContain('best r7 1135 tok_s');
+    expect(frame).toContain('Ctrl+W: switch pane');
+  });
+
+  it('gives the row to the table alone when the chat cannot fit beside it', async () => {
+    const testRenderer = await createTestRenderer({width: 84, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const landing = await frameAfter(testRenderer);
+
+    // Two columns would both be unreadable here, so the table keeps the row.
+    expect(landing).not.toContain('Experiment chat');
+    expect(landing).toContain('H-07');
+    expect(controller.state.chatDockFits).toBe(false);
+  });
+
+  it('keeps the table behind the chat modal instead of the round transcript', async () => {
+    const testRenderer = await createTestRenderer({width: 84, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    // What a question does where the chat cannot dock.
+    controller.publish({...controller.state, chatOpen: true});
+
+    const frame = await frameAfter(testRenderer);
+
+    expect(frame).toContain('Experiment chat');
+    expect(frame).toContain('H-07');
+    // The per-round chrome belongs to a hypothesis the operator never opened.
+    expect(frame).not.toContain('─ Rounds ─');
+    expect(frame).not.toContain('─ Agents ─');
+  });
+
+  it('moves the pane keys onto the docked chat and back with Ctrl+W', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    const focused = await frameAfter(testRenderer);
+    expect(focused).toContain('▸ Experiment chat');
+    expect(focused).toContain('Ask about this run');
+    expect(controller.state.layout.focus).toBe('chat');
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('left');
+  });
+
+  it('leaves the table its own keys while the chat is docked', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {claim: 'batch the prefill step', resolved_outcome: 'proven'}),
+      logEntry('H-08', 42, 42, {claim: 'bigger KV cache block', resolved_outcome: 'disproven'}),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    // Arrows still belong to the table, docked chat or not.
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await frameAfter(testRenderer);
+    expect(controller.state.experimentLog?.selectedId).toBe('H-08');
+  });
+
   it('renders the transcript and the visualization side by side', async () => {
     const testRenderer = await createTestRenderer({width: 140, height: 20});
     const controller = splitController();
@@ -1163,7 +1838,7 @@ describe('theming', () => {
     expect(spanColors(testRenderer, 'Performance · focused')?.fg).toBe(theme.borderFocus);
     expect(spanColors(testRenderer, 'best r7 1135 tok_s')?.fg).toBe(theme.textPrimary);
 
-    controller.togglePaneFocus();
+    controller.cyclePaneFocus();
     await frameAfter(testRenderer);
 
     // Focus moved to the transcript, so the pane border drops back to the
@@ -1234,6 +1909,25 @@ async function frameAfter(testRenderer: TestRendererSetup): Promise<string> {
 async function frameAfterEscape(testRenderer: TestRendererSetup): Promise<string> {
   await new Promise(resolve => setTimeout(resolve, 40));
   return frameAfter(testRenderer);
+}
+
+/** A client on the landing view, with one hypothesis to show. */
+function logController(): FakeController {
+  const controller = new FakeController({
+    ...initialSessionState(),
+    status: 'running',
+    rounds: [{number: 41, status: 'completed'}],
+  });
+  controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
+  controller.experiments = [
+    logEntry('H-07', 41, 41, {
+      claim: 'batch the prefill step',
+      resolved_outcome: 'proven',
+      judge_verdict: 'pass',
+      rounds: [{round: 41, passed: true, reviewed: true}],
+    }),
+  ];
+  return controller;
 }
 
 function splitController(): FakeController {
@@ -1314,7 +2008,9 @@ class FakeController implements SessionController {
   state: SessionState;
 
   publish(state: SessionState): void {
-    this.state = state;
+    // The real controller normalizes focus on every state change; the fake has
+    // to as well, or tests pass on a focus the client could never be in.
+    this.state = normalizeFocus(state);
     for (const listener of this.#listeners) listener(this.state);
   }
 
@@ -1413,18 +2109,39 @@ class FakeController implements SessionController {
     this.selectNextAgent();
   }
   selectNextRound(): void {
-    const index = this.state.rounds.findIndex(round => round.number === this.state.selectedRound);
-    const next =
-      this.state.rounds[(index + 1 + this.state.rounds.length) % this.state.rounds.length];
-    this.state = {...this.state, selectedRound: next?.number ?? null, selectedAgentKind: null};
-    for (const listener of this.#listeners) listener(this.state);
+    this.publish(selectNextRound(this.state));
   }
   selectPreviousRound(): void {
-    this.selectNextRound();
+    this.publish(selectPreviousRound(this.state));
+  }
+  selectAgent(kind: string): void {
+    this.publish(selectAgent(this.state, kind));
+  }
+  selectNextEntry(delta: number, id?: string): void {
+    this.publish(selectNextEntry(this.state, delta, id));
+  }
+  clearEntrySelection(): void {
+    this.publish(clearEntrySelection(this.state));
+  }
+  clearAgentSelection(): void {
+    this.publish(clearAgentSelection(this.state));
+  }
+  focusRound(focus: RoundFocus): void {
+    this.publish(focusRound(this.state, focus));
+  }
+  selectNextTodo(delta: number): void {
+    this.publish(selectNextTodo(this.state, delta));
   }
   selectRound(roundNumber: number): void {
     this.state = {...this.state, selectedRound: roundNumber, selectedAgentKind: null};
     for (const listener of this.#listeners) listener(this.state);
+  }
+  #promptToggle: (() => void) | null = null;
+  onTogglePrompt(handler: () => void): void {
+    this.#promptToggle = handler;
+  }
+  togglePrompt(): void {
+    this.#promptToggle?.();
   }
   toggleTodos(): void {
     this.state = {...this.state, todosExpanded: !this.state.todosExpanded};
@@ -1451,8 +2168,17 @@ class FakeController implements SessionController {
   closePane(): void {
     this.publish(closePane(this.state));
   }
-  togglePaneFocus(): void {
-    this.publish(togglePaneFocus(this.state));
+  closeOverlays(): void {
+    this.publish(closeOverlays(this.state));
+  }
+  cyclePaneFocus(): void {
+    this.publish(cyclePaneFocus(this.state));
+  }
+  focusPane(focus: PaneFocus): void {
+    this.publish(focusPane(this.state, focus));
+  }
+  setChatDockFits(fits: boolean): void {
+    this.publish(setChatDockFits(this.state, fits));
   }
 
   /** Content the fake server returns for whichever visualization is opened. */

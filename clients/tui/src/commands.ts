@@ -4,6 +4,12 @@ import {isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export type ParsedInput = {
   localView?: 'chat' | 'help' | 'theme';
+  /**
+   * Surfaces that also have a key. macOS reserves the function keys for system
+   * controls and a terminal may keep a Control chord for itself, so every
+   * toggle is reachable by name as well.
+   */
+  toggle?: 'todos' | 'prompt';
   chatMessage?: string;
   themeName?: ThemeName;
   request?: RequestInput;
@@ -35,21 +41,45 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
     description: 'Open the selected hypothesis, or /open-round --N for round N',
   },
   {name: '/perf', description: 'Plot performance by round in the right pane'},
+  {name: '/todos', description: "Expand or collapse the visible agent's todo list"},
+  {name: '/prompt', description: 'Expand or collapse the latest prompt in view'},
   {name: '/theme', description: 'List themes, or switch with /theme <name>'},
 ];
 
-export const HELP_TEXT = [
-  'Available',
-  ...SLASH_COMMANDS.map(command => `  ${command.name.padEnd(18)} ${command.description}`),
-  '',
-  'Planned',
-  '  /round <number>    Inspect a completed round',
-  '  /invocation <id>   Inspect an agent invocation',
-].join('\n');
+/**
+ * Where the chat is a pane of the current view there is nothing for `/chat` to
+ * open, so it leaves the command surface rather than sitting in it as a command
+ * that does nothing new. It is still accepted, and still opens the chat
+ * anywhere the chat is not already on screen.
+ */
+export interface CommandContext {
+  chatDocked?: boolean;
+}
 
-export function suggestSlashCommands(text: string): readonly SlashCommand[] {
+export function availableCommands(context: CommandContext = {}): readonly SlashCommand[] {
+  if (!context.chatDocked) return SLASH_COMMANDS;
+  return SLASH_COMMANDS.filter(command => command.name !== '/chat');
+}
+
+export function helpText(context: CommandContext = {}): string {
+  return [
+    'Available',
+    ...availableCommands(context).map(
+      command => `  ${command.name.padEnd(18)} ${command.description}`,
+    ),
+    '',
+    'Planned',
+    '  /round <number>    Inspect a completed round',
+    '  /invocation <id>   Inspect an agent invocation',
+  ].join('\n');
+}
+
+export function suggestSlashCommands(
+  text: string,
+  context: CommandContext = {},
+): readonly SlashCommand[] {
   if (!text.startsWith('/') || /\s/.test(text)) return [];
-  return SLASH_COMMANDS.filter(command => command.name.startsWith(text));
+  return availableCommands(context).filter(command => command.name.startsWith(text));
 }
 
 export function slashCommandRange(text: string): {start: number; end: number} | null {
@@ -94,6 +124,8 @@ export function parseInput(text: string): ParsedInput {
     }
     return {openRound: {round: Number(match[1])}};
   }
+  if (text === '/todos') return {toggle: 'todos'};
+  if (text === '/prompt') return {toggle: 'prompt'};
   if (text === '/perf') {
     return {request: {type: 'query.performance'}, responseView: 'perf', paneView: 'perf'};
   }

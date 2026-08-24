@@ -1,5 +1,11 @@
 import {describe, expect, it} from 'bun:test';
-import {parseInput, slashCommandRange, suggestSlashCommands} from './commands.js';
+import {
+  availableCommands,
+  helpText,
+  parseInput,
+  slashCommandRange,
+  suggestSlashCommands,
+} from './commands.js';
 
 describe('parseInput', () => {
   it('accepts the intentionally small slash-command surface', () => {
@@ -85,6 +91,35 @@ describe('parseInput', () => {
   });
 });
 
+describe('command surface by view', () => {
+  it('drops /chat where the chat is already a pane of the view', () => {
+    const docked = availableCommands({chatDocked: true}).map(command => command.name);
+
+    expect(docked).not.toContain('/chat');
+    expect(docked).toContain('/perf');
+    expect(helpText({chatDocked: true})).not.toContain('/chat');
+    expect(suggestSlashCommands('/c', {chatDocked: true})).toEqual([]);
+  });
+
+  it('offers /chat everywhere the chat is not already on screen', () => {
+    expect(availableCommands().map(command => command.name)).toContain('/chat');
+    expect(helpText()).toContain('/chat');
+    expect(suggestSlashCommands('/c').map(command => command.name)).toEqual(['/chat']);
+  });
+
+  it('reaches the todo and prompt toggles by name', () => {
+    // macOS keeps the function keys for itself and a terminal may keep a
+    // Control chord, so both toggles have to be reachable without either.
+    expect(parseInput('/todos')).toEqual({toggle: 'todos'});
+    expect(parseInput('/prompt')).toEqual({toggle: 'prompt'});
+  });
+
+  it('still accepts /chat when it is not offered, since the chat is the point', () => {
+    // Hidden from the list, not removed from the client.
+    expect(parseInput('/chat')).toEqual({localView: 'chat'});
+  });
+});
+
 describe('slash-command input helpers', () => {
   it('suggests available commands from a slash prefix', () => {
     expect(suggestSlashCommands('/').map(command => command.name)).toEqual([
@@ -95,6 +130,8 @@ describe('slash-command input helpers', () => {
       '/steer',
       '/open-round',
       '/perf',
+      '/todos',
+      '/prompt',
       '/theme',
     ]);
     expect(suggestSlashCommands('/h').map(command => command.name)).toEqual(['/help']);

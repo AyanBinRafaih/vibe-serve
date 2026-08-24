@@ -16,9 +16,21 @@ export interface SessionState {
   roundLabel: string | null;
   outerLoop: string | null;
   rounds: RoundSummary[];
+  /** Rounds the run intends to reach, from ``run_started``; null until it arrives. */
+  maxRounds: number | null;
   phases: AgentPhase[];
   selectedRound: number | null;
   selectedAgentKind: string | null;
+  /** Transcript entry the arrow keys are on, so a trace is readable without a mouse. */
+  selectedEntryId: string | null;
+  /** Todo row the arrow keys are on while the todo box holds focus. */
+  selectedTodoIndex: number | null;
+  /**
+   * Which half of the round view the arrow keys act on. The round view is two
+   * panes side by side, and both are navigable, so the keys have to belong to
+   * one of them at a time.
+   */
+  roundFocus: RoundFocus;
   conversation: ConversationEntry[];
   overlay: OverlayPanel | null;
   chatOpen: boolean;
@@ -33,6 +45,13 @@ export interface SessionState {
   experimentLog: ExperimentLogState | null;
   hypothesisScope: HypothesisScope | null;
   layout: LayoutState;
+  /**
+   * Whether the terminal is wide enough to carry the docked chat beside the
+   * log. Measured by the renderer and reported in, because where a question's
+   * answer is displayed has to agree with what is actually on screen: too
+   * narrow to dock and the chat is the modal it has always been.
+   */
+  chatDockFits: boolean;
   /** Non-null while the theme list is open as a keyboard selection. */
   themePicker: ThemePicker | null;
   /**
@@ -42,6 +61,9 @@ export interface SessionState {
    */
   typedToolEvents: boolean;
 }
+
+/** The agent graph on the left, or the transcript on the right. */
+export type RoundFocus = 'agents' | 'transcript';
 
 export interface TodoItem {
   content: string;
@@ -97,10 +119,17 @@ export interface RightPane {
   error: string | null;
 }
 
+/**
+ * Which column the pane keys act on. ``left`` is whatever holds the middle of
+ * the row, the experiment log or the transcript; ``chat`` and ``right`` are the
+ * panes beside it.
+ */
+export type PaneFocus = 'chat' | 'left' | 'right';
+
 export interface LayoutState {
-  /** null means single-pane: the transcript has the full width. */
+  /** null means no visualization pane: the left side has the rest of the row. */
   right: RightPane | null;
-  focus: 'left' | 'right';
+  focus: PaneFocus;
 }
 
 export interface ThemePicker {
@@ -153,9 +182,13 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     roundLabel: null,
     outerLoop: null,
     rounds: [],
+    maxRounds: null,
     phases: [],
     selectedRound: null,
     selectedAgentKind: null,
+    selectedEntryId: null,
+    selectedTodoIndex: null,
+    roundFocus: 'transcript',
     conversation: [],
     overlay: null,
     chatOpen: false,
@@ -172,6 +205,9 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
     hypothesisScope: null,
     layout: {right: null, focus: 'left'},
+    // Docked until the renderer measures otherwise, so the landing view carries
+    // the chat from the first frame rather than after a resize.
+    chatDockFits: true,
     themePicker: null,
     typedToolEvents: false,
   };
@@ -188,9 +224,57 @@ export function entryKey(entry: HypothesisEntry, index: number): string {
     : entry.hypothesis_id || `#${index}`;
 }
 
-/** True when the table itself is on screen rather than a hypothesis trajectory. */
+/**
+ * True when the table itself is on screen rather than a hypothesis trajectory.
+ * The chat does not enter into it: docked it is part of this view, and as a
+ * modal it floats over it, so asking a question never swaps the table for the
+ * per-round transcript underneath.
+ */
 export function experimentLogVisible(state: SessionState): boolean {
-  return state.experimentLog !== null && state.hypothesisScope === null && !state.chatOpen;
+  return state.experimentLog !== null && state.hypothesisScope === null;
+}
+
+/**
+ * The chat is docked on the landing view: it is part of that view rather than a
+ * dialog over it, so a question never hides the table it is about. Inside a
+ * hypothesis, and in a terminal too narrow for two columns, it stays the modal
+ * it was.
+ */
+export function chatDocked(state: SessionState): boolean {
+  return state.chatDockFits && state.experimentLog !== null && state.hypothesisScope === null;
+}
+
+/** True when the docked chat is the thing on screen rather than the modal. */
+export function chatPaneVisible(state: SessionState): boolean {
+  return chatDocked(state) && !state.chatOpen;
+}
+
+export function chatPaneFocused(state: SessionState): boolean {
+  return chatPaneVisible(state) && state.layout.focus === 'chat';
+}
+
+export function rightPaneFocused(state: SessionState): boolean {
+  return state.layout.right !== null && state.layout.focus === 'right';
+}
+
+export function setChatDockFits(state: SessionState, fits: boolean): SessionState {
+  if (state.chatDockFits === fits) return state;
+  const layout =
+    fits || state.layout.focus !== 'chat'
+      ? state.layout
+      : {...state.layout, focus: 'left' as const};
+  return {...state, chatDockFits: fits, layout};
+}
+
+/**
+ * What ``/chat`` does. Docked, the chat is already on screen, so opening it
+ * means putting the pane keys on it rather than covering the table.
+ */
+export function openChat(state: SessionState): SessionState {
+  if (chatDocked(state)) {
+    return {...state, overlay: null, layout: {...state.layout, focus: 'chat'}};
+  }
+  return {...state, overlay: null, chatOpen: true};
 }
 
 export function openExperimentLog(state: SessionState): SessionState {
@@ -232,8 +316,13 @@ export function moveExperimentSelection(state: SessionState, delta: number): Ses
   const log = state.experimentLog;
   if (log === null || state.hypothesisScope !== null || log.entries.length === 0) return state;
   const keys = log.entries.map(entryKey);
-  const current = log.selectedId === null ? 0 : keys.indexOf(log.selectedId);
-  const index = Math.min(keys.length - 1, Math.max(0, (current === -1 ? 0 : current) + delta));
+  const current = log.selectedId === null ? -1 : keys.indexOf(log.selectedId);
+  // With nothing selected the first key lands on the first row rather than
+  // stepping past it: the table has a selection the moment it is used.
+  if (current === -1) {
+    return {...state, experimentLog: {...log, selectedId: keys[0] ?? null}};
+  }
+  const index = Math.min(keys.length - 1, Math.max(0, current + delta));
   return {...state, experimentLog: {...log, selectedId: keys[index] ?? null}};
 }
 
@@ -249,9 +338,19 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
   return {
     ...state,
     overlay: null,
+    // A visualization opened from the log belongs to the log. Carrying it into
+    // the round view would leave the operator reading one view's answer beside
+    // another view's transcript.
+    layout: {right: null, focus: 'left'},
     hypothesisScope: {id: entry.hypothesis_id, label: hypothesisLabel(entry), rounds},
-    selectedRound: null,
+    // Land on the hypothesis's latest round rather than on "no round". The
+    // round view is built around one round: the strip marks it, the agent graph
+    // draws its phases, the transcript carries its turns. Leaving the round
+    // unset drew an empty strip and an empty graph, and `[` walks back through
+    // the earlier rounds from here anyway.
+    selectedRound: rounds.at(-1) ?? null,
     selectedAgentKind: null,
+    selectedEntryId: null,
   };
 }
 
@@ -278,6 +377,7 @@ export function enterExperimentRound(
     ...state,
     overlay: null,
     chatOpen: false,
+    layout: {right: null, focus: 'left'},
     hypothesisScope: {
       id: entry.hypothesis_id,
       label: hypothesisLabel(entry),
@@ -285,6 +385,7 @@ export function enterExperimentRound(
     },
     selectedRound: roundNumber,
     selectedAgentKind: null,
+    selectedEntryId: null,
     experimentLog:
       state.experimentLog === null
         ? null
@@ -373,12 +474,53 @@ export function closePane(state: SessionState): SessionState {
   return {...state, layout: {right: null, focus: 'left'}};
 }
 
-export function togglePaneFocus(state: SessionState): SessionState {
-  if (state.layout.right === null) return state;
+/**
+ * Moves the pane keys one column to the right, wrapping. Only the columns
+ * actually on screen take part, so the operator never lands on a pane they
+ * cannot see.
+ */
+export function cyclePaneFocus(state: SessionState): SessionState {
+  const order = visiblePaneOrder(state);
+  if (order.length < 2) return state;
+  const next = order[(order.indexOf(state.layout.focus) + 1) % order.length] ?? 'left';
+  return {...state, layout: {...state.layout, focus: next}};
+}
+
+/**
+ * Focus has to name a column that is actually on screen. A pane can close, or a
+ * view can change, while the keys still point at it, and every keystroke then
+ * goes to a surface that is not there: the client looks frozen. Called on every
+ * state change, so focus can never be left pointing at nothing.
+ */
+export function normalizeFocus(state: SessionState): SessionState {
+  const order = visiblePaneOrder(state);
+  if (order.includes(state.layout.focus)) return state;
+  return {...state, layout: {...state.layout, focus: 'left'}};
+}
+
+/** Escape from a round view: close whatever is layered over it, all of it. */
+export function closeOverlays(state: SessionState): SessionState {
+  if (state.layout.right === null && !state.chatOpen && state.overlay === null) return state;
   return {
     ...state,
-    layout: {...state.layout, focus: state.layout.focus === 'left' ? 'right' : 'left'},
+    overlay: null,
+    chatOpen: false,
+    layout: {right: null, focus: 'left'},
   };
+}
+
+export function focusPane(state: SessionState, focus: PaneFocus): SessionState {
+  if (state.layout.focus === focus) return state;
+  if (!visiblePaneOrder(state).includes(focus)) return state;
+  return {...state, layout: {...state.layout, focus}};
+}
+
+function visiblePaneOrder(state: SessionState): PaneFocus[] {
+  return [
+    ...(chatPaneVisible(state) ? (['chat'] as const) : []),
+    'left' as const,
+    ...(state.layout.right !== null ? (['right'] as const) : []),
+  ];
 }
 
 export function setTheme(state: SessionState, themeName: ThemeName): SessionState {
@@ -477,6 +619,7 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
 
   if (event.type === 'run_started') {
     next.status = 'running';
+    if (event.data?.kind === 'run_started') next.maxRounds = event.data.max_rounds;
   }
   if (event.type === 'configuration_failed') {
     next.status = 'failed';
@@ -493,6 +636,13 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
   return next;
 }
 
+/**
+ * The chat shows the exchange: what was asked, and what came back. The chat
+ * agent's narration, tool turns, and phase markers are run plumbing; they
+ * belong in the transcript, and here they only bury the answer.
+ */
+const CHAT_KINDS: ReadonlySet<ConversationEntry['kind']> = new Set(['user', 'assistant', 'result']);
+
 function applyChatEvent(state: SessionState, event: RunEvent): SessionState {
   const next = {...state};
   const data = event.data;
@@ -503,6 +653,10 @@ function applyChatEvent(state: SessionState, event: RunEvent): SessionState {
     data?.kind === 'agent_output_chunk' && data.channel === 'tool' && next.chatTypedToolEvents;
   if (suppressed) return next;
   const entry = eventToConversationEntry(event);
+  // The chat is a question and its answer. The chat agent's own diagnostics and
+  // phase markers are run plumbing: they belong in the transcript, and in the
+  // chat they only bury the answer the operator asked for.
+  if (entry !== null && !CHAT_KINDS.has(entry.kind)) return next;
   if (entry !== null) {
     next.chatConversation = appendConversation(next.chatConversation, entry);
   }
@@ -515,7 +669,7 @@ export function selectNextAgent(state: SessionState): SessionState {
   const current = state.selectedAgentKind;
   const index = current === null ? -1 : phases.findIndex(phase => phase.kind === current);
   const next = phases[(index + 1 + phases.length) % phases.length];
-  return {...state, selectedAgentKind: next?.kind ?? null, overlay: null};
+  return {...state, selectedAgentKind: next?.kind ?? null, roundFocus: 'agents', overlay: null};
 }
 
 export function selectPreviousAgent(state: SessionState): SessionState {
@@ -524,20 +678,31 @@ export function selectPreviousAgent(state: SessionState): SessionState {
   const current = state.selectedAgentKind;
   const index = current === null ? 0 : phases.findIndex(phase => phase.kind === current);
   const previous = phases[(index - 1 + phases.length) % phases.length];
-  return {...state, selectedAgentKind: previous?.kind ?? null, overlay: null};
+  return {
+    ...state,
+    selectedAgentKind: previous?.kind ?? null,
+    roundFocus: 'agents',
+    overlay: null,
+  };
 }
 
 export function selectNextRound(state: SessionState): SessionState {
-  const rounds = scopedRounds(state);
+  const rounds = stripRounds(state);
   if (rounds.length === 0) return state;
   const visible = visibleRoundNumber(state);
   const index = visible === null ? -1 : rounds.findIndex(round => round.number === visible);
   const next = rounds[(index + 1 + rounds.length) % rounds.length];
-  return {...state, selectedRound: next?.number ?? null, selectedAgentKind: null, overlay: null};
+  return {
+    ...state,
+    selectedRound: next?.number ?? null,
+    selectedAgentKind: null,
+    selectedEntryId: null,
+    overlay: null,
+  };
 }
 
 export function selectPreviousRound(state: SessionState): SessionState {
-  const rounds = scopedRounds(state);
+  const rounds = stripRounds(state);
   if (rounds.length === 0) return state;
   const visible = visibleRoundNumber(state);
   const index = visible === null ? 0 : rounds.findIndex(round => round.number === visible);
@@ -546,17 +711,102 @@ export function selectPreviousRound(state: SessionState): SessionState {
     ...state,
     selectedRound: previous?.number ?? null,
     selectedAgentKind: null,
+    selectedEntryId: null,
     overlay: null,
   };
 }
 
 export function selectRound(state: SessionState, roundNumber: number): SessionState {
-  if (!scopedRounds(state).some(round => round.number === roundNumber)) return state;
-  return {...state, selectedRound: roundNumber, selectedAgentKind: null, overlay: null};
+  if (!stripRounds(state).some(round => round.number === roundNumber)) return state;
+  return {
+    ...state,
+    selectedRound: roundNumber,
+    selectedAgentKind: null,
+    selectedEntryId: null,
+    overlay: null,
+  };
 }
 
 export function clearAgentSelection(state: SessionState): SessionState {
-  return {...state, selectedAgentKind: null, overlay: null};
+  return {
+    ...state,
+    selectedAgentKind: null,
+    selectedEntryId: null,
+    roundFocus: 'transcript',
+    overlay: null,
+  };
+}
+
+/**
+ * Picks one agent out of the round, or clears the pick when it is already the
+ * selected one, so clicking a node twice behaves the way a toggle should. The
+ * transcript follows the selection, so the entry cursor starts over with it.
+ */
+export function selectAgent(state: SessionState, kind: string): SessionState {
+  const selected = state.selectedAgentKind === kind ? null : kind;
+  return {
+    ...state,
+    selectedAgentKind: selected,
+    selectedEntryId: null,
+    roundFocus: 'agents',
+    overlay: null,
+  };
+}
+
+/**
+ * Moves the transcript cursor. The cursor is an entry id rather than an index
+ * because the visible list changes underneath it as the run streams: an id
+ * still points at the same turn after new output arrives.
+ */
+export function selectNextEntry(state: SessionState, delta: number, id?: string): SessionState {
+  const entries = visibleConversation(state);
+  if (entries.length === 0) return state;
+  // A click names the entry outright; the keys step from wherever the cursor is.
+  if (id !== undefined) {
+    if (!entries.some(entry => entry.id === id)) return state;
+    return {...state, selectedEntryId: state.selectedEntryId === id ? null : id};
+  }
+  const current =
+    state.selectedEntryId === null
+      ? -1
+      : entries.findIndex(entry => entry.id === state.selectedEntryId);
+  // No cursor yet: step in from the end the operator is moving away from.
+  const start = current === -1 ? (delta > 0 ? -1 : entries.length) : current;
+  const index = Math.min(entries.length - 1, Math.max(0, start + delta));
+  return {...state, selectedEntryId: entries[index]?.id ?? null};
+}
+
+/**
+ * Moves the round view's keys one pane over, in the direction the arrow points.
+ * The agent graph is the left pane and the transcript the right one, so this is
+ * the spatial move; at either edge it stays put rather than wrapping, because
+ * wrapping across the width of the screen is disorienting.
+ */
+export function focusRound(state: SessionState, focus: RoundFocus): SessionState {
+  if (state.roundFocus === focus) return state;
+  // Arriving at the graph with nothing picked out puts the cursor on the agent
+  // whose turns are on screen, so Tab starts from where the operator is looking.
+  if (focus === 'agents' && state.selectedAgentKind === null) {
+    const phases = visiblePhases(state);
+    const active = phases.find(phase => phase.status === 'active') ?? phases[0];
+    return {...state, roundFocus: focus, selectedAgentKind: active?.kind ?? null};
+  }
+  return {...state, roundFocus: focus};
+}
+
+export function clearEntrySelection(state: SessionState): SessionState {
+  if (state.selectedEntryId === null) return state;
+  return {...state, selectedEntryId: null};
+}
+
+/** Moves the todo cursor within the visible phase's list. */
+export function selectNextTodo(state: SessionState, delta: number): SessionState {
+  const todos = visibleTodos(state);
+  if (todos.length === 0) return state;
+  const current = state.selectedTodoIndex;
+  const start = current === null ? (delta > 0 ? -1 : todos.length) : current;
+  const index = Math.min(todos.length - 1, Math.max(0, start + delta));
+  return {...state, selectedTodoIndex: index};
 }
 
 function formatConfigurationFailure(event: RunEvent): string {
@@ -767,7 +1017,26 @@ function appendConversation(
   ) {
     return [...previous.slice(0, -1), {...last, content: last.content + incoming.content}];
   }
-  return [...previous, incoming].slice(-1_000);
+  return capConversation([...previous, incoming]);
+}
+
+/**
+ * A run can outlive any fixed number of entries, but a round the operator can
+ * still open must keep all of its turns: a half-evicted round reads as a round
+ * that never ran. So the cap is generous, and when it is reached the oldest
+ * round goes as a whole rather than the oldest few lines.
+ */
+const MAX_CONVERSATION_ENTRIES = 20_000;
+
+function capConversation(entries: ConversationEntry[]): ConversationEntry[] {
+  if (entries.length <= MAX_CONVERSATION_ENTRIES) return entries;
+  const oldestRound = entries.find(entry => entry.roundNumber !== undefined)?.roundNumber;
+  if (oldestRound === undefined) return entries.slice(-MAX_CONVERSATION_ENTRIES);
+  const kept = entries.filter(
+    entry => entry.roundNumber === undefined || entry.roundNumber > oldestRound,
+  );
+  // Nothing to drop by round (one huge round): fall back to trimming the front.
+  return kept.length === entries.length ? entries.slice(-MAX_CONVERSATION_ENTRIES) : kept;
 }
 
 function findToolCall(previous: ConversationEntry[], result: ConversationEntry): number {
@@ -850,17 +1119,6 @@ function formatTokenCount(count: number): string {
 }
 
 export function visibleConversation(state: SessionState): ConversationEntry[] {
-  const scope = state.hypothesisScope;
-  // Inside a hypothesis with no round picked out, show the whole trajectory of
-  // that hypothesis rather than only its latest round.
-  if (scope !== null && state.selectedRound === null) {
-    return state.conversation.filter(entry => {
-      if (entry.roundNumber === undefined || !scope.rounds.includes(entry.roundNumber)) {
-        return false;
-      }
-      return state.selectedAgentKind === null || entry.agentKind === state.selectedAgentKind;
-    });
-  }
   const roundNumber = visibleRoundNumber(state);
   return state.conversation.filter(entry => {
     if (roundNumber !== null && entry.roundNumber !== roundNumber) return false;
@@ -913,15 +1171,43 @@ export function visibleTodos(state: SessionState): TodoItem[] {
 }
 
 export function visibleRoundNumber(state: SessionState): number | null {
-  if (state.hypothesisScope !== null && state.selectedRound === null) return null;
-  return visibleRunMapRoundNumber(scopedRounds(state), state.selectedRound);
+  const scope = state.hypothesisScope;
+  if (scope !== null && state.selectedRound === null) {
+    // Opening a hypothesis lands on one of its rounds rather than on nothing.
+    // Leaving the round unset used to mean "the whole trajectory", which drew an
+    // empty agent strip and an empty transcript for any run whose events are not
+    // all round-stamped: a blank view where a round was asked for.
+    const rounds = state.rounds.filter(round => scope.rounds.includes(round.number));
+    const active = [...rounds].reverse().find(round => round.status === 'active');
+    return active?.number ?? rounds.at(-1)?.number ?? scope.rounds.at(-1) ?? null;
+  }
+  return visibleRunMapRoundNumber(stripRounds(state), state.selectedRound);
 }
 
-/** The rounds the strip and round navigation operate on for the current view. */
+/** The rounds owned by the hypothesis on screen, or every round outside one. */
 export function scopedRounds(state: SessionState): RoundSummary[] {
   const scope = state.hypothesisScope;
   if (scope === null) return state.rounds;
   return state.rounds.filter(round => scope.rounds.includes(round.number));
+}
+
+/**
+ * What the strip shows and what round navigation moves through: every round of
+ * the run, including ones it has not reached yet. A run announces how many
+ * rounds it intends to take, so the strip can show the shape of the whole run
+ * from the first round rather than growing one chip at a time. Rounds beyond
+ * what has happened carry ``planned`` and open an empty view, which is the
+ * honest thing to show for a round that has not run.
+ */
+export function stripRounds(state: SessionState): RoundSummary[] {
+  const highest = Math.max(state.maxRounds ?? 0, ...state.rounds.map(round => round.number), 0);
+  if (highest === 0) return state.rounds;
+  const known = new Map(state.rounds.map(round => [round.number, round]));
+  const rounds: RoundSummary[] = [];
+  for (let number = 1; number <= highest; number += 1) {
+    rounds.push(known.get(number) ?? {number, status: 'planned'});
+  }
+  return rounds;
 }
 
 const MAX_TOOL_ARG_LEN = 80;

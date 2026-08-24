@@ -23,10 +23,11 @@ export function conversationRole(entry: ConversationEntry): ConversationRole {
   if (entry.kind === 'assistant') return 'assistant';
   if (entry.kind === 'user') return 'user';
   if (entry.kind === 'prompt') return 'prompt';
-  if (entry.kind === 'analysis') return 'analysis';
-  if (entry.kind === 'tool' || entry.kind === 'diagnostic' || entry.kind === 'subprocess') {
-    return 'tool';
-  }
+  // An agent narrating its own work is analysis whichever channel carried it:
+  // the diagnostic channel is where most backends put that narration, and
+  // slate-on-slate buried it. Tool turns keep the neutral surface.
+  if (entry.kind === 'analysis' || entry.kind === 'diagnostic') return 'analysis';
+  if (entry.kind === 'tool' || entry.kind === 'subprocess') return 'tool';
   return 'neutral';
 }
 
