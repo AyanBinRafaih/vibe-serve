@@ -16,6 +16,7 @@ export interface KeybindingActions {
   toggleTodos(): void;
   scrollRightPane(delta: number): void;
   scrollChatPane(delta: number): void;
+  scrollErrorBanner(delta: number): void;
 }
 
 export function bindKeybindings(
@@ -28,6 +29,15 @@ export function bindKeybindings(
     if (key.ctrl && key.name === 'c') {
       key.preventDefault();
       renderer.destroy();
+      return;
+    }
+    if (
+      controller.state.errorBanner !== null &&
+      key.ctrl &&
+      (key.name === 'pageup' || key.name === 'pagedown')
+    ) {
+      actions.scrollErrorBanner(key.name === 'pageup' ? -1 : 1);
+      key.preventDefault();
       return;
     }
     // Pane switching works from anywhere a second column is on screen, which

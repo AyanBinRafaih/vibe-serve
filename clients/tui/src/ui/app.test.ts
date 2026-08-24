@@ -84,6 +84,36 @@ describe('OpenTUI presentation', () => {
     expect(frame).toContain('Type a question or /help');
   });
 
+  it('keeps a fatal error visible above the empty experiment log', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 24});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    controller.publish({
+      ...controller.state,
+      experimentLog: {entries: [], selectedId: null, pending: false, error: null},
+      errorBanner: {
+        title: 'Run failed',
+        message: 'RuntimeError: app-server initialization was denied\nOperation not permitted',
+        severity: 'fatal',
+        scope: 'run',
+        agentKind: 'orchestrator',
+        roundLabel: 'round-1-pre',
+        invocationId: null,
+        count: 1,
+      },
+    });
+
+    const frame = await testRenderer.waitForFrame(value =>
+      value.includes('app-server initialization was denied'),
+    );
+    expect(frame).toContain('Run failed · orchestrator · round-1-pre');
+    expect(frame).toContain('Operation not permitted');
+    expect(frame).toContain('Experiments');
+
+    expect(frame).toContain('Ctrl+PgUp/PgDn: scroll');
+  });
+
   it('renders quiet round labels without status text or symbols', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const activeStartedAt = new Date(Date.now() - 65_000).toISOString();

@@ -60,6 +60,30 @@ export interface SessionState {
    * by older backends) are ignored so tool turns never render twice.
    */
   typedToolEvents: boolean;
+  /** Root-level error state, independent of the active transcript or log view. */
+  errorBanner: ErrorBannerState | null;
+}
+
+export type ErrorSeverity = 'recoverable' | 'fatal';
+export type ErrorScope =
+  | 'configuration'
+  | 'invocation'
+  | 'run'
+  | 'protocol'
+  | 'request'
+  | 'transport'
+  | 'input';
+
+export interface ErrorBannerState {
+  title: string;
+  message: string;
+  severity: ErrorSeverity;
+  scope: ErrorScope;
+  agentKind: string | null;
+  roundLabel: string | null;
+  invocationId: string | null;
+  /** Equivalent reports are folded into one banner. */
+  count: number;
 }
 
 /** The agent graph on the left, or the transcript on the right. */
@@ -210,6 +234,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     chatDockFits: true,
     themePicker: null,
     typedToolEvents: false,
+    errorBanner: null,
   };
 }
 
@@ -570,7 +595,8 @@ export function applySnapshot(state: SessionState, snapshot: RunSnapshot): Sessi
 export function applyEvent(state: SessionState, event: RunEvent): SessionState {
   const sequence = event.sequence ?? 0;
   if (sequence > 0 && sequence <= state.sequence) return state;
-  const next = {...state, sequence: Math.max(state.sequence, sequence)};
+  let next = {...state, sequence: Math.max(state.sequence, sequence)};
+  next = applyFailureEvent(next, event);
   if (event.agent_kind === 'chat') return applyChatEvent(next, event);
   if (event.agent_kind) next.agentKind = event.agent_kind;
   if (event.round_label) next.roundLabel = event.round_label;
@@ -807,6 +833,130 @@ export function selectNextTodo(state: SessionState, delta: number): SessionState
   const start = current === null ? (delta > 0 ? -1 : todos.length) : current;
   const index = Math.min(todos.length - 1, Math.max(0, start + delta));
   return {...state, selectedTodoIndex: index};
+}
+
+export interface ErrorReport {
+  scope: ErrorScope;
+  severity?: ErrorSeverity;
+  title?: string;
+  agentKind?: string | null;
+  roundLabel?: string | null;
+  invocationId?: string | null;
+}
+
+/**
+ * Records an error independently of any particular view. A terminal event
+ * commonly repeats an invocation failure, so equivalent reports promote the
+ * current banner instead of burying its cause beneath a duplicate.
+ */
+export function reportError(
+  state: SessionState,
+  message: string,
+  report: ErrorReport,
+): SessionState {
+  const severity = report.severity ?? 'recoverable';
+  const banner: ErrorBannerState = {
+    title: report.title ?? errorTitle(report.scope),
+    message: message || 'An unknown error occurred.',
+    severity,
+    scope: report.scope,
+    agentKind: report.agentKind ?? null,
+    roundLabel: report.roundLabel ?? null,
+    invocationId: report.invocationId ?? null,
+    count: 1,
+  };
+  const existing = state.errorBanner;
+  if (existing === null || !equivalentError(existing, banner)) {
+    return {...state, errorBanner: banner};
+  }
+  const promoted = existing.severity === 'fatal' || severity === 'fatal' ? 'fatal' : 'recoverable';
+  return {
+    ...state,
+    errorBanner: {
+      ...existing,
+      message: moreInformativeMessage(existing.message, banner.message),
+      severity: promoted,
+      title: promoted === 'fatal' ? banner.title : existing.title,
+      scope: promoted === 'fatal' ? banner.scope : existing.scope,
+      agentKind: existing.agentKind ?? banner.agentKind,
+      roundLabel: existing.roundLabel ?? banner.roundLabel,
+      invocationId: existing.invocationId ?? banner.invocationId,
+      count: existing.count + 1,
+    },
+  };
+}
+
+function applyFailureEvent(state: SessionState, event: RunEvent): SessionState {
+  const data = event.data;
+  if (data?.kind === 'configuration_failed') {
+    return reportError(state, formatConfigurationFailure(event), {
+      scope: 'configuration',
+      severity: 'fatal',
+      title: 'Configuration failed',
+    });
+  }
+  if (
+    data?.kind === 'invocation_finished' &&
+    ((data.error !== null && data.error !== undefined) || event.status === 'failed')
+  ) {
+    return reportError(state, data.error || event.text || 'Agent invocation failed.', {
+      scope: 'invocation',
+      title: 'Invocation failed',
+      agentKind: event.agent_kind ?? null,
+      roundLabel: event.round_label ?? null,
+      invocationId: event.invocation_id ?? null,
+    });
+  }
+  if (event.type === 'run_failed' || event.type === 'run_interrupted') {
+    const interruption =
+      data?.kind === 'run_interrupted'
+        ? `${data.reason}${data.signal === null ? '' : ` (${data.signal})`}`
+        : '';
+    const fallback = event.type === 'run_failed' ? 'Run failed.' : 'Run interrupted.';
+    return reportError(state, event.text || interruption || fallback, {
+      scope: 'run',
+      severity: 'fatal',
+      title: event.type === 'run_interrupted' ? 'Run interrupted' : 'Run failed',
+      agentKind: event.agent_kind ?? null,
+      roundLabel: event.round_label ?? null,
+      invocationId: event.invocation_id ?? null,
+    });
+  }
+  return state;
+}
+
+/** Keep a terminal wrapper's extra context when it repeats an invocation error. */
+function moreInformativeMessage(current: string, later: string): string {
+  if (later.length >= current.length) return later;
+  const currentLines = current.split('\n').length;
+  const laterLines = later.split('\n').length;
+  return laterLines > currentLines ? later : current;
+}
+
+function equivalentError(left: ErrorBannerState, right: ErrorBannerState): boolean {
+  if (left.invocationId !== null && left.invocationId === right.invocationId) return true;
+  const leftMessage = left.message.trim();
+  const rightMessage = right.message.trim();
+  if (leftMessage === rightMessage) return true;
+  // Terminal wrappers often add only an exception prefix around an invocation
+  // error. Fold those together, but do not equate short generic diagnostics.
+  return (
+    Math.min(leftMessage.length, rightMessage.length) >= 24 &&
+    (leftMessage.includes(rightMessage) || rightMessage.includes(leftMessage))
+  );
+}
+
+function errorTitle(scope: ErrorScope): string {
+  const titles: Record<ErrorScope, string> = {
+    configuration: 'Configuration failed',
+    invocation: 'Invocation failed',
+    run: 'Run failed',
+    protocol: 'Protocol error',
+    request: 'Request failed',
+    transport: 'Connection lost',
+    input: 'Input error',
+  };
+  return titles[scope];
 }
 
 function formatConfigurationFailure(event: RunEvent): string {

@@ -11,6 +11,7 @@ import {AgentMapView} from './agent-map.js';
 import {ChatOverlayView} from './chat-overlay.js';
 import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
 import {ConversationView} from './conversation.js';
+import {ErrorBannerView} from './error-banner.js';
 import {ExperimentLogView} from './experiment-log.js';
 import {createChatInputPanel, createInputPanel} from './input.js';
 import {bindKeybindings} from './keybindings.js';
@@ -102,6 +103,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   let markdownStyle = createMarkdownStyle(theme);
   const roundStrip = new RoundStripView(renderer, controller, theme);
   const todoStrip = new TodoStripView(renderer, controller, theme);
+  const errorBanner = new ErrorBannerView(renderer, theme);
   const agentMap = new AgentMapView(renderer, controller, theme);
   const overlay = new OverlayView(renderer, theme);
   const experimentLog = new ExperimentLogView(renderer, controller, theme);
@@ -181,6 +183,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   bottom.add(chatInputColumn);
   bottom.add(commandColumn);
   root.add(header);
+  root.add(errorBanner.output);
   root.add(roundStrip.output);
   root.add(main);
   root.add(todoStrip.output);
@@ -202,6 +205,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     help.fg = theme.textSubtle;
     roundStrip.applyTheme(theme);
     todoStrip.applyTheme(theme);
+    errorBanner.applyTheme(theme);
     agentMap.applyTheme(theme);
     overlay.applyTheme(theme);
     experimentLog.applyTheme(theme);
@@ -248,6 +252,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     header.content = showLog
       ? `VibeSys · ${statusText(state)} · experiments`
       : `VibeSys · ${statusText(state)}${scope}${selection}${returnHint}`;
+    errorBanner.render(state);
     // The log carries its own key hints in its footer, so when it shares the
     // row with a pane the global line is the place for the pane's keys.
     help.content = showSplit
@@ -292,7 +297,8 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     // visualization instead of over it. Bounds come from the siblings that
     // actually occupy those rows, so a taller todo strip still fits.
     if (showSplit) {
-      const top = header.height + (showLog ? 0 : roundStrip.output.height);
+      const errorHeight = state.errorBanner === null ? 0 : errorBanner.output.height;
+      const top = header.height + errorHeight + (showLog ? 0 : roundStrip.output.height);
       const below = todoStrip.output.height + help.height + input.box.height;
       chat.setPaneBounds({
         left: 1,
@@ -358,6 +364,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     toggleTodos: () => controller.toggleTodos(),
     scrollRightPane: delta => rightPane.scrollBy(delta),
     scrollChatPane: delta => chatPane.scrollBy(delta),
+    scrollErrorBanner: delta => errorBanner.scrollBy(delta),
   });
   // Pane widths come from the terminal, so a resize has to redraw even though
   // no state changed.

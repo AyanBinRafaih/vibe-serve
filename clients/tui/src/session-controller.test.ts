@@ -57,6 +57,7 @@ describe('session controller', () => {
 
     expect(controller.state.status).toBe('completed');
     expect(controller.state.overlay).toBeNull();
+    expect(controller.state.errorBanner).toBeNull();
   });
 
   it('renders a performance curve from the perf command', async () => {
@@ -417,14 +418,14 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
 
     await controller.submit('/history');
-    expect(controller.state.overlay?.kind).toBe('error');
-    expect(controller.state.overlay?.content).toContain('Unknown command: /history');
+    expect(controller.state.errorBanner?.scope).toBe('input');
+    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
 
     await controller.submit('/history rounds');
-    expect(controller.state.overlay?.content).toContain('Unknown command: /history rounds');
+    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history rounds');
 
     await controller.submit('/experiments');
-    expect(controller.state.overlay?.content).toContain('Unknown command: /experiments');
+    expect(controller.state.errorBanner?.message).toContain('Unknown command: /experiments');
 
     expect(transport.requests).toEqual([]);
   });
@@ -770,8 +771,8 @@ describe('session controller', () => {
 
     await controller.submitChat('/nope');
 
-    expect(controller.state.overlay?.kind).toBe('error');
-    expect(controller.state.overlay?.content).toContain('Unknown command');
+    expect(controller.state.errorBanner).toMatchObject({scope: 'input'});
+    expect(controller.state.errorBanner?.message).toContain('Unknown command');
     expect(transport.requests).toEqual([]);
   });
 
@@ -798,8 +799,8 @@ describe('session controller', () => {
 
     await controller.submit('/theme monokai');
 
-    expect(controller.state.overlay?.kind).toBe('error');
-    expect(controller.state.overlay?.content).toContain('Unknown theme: monokai');
+    expect(controller.state.errorBanner).toMatchObject({scope: 'input'});
+    expect(controller.state.errorBanner?.message).toContain('Unknown theme: monokai');
     expect(controller.state.themeName).toBe('dark');
     expect(transport.requests).toEqual([]);
   });

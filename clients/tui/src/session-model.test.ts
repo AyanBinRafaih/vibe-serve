@@ -109,9 +109,96 @@ describe('session event model', () => {
     expect(state.status).toBe('failed');
     expect(state.terminal).toBe(true);
     expect(state.overlay).toBeNull();
+    expect(state.errorBanner).toMatchObject({
+      title: 'Configuration failed',
+      severity: 'fatal',
+    });
+    expect(state.errorBanner?.message).toContain('This run has completed 30 rounds.');
     expect(state.conversation[0]?.content).toContain('This run has completed 30 rounds.');
     expect(state.conversation[0]?.content).toContain('resume_limit_exhausted');
     expect(state.conversation[0]?.tone).toBe('failure');
+  });
+
+  it('promotes an invocation failure to one terminal error banner', () => {
+    let state = applyEvent(initialSessionState(), {
+      ...event(1, 'invocation_finished', {
+        kind: 'invocation_finished',
+        error: 'RuntimeError: app-server initialization was denied',
+      }),
+      status: 'failed',
+      invocation_id: 'invocation-1',
+    });
+
+    expect(state.errorBanner).toMatchObject({
+      title: 'Invocation failed',
+      severity: 'recoverable',
+      invocationId: 'invocation-1',
+    });
+    state = applyEvent(state, {
+      ...event(2, 'run_failed'),
+      text: 'RuntimeError: app-server initialization was denied',
+    });
+
+    expect(state.errorBanner).toMatchObject({
+      title: 'Run failed',
+      severity: 'fatal',
+      count: 2,
+    });
+  });
+
+  it('keeps the more detailed terminal message when a failure is deduplicated', () => {
+    let state = applyEvent(initialSessionState(), {
+      ...event(1, 'invocation_finished', {
+        kind: 'invocation_finished',
+        error: 'RuntimeError: app-server initialization was denied',
+      }),
+      invocation_id: 'invocation-1',
+    });
+    const terminalMessage =
+      'RuntimeError: app-server initialization was denied\nOperation not permitted (os error 1)';
+    state = applyEvent(state, {...event(2, 'run_failed'), text: terminalMessage});
+
+    expect(state.errorBanner).toMatchObject({count: 2, message: terminalMessage});
+  });
+
+  it('uses an error-bearing invocation result even when the status is absent', () => {
+    const state = applyEvent(initialSessionState(), {
+      ...event(1, 'invocation_finished', {
+        kind: 'invocation_finished',
+        error: 'The agent process could not start.',
+      }),
+      status: null,
+    });
+
+    expect(state.errorBanner).toMatchObject({
+      title: 'Invocation failed',
+      message: 'The agent process could not start.',
+    });
+  });
+
+  it('uses the terminal event type for an empty failure message', () => {
+    const failed = applyEvent(initialSessionState(), event(1, 'run_failed'));
+    const interrupted = applyEvent(initialSessionState(), event(1, 'run_interrupted'));
+
+    expect(failed.errorBanner?.message).toBe('Run failed.');
+    expect(interrupted.errorBanner?.message).toBe('Run interrupted.');
+  });
+
+  it('shows structured interruption details when no event text is present', () => {
+    const state = applyEvent(
+      initialSessionState(),
+      event(1, 'run_interrupted', {
+        kind: 'run_interrupted',
+        reason: 'launcher_terminated',
+        signal: 'SIGTERM',
+      }),
+    );
+
+    expect(state.errorBanner).toMatchObject({
+      title: 'Run interrupted',
+      message: 'launcher_terminated (SIGTERM)',
+      severity: 'fatal',
+    });
   });
 
   it('routes chat agent trajectory events away from the experiment transcript', () => {

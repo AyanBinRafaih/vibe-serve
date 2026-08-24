@@ -32,6 +32,7 @@ import {
   type PaneFocus,
   type PaneView,
   type RoundFocus,
+  reportError,
   type SessionState,
   selectAgent,
   selectNextAgent,
@@ -127,18 +128,31 @@ export class SocketSessionController implements SessionController {
   }
 
   async start(): Promise<void> {
-    const response = await this.client.request({type: 'query.snapshot'});
-    if (response.snapshot) this.#setState(applySnapshot(this.#state, response.snapshot));
+    try {
+      const response = await this.client.request({type: 'query.snapshot'});
+      if (response.snapshot) this.#setState(applySnapshot(this.#state, response.snapshot));
+    } catch (error) {
+      this.#setState(reportError(this.#state, String(error), {scope: 'request'}));
+    }
     // The log is the landing view, so it is populated before the first frame
     // rather than on demand.
     await this.#loadExperiments();
-    this.#eventSubscription = await this.client.subscribe(
-      0,
-      message => this.#onMessage(message),
-      error => {
-        if (!this.#state.terminal) this.#setState(showDetail(this.#state, String(error), 'error'));
-      },
-    );
+    try {
+      this.#eventSubscription = await this.client.subscribe(
+        0,
+        message => this.#onMessage(message),
+        error => {
+          // A terminal event already carries the actual outcome. The socket
+          // closing afterward is lifecycle cleanup, not a second failure that
+          // should replace the useful diagnostic in the banner.
+          if (!this.#state.terminal) {
+            this.#setState(reportError(this.#state, String(error), {scope: 'transport'}));
+          }
+        },
+      );
+    } catch (error) {
+      this.#setState(reportError(this.#state, String(error), {scope: 'transport'}));
+    }
   }
 
   async stop(): Promise<void> {
@@ -325,7 +339,9 @@ export class SocketSessionController implements SessionController {
       const content = renderPerformanceCurve(response.performance ?? [], response.events ?? []);
       this.#setState(setPaneContent(this.#state, view, content));
     } catch (error) {
-      this.#setState(failPane(this.#state, view, String(error)));
+      this.#setState(
+        reportError(failPane(this.#state, view, String(error)), String(error), {scope: 'request'}),
+      );
     }
   }
 
@@ -371,7 +387,9 @@ export class SocketSessionController implements SessionController {
       const response = await this.client.request({type: 'query.experiments'});
       this.#setState(setExperiments(this.#state, response.experiments ?? []));
     } catch (error) {
-      this.#setState(failExperiments(this.#state, String(error)));
+      this.#setState(
+        reportError(failExperiments(this.#state, String(error)), String(error), {scope: 'request'}),
+      );
     }
   }
 
@@ -452,7 +470,7 @@ export class SocketSessionController implements SessionController {
       this.#setState(state);
     } catch (error) {
       this.#setState({
-        ...this.#state,
+        ...reportError(this.#state, String(error), {scope: 'request'}),
         chatConversation: appendChatEntry(this.#state.chatConversation, {
           id: `chat-error-${++this.#chatMessageId}`,
           kind: 'result',
@@ -466,7 +484,8 @@ export class SocketSessionController implements SessionController {
 
   async submit(value: string): Promise<void> {
     const parsed = parseInput(value.trim());
-    if (parsed.error) return this.#setState(showDetail(this.#state, parsed.error, 'error'));
+    if (parsed.error)
+      return this.#setState(reportError(this.#state, parsed.error, {scope: 'input'}));
     if (parsed.localView === 'help') {
       return this.#setState(
         showDetail(this.#state, helpText({chatDocked: chatPaneVisible(this.#state)}), 'help'),
@@ -507,7 +526,7 @@ export class SocketSessionController implements SessionController {
       const rendered = renderResponse(parsed.request, response, parsed.responseView);
       if (rendered !== null) this.#setState(showDetail(this.#state, rendered));
     } catch (error) {
-      this.#setState(showDetail(this.#state, String(error), 'error'));
+      this.#setState(reportError(this.#state, String(error), {scope: 'request'}));
     }
   }
 
@@ -525,7 +544,7 @@ export class SocketSessionController implements SessionController {
       this.#refreshPaneFor(message.events);
     }
     if (message.type === 'protocol_error') {
-      this.#setState(showDetail(this.#state, message.message, 'error'));
+      this.#setState(reportError(this.#state, message.message, {scope: 'protocol'}));
     }
   }
 
