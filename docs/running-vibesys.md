@@ -100,9 +100,9 @@ a Docker Compose topology the agent must build, start, and trace. Such a task
 needs Docker Engine reachable without `sudo` and, when its benchmark shells out
 to Go helpers, a Go toolchain on `PATH`.
 
-A local run in this domain therefore imports two host resources the default
-confinement withholds: the Docker control socket, and the task scratch
-directory `/tmp/vibesys-<task>`. The scratch directory is shared with the host
+A local run in this domain therefore imports two domain-specific host resources
+the default confinement withholds: the Docker control socket, and the task
+scratch directory `/tmp/vibesys-<task>`. The scratch directory is shared with the host
 rather than masked by the sandbox's private `/tmp`, because Docker resolves a
 bind-mount source in the daemon's namespace, not the agent's, so a capture
 directory only resolves when the path names the same directory inside and

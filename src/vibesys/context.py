@@ -829,6 +829,21 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         if not session.view.cli_sandboxed:
             agent_host_resources = (*container_runtime_resources(), *scratch_resources)
 
+    # A packaged benchmark command names ``${PACKAGE_ROOT}``, and the Profiler
+    # is told to run that command when no capture exists yet. The package lives
+    # outside the workspace, so without importing it the command dies on a
+    # missing directory and the role returns no evidence at all. Read-only: the
+    # evaluator is trusted, integrity-checked input that no role may edit.
+    if not session.view.cli_sandboxed and evaluator_package_root is not None:
+        agent_host_resources = (
+            *agent_host_resources,
+            HostResource(
+                evaluator_package_root,
+                HostResourceAccess.READ_ONLY,
+                "evaluator package",
+            ),
+        )
+
     # Build the backend-agnostic agent client. Loops invoke this instead
     # of calling create_deep_agent / vibesys._agent_cli directly. The cli
     # backend is rejected if --docker is set; build_agent_client raises
