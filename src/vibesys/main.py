@@ -863,6 +863,7 @@ def run_environment_spec_from_args(args: argparse.Namespace) -> RunEnvironmentSp
         modal_model_volume=args.modal_model_volume,
         modal_app=args.modal_app,
         modal_entrypoint=bundle.modal_entrypoint if bundle is not None else None,
+        resources=bundle.manifest.resources if bundle is not None else None,
     )
 
 
@@ -1498,10 +1499,10 @@ def _build_migrate_run_environment_parser() -> argparse.ArgumentParser:
     parser = _RunArgumentParser(
         prog=f"vibesys {_MIGRATE_RUN_ENVIRONMENT_COMMAND}",
         description=(
-            "Record the runtime environment an existing run executes in. Run "
-            "metadata written before run schema version 2 never captured it, so "
-            "the operator supplies the environment the run was launched with. "
-            "The migration is one-way."
+            "Migrate an existing run's execution metadata. Version 1 never "
+            "captured the runtime environment, so the operator supplies it. "
+            "For version 2, the supplied environment must match the recording "
+            "before portable resource metadata is added. The migration is one-way."
         ),
     )
     parser.add_argument(
@@ -1535,7 +1536,7 @@ def _build_migrate_run_environment_parser() -> argparse.ArgumentParser:
 
 
 def _run_migrate_run_environment(argv: list[str]) -> None:
-    """Stamp an explicit runtime environment into one pre-version-2 run."""
+    """Migrate one version 1 or 2 run to the current execution schema."""
     args = _build_migrate_run_environment_parser().parse_args(argv)
     project_root = (args.project or Path.cwd()).expanduser().resolve()
     # Build the record through the same producer a fresh run uses so a migrated

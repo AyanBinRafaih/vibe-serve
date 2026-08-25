@@ -330,9 +330,10 @@ a flag that contradicts the recording is rejected like any other immutable
 configuration field. The candidate's Modal entrypoint is declared by the task,
 not recorded, so it follows the current input bundle.
 
-Run metadata written before run schema version 2 has no recorded environment.
-VibeSys refuses to load it rather than guess a local environment. Stamp the
-environment the run was launched with, once:
+Run schema version 1 has no recorded environment. Version 2 has no portable
+compute-resource request. VibeSys refuses to load either rather than infer
+missing execution metadata. Stamp the environment the run was launched with,
+or confirm the environment already present in a version 2 recording, once:
 
 ```bash
 vibesys migrate-run-environment --project . --run <run-id> --run-environment modal

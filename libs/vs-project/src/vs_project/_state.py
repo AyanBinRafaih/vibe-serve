@@ -39,10 +39,10 @@ if TYPE_CHECKING:
     from uuid import UUID
 
 PROJECT_SCHEMA_VERSION: Literal[1] = 1
-# Version 2 added the required run-environment recording to a run's
-# configuration. Older recordings cannot be interpreted safely, so they are
-# rejected at load time and must be migrated with an explicit environment.
-RUN_SCHEMA_VERSION: Literal[2] = 2
+# Version 2 added the required run-environment recording. Version 3 adds the
+# portable compute-resource request used to reproduce remote execution. Older
+# recordings are rejected at load time and must be migrated explicitly.
+RUN_SCHEMA_VERSION: Literal[3] = 3
 _CONFIG_DIRECTORY_NAME = project_paths.CONFIGURATION_DIRECTORY_NAME
 _STATE_DIRECTORY_PARTS = project_paths.STATE_DIRECTORY_PARTS
 _STATE_DIRECTORY_PATH = project_paths.STATE_DIRECTORY_PATH
@@ -728,6 +728,22 @@ class ProjectManifest(_CommittedManifest):
     initial_input_fingerprint: Sha256Digest
 
 
+class RunResourceRequest(BaseModel):
+    """Portable compute resources required by one run environment.
+
+    Operator-owned cluster profiles resolve this logical request to concrete
+    infrastructure. Provider names, partitions, accounts, images, paths, and
+    transient allocation identifiers deliberately do not belong here.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    nodes: Annotated[int, Field(gt=0)] = 1
+    accelerators_per_node: Annotated[int, Field(gt=0)]
+    accelerator_backend: Literal["cuda", "rocm", "trainium"]
+    cpus_per_node: Annotated[int, Field(gt=0)] | None = None
+
+
 class RunEnvironmentRecord(BaseModel):
     """Runtime environment a run executes in, recorded for faithful resume.
 
@@ -739,11 +755,12 @@ class RunEnvironmentRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    name: Literal["local", "docker", "modal"]
+    name: Literal["local", "docker", "modal", "skypilot"]
     image: PortableText | None = None
     gpu: PortableText | None = None
     model_volume: PortableText | None = None
     app: PortableText | None = None
+    resources: RunResourceRequest | None = None
 
 
 class _BaseRunConfiguration(BaseModel):
@@ -837,7 +854,7 @@ RunConfiguration = Annotated[
 class RunManifest(_CommittedManifest):
     """Immutable identity and starting provenance of one optimization run."""
 
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     run_id: Identifier
     project_id: Identifier
     task_name: Identifier | None = None
@@ -1126,12 +1143,12 @@ class ProjectState:
         run_id: str,
         run_environment: RunEnvironmentRecord,
     ) -> RunManifest:
-        """Stamp an explicit run environment into a pre-version-2 run manifest.
+        """Migrate a version 1 or 2 run to the current environment schema.
 
         Run schema version 1 never recorded the runtime environment, so the
-        operator supplies the environment the run actually used. The migration
-        is one-way and idempotent only in the sense that a manifest already at
-        the current version is rejected rather than rewritten.
+        operator supplies the environment the run actually used. Version 2
+        already recorded it, so the supplied value must match before the
+        optional portable resource request is added. The migration is one-way.
         """
         self._validate_storage_roots()
         path = self._run_manifest_path(run_id)
@@ -1141,25 +1158,42 @@ class ProjectState:
             raise ProjectStateError(
                 f"Run metadata at {path} is already at run schema version {RUN_SCHEMA_VERSION}"
             )
-        if recorded_version != 1:
+        if recorded_version not in {1, 2}:
             raise ProjectStateError(
                 f"Run metadata at {path} records unsupported run schema version "
-                f"{recorded_version!r}; only version 1 can be migrated"
+                f"{recorded_version!r}; only versions 1 and 2 can be migrated"
             )
         configuration = raw.get("configuration")
         if not isinstance(configuration, dict):
             raise ProjectStateError(f"Run metadata at {path} has no configuration object")
-        if "run_environment" in configuration:
-            raise ProjectStateError(
-                f"Run metadata at {path} already records a run environment; "
-                "its schema version is inconsistent with its contents"
-            )
+        if recorded_version == 1:
+            if "run_environment" in configuration:
+                raise ProjectStateError(
+                    f"Run metadata at {path} already records a run environment; "
+                    "its schema version is inconsistent with its contents"
+                )
+            migrated_environment = run_environment
+        else:
+            recorded_environment = configuration.get("run_environment")
+            try:
+                migrated_environment = RunEnvironmentRecord.model_validate(
+                    recorded_environment, strict=True
+                )
+            except (TypeError, ValueError) as exc:
+                raise ProjectStateError(
+                    f"Run metadata at {path} has an invalid run environment: {exc}"
+                ) from exc
+            if migrated_environment != run_environment:
+                raise ProjectStateError(
+                    f"Run metadata at {path} records a different run environment; "
+                    "supply the environment already recorded by version 2"
+                )
         migrated = {
             **raw,
             "schema_version": RUN_SCHEMA_VERSION,
             "configuration": {
                 **configuration,
-                "run_environment": run_environment.model_dump(mode="json"),
+                "run_environment": migrated_environment.model_dump(mode="json"),
             },
         }
         try:
@@ -2030,11 +2064,16 @@ def _require_current_run_schema(path: Path, run_id: str) -> None:
     recorded_version = _read_json_object(path).get("schema_version")
     if not isinstance(recorded_version, int) or recorded_version >= RUN_SCHEMA_VERSION:
         return
+    missing_contract = (
+        "the runtime environment the run executes in"
+        if recorded_version == 1
+        else "portable compute-resource requirements"
+    )
     raise RunSchemaMigrationRequiredError(
         f"Run metadata at {path} uses run schema version {recorded_version}, but this "
-        f"VibeSys requires version {RUN_SCHEMA_VERSION}, which records the runtime "
-        "environment the run executes in. Migrate the run with the environment it "
-        "was launched with; VibeSys cannot infer it from an older recording.",
+        f"VibeSys requires version {RUN_SCHEMA_VERSION}, which records "
+        f"{missing_contract}. Migrate the run with the environment it was launched "
+        "with; VibeSys cannot infer missing execution metadata.",
         path=path,
         run_id=run_id,
         recorded_version=recorded_version,
