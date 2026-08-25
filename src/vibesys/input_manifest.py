@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from vibesys.domains.base import DomainName
 from vibesys.evaluators import EvaluatorPackageRequirement, resolve_evaluator_package
+from vs_project import RunResourceRequest
 
 if TYPE_CHECKING:
     from vs_project import Project, TaskDirectory
@@ -263,6 +264,7 @@ class InputManifest(BaseModel):
     agent: AgentInput
     accuracy: InputCommand
     benchmark: BenchmarkCommand
+    resources: RunResourceRequest | None = None
     environment: EnvironmentInput | None = None
     workspace: WorkspaceInput | None = None
     evaluator: EvaluatorInput | None = None
@@ -293,7 +295,7 @@ class InputManifest(BaseModel):
         return self
 
 
-def render_input_manifest(manifest: InputManifest) -> str:  # noqa: C901
+def render_input_manifest(manifest: InputManifest) -> str:  # noqa: C901, PLR0912
     """Serialize a validated input manifest as deterministic TOML."""
 
     def toml_string(value: str) -> str:
@@ -331,6 +333,19 @@ def render_input_manifest(manifest: InputManifest) -> str:  # noqa: C901
                 f"entrypoint = {toml_string(manifest.environment.modal.entrypoint)}",
             ]
         )
+
+    if manifest.resources is not None:
+        lines.extend(
+            [
+                "",
+                "[resources]",
+                f"nodes = {manifest.resources.nodes}",
+                f"accelerators_per_node = {manifest.resources.accelerators_per_node}",
+                (f"accelerator_backend = {toml_string(manifest.resources.accelerator_backend)}"),
+            ]
+        )
+        if manifest.resources.cpus_per_node is not None:
+            lines.append(f"cpus_per_node = {manifest.resources.cpus_per_node}")
 
     lines.extend(
         [

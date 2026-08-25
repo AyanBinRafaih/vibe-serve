@@ -43,11 +43,11 @@ from vibesys.evaluators import PROJECT_ROOT_TOKEN, load_evaluator_package
 from vibesys.input_manifest import WorkspaceSource  # noqa: TC001  # tracked: #288
 from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, render_template
-from vs_project import RunEnvironmentRecord
+from vs_project import RunEnvironmentRecord, RunResourceRequest
 from vs_sandbox import ProjectPathPolicy
 
 _SHELL_COMMAND_ARG_COUNT = 3
-_RECORDED_ENVIRONMENT_NAMES = frozenset({"local", "docker", "modal"})
+_RECORDED_ENVIRONMENT_NAMES = frozenset({"local", "docker", "modal", "skypilot"})
 _ENVIRONMENTS_TEMPLATE_DIR = PROMPTS_DIR / "environments"
 
 if TYPE_CHECKING:
@@ -66,6 +66,7 @@ class RunEnvironmentSpec:
 
     name: str = "local"
     options: Mapping[str, object] = field(default_factory=dict)
+    resources: RunResourceRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -680,6 +681,7 @@ def run_environment_record(spec: RunEnvironmentSpec) -> RunEnvironmentRecord:
         gpu=_recorded_option(spec, "gpu"),
         model_volume=_recorded_option(spec, "model_volume"),
         app=_recorded_option(spec, "app"),
+        resources=spec.resources,
     )
 
 
@@ -707,6 +709,7 @@ def make_run_environment_spec(  # noqa: PLR0913  # tracked: #288
     modal_model_volume: str | None = None,
     modal_app: str = "vibesys",
     modal_entrypoint: str | None = None,
+    resources: RunResourceRequest | None = None,
 ) -> RunEnvironmentSpec:
     """Build a spec from the current CLI compatibility flags.
 
@@ -731,10 +734,13 @@ def make_run_environment_spec(  # noqa: PLR0913  # tracked: #288
         return RunEnvironmentSpec(
             name="modal",
             options=options,
+            resources=resources,
         )
     if use_docker:
-        return RunEnvironmentSpec(name="docker", options={"image": docker_image})
-    return RunEnvironmentSpec()
+        return RunEnvironmentSpec(
+            name="docker", options={"image": docker_image}, resources=resources
+        )
+    return RunEnvironmentSpec(resources=resources)
 
 
 def _modal_app_name(run_id: str, fallback: str) -> str:

@@ -22,6 +22,7 @@ const sidebars: SidebarsConfig = {
         'contributing/extending-profilers',
         'contributing/skill-metadata',
         'contributing/openevolve',
+        'contributing/remote-slurm-execution',
         'contributing/issue-authoring',
         'contributing/publishing',
       ],

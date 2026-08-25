@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, TypeVar
 from pydantic import BaseModel
 
 from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #288
-from vibesys.agents.client import AgentClient
 from vibesys.agents.contracts import AgentCapabilities
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
 from vibesys.schemas import HypothesisOutcome
@@ -22,7 +21,7 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound=BaseModel)
 
 
-class StubAgentClient(AgentClient):
+class StubAgentClient:
     """Return valid canned responses without invoking an external agent."""
 
     backend_name = "stub"

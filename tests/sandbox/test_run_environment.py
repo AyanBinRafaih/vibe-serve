@@ -20,7 +20,7 @@ from vibesys.sandbox.run_environment import (
     make_run_environment_spec,
     run_environment_record,
 )
-from vs_project import Project, RunEnvironmentRecord
+from vs_project import Project, RunEnvironmentRecord, RunResourceRequest
 from vs_sandbox import ProjectPathPolicy
 
 
@@ -114,6 +114,16 @@ def test_run_environment_record_captures_operator_selected_options():  # noqa: A
         gpu="accelerator",
         model_volume="weights",
         app="candidate",
+    )
+
+    resources = RunResourceRequest(
+        nodes=1,
+        accelerators_per_node=4,
+        accelerator_backend="rocm",
+        cpus_per_node=192,
+    )
+    assert run_environment_record(RunEnvironmentSpec(resources=resources)) == RunEnvironmentRecord(
+        name="local", resources=resources
     )
 
 

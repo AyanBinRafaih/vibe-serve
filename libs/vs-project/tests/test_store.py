@@ -25,6 +25,7 @@ from vs_project import (
     RunConfiguration,
     RunEnvironmentRecord,
     RunManifest,
+    RunResourceRequest,
     RunSchemaMigrationRequiredError,
     StateFile,
     StateModelNotFoundError,
@@ -729,6 +730,7 @@ def test_run_manifest_persists_complete_agent_loop_behavior(tmp_path: Path) -> N
             "image": None,
             "model_volume": None,
             "name": "local",
+            "resources": None,
         },
     }
 
@@ -1628,6 +1630,16 @@ def _downgrade_run_schema(store: Project, run_id: str) -> Path:
     return path
 
 
+def _downgrade_run_schema_to_v2(store: Project, run_id: str) -> Path:
+    """Rewrite one run manifest as a version 2 recording without resources."""
+    path = store.state._run_manifest_path(run_id)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["schema_version"] = 2
+    del raw["configuration"]["run_environment"]["resources"]
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    return path
+
+
 def test_loading_a_pre_environment_run_requires_migration(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run = _run(store)
@@ -1656,6 +1668,58 @@ def test_migrating_a_run_records_the_supplied_environment(tmp_path: Path) -> Non
     assert migrated.model_dump(exclude={"schema_version", "configuration"}) == run.model_dump(
         exclude={"schema_version", "configuration"}
     )
+
+
+def test_migrating_a_version_2_run_preserves_its_environment(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run = _run(store)
+    _downgrade_run_schema_to_v2(store, run.run_id)
+
+    with pytest.raises(RunSchemaMigrationRequiredError) as caught:
+        store.state.load_run(run.run_id)
+    assert caught.value.recorded_version == 2
+
+    migrated = store.state.migrate_run_environment(run.run_id, run.configuration.run_environment)
+
+    assert migrated.schema_version == RUN_SCHEMA_VERSION
+    assert migrated.configuration.run_environment == run.configuration.run_environment
+    assert store.state.load_run(run.run_id) == migrated
+
+
+def test_migrating_a_version_2_run_rejects_a_different_environment(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run = _run(store)
+    _downgrade_run_schema_to_v2(store, run.run_id)
+
+    with pytest.raises(ProjectStateError, match="different run environment"):
+        store.state.migrate_run_environment(run.run_id, RunEnvironmentRecord(name="modal"))
+
+
+def test_run_environment_round_trips_portable_resources(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    resources = RunResourceRequest(
+        nodes=2,
+        accelerators_per_node=4,
+        accelerator_backend="rocm",
+        cpus_per_node=192,
+    )
+    configuration = _configuration().model_copy(
+        update={"run_environment": RunEnvironmentRecord(name="skypilot", resources=resources)}
+    )
+    run = store.state.new_run_manifest(
+        "Remote Queue",
+        branch="vibesys/remote-queue",
+        vibesys_version="0.2.0",
+        configuration=configuration,
+        trusted_input_baseline="a" * 40,
+        now=NOW,
+        unique=UUID(int=99),
+    )
+    store.state.create_run(run)
+
+    loaded = store.state.load_run(run.run_id)
+
+    assert loaded.configuration.run_environment.resources == resources
 
 
 def test_migrating_a_current_run_is_rejected(tmp_path: Path) -> None:

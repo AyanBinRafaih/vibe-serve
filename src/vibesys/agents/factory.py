@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from vibesys.agents.client import AgentClient, AgentDiagnosticLog
 from vibesys.constants import DEFAULT_AGENT_BACKEND
@@ -77,7 +77,7 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
     if backend == "stub":
         from vibesys.agents.stub_runner import StubAgentClient  # noqa: PLC0415
 
-        return StubAgentClient()
+        return cast("AgentClient", StubAgentClient())
 
     if backend != "cli":
         raise SystemExit(f"unknown agent backend: {backend!r}")  # noqa: TRY003  # tracked: #288
