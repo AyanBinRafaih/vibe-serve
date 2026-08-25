@@ -16,6 +16,7 @@ import {
   cyclePaneFocus,
   enterExperimentDrilldown,
   enterExperimentRound,
+  enterUnownedExperimentRound,
   failExperiments,
   failPane,
   focusPane,
@@ -35,6 +36,7 @@ import {
   reportError,
   type SessionState,
   selectAgent,
+  selectExperimentActivity,
   selectNextAgent,
   selectNextEntry,
   selectNextRound,
@@ -86,6 +88,7 @@ export interface SessionController {
   focusPane(focus: PaneFocus): void;
   setChatDockFits(fits: boolean): void;
   moveExperimentSelection(delta: number): void;
+  selectExperimentActivity(): void;
   enterExperimentDrilldown(): void;
   leaveExperimentDrilldown(): void;
   openThemePicker(): void;
@@ -276,7 +279,8 @@ export class SocketSessionController implements SessionController {
     if (roundNumber !== undefined) {
       return (
         enterExperimentRound(this.#state, roundNumber) ??
-        showDetail(this.#state, `Round ${roundNumber} is not in any recorded hypothesis.`)
+        enterUnownedExperimentRound(this.#state, roundNumber) ??
+        showDetail(this.#state, `Round ${roundNumber} has not been recorded.`)
       );
     }
     const scope = this.#state.hypothesisScope;
@@ -364,6 +368,10 @@ export class SocketSessionController implements SessionController {
 
   moveExperimentSelection(delta: number): void {
     this.#setState(moveExperimentSelection(this.#state, delta));
+  }
+
+  selectExperimentActivity(): void {
+    this.#setState(selectExperimentActivity(this.#state));
   }
 
   enterExperimentDrilldown(): void {

@@ -118,9 +118,26 @@ export interface PhaseTodos {
 export interface ExperimentLogState {
   entries: HypothesisEntry[];
   selectedId: string | null;
+  /** The transient planning activity is selected instead of a recorded claim. */
+  selectedActivity?: boolean;
+  /** A recorded round that has no hypothesis entry is selected. */
+  selectedUnownedRound?: number | null;
   pending: boolean;
   error: string | null;
 }
+
+/** A planning phase that has not produced a hypothesis record yet. */
+export interface HypothesisPlanningActivity {
+  stage: 'pre' | 'profile' | 'plan';
+  roundNumber: number;
+  startedAt?: string;
+}
+
+/** Every selectable item in the hypotheses-first index. */
+export type ExperimentIndexItem =
+  | {kind: 'activity'; key: 'activity'; activity: HypothesisPlanningActivity}
+  | {kind: 'hypothesis'; key: string; entry: HypothesisEntry}
+  | {kind: 'round'; key: `round-${number}`; roundNumber: number};
 
 /**
  * The hypothesis whose rounds the operator opened. While this is set the
@@ -131,6 +148,8 @@ export interface HypothesisScope {
   id: string;
   label: string;
   rounds: number[];
+  /** A single recorded round not yet associated with a hypothesis. */
+  source?: 'hypothesis' | 'round';
 }
 
 /**
@@ -330,9 +349,27 @@ export function setExperiments(state: SessionState, entries: HypothesisEntry[]):
     log.selectedId !== null && keys.includes(log.selectedId)
       ? log.selectedId
       : (keys[entries.findIndex(entry => entry.active === true)] ?? keys[0] ?? null);
+  const unownedRounds = unownedExperimentRounds(state, entries);
+  const currentUnownedRound = log.selectedUnownedRound;
+  const selectedUnownedRound =
+    currentUnownedRound !== undefined &&
+    currentUnownedRound !== null &&
+    unownedRounds.includes(currentUnownedRound)
+      ? currentUnownedRound
+      : entries.length === 0
+        ? (unownedRounds[0] ?? null)
+        : null;
   return {
     ...state,
-    experimentLog: {...log, entries, selectedId, pending: false, error: null},
+    experimentLog: {
+      ...log,
+      entries,
+      selectedId,
+      selectedActivity: hypothesisPlanningActivity(state) !== null && log.selectedActivity === true,
+      selectedUnownedRound,
+      pending: false,
+      error: null,
+    },
   };
 }
 
@@ -344,16 +381,26 @@ export function failExperiments(state: SessionState, error: string): SessionStat
 
 export function moveExperimentSelection(state: SessionState, delta: number): SessionState {
   const log = state.experimentLog;
-  if (log === null || state.hypothesisScope !== null || log.entries.length === 0) return state;
-  const keys = log.entries.map(entryKey);
-  const current = log.selectedId === null ? -1 : keys.indexOf(log.selectedId);
-  // With nothing selected the first key lands on the first row rather than
-  // stepping past it: the table has a selection the moment it is used.
-  if (current === -1) {
-    return {...state, experimentLog: {...log, selectedId: keys[0] ?? null}};
+  if (log === null || state.hypothesisScope !== null) return state;
+  const items = experimentIndexItems(state);
+  if (items.length === 0) return state;
+  const selected = selectedExperimentIndexItem(state);
+  const current = selected === null ? -1 : items.findIndex(item => item.key === selected.key);
+  const index = current === -1 ? 0 : Math.min(items.length - 1, Math.max(0, current + delta));
+  return selectExperimentIndexItem(state, items[index]);
+}
+
+/** Selects the current planning work so Enter opens its live agent turns. */
+export function selectExperimentActivity(state: SessionState): SessionState {
+  const log = state.experimentLog;
+  if (
+    log === null ||
+    state.hypothesisScope !== null ||
+    hypothesisPlanningActivity(state) === null
+  ) {
+    return state;
   }
-  const index = Math.min(keys.length - 1, Math.max(0, current + delta));
-  return {...state, experimentLog: {...log, selectedId: keys[index] ?? null}};
+  return {...state, experimentLog: {...log, selectedActivity: true, selectedUnownedRound: null}};
 }
 
 /**
@@ -361,6 +408,21 @@ export function moveExperimentSelection(state: SessionState, delta: number): Ses
  * so leaving the trajectory lands the operator back on the same row.
  */
 export function enterExperimentDrilldown(state: SessionState): SessionState {
+  const activity = hypothesisPlanningActivity(state);
+  if (
+    activity !== null &&
+    (state.experimentLog?.selectedActivity === true ||
+      (state.experimentLog?.entries.length === 0 &&
+        (state.experimentLog?.selectedUnownedRound ?? null) === null))
+  ) {
+    return enterUnownedExperimentRound(state, activity.roundNumber) ?? state;
+  }
+  const selectedRound =
+    state.experimentLog?.selectedUnownedRound ??
+    (selectedExperiment(state) === null ? unownedExperimentRounds(state)[0] : undefined);
+  if (selectedRound !== undefined && selectedRound !== null) {
+    return enterUnownedExperimentRound(state, selectedRound) ?? state;
+  }
   const entry = selectedExperiment(state);
   if (entry === null || state.hypothesisScope !== null) return state;
   const rounds = scopeRounds(entry);
@@ -372,7 +434,12 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
     // the round view would leave the operator reading one view's answer beside
     // another view's transcript.
     layout: {right: null, focus: 'left'},
-    hypothesisScope: {id: entry.hypothesis_id, label: hypothesisLabel(entry), rounds},
+    hypothesisScope: {
+      id: entry.hypothesis_id,
+      label: hypothesisLabel(entry),
+      rounds,
+      source: 'hypothesis',
+    },
     // Land on the hypothesis's latest round rather than on "no round". The
     // round view is built around one round: the strip marks it, the agent graph
     // draws its phases, the transcript carries its turns. Leaving the round
@@ -412,6 +479,7 @@ export function enterExperimentRound(
       id: entry.hypothesis_id,
       label: hypothesisLabel(entry),
       rounds: scopeRounds(entry),
+      source: 'hypothesis',
     },
     selectedRound: roundNumber,
     selectedAgentKind: null,
@@ -424,6 +492,33 @@ export function enterExperimentRound(
   return scoped;
 }
 
+/**
+ * Opens a recorded round that is not currently indexed by a hypothesis. This
+ * is intentionally derived only from observed rounds, never from the planned
+ * round count, so an empty future round is not presented as historical work.
+ */
+export function enterUnownedExperimentRound(
+  state: SessionState,
+  roundNumber: number,
+): SessionState | null {
+  if (!state.rounds.some(round => round.number === roundNumber)) return null;
+  return {
+    ...state,
+    overlay: null,
+    chatOpen: false,
+    layout: {right: null, focus: 'left'},
+    hypothesisScope: {
+      id: `round-${roundNumber}`,
+      label: `Round ${roundNumber}`,
+      rounds: [roundNumber],
+      source: 'round',
+    },
+    selectedRound: roundNumber,
+    selectedAgentKind: null,
+    selectedEntryId: null,
+  };
+}
+
 function entryKeyFor(entries: HypothesisEntry[], entry: HypothesisEntry): string | null {
   const index = entries.indexOf(entry);
   return index === -1 ? null : entryKey(entry, index);
@@ -432,9 +527,13 @@ function entryKeyFor(entries: HypothesisEntry[], entry: HypothesisEntry): string
 function scopeRounds(entry: HypothesisEntry): number[] {
   const listed = (entry.rounds ?? []).map(round => round.round);
   if (listed.length > 0) return [...listed].sort((a, b) => a - b);
-  // An active hypothesis whose first round has not finished has no round
-  // records yet, but its opening round is still worth showing.
-  return entry.first_round > 0 ? [entry.first_round] : [];
+  // A record can summarize a continuation before its per-round outcomes have
+  // been persisted. Its declared range is still the server's ownership claim.
+  if (entry.first_round <= 0 || entry.last_round < entry.first_round) return [];
+  return Array.from(
+    {length: Math.max(0, entry.last_round - entry.first_round + 1)},
+    (_, index) => entry.first_round + index,
+  );
 }
 
 function hypothesisLabel(entry: HypothesisEntry): string {
@@ -450,6 +549,136 @@ export function selectedExperiment(state: SessionState): HypothesisEntry | null 
   if (log === null || log.selectedId === null) return null;
   const index = log.entries.map(entryKey).indexOf(log.selectedId);
   return index === -1 ? null : (log.entries[index] ?? null);
+}
+
+/**
+ * Observed numeric rounds not represented by any hypothesis record. Events
+ * without a numeric round label remain in the run transcript but cannot be
+ * honestly assigned an index row.
+ */
+export function unownedExperimentRounds(
+  state: SessionState,
+  entries: HypothesisEntry[] = state.experimentLog?.entries ?? [],
+): number[] {
+  const owned = new Set(entries.flatMap(scopeRounds));
+  const planningRound = hypothesisPlanningActivity(state)?.roundNumber;
+  return state.rounds
+    .filter(
+      round =>
+        !owned.has(round.number) && round.number !== planningRound && round.status !== 'planned',
+    )
+    .map(round => round.number);
+}
+
+/** The visual index: live planning, hypotheses, then observed unowned rounds. */
+export function experimentIndexItems(state: SessionState): ExperimentIndexItem[] {
+  const items: ExperimentIndexItem[] = [];
+  const activity = hypothesisPlanningActivity(state);
+  if (activity !== null) items.push({kind: 'activity', key: 'activity', activity});
+  for (const [index, entry] of (state.experimentLog?.entries ?? []).entries()) {
+    items.push({kind: 'hypothesis', key: entryKey(entry, index), entry});
+  }
+  for (const roundNumber of unownedExperimentRounds(state)) {
+    items.push({kind: 'round', key: `round-${roundNumber}`, roundNumber});
+  }
+  return items;
+}
+
+export function selectedExperimentIndexItem(state: SessionState): ExperimentIndexItem | null {
+  const log = state.experimentLog;
+  if (log === null) return null;
+  const items = experimentIndexItems(state);
+  if (log.selectedActivity === true) return items.find(item => item.kind === 'activity') ?? null;
+  if (log.selectedUnownedRound !== undefined && log.selectedUnownedRound !== null) {
+    return (
+      items.find(item => item.kind === 'round' && item.roundNumber === log.selectedUnownedRound) ??
+      null
+    );
+  }
+  return log.selectedId === null
+    ? null
+    : (items.find(item => item.kind === 'hypothesis' && item.key === log.selectedId) ?? null);
+}
+
+function selectExperimentIndexItem(
+  state: SessionState,
+  item: ExperimentIndexItem | undefined,
+): SessionState {
+  const log = state.experimentLog;
+  if (log === null || item === undefined) return state;
+  if (item.kind === 'activity')
+    return {...state, experimentLog: {...log, selectedActivity: true, selectedUnownedRound: null}};
+  if (item.kind === 'round') {
+    return {
+      ...state,
+      experimentLog: {...log, selectedActivity: false, selectedUnownedRound: item.roundNumber},
+    };
+  }
+  return {
+    ...state,
+    experimentLog: {
+      ...log,
+      selectedId: item.key,
+      selectedActivity: false,
+      selectedUnownedRound: null,
+    },
+  };
+}
+
+/**
+ * The loop publishes these labels before it writes a hypothesis record. Keep
+ * this derived from active, named phases: an old phase must never make the
+ * experiment log look live, and unrelated profiler work must not be presented
+ * as hypothesis planning.
+ */
+export function hypothesisPlanningActivity(state: SessionState): HypothesisPlanningActivity | null {
+  if (state.terminal || state.experimentLog === null) return null;
+  const phase = [...state.phases]
+    .reverse()
+    .find(
+      candidate =>
+        candidate.status === 'active' && planningStage(candidate.kind, candidate.roundLabel),
+    );
+  if (phase === undefined || phase.roundNumber === null) return null;
+  const roundNumber = phase.roundNumber;
+  if (state.experimentLog.entries.some(entry => scopeRounds(entry).includes(roundNumber)))
+    return null;
+  const stage = planningStage(phase.kind, phase.roundLabel);
+  if (stage === null) return null;
+  const startedAt = earliestPlanningStartedAt(state.phases, roundNumber);
+  return {
+    stage,
+    roundNumber,
+    ...(startedAt === undefined ? {} : {startedAt}),
+  };
+}
+
+function earliestPlanningStartedAt(phases: AgentPhase[], roundNumber: number): string | undefined {
+  const starts = phases
+    .filter(
+      phase => phase.roundNumber === roundNumber && planningStage(phase.kind, phase.roundLabel),
+    )
+    .flatMap(phase =>
+      phase.startedAt === undefined
+        ? []
+        : [[phase.startedAt, Date.parse(phase.startedAt)] as const],
+    )
+    .filter(([, timestamp]) => Number.isFinite(timestamp));
+  if (starts.length === 0) return undefined;
+  return starts.reduce((earliest, candidate) =>
+    candidate[1] < earliest[1] ? candidate : earliest,
+  )[0];
+}
+
+function planningStage(
+  agentKind: string,
+  roundLabel: string | null,
+): HypothesisPlanningActivity['stage'] | null {
+  if (roundLabel === null) return null;
+  if (agentKind === 'orchestrator' && /^round-\d+-pre$/.test(roundLabel)) return 'pre';
+  if (agentKind === 'profiler' && /^round-\d+-profiler$/.test(roundLabel)) return 'profile';
+  if (agentKind === 'orchestrator' && /^round-\d+-plan$/.test(roundLabel)) return 'plan';
+  return null;
 }
 
 export const PANE_TITLES: Record<PaneView, string> = {

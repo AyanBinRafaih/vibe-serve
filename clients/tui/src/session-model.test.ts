@@ -10,14 +10,18 @@ import {
   cyclePaneFocus,
   enterExperimentDrilldown,
   enterExperimentRound,
+  enterUnownedExperimentRound,
   failPane,
   focusPane,
+  hypothesisPlanningActivity,
   initialSessionState,
   leaveExperimentDrilldown,
+  moveExperimentSelection,
   moveThemeSelection,
   openChat,
   openPane,
   openThemePicker,
+  selectExperimentActivity,
   selectNextAgent,
   selectNextRound,
   selectRound,
@@ -28,10 +32,178 @@ import {
   showDetail,
   statusText,
   toggleTodos,
+  unownedExperimentRounds,
   visibleConversation,
   visiblePhases,
   visibleTodos,
 } from './session-model.js';
+
+describe('hypothesis planning activity', () => {
+  function stateFor(
+    kind: string,
+    roundLabel: string,
+    entries: Parameters<typeof setExperiments>[1] = [],
+  ): SessionState {
+    return setExperiments(
+      {
+        ...initialSessionState(),
+        phases: [
+          {
+            kind,
+            status: 'active',
+            roundNumber: 3,
+            roundLabel,
+            startedAt: '2026-01-01T00:00:00Z',
+          },
+        ],
+      },
+      entries,
+    );
+  }
+
+  it("maps the loop's named pre, profiler, and plan phases", () => {
+    expect(hypothesisPlanningActivity(stateFor('orchestrator', 'round-3-pre'))).toMatchObject({
+      stage: 'pre',
+      roundNumber: 3,
+    });
+    expect(hypothesisPlanningActivity(stateFor('profiler', 'round-3-profiler'))).toMatchObject({
+      stage: 'profile',
+      roundNumber: 3,
+    });
+    expect(hypothesisPlanningActivity(stateFor('orchestrator', 'round-3-plan'))).toMatchObject({
+      stage: 'plan',
+      roundNumber: 3,
+    });
+  });
+
+  it('does not present a phase as planning after its round has a hypothesis', () => {
+    const entries = [
+      {
+        hypothesis_id: 'H-03',
+        identified: true,
+        first_round: 3,
+        last_round: 3,
+        rounds: [],
+        kept: false,
+        active: true,
+      },
+    ] as Parameters<typeof setExperiments>[1];
+
+    expect(
+      hypothesisPlanningActivity(stateFor('orchestrator', 'round-3-plan', entries)),
+    ).toBeNull();
+  });
+
+  it('keeps elapsed planning time from the earliest observed planning phase', () => {
+    const state = stateFor('orchestrator', 'round-3-plan');
+    state.phases = [
+      {
+        kind: 'orchestrator',
+        status: 'completed',
+        roundNumber: 3,
+        roundLabel: 'round-3-pre',
+        startedAt: '2026-01-01T00:00:00Z',
+      },
+      {
+        kind: 'orchestrator',
+        status: 'active',
+        roundNumber: 3,
+        roundLabel: 'round-3-plan',
+        startedAt: '2026-01-01T00:01:00Z',
+      },
+    ];
+
+    expect(hypothesisPlanningActivity(state)?.startedAt).toBe('2026-01-01T00:00:00Z');
+  });
+
+  it('ignores similarly named phases outside the loop contract', () => {
+    expect(hypothesisPlanningActivity(stateFor('profiler', 'round-3-profile-retry'))).toBeNull();
+  });
+
+  it('selects planning activity ahead of existing hypotheses and opens its recorded round', () => {
+    let state = setExperiments(
+      {
+        ...stateFor('orchestrator', 'round-3-plan'),
+        rounds: [{number: 3, status: 'active' as const}],
+      },
+      [
+        {
+          hypothesis_id: 'H-02',
+          identified: true,
+          first_round: 2,
+          last_round: 2,
+          rounds: [{round: 2, passed: true, reviewed: true}],
+          kept: true,
+          active: false,
+        },
+      ],
+    );
+
+    state = moveExperimentSelection(state, -1);
+    expect(state.experimentLog?.selectedActivity).toBe(true);
+
+    const opened = enterExperimentDrilldown(state);
+    expect(opened.hypothesisScope).toMatchObject({id: 'round-3', rounds: [3], source: 'round'});
+    expect(opened.selectedRound).toBe(3);
+  });
+
+  it('opens the first planning activity without a synthetic hypothesis row', () => {
+    const state = {
+      ...stateFor('orchestrator', 'round-3-pre'),
+      rounds: [{number: 3, status: 'active' as const}],
+    };
+
+    const opened = enterExperimentDrilldown(selectExperimentActivity(state));
+    expect(opened.hypothesisScope).toMatchObject({id: 'round-3', label: 'Round 3'});
+  });
+
+  it('does not duplicate the planning round as an unowned index item', () => {
+    const state = {
+      ...stateFor('orchestrator', 'round-3-plan'),
+      rounds: [{number: 3, status: 'active' as const}],
+    };
+
+    expect(unownedExperimentRounds(state)).toEqual([]);
+  });
+});
+
+describe('unowned rounds', () => {
+  it('opens an observed round and keeps its turns scoped to that round', () => {
+    const state = {
+      ...initialSessionState(),
+      rounds: [{number: 9, status: 'completed' as const}],
+      conversation: [
+        {id: 'r8', kind: 'assistant' as const, content: 'old', roundNumber: 8},
+        {id: 'r9', kind: 'assistant' as const, content: 'kept', roundNumber: 9},
+      ],
+    };
+    const opened = enterUnownedExperimentRound(state, 9);
+
+    expect(opened?.hypothesisScope).toMatchObject({id: 'round-9', source: 'round'});
+    expect(opened && visibleConversation(opened).map(entry => entry.content)).toEqual(['kept']);
+  });
+
+  it('does not turn an announced but unobserved round into historical work', () => {
+    const state = {...initialSessionState(), maxRounds: 9};
+    expect(enterUnownedExperimentRound(state, 9)).toBeNull();
+  });
+
+  it('does not assign invalid zero-based ranges to a hypothesis', () => {
+    const state = setExperiments(initialSessionState(), [
+      {
+        hypothesis_id: 'H-invalid',
+        identified: true,
+        first_round: 0,
+        last_round: 0,
+        rounds: [],
+        kept: false,
+        active: false,
+      },
+    ]);
+
+    expect(enterExperimentRound(state, 0)).toBeNull();
+  });
+});
 
 describe('session event model', () => {
   it('reduces semantic events into a presentation-neutral transcript', () => {

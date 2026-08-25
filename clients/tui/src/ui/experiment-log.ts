@@ -1,7 +1,17 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
 import type {HypothesisEntry} from '../protocol.js';
 import type {SessionController} from '../session-controller.js';
-import {entryKey, experimentLogVisible, type SessionState} from '../session-model.js';
+import {
+  entryKey,
+  experimentIndexItems,
+  experimentLogVisible,
+  type HypothesisPlanningActivity,
+  hypothesisPlanningActivity,
+  type SessionState,
+  selectedExperimentIndexItem,
+  unownedExperimentRounds,
+} from '../session-model.js';
+import {elapsedLabel} from './previews.js';
 import type {Theme} from './theme.js';
 
 const MIN_BODY_WIDTH = 40;
@@ -49,6 +59,8 @@ export class ExperimentLogView {
   #renderedState: SessionState | null = null;
   #renderedWidth = 0;
   #availableWidth: number | null = null;
+  #elapsedTimer: ReturnType<typeof setInterval> | null = null;
+  #activeActivityLine: {text: TextRenderable; content: string; startedAt: string} | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
@@ -124,6 +136,10 @@ export class ExperimentLogView {
     this.#renderedState = null;
   }
 
+  destroy(): void {
+    this.#stopElapsedTimer();
+  }
+
   render(state: SessionState): void {
     const log = experimentLogVisible(state) ? state.experimentLog : null;
     if (log === null) {
@@ -150,30 +166,124 @@ export class ExperimentLogView {
       this.#footerLine.content = '';
       return;
     }
+    const activity = hypothesisPlanningActivity(state);
     if (log.entries.length === 0) {
+      if (activity !== null) {
+        this.#renderKickoff(activity, state);
+        return;
+      }
+      if (unownedExperimentRounds(state).length > 0) {
+        this.#renderTable(
+          log.entries,
+          log.selectedId,
+          log.selectedUnownedRound ?? null,
+          null,
+          state,
+        );
+        return;
+      }
       this.#header.content = '';
       this.#line('No hypotheses have been recorded yet.', this.#theme.textSubtle);
       this.#footerLine.content = 'The first one appears once the orchestrator has planned a round.';
       return;
     }
-    this.#renderTable(log.entries, log.selectedId);
+    this.#renderTable(
+      log.entries,
+      log.selectedId,
+      log.selectedUnownedRound ?? null,
+      activity,
+      state,
+    );
   }
 
-  #renderTable(entries: HypothesisEntry[], selectedId: string | null): void {
+  #renderKickoff(activity: HypothesisPlanningActivity, state: SessionState): void {
+    const hypothesis = planningHypothesisLabel(0);
+    const selectedUnownedRound = state.experimentLog?.selectedUnownedRound ?? null;
+    const activitySelected = selectedUnownedRound === null;
+    this.#header.content = `Planning ${hypothesis} · Round ${activity.roundNumber}`;
+    this.#line('Run kickoff', this.#theme.textSubtle);
+    for (const stage of kickoffStages(activity.stage, hypothesis)) {
+      if (stage.current) {
+        this.#activityLine(`${stage.marker} ${stage.label}`, activity, activitySelected);
+      } else this.#line(`${stage.marker} ${stage.label}`, this.#theme.textSubtle);
+    }
+    this.#line(
+      'This activity becomes the first hypothesis when the orchestrator finishes its plan.',
+      this.#theme.textPrimary,
+    );
+    const unowned = unownedExperimentRounds(state);
+    if (unowned.length > 0) {
+      this.#line('UNASSOCIATED ROUNDS', this.#theme.textSubtle);
+      for (const [index, roundNumber] of unowned.entries()) {
+        this.#roundRow(roundNumber, selectedUnownedRound === roundNumber, index + 1);
+      }
+    }
+    this.#footerLine.content =
+      unowned.length === 0
+        ? 'The hypothesis list will appear here when planning completes.'
+        : '↑↓: select activity or recorded round · Enter: open';
+  }
+
+  #renderTable(
+    entries: HypothesisEntry[],
+    selectedId: string | null,
+    selectedUnownedRound: number | null,
+    activity: HypothesisPlanningActivity | null,
+    state: SessionState,
+  ): void {
     const columns = resolveColumns(this.#bodyWidth());
     const keys = entries.map(entryKey);
     const selected = selectedId === null ? 0 : Math.max(0, keys.indexOf(selectedId));
+    const activitySelected =
+      activity !== null && this.#renderedState?.experimentLog?.selectedActivity === true;
 
     this.#header.content = headerRow(columns);
+    const activityRows =
+      activity === null ? 0 : this.#renderActivity(activity, entries.length, activitySelected);
     for (const [index, entry] of entries.entries()) {
-      this.#row(entry, columns, keys[index] === selectedId, index);
+      this.#row(
+        entry,
+        columns,
+        keys[index] === selectedId && !activitySelected,
+        index,
+        activity === null ? 0 : 1,
+      );
+    }
+    const unowned = unownedExperimentRounds(state);
+    if (unowned.length > 0) {
+      this.#line('UNASSOCIATED ROUNDS', this.#theme.textSubtle);
+      for (const [index, roundNumber] of unowned.entries()) {
+        this.#roundRow(
+          roundNumber,
+          selectedUnownedRound === roundNumber,
+          (activity === null ? 0 : 1) + entries.length + index,
+        );
+      }
     }
     // Keyboard selection nudges the scroll position only when the row would
     // otherwise be off screen, so the wheel stays in charge the rest of the
     // time. Computed rather than deferred to scrollChildIntoView, which needs
     // a layout pass the freshly added rows have not had yet.
-    this.#followSelection(selected, entries.length);
-    const position = `${selected + 1}/${entries.length}`;
+    this.#followSelection(
+      this.#selectedRenderIndex(
+        entries.length,
+        activity,
+        selected,
+        activitySelected,
+        selectedUnownedRound,
+        unowned,
+      ),
+      entries.length + activityRows + (unowned.length === 0 ? 0 : unowned.length + 1),
+    );
+    const selectedUnownedIndex =
+      selectedUnownedRound === null ? -1 : unowned.indexOf(selectedUnownedRound);
+    const totalIndexItems = entries.length + unowned.length + (activity === null ? 0 : 1);
+    const positionIndex = activitySelected
+      ? 1
+      : selectedUnownedIndex === -1
+        ? selected + (activity === null ? 1 : 2)
+        : entries.length + selectedUnownedIndex + (activity === null ? 1 : 2);
+    const position = `${positionIndex}/${totalIndexItems}`;
     // The hint is the first thing to give up room; truncating it mid-word
     // reads as breakage rather than as a narrow terminal.
     const hint =
@@ -183,7 +293,28 @@ export class ExperimentLogView {
     this.#footerLine.content = `${position} · ${hint}`;
   }
 
-  #row(entry: HypothesisEntry, columns: Columns, isSelected: boolean, index: number): void {
+  #renderActivity(
+    activity: HypothesisPlanningActivity,
+    existingHypotheses: number,
+    selected: boolean,
+  ): number {
+    const hypothesis = planningHypothesisLabel(existingHypotheses);
+    this.#line('CURRENT ACTIVITY', this.#theme.textSubtle);
+    this.#activityLine(
+      `● Planning ${hypothesis} · ${planningStageSummary(activity.stage)} · Round ${activity.roundNumber}`,
+      activity,
+      selected,
+    );
+    return 2;
+  }
+
+  #row(
+    entry: HypothesisEntry,
+    columns: Columns,
+    isSelected: boolean,
+    index: number,
+    activityOffset: number,
+  ): void {
     const cells = entryCells(entry, columns);
     // The active hypothesis is called out on its own, so it stays visible
     // whether or not it happens to be the selected row.
@@ -197,7 +328,9 @@ export class ExperimentLogView {
       flexDirection: 'row',
       ...selection,
       onMouseUp: () => {
-        this.controller.moveExperimentSelection(index - this.#selectedIndex());
+        this.controller.moveExperimentSelection(
+          index + activityOffset - this.#selectedNavigationIndex(),
+        );
       },
     });
     // The outcome is its own renderable so the resolution can carry a color of
@@ -206,6 +339,26 @@ export class ExperimentLogView {
     row.add(this.#cell(cells.leading, base, isSelected));
     row.add(this.#cell(cells.outcome, outcomeColor(this.#theme, entry), isSelected));
     if (cells.trailing) row.add(this.#cell(cells.trailing, base, isSelected));
+    this.#rows.add(row);
+  }
+
+  #roundRow(roundNumber: number, isSelected: boolean, index: number): void {
+    const row = new BoxRenderable(this.renderer, {
+      id: `unowned-round-${roundNumber}`,
+      width: '100%',
+      height: 1,
+      flexShrink: 0,
+      ...(isSelected ? {backgroundColor: this.#theme.selectedSurface} : {}),
+      onMouseUp: () =>
+        this.controller.moveExperimentSelection(index - this.#selectedNavigationIndex()),
+    });
+    row.add(
+      this.#cell(
+        ` Round ${roundNumber} · recorded agent turns · no hypothesis`,
+        this.#theme.textPrimary,
+        isSelected,
+      ),
+    );
     this.#rows.add(row);
   }
 
@@ -234,22 +387,67 @@ export class ExperimentLogView {
     return Math.max(MIN_VIEWPORT_ROWS, this.renderer.terminalHeight - CHROME_ROWS);
   }
 
-  #selectedIndex(): number {
-    const log = this.#renderedState?.experimentLog;
-    if (log === undefined || log === null || log.selectedId === null) return 0;
-    return Math.max(0, log.entries.map(entryKey).indexOf(log.selectedId));
+  #selectedNavigationIndex(): number {
+    const state = this.#renderedState;
+    if (state === null) return 0;
+    const selected = selectedExperimentIndexItem(state);
+    const index =
+      selected === null
+        ? 0
+        : experimentIndexItems(state).findIndex(item => item.key === selected.key);
+    return Math.max(0, index);
   }
 
-  #line(content: string, fg: string): void {
-    this.#rows.add(
-      new TextRenderable(this.renderer, {
-        content,
-        fg,
-        width: '100%',
-        wrapMode: 'none',
-        truncate: true,
-      }),
-    );
+  #selectedRenderIndex(
+    entriesLength: number,
+    activity: HypothesisPlanningActivity | null,
+    selectedHypothesis: number,
+    activitySelected: boolean,
+    selectedUnownedRound: number | null,
+    unowned: number[],
+  ): number {
+    if (activitySelected) return 1;
+    const unownedIndex = selectedUnownedRound === null ? -1 : unowned.indexOf(selectedUnownedRound);
+    if (unownedIndex !== -1) return (activity === null ? 1 : 3) + entriesLength + unownedIndex;
+    return selectedHypothesis + (activity === null ? 0 : 2);
+  }
+
+  #activityLine(content: string, activity: HypothesisPlanningActivity, selected: boolean): void {
+    const row = new BoxRenderable(this.renderer, {
+      id: 'planning-activity',
+      width: '100%',
+      height: 1,
+      flexShrink: 0,
+      ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
+      onMouseUp: () => this.controller.selectExperimentActivity(),
+    });
+    const text = new TextRenderable(this.renderer, {
+      content,
+      fg: this.#theme.warning,
+      width: '100%',
+      ...(selected ? {bg: this.#theme.selectedSurface} : {}),
+      wrapMode: 'none',
+      truncate: true,
+    });
+    row.add(text);
+    this.#rows.add(row);
+    if (activity.startedAt === undefined || !Number.isFinite(Date.parse(activity.startedAt)))
+      return;
+    this.#activeActivityLine = {text, content, startedAt: activity.startedAt};
+    this.#refreshElapsedActivity();
+    this.#syncElapsedTimer();
+  }
+
+  #line(content: string, fg: string): TextRenderable {
+    const text = new TextRenderable(this.renderer, {
+      content,
+      fg,
+      width: '100%',
+      wrapMode: 'none',
+      truncate: true,
+    });
+    this.#rows.add(text);
+    return text;
   }
 
   #bodyWidth(): number {
@@ -258,10 +456,31 @@ export class ExperimentLogView {
   }
 
   #clear(): void {
+    this.#activeActivityLine = null;
+    this.#stopElapsedTimer();
     for (const child of [...this.#rows.getChildren()]) {
       this.#rows.remove(child);
       child.destroyRecursively();
     }
+  }
+
+  #syncElapsedTimer(): void {
+    if (this.#activeActivityLine === null || this.#elapsedTimer !== null) return;
+    this.#elapsedTimer = setInterval(() => this.#refreshElapsedActivity(), 1000);
+  }
+
+  #refreshElapsedActivity(): void {
+    const activity = this.#activeActivityLine;
+    if (activity === null) return;
+    const elapsed = Date.now() - Date.parse(activity.startedAt);
+    if (!Number.isFinite(elapsed)) return;
+    activity.text.content = `${activity.content} · ${elapsedLabel(elapsed)}`;
+  }
+
+  #stopElapsedTimer(): void {
+    if (this.#elapsedTimer === null) return;
+    clearInterval(this.#elapsedTimer);
+    this.#elapsedTimer = null;
   }
 }
 
@@ -379,6 +598,45 @@ export function formatMeasured(entry: HypothesisEntry): string {
   }
   if (typeof entry.perf_metric === 'number') return trimNumber(entry.perf_metric);
   return '—';
+}
+
+function planningHypothesisLabel(existingHypotheses: number): string {
+  return `Hypothesis ${existingHypotheses + 1}`;
+}
+
+function kickoffStages(
+  stage: HypothesisPlanningActivity['stage'],
+  hypothesis: string,
+): Array<{marker: string; label: string; current: boolean}> {
+  const current = (target: HypothesisPlanningActivity['stage']): boolean => stage === target;
+  const completed = (target: HypothesisPlanningActivity['stage']): boolean =>
+    (stage === 'profile' || stage === 'plan') && target === 'pre';
+  return [
+    {
+      marker: current('pre') ? '●' : completed('pre') ? '✓' : '○',
+      label: 'Decide whether profiling is needed',
+      current: current('pre'),
+    },
+    {
+      marker: current('profile') ? '●' : '○',
+      label: current('profile') ? `Profile before ${hypothesis}` : 'Profile if needed',
+      current: current('profile'),
+    },
+    {
+      marker: current('plan') ? '●' : '○',
+      label: `Form ${hypothesis}`,
+      current: current('plan'),
+    },
+  ];
+}
+
+function planningStageSummary(stage: HypothesisPlanningActivity['stage']): string {
+  const labels: Record<HypothesisPlanningActivity['stage'], string> = {
+    pre: 'deciding whether profiling is needed',
+    profile: 'profiling',
+    plan: 'forming it',
+  };
+  return labels[stage];
 }
 
 function rowId(index: number): string {
