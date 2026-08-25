@@ -670,7 +670,7 @@ describe('session controller', () => {
     expect(controller.state.experimentLog?.selectedId).toBe('H-02');
   });
 
-  it('reports a round that belongs to no hypothesis', async () => {
+  it('opens a recorded round that belongs to no hypothesis', async () => {
     const transport = new FakeTransport();
     transport.experiments = [
       entry('H-01', 1, 1, {rounds: [{round: 1, passed: true, reviewed: true}]}),
@@ -678,11 +678,38 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
 
+    transport.emit({
+      type: 'event',
+      event: {...event(1, 'phase_started'), agent_kind: 'orchestrator', round_label: 'round-9-pre'},
+    });
+
     await controller.submit('/open-round --9');
 
-    expect(controller.state.overlay?.content).toContain(
-      'Round 9 is not in any recorded hypothesis.',
-    );
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'round-9', rounds: [9]});
+    expect(controller.state.selectedRound).toBe(9);
+  });
+
+  it('opens the first planning activity before it has a hypothesis record', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emit({
+      type: 'event',
+      event: {...event(1, 'phase_started'), agent_kind: 'orchestrator', round_label: 'round-1-pre'},
+    });
+
+    controller.enterExperimentDrilldown();
+
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'round-1', rounds: [1]});
+    expect(controller.state.selectedRound).toBe(1);
+  });
+
+  it('reports a round that has not been observed', async () => {
+    const controller = new SocketSessionController(new FakeTransport());
+
+    await controller.submit('/open-round --9');
+
+    expect(controller.state.overlay?.content).toContain('Round 9 has not been recorded.');
     expect(controller.state.hypothesisScope).toBeNull();
   });
 

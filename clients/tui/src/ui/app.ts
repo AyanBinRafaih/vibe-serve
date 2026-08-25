@@ -383,6 +383,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
       conversation.destroy();
       roundStrip.destroy();
       agentMap.destroy();
+      experimentLog.destroy();
       root.destroyRecursively();
       markdownStyle.destroy();
     },
