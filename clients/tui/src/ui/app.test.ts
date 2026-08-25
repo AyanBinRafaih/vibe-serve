@@ -12,6 +12,7 @@ import {
   cyclePaneFocus,
   enterExperimentDrilldown,
   enterExperimentRound,
+  enterUnownedExperimentRound,
   focusPane,
   focusRound,
   initialSessionState,
@@ -26,6 +27,7 @@ import {
   type RoundFocus,
   type SessionState,
   selectAgent,
+  selectExperimentActivity,
   selectNextEntry,
   selectNextRound,
   selectNextTodo,
@@ -1926,6 +1928,129 @@ describe('theming', () => {
     // The log is the root view: nothing offers a way out of it.
     expect(frame).not.toContain('Esc');
   });
+
+  it('uses the empty hypotheses screen as a truthful planning kickoff', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 16});
+    const planningStartedAt = new Date(Date.now() - 65_000).toISOString();
+    const controller = new FakeController({
+      ...initialSessionState(),
+      status: 'running',
+      phases: [
+        {
+          kind: 'orchestrator',
+          status: 'active',
+          roundNumber: 1,
+          roundLabel: 'round-1-pre',
+          startedAt: planningStartedAt,
+        },
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const frame = await frameAfter(testRenderer);
+    expect(frame).toContain('Planning Hypothesis 1 · Round 1');
+    expect(frame).toContain('Run kickoff');
+    expect(frame).toContain('Decide whether profiling is needed');
+    expect(frame).toContain('Profile if needed');
+    expect(frame).toContain('Form Hypothesis 1');
+    expect(frame).toMatch(/1m \d+s/);
+    expect(frame).toContain('This activity becomes');
+    expect(frame).not.toContain('No hypotheses have been recorded yet.');
+  });
+
+  it('keeps earlier unassociated rounds visible and openable during kickoff', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 18});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      status: 'running',
+      rounds: [{number: 1, status: 'completed'}],
+      phases: [{kind: 'orchestrator', status: 'active', roundNumber: 2, roundLabel: 'round-2-pre'}],
+      conversation: [
+        {id: 'r1', kind: 'assistant', content: 'earlier unassociated turn', roundNumber: 1},
+        {id: 'r2', kind: 'assistant', content: 'planning turn', roundNumber: 2},
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const kickoff = await frameAfter(testRenderer);
+    expect(kickoff).toContain('Planning Hypothesis 1 · Round 2');
+    expect(kickoff).toContain('UNASSOCIATED ROUNDS');
+    expect(kickoff).toContain('Round 1 · recorded agent turns · no hypothesis');
+
+    testRenderer.mockInput.pressEnter();
+    const round = await frameAfter(testRenderer);
+    expect(round).toContain('earlier unassociated turn');
+    expect(round).not.toContain('planning turn');
+  });
+
+  it('indexes and opens recorded rounds that have no hypothesis', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 18});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 7, status: 'completed'}],
+      conversation: [
+        {id: 'r6', kind: 'assistant', content: 'other round', roundNumber: 6},
+        {id: 'r7', kind: 'assistant', content: 'unindexed turn', roundNumber: 7},
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    expect(await frameAfter(testRenderer)).toContain(
+      'Round 7 · recorded agent turns · no hypothesis',
+    );
+
+    testRenderer.mockInput.pressEnter();
+    const detail = await frameAfter(testRenderer);
+    expect(detail).toContain('Round 7');
+    expect(detail).toContain('unindexed turn');
+    expect(detail).not.toContain('other round');
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    expect(await frameAfterEscape(testRenderer)).toContain('UNASSOCIATED ROUNDS');
+  });
+
+  it('pins later hypothesis planning above the existing history', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 18});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      status: 'running',
+      phases: [
+        {kind: 'orchestrator', status: 'active', roundNumber: 42, roundLabel: 'round-42-plan'},
+      ],
+    });
+    controller.experiments = [logEntry('H-07', 41, 41, {claim: 'batch the prefill step'})];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const frame = await frameAfter(testRenderer);
+    expect(frame).toContain('CURRENT ACTIVITY');
+    expect(frame).toContain('Planning Hypothesis 2 · forming it · Round 42');
+    expect(frame).toContain('H-07');
+    expect(frame).not.toContain('UNASSOCIATED ROUNDS');
+  });
+
+  it('labels an explicit profiler phase without claiming it will happen earlier', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 16});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      status: 'running',
+      phases: [
+        {kind: 'profiler', status: 'active', roundNumber: 1, roundLabel: 'round-1-profiler'},
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    expect(await frameAfter(testRenderer)).toContain('Profile before Hypothesis 1');
+  });
 });
 
 /**
@@ -2193,6 +2318,9 @@ class FakeController implements SessionController {
   moveExperimentSelection(delta: number): void {
     this.publish(moveExperimentSelection(this.state, delta));
   }
+  selectExperimentActivity(): void {
+    this.publish(selectExperimentActivity(this.state));
+  }
   enterExperimentDrilldown(): void {
     this.publish(enterExperimentDrilldown(this.state));
   }
@@ -2225,7 +2353,7 @@ class FakeController implements SessionController {
       return;
     }
     const scoped = enterExperimentRound(this.state, roundNumber);
-    if (scoped !== null) this.publish(scoped);
+    this.publish(scoped ?? enterUnownedExperimentRound(this.state, roundNumber) ?? this.state);
   }
   leaveExperimentDrilldown(): void {
     this.publish(leaveExperimentDrilldown(this.state));
