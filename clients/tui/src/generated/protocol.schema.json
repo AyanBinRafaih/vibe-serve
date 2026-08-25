@@ -456,6 +456,7 @@
         "server_ready",
         "configuration_failed",
         "run_started",
+        "experiments_changed",
         "run_interrupted",
         "chat",
         "status_query",
@@ -548,6 +549,30 @@
         }
       },
       "title": "ExperimentQuery",
+      "type": "object"
+    },
+    "ExperimentsChangedData": {
+      "properties": {
+        "kind": {
+          "const": "experiments_changed",
+          "default": "experiments_changed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "project_attached",
+            "active_hypothesis_changed",
+            "round_persisted"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "ExperimentsChangedData",
       "type": "object"
     },
     "HistoryQuery": {
@@ -1195,6 +1220,18 @@
           },
           "title": "Experiments",
           "type": "array"
+        },
+        "experiments_ready": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Experiments Ready"
         }
       },
       "required": [
@@ -1385,6 +1422,7 @@
                   "benchmark_result": "#/$defs/BenchmarkResultData",
                   "chat": "#/$defs/ChatData",
                   "configuration_failed": "#/$defs/ConfigurationFailedData",
+                  "experiments_changed": "#/$defs/ExperimentsChangedData",
                   "invocation_finished": "#/$defs/InvocationFinishedData",
                   "invocation_started": "#/$defs/InvocationStartedData",
                   "judge_result": "#/$defs/JudgeResultData",
@@ -1423,6 +1461,9 @@
                 },
                 {
                   "$ref": "#/$defs/RunInterruptedData"
+                },
+                {
+                  "$ref": "#/$defs/ExperimentsChangedData"
                 },
                 {
                   "$ref": "#/$defs/ConfigurationFailedData"

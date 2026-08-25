@@ -625,9 +625,6 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             project_state.initialization_snapshot(run_id),
         )
 
-    if supervisor is not None:
-        supervisor.attach(log_dir, project=project, run_id=run_id)
-
     if project_configuration.outer_loop == "agent":
         if active_state_model_type is None:
             raise ValueError("agent runs require an active state model type")  # noqa: TRY003  # tracked: #288
@@ -641,6 +638,18 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             recovery = round_transaction_coordinator.recover()
             if recovery is not RoundRecoveryOutcome.NO_TRANSACTION:
                 logger.lprint(f"[project] recovered round transaction: {recovery.value}")
+
+    if supervisor is not None:
+        supervisor.attach(log_dir, project=project, run_id=run_id)
+        from vibesys.server.events import (  # noqa: PLC0415  # tracked: #288
+            EventType,
+            ExperimentsChangedData,
+        )
+
+        supervisor.record(
+            EventType.EXPERIMENTS_CHANGED,
+            data=ExperimentsChangedData(reason="project_attached"),
+        )
 
     project_ref_dir = (
         project_root / task_root.relative_to(input_dir) / "reference"

@@ -177,6 +177,10 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     events: list[RunEvent] = Field(default_factory=list)
     performance: list[PerformanceRound] = Field(default_factory=list)
     experiments: list[HypothesisEntry] = Field(default_factory=list)
+    # False means canonical project/run state is not attached yet. Keeping the
+    # readiness marker separate preserves the protocol-v1 list contract while
+    # distinguishing bootstrap from an authoritative empty experiment log.
+    experiments_ready: bool | None = None
 
     @classmethod
     def from_exception(
