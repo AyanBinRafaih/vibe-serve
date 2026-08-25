@@ -12,6 +12,7 @@ import {
   enterExperimentDrilldown,
   enterExperimentRound,
   enterUnownedExperimentRound,
+  experimentIndexItems,
   failPane,
   focusedPane,
   focusPane,
@@ -124,7 +125,7 @@ describe('hypothesis planning activity', () => {
     expect(hypothesisPlanningActivity(stateFor('profiler', 'round-3-profile-retry'))).toBeNull();
   });
 
-  it('selects planning activity ahead of existing hypotheses and opens its recorded round', () => {
+  it('selects planning activity after existing hypotheses and opens its recorded round', () => {
     let state = setExperiments(
       {
         ...stateFor('orchestrator', 'round-3-plan'),
@@ -143,7 +144,7 @@ describe('hypothesis planning activity', () => {
       ],
     );
 
-    state = moveExperimentSelection(state, -1);
+    state = moveExperimentSelection(state, 1);
     expect(state.experimentLog?.selectedActivity).toBe(true);
 
     const opened = enterExperimentDrilldown(state);
@@ -168,6 +169,91 @@ describe('hypothesis planning activity', () => {
     };
 
     expect(unownedExperimentRounds(state)).toEqual([]);
+  });
+
+  it('orders mixed history by round and keeps live planning last', () => {
+    const state = setExperiments(
+      {
+        ...initialSessionState(),
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'active' as const,
+            roundNumber: 5,
+            roundLabel: 'round-5-plan',
+          },
+        ],
+        rounds: [
+          {number: 4, status: 'completed' as const},
+          {number: 2, status: 'completed' as const},
+          {number: 5, status: 'active' as const},
+        ],
+      },
+      [
+        {
+          hypothesis_id: 'H-03',
+          identified: true,
+          first_round: 3,
+          last_round: 3,
+          rounds: [],
+          kept: false,
+          active: false,
+        },
+        {
+          hypothesis_id: 'H-01',
+          identified: true,
+          first_round: 1,
+          last_round: 1,
+          rounds: [],
+          kept: true,
+          active: false,
+        },
+      ],
+    );
+
+    expect(
+      experimentIndexItems(state).map(item =>
+        item.kind === 'hypothesis'
+          ? item.entry.hypothesis_id
+          : item.kind === 'round'
+            ? `round-${item.roundNumber}`
+            : `planning-${item.activity.roundNumber}`,
+      ),
+    ).toEqual(['H-01', 'round-2', 'H-03', 'round-4', 'planning-5']);
+  });
+
+  it('moves a selected planning row onto the hypothesis that materializes from it', () => {
+    let state = selectExperimentActivity(
+      setExperiments(
+        {
+          ...stateFor('orchestrator', 'round-3-plan'),
+          rounds: [{number: 3, status: 'active' as const}],
+        },
+        [],
+      ),
+    );
+    // Phase completion may arrive before the refreshed experiment response.
+    state = {
+      ...state,
+      phases: state.phases.map(phase => ({...phase, status: 'completed' as const})),
+    };
+    state = setExperiments(state, [
+      {
+        hypothesis_id: 'H-03',
+        identified: true,
+        first_round: 3,
+        last_round: 3,
+        rounds: [],
+        kept: false,
+        active: true,
+      },
+    ]);
+
+    expect(state.experimentLog).toMatchObject({
+      selectedId: 'H-03',
+      selectedActivity: false,
+      selectedActivityRound: null,
+    });
   });
 });
 
