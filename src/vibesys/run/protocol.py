@@ -7,22 +7,26 @@ concrete class, which keeps the facade's construction internals out of the
 loops' contract.
 """
 
-from collections.abc import Callable
-from contextlib import AbstractContextManager
-from pathlib import Path
-from typing import Any, Protocol, TypeVar
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
-from vibesys.agents.client import AgentClient
-from vibesys.agents.progress import AgentProgress
-from vibesys.constants import ComputeBackend
-from vibesys.input_manifest import WorkspaceSource
-from vibesys.profilers import ProfilerKind
-from vibesys.run.git_tracker import GitTracker
-from vibesys.run.state import RunState
-from vs_loop_state import RoundRecord
-from vs_project import Project, StateTransition
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from contextlib import AbstractContextManager
+    from pathlib import Path
+
+    from vibesys.agents.client import AgentClient
+    from vibesys.agents.progress import AgentProgress
+    from vibesys.constants import ComputeBackend
+    from vibesys.input_manifest import WorkspaceSource
+    from vibesys.profilers import ProfilerKind
+    from vibesys.run.git_tracker import GitTracker
+    from vibesys.run.state import RunState
+    from vs_loop_state import RoundRecord
+    from vs_project import Project, StateTransition
 
 T = TypeVar("T", bound=BaseModel)
 
