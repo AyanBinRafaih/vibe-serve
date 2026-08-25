@@ -8,8 +8,11 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 from importlib import import_module
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from vibesys.agents.cli_common import build_schema_hint
@@ -23,22 +26,36 @@ from vibesys.agents.contracts import (
     AgentTurnResult,
     AgentUsage,
 )
+from vibesys.agents.host_resource_declarations import (
+    declare_active_rust_toolchain_resources,
+    resolve_active_rust_toolchain,
+)
 from vibesys.agents.omnigent.providers import (
     OMNIGENT_PROVIDER_EXECUTORS,
     OmnigentExecutorSpec,
     supported_providers,
 )
+from vs_sandbox import HostResourceContext
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
-    from pathlib import Path
 
 _TOOL_EXECUTOR_ATTR = "_tool_executor"
 """Private Omnigent 0.6.0 tool-dispatch seam, guarded before assignment."""
 
+_OMNIGENT_INTERNAL_HIDDEN = frozenset({".codex-tmp"})
+"""Runtime-owned workspace paths that OS tools must not traverse."""
+
+_CARGO_GENERATED_HIDDEN = frozenset({".cargo-lock", ".fingerprint", ".rustc_info.json"})
+"""Cargo-generated basenames needed beneath the conventional target directory."""
+
 
 class OmnigentDriverError(RuntimeError):
     """An Omnigent driver requirement could not be satisfied safely."""
+
+
+def _is_top_level_dot_path(path: Path) -> bool:
+    return len(path.parts) == 1 and path.name.startswith(".")
 
 
 def _resolve_executor_spec(provider: str) -> OmnigentExecutorSpec:
@@ -96,6 +113,8 @@ def _flatten_tool_schema(tool: Any) -> dict[str, Any]:  # noqa: ANN401
 def _build_os_tools(
     os_env_spec: Any,  # noqa: ANN401
     workspace: Path,
+    environment: dict[str, str] | None = None,
+    shell_os_env_spec: Any | None = None,  # noqa: ANN401
 ) -> tuple[list[dict[str, Any]], Callable[[str, dict[str, Any]], Any]]:
     """Build Omnigent's sandboxed filesystem tools and their dispatcher."""
     try:
@@ -118,6 +137,17 @@ def _build_os_tools(
         )
 
     tools = build_os_env_tools(os_env)
+    if shell_os_env_spec is not None:
+        shell_os_env = create_os_environment(shell_os_env_spec)
+        if shell_os_env is None:
+            raise OmnigentDriverError(
+                f"Omnigent could not create a sandboxed shell environment for {workspace}"
+            )
+        shell_tools = build_os_env_tools(shell_os_env)
+        shell_tool = next((tool for tool in shell_tools if tool.name() == "sys_os_shell"), None)
+        if shell_tool is None:  # pragma: no cover - guarded against Omnigent API drift
+            raise OmnigentDriverError("Omnigent did not provide its sys_os_shell tool")
+        tools = [shell_tool if tool.name() == "sys_os_shell" else tool for tool in tools]
     by_name = {tool.name(): tool for tool in tools}
     schemas = [_flatten_tool_schema(tool) for tool in tools]
     context = ToolContext(task_id="vibesys", agent_id="vibesys", workspace=workspace)
@@ -126,7 +156,12 @@ def _build_os_tools(
         tool = by_name.get(name)
         if tool is None:
             return {"error": f"unknown tool {name!r}"}
-        return await asyncio.to_thread(tool.invoke, json.dumps(args), context)
+
+        def invoke() -> Any:  # noqa: ANN401
+            with _patched_environ(environment or {}):
+                return tool.invoke(json.dumps(args), context)
+
+        return await asyncio.to_thread(invoke)
 
     return schemas, dispatch
 
@@ -286,6 +321,7 @@ class OmnigentDriver:
     def __init__(self) -> None:
         """Create a driver with no live sessions or event loop."""
         self._sessions: set[OmnigentSession] = set()
+        self._executor_scratch: dict[int, tempfile.TemporaryDirectory[str]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
 
@@ -347,11 +383,15 @@ class OmnigentDriver:
                 "Omnigent cannot run this agent in VibeSys's container execution path"
             )
         project_paths = spec.policy.project_paths
-        if project_paths is not None and (
-            project_paths.read_only_paths or project_paths.hidden_paths
-        ):
+        read_only_paths = () if project_paths is None else project_paths.read_only_paths
+        hidden_paths = () if project_paths is None else project_paths.hidden_paths
+        unsupported_paths = [path for path in read_only_paths if not _is_top_level_dot_path(path)]
+        unsupported_paths.extend(path for path in hidden_paths if not _is_top_level_dot_path(path))
+        if unsupported_paths:
             raise OmnigentDriverError(
-                "Omnigent 0.6.0 cannot enforce VibeSys nested read-only or hidden paths"
+                "Omnigent 0.6.0 can support only top-level dot paths in the "
+                "VibeSys project policy; unsupported paths: "
+                f"{[str(path) for path in unsupported_paths]}"
             )
 
     def run_awaitable(self, awaitable: Any) -> Any:  # noqa: ANN401
@@ -375,48 +415,138 @@ class OmnigentDriver:
                 "this integration requires the Omnigent 0.6.0 executor API"
             ) from exc
 
-    def _build_os_env(self, workspace: Path) -> Any:  # noqa: ANN401
+    def _build_os_env(
+        self,
+        spec: AgentSessionSpec,
+        *,
+        additional_write_paths: tuple[Path, ...] = (),
+        env_passthrough: tuple[str, ...] = (),
+        include_toolchain: bool = False,
+    ) -> Any:  # noqa: ANN401
         try:
             from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec  # noqa: PLC0415
         except ImportError as exc:
             raise _missing_omnigent("Omnigent OS-environment datamodel", exc) from exc
+        workspace = spec.workspace
+        project_paths = spec.policy.project_paths
+        hidden = set(() if project_paths is None else project_paths.hidden_paths)
+        allow_hidden = [
+            entry.name
+            for entry in sorted(workspace.iterdir(), key=lambda path: path.name)
+            if entry.name.startswith(".")
+            and entry.name not in _OMNIGENT_INTERNAL_HIDDEN
+            and Path(entry.name) not in hidden
+        ]
+        allow_hidden.extend(sorted(_CARGO_GENERATED_HIDDEN))
+        environment = {**os.environ, **dict(spec.environment)}
+        read_paths = None
+        if include_toolchain:
+            resources = declare_active_rust_toolchain_resources(
+                HostResourceContext(env=environment),
+                workspace=workspace,
+            )
+            read_paths = sorted(
+                {
+                    str(resource.path.expanduser().resolve())
+                    for resource in resources
+                    if resource.path.exists()
+                }
+            )
+        sandbox = OSEnvSandboxSpec(
+            type=_sandbox_backend_for_platform(),
+            read_paths=read_paths,
+            write_paths=[str(workspace), *(str(path) for path in additional_write_paths)],
+            cwd_allow_hidden=allow_hidden,
+            env_passthrough=list(env_passthrough) or None,
+        )
         return OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(
-                type=_sandbox_backend_for_platform(),
-                write_paths=[str(workspace)],
-            ),
+            sandbox=sandbox,
         )
 
     def _build_executor(self, spec: AgentSessionSpec) -> tuple[Any, list[dict[str, Any]]]:
         executor_spec = _resolve_executor_spec(spec.provider)
         executor_cls = self._executor_class(executor_spec)
-        os_env_spec = self._build_os_env(spec.workspace)
-        try:
-            executor = executor_cls(
-                cwd=str(spec.workspace),
-                model=spec.model,
-                os_env=os_env_spec,
+        os_env_spec = self._build_os_env(spec)
+        scratch = tempfile.TemporaryDirectory(prefix="vibesys-omnigent-")
+        scratch_path = Path(scratch.name)
+        environment = {**os.environ, **dict(spec.environment)}
+        tool_environment = dict(spec.environment)
+        rust_toolchain = resolve_active_rust_toolchain(
+            HostResourceContext(env=environment),
+            workspace=spec.workspace,
+        )
+        if rust_toolchain is not None:
+            rust_bin = rust_toolchain[0] / "bin"
+            tool_environment.update(
+                {
+                    "CARGO_HOME": str(scratch_path / "cargo-home"),
+                    "PATH": os.pathsep.join((str(rust_bin), environment.get("PATH", ""))),
+                    "RUSTC": str(rust_bin / "rustc"),
+                    "RUSTDOC": str(rust_bin / "rustdoc"),
+                    "RUSTUP_AUTO_INSTALL": "0",
+                }
             )
+            if sys.platform.startswith("linux"):
+                linker = shutil.which("cc", path=environment.get("PATH")) or shutil.which(
+                    "gcc", path=environment.get("PATH")
+                )
+                if linker is not None:
+                    host = rust_toolchain[1].parent.name.upper().replace("-", "_")
+                    tool_environment[f"CARGO_TARGET_{host}_LINKER"] = str(Path(linker).resolve())
+        try:
+            shell_os_env_spec = self._build_os_env(
+                spec,
+                additional_write_paths=(scratch_path,),
+                env_passthrough=tuple(tool_environment),
+                include_toolchain=True,
+            )
+        except BaseException:
+            scratch.cleanup()
+            raise
+        executor_kwargs: dict[str, Any] = {
+            "cwd": str(spec.workspace),
+            "model": spec.model,
+            "os_env": os_env_spec,
+        }
+        if spec.provider == "codex":
+            # Codex's native workspace sandbox cannot represent Omnigent's
+            # dot-path masks. Route all filesystem access through the
+            # sandboxed sys_os_* tools instead.
+            executor_kwargs["disable_native_tools"] = True
+        try:
+            executor = executor_cls(**executor_kwargs)
         except ImportError as exc:
+            scratch.cleanup()
             raise OmnigentDriverError(
                 f"Omnigent provider {spec.provider!r} is unavailable: {exc}"
             ) from exc
+        except BaseException:
+            scratch.cleanup()
+            raise
         if not hasattr(executor, _TOOL_EXECUTOR_ATTR):
             with contextlib.suppress(Exception):
                 self.close_executor(executor)
+            scratch.cleanup()
             raise OmnigentDriverError(
                 f"{executor_cls.__name__} has no {_TOOL_EXECUTOR_ATTR!r} slot; "
                 "this integration requires the private Omnigent 0.6.0 tool-dispatch seam"
             )
         try:
-            schemas, dispatch = _build_os_tools(os_env_spec, spec.workspace)
+            schemas, dispatch = _build_os_tools(
+                os_env_spec,
+                spec.workspace,
+                tool_environment,
+                shell_os_env_spec,
+            )
         except BaseException:
             with contextlib.suppress(Exception):
                 self.close_executor(executor)
+            scratch.cleanup()
             raise
         setattr(executor, _TOOL_EXECUTOR_ATTR, dispatch)
+        self._executor_scratch[id(executor)] = scratch
         return executor, schemas
 
     def release_session(self, session: OmnigentSession, executor: Any) -> None:  # noqa: ANN401
@@ -426,9 +556,14 @@ class OmnigentDriver:
 
     def close_executor(self, executor: Any) -> None:  # noqa: ANN401
         """Close a native executor, awaiting asynchronous cleanup when needed."""
-        close = getattr(executor, "close", None)
-        if close is None:
-            return
-        result = close()
-        if asyncio.iscoroutine(result):
-            self.run_awaitable(result)
+        try:
+            close = getattr(executor, "close", None)
+            if close is None:
+                return
+            result = close()
+            if asyncio.iscoroutine(result):
+                self.run_awaitable(result)
+        finally:
+            scratch = self._executor_scratch.pop(id(executor), None)
+            if scratch is not None:
+                scratch.cleanup()
