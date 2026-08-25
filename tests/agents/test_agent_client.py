@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -22,6 +23,8 @@ from vibesys.agents.contracts import (
     AgentUsage,
     SessionDisposition,
 )
+from vibesys.render.sink import output_sink
+from vibesys.server.events import AgentOutputChunkData, EventType
 
 
 class _Response(BaseModel):
@@ -35,6 +38,7 @@ class _FakeSession:
     close_calls: int = 0
     error: BaseException | None = None
     observers: list[AgentObserver | None] = field(default_factory=list)
+    events: list[AgentEvent] = field(default_factory=list)
 
     def run_turn(
         self,
@@ -43,6 +47,9 @@ class _FakeSession:
     ) -> AgentTurnResult:
         self.turns.append(request)
         self.observers.append(observer)
+        if observer is not None:
+            for event in self.events:
+                observer.on_event(event)
         if self.error is not None:
             raise self.error
         return self.results.pop(0)
@@ -146,6 +153,132 @@ def test_client_forwards_observer_to_session() -> None:
     assert session.observers == [observer]
     observer.on_event(AgentEvent(AgentEventKind.TEXT, text="chunk"))
     assert observer.events == [AgentEvent(AgentEventKind.TEXT, text="chunk")]
+
+
+def test_invoke_preserves_streamed_text_deltas_and_paragraphs(tmp_path: Path) -> None:
+    deltas = ["Tokens", " stay", " together.\n\n", "Next paragraph."]
+    session = _FakeSession(
+        results=[AgentTurnResult("".join(deltas))],
+        events=[AgentEvent(AgentEventKind.TEXT, text=delta) for delta in deltas],
+    )
+    log = io.StringIO()
+    client = AgentClient(_FakeDriver([session]), run_log_file=log)
+    seen = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        client.invoke_text(
+            kind="implementer",
+            workspace=tmp_path,
+            system_prompt="system",
+            user_prompt="user",
+            round_label="round-1",
+        )
+    finally:
+        unsubscribe()
+
+    assistant_chunks = [
+        event.data.content
+        for event in seen
+        if event.type is EventType.AGENT_OUTPUT_CHUNK
+        and isinstance(event.data, AgentOutputChunkData)
+        and event.data.channel == "assistant"
+        and event.agent_kind == "implementer"
+    ]
+    assert assistant_chunks == [*deltas, "\n"]
+    assert "Tokens stay together.\n\nNext paragraph.\n" in log.getvalue()
+
+
+def test_invoke_closes_text_before_tool_event(tmp_path: Path) -> None:
+    session = _FakeSession(
+        results=[AgentTurnResult("Done")],
+        events=[
+            AgentEvent(AgentEventKind.TEXT, text="Checking"),
+            AgentEvent(AgentEventKind.TEXT, text=" now"),
+            AgentEvent(AgentEventKind.TOOL_CALL, payload={"tool": "shell", "args": {}}),
+            AgentEvent(AgentEventKind.TEXT, text="Done"),
+        ],
+    )
+    client = AgentClient(_FakeDriver([session]))
+    seen = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        client.invoke_text(
+            kind="implementer",
+            workspace=tmp_path,
+            system_prompt="system",
+            user_prompt="user",
+            round_label="round-1",
+        )
+    finally:
+        unsubscribe()
+
+    relevant = [
+        (event.type, getattr(event.data, "content", None))
+        for event in seen
+        if event.type in (EventType.AGENT_OUTPUT_CHUNK, EventType.TOOL_CALL)
+        and event.agent_kind == "implementer"
+    ]
+    assert relevant == [
+        (EventType.AGENT_OUTPUT_CHUNK, "Checking"),
+        (EventType.AGENT_OUTPUT_CHUNK, " now"),
+        (EventType.AGENT_OUTPUT_CHUNK, "\n"),
+        (EventType.TOOL_CALL, None),
+        (EventType.AGENT_OUTPUT_CHUNK, "Done"),
+        (EventType.AGENT_OUTPUT_CHUNK, "\n"),
+    ]
+
+
+def test_invoke_closes_streamed_text_before_reporting_error(tmp_path: Path) -> None:
+    session = _FakeSession(
+        results=[],
+        error=ValueError("failed"),
+        events=[AgentEvent(AgentEventKind.TEXT, text="partial output")],
+    )
+    log = io.StringIO()
+    client = AgentClient(_FakeDriver([session]), run_log_file=log)
+
+    with pytest.raises(ValueError, match="failed"):
+        client.invoke_text(
+            kind="implementer",
+            workspace=tmp_path,
+            system_prompt="system",
+            user_prompt="user",
+            round_label="round-1",
+        )
+
+    assert "partial output\n\n=== Implementer ROUND ERROR" in log.getvalue()
+
+
+def test_invoke_preserves_terminal_newline_on_cancellation(tmp_path: Path) -> None:
+    session = _FakeSession(
+        results=[],
+        error=KeyboardInterrupt(),
+        events=[AgentEvent(AgentEventKind.TEXT, text="partial output\n")],
+    )
+    client = AgentClient(_FakeDriver([session]))
+    seen = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            client.invoke_text(
+                kind="implementer",
+                workspace=tmp_path,
+                system_prompt="system",
+                user_prompt="user",
+                round_label="round-1",
+            )
+    finally:
+        unsubscribe()
+
+    assistant_chunks = [
+        event.data.content
+        for event in seen
+        if event.type is EventType.AGENT_OUTPUT_CHUNK
+        and isinstance(event.data, AgentOutputChunkData)
+        and event.data.channel == "assistant"
+        and event.agent_kind == "implementer"
+    ]
+    assert assistant_chunks == ["partial output\n"]
 
 
 def test_changed_session_spec_closes_and_replaces_cached_session() -> None:
