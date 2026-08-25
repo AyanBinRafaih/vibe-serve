@@ -1,6 +1,7 @@
 import type {CliRenderer, KeyEvent, ScrollBoxRenderable} from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
 import {chatPaneFocused, chatPaneVisible, experimentLogVisible} from '../session-model.js';
+import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 
 export interface KeybindingActions {
   completeInput(): boolean;
@@ -17,20 +18,26 @@ export interface KeybindingActions {
   scrollRightPane(delta: number): void;
   scrollChatPane(delta: number): void;
   scrollErrorBanner(delta: number): void;
+  clearTransientStatus(): void;
+  showClipboardStatus(result: Exclude<ClipboardCopyResult, 'no-selection'>): void;
 }
 
 export function bindKeybindings(
   renderer: CliRenderer,
   controller: SessionController,
   viewport: ScrollBoxRenderable,
+  clipboard: SelectionClipboard,
   actions: KeybindingActions,
 ): () => void {
   const onKey = (key: KeyEvent): void => {
-    if (key.ctrl && key.name === 'c') {
+    if (key.ctrl && !key.shift && key.name === 'c') {
       key.preventDefault();
-      renderer.destroy();
+      const result = clipboard.copySelection();
+      if (result === 'no-selection') renderer.destroy();
+      else actions.showClipboardStatus(result);
       return;
     }
+    actions.clearTransientStatus();
     // F4 is delivered consistently by terminal emulators and has no text-input
     // meaning. Zoom is a presentation toggle, so it is disabled only while a
     // modal surface owns the screen.

@@ -39,6 +39,7 @@ import {
   togglePaneZoom,
 } from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
+import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 import {resolveTheme, type ThemeName} from './theme.js';
 
 const cleanup: Array<() => void> = [];
@@ -1044,7 +1045,7 @@ describe('OpenTUI presentation', () => {
   });
 
   it('exits on the first Ctrl-C even while the input is focused', async () => {
-    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const testRenderer = await createTestRenderer({width: 80, height: 16, exitOnCtrlC: false});
     const controller = new FakeController(initialSessionState());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     cleanup.push(() => app.destroy());
@@ -1053,6 +1054,40 @@ describe('OpenTUI presentation', () => {
     testRenderer.mockInput.pressKey('c', {ctrl: true});
 
     await destroyed;
+  });
+
+  it('copies a selected range on Ctrl-C without exiting', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16, exitOnCtrlC: false});
+    const controller = new FakeController(initialSessionState());
+    const clipboard = clipboardReturning('copied');
+    const app = createOpenTuiApp(testRenderer.renderer, controller, clipboard);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Ask or command'));
+
+    testRenderer.mockInput.pressKey('c', {ctrl: true});
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('Copied selected text'));
+    expect(frame).toContain('Ctrl+C exits when no text is selected');
+    expect(clipboard.calls).toBe(1);
+
+    testRenderer.mockInput.pressKey('x');
+    await testRenderer.waitForFrame(value => !value.includes('Copied selected text'));
+  });
+
+  it('keeps running and explains the fallback when OSC52 copy is unavailable', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 16, exitOnCtrlC: false});
+    const controller = new FakeController(initialSessionState());
+    const clipboard = clipboardReturning('unsupported');
+    const app = createOpenTuiApp(testRenderer.renderer, controller, clipboard);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Ask or command'));
+
+    testRenderer.mockInput.pressKey('c', {ctrl: true});
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('Copy unavailable'));
+    expect(frame).toContain('selection kept');
+    expect(frame).toContain('terminal copy command');
+    expect(clipboard.calls).toBe(1);
   });
 
   it('advertises Escape and returns a non-live view to live output', async () => {
@@ -2754,6 +2789,21 @@ function registerCleanup(
     app.destroy();
     renderer.destroy();
   });
+}
+
+function clipboardReturning(
+  result: ClipboardCopyResult,
+): SelectionClipboard & {readonly calls: number} {
+  let calls = 0;
+  return {
+    get calls(): number {
+      return calls;
+    },
+    copySelection(): ClipboardCopyResult {
+      calls += 1;
+      return result;
+    },
+  };
 }
 
 class FakeController implements SessionController {

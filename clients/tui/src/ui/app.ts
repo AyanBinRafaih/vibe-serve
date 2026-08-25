@@ -13,6 +13,7 @@ import {AgentMapView} from './agent-map.js';
 import {createChatDraft} from './chat-composer.js';
 import {ChatOverlayView} from './chat-overlay.js';
 import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
+import {RendererSelectionClipboard, type SelectionClipboard} from './clipboard.js';
 import {ConversationView} from './conversation.js';
 import {ErrorBannerView} from './error-banner.js';
 import {ExperimentLogView} from './experiment-log.js';
@@ -56,7 +57,11 @@ function emptyTranscriptMessage(state: SessionState): string {
   return 'Waiting for run events…';
 }
 
-export function createOpenTuiApp(renderer: CliRenderer, controller: SessionController): OpenTuiApp {
+export function createOpenTuiApp(
+  renderer: CliRenderer,
+  controller: SessionController,
+  clipboard: SelectionClipboard = new RendererSelectionClipboard(renderer),
+): OpenTuiApp {
   let themeName: ThemeName = controller.state.themeName;
   let theme = resolveTheme(themeName);
   const root = new BoxRenderable(renderer, {
@@ -124,6 +129,8 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     fg: theme.textSubtle,
     content: KEY_HELP,
   });
+  let renderedKeyHelp = KEY_HELP;
+  let transientStatus: string | null = null;
   let markdownStyle = createMarkdownStyle(theme);
   const roundStrip = new RoundStripView(renderer, controller, theme);
   const todoStrip = new TodoStripView(renderer, controller, theme);
@@ -273,7 +280,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     errorBanner.render(state);
     // The log carries its own key hints in its footer, so when it shares the
     // row with a pane the global line is the place for the pane's keys.
-    help.content = showSplit
+    renderedKeyHelp = showSplit
       ? SPLIT_KEY_HELP
       : showLog
         ? showChatPane
@@ -282,6 +289,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
         : state.hypothesisScope === null
           ? KEY_HELP
           : SCOPED_KEY_HELP;
+    help.content = transientStatus ?? renderedKeyHelp;
     // The round strip and agent map are per-round detail. They belong to a
     // hypothesis trajectory, not to the list of claims.
     const showAgents = !showLog && (zoomedPane === null ? !showSplit : zoomedPane === 'agents');
@@ -358,7 +366,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     }
     releasePreviousStyle?.();
   };
-  const unbindKeys = bindKeybindings(renderer, controller, viewport, {
+  const unbindKeys = bindKeybindings(renderer, controller, viewport, clipboard, {
     completeInput: () => input.completeSuggestion(),
     // Enter belongs to a pane only when nothing is typed anywhere. Asking which
     // box has the cursor is not enough: a question waiting in the other box is
@@ -378,6 +386,18 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     scrollRightPane: delta => rightPane.scrollBy(delta),
     scrollChatPane: delta => chatPane.scrollBy(delta),
     scrollErrorBanner: delta => errorBanner.scrollBy(delta),
+    clearTransientStatus: () => {
+      if (transientStatus === null) return;
+      transientStatus = null;
+      help.content = renderedKeyHelp;
+    },
+    showClipboardStatus: result => {
+      transientStatus =
+        result === 'copied'
+          ? 'Copied selected text · Ctrl+C exits when no text is selected'
+          : 'Copy unavailable (OSC52) · selection kept · use your terminal copy command';
+      help.content = transientStatus;
+    },
   });
   // Pane widths come from the terminal, so a resize has to redraw even though
   // no state changed.

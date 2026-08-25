@@ -10,7 +10,10 @@ const socketPath = process.env['VIBESYS_CONTROL_SOCKET'];
 if (!socketPath) throw new Error('VIBESYS_CONTROL_SOCKET is required');
 
 const client = await SupervisionClient.connect(socketPath);
-const renderer = await createCliRenderer({exitOnCtrlC: true});
+// VibeSys owns Ctrl+C so a nonempty OpenTUI selection can be copied before the
+// same chord falls back to exiting. Enabling OpenTUI's parallel exit handler
+// would make those two outcomes race.
+const renderer = await createCliRenderer({exitOnCtrlC: false});
 const controller = new SocketSessionController(
   client,
   resolveTheme(process.env['VIBESYS_THEME']).name,
