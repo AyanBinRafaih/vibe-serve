@@ -36,17 +36,17 @@ class RunInspector:
         if any(word in query for word in ("doing", "current", "status", "now")):
             return self._status_answer(question, self.supervisor.status())
         if any(word in query for word in ("failed", "failure", "why")):
-            failed = self._latest_invocation(status=EventStatus.FAILED)
+            failed = self._latest_execution(status=EventStatus.FAILED)
             answer = (
-                "Latest failed agent invocation:\n" + failed
+                "Latest failed agent execution:\n" + failed
                 if failed
                 else self._search_latest(("judge", "fail", "feedback", "verdict"), "judge result")
             )
             return self._status_answer(question, answer)
         if "judge" in query:
-            judge = self._latest_invocation(agent_kind="judge")
+            judge = self._latest_execution(agent_kind="judge")
             answer = (
-                "Latest judge invocation:\n" + judge
+                "Latest judge execution:\n" + judge
                 if judge
                 else self._search_latest(("judge", "feedback", "verdict"), "judge result")
             )
@@ -138,11 +138,11 @@ class RunInspector:
                 )
         return f"No {label} has been persisted yet."
 
-    def _latest_invocation(
+    def _latest_execution(
         self, *, status: EventStatus | None = None, agent_kind: str | None = None
     ) -> str | None:
         for event in reversed(self.supervisor.read_events()):
-            if event.type is not EventType.INVOCATION_FINISHED:
+            if event.type is not EventType.AGENT_EXECUTION_FINISHED:
                 continue
             if status is not None and event.status is not status:
                 continue

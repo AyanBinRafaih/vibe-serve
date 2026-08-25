@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
 from vibesys.server.diagnostics import Diagnostic, DiagnosticScope, exception_to_diagnostic
-from vibesys.server.events import RunEvent
+from vibesys.server.events import AgentExecutionActivityData, RunEvent
 
 PROTOCOL_VERSION = 1
 
@@ -87,6 +87,19 @@ ProtocolRequest = Annotated[
 ]
 
 
+class ActiveAgentExecution(ProtocolModel):
+    """Authoritative activity checkpoint for one running agent execution."""
+
+    execution_id: str
+    agent_kind: str
+    round_label: str
+    stage: str
+    attempt: int | None = None
+    assignment: str
+    started_at: datetime
+    activity: AgentExecutionActivityData
+
+
 class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288
     protocol_version: Literal[1] = PROTOCOL_VERSION
     run_id: str
@@ -94,6 +107,7 @@ class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288
     status: str
     agent_kind: str | None = None
     round_label: str | None = None
+    active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
 
 
 class CommandAck(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -212,6 +226,8 @@ class EventMessage(ProtocolModel):  # noqa: D101  # tracked: #288
 class EventBatchMessage(ProtocolModel):  # noqa: D101  # tracked: #288
     type: Literal["event_batch"] = "event_batch"
     events: list[RunEvent]
+    through_sequence: int = Field(default=0, ge=0)
+    active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
 
 
 class ProtocolErrorMessage(ProtocolModel):  # noqa: D101  # tracked: #288

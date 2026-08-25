@@ -10,7 +10,7 @@ from enum import StrEnum
 from pathlib import Path  # noqa: TC003  # tracked: #288
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError, model_validator
 
 from vibesys.server.diagnostics import Diagnostic
 
@@ -27,6 +27,9 @@ class EventType(StrEnum):  # noqa: D101  # tracked: #288
     CONTROL = "control"
     INVOCATION_STARTED = "invocation_started"
     INVOCATION_FINISHED = "invocation_finished"
+    AGENT_EXECUTION_STARTED = "agent_execution_started"
+    AGENT_EXECUTION_ACTIVITY_CHANGED = "agent_execution_activity_changed"
+    AGENT_EXECUTION_FINISHED = "agent_execution_finished"
     PHASE_STARTED = "phase_started"
     PHASE_FINISHED = "phase_finished"
     AGENT_OUTPUT_CHUNK = "agent_output_chunk"
@@ -50,6 +53,8 @@ class EventStatus(StrEnum):  # noqa: D101  # tracked: #288
     CONSUMED = "consumed"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
 
 
 OutputStream = Literal["stdout", "stderr"]
@@ -72,6 +77,37 @@ class InvocationStartedData(BaseModel):  # noqa: D101  # tracked: #288
 
 class InvocationFinishedData(BaseModel):  # noqa: D101  # tracked: #288
     kind: Literal["invocation_finished"] = "invocation_finished"
+    result: Any = None
+    error: str | None = None
+
+
+ExecutionActivityMode = Literal["thinking", "responding", "tool", "waiting"]
+
+
+class AgentExecutionActivityData(BaseModel):
+    """Complete current activity for an active agent execution."""
+
+    kind: Literal["agent_execution_activity_changed"] = "agent_execution_activity_changed"
+    mode: ExecutionActivityMode
+    summary: str
+    tool: str | None = None
+
+
+class AgentExecutionStartedData(BaseModel):
+    """Semantic context for one prompt-to-result agent execution."""
+
+    kind: Literal["agent_execution_started"] = "agent_execution_started"
+    stage: str
+    attempt: int | None = None
+    system_prompt: str = ""
+    user_prompt: str = ""
+    activity: AgentExecutionActivityData
+
+
+class AgentExecutionFinishedData(BaseModel):
+    """Terminal result for one agent execution."""
+
+    kind: Literal["agent_execution_finished"] = "agent_execution_finished"
     result: Any = None
     error: str | None = None
 
@@ -213,6 +249,9 @@ EventData = Annotated[
     ChatData
     | InvocationStartedData
     | InvocationFinishedData
+    | AgentExecutionStartedData
+    | AgentExecutionActivityData
+    | AgentExecutionFinishedData
     | OutputData
     | ServerReadyData
     | RunStartedData
@@ -249,7 +288,25 @@ class RunEvent(BaseModel):
     round_label: str | None = None
     agent_kind: str | None = None
     invocation_id: str | None = None
+    execution_id: str | None = None
     data: EventData | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _execution_identity_compatibility(cls, value: Any) -> Any:  # noqa: ANN401
+        """Expose legacy invocation identity through the canonical field."""
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        execution_id = result.get("execution_id")
+        invocation_id = result.get("invocation_id")
+        if execution_id is None and invocation_id is not None:
+            result["execution_id"] = invocation_id
+        elif invocation_id is None and execution_id is not None:
+            # Retain the old field during the protocol migration so older
+            # presentation clients can still correlate streamed output.
+            result["invocation_id"] = execution_id
+        return result
 
 
 class EventStore:

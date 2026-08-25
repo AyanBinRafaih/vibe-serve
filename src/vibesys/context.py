@@ -3,7 +3,6 @@
 import json
 import shutil
 import threading
-import uuid
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
@@ -1309,10 +1308,13 @@ class _RunContext:
         (e.g. ``iteration=`` for plain-loop runner extensions) still work.
         """
         supervisor = getattr(self, "supervisor", None)
+        execution_id: str | None = None
         if supervisor is not None:
-            # before_agent blocks while paused and returns the prompt with any
-            # queued operator steering appended, so the next invocation sees it.
-            user_prompt = supervisor.before_agent(kind, round_label, user_prompt, system_prompt)
+            execution = supervisor.start_agent_execution(
+                kind, round_label, user_prompt, system_prompt
+            )
+            user_prompt = execution.user_prompt
+            execution_id = execution.execution_id
         result: T | None = None
         error: BaseException | None = None
         try:
@@ -1325,6 +1327,7 @@ class _RunContext:
                 response_cls=response_cls,
                 fallback_factory=fallback_factory,
                 round_label=round_label,
+                invocation_id=execution_id,
                 progress=progress if progress is not None else self.current_progress(),
                 **extra,
             )
@@ -1334,7 +1337,13 @@ class _RunContext:
             raise
         finally:
             if supervisor is not None:
-                supervisor.after_agent(kind, round_label, result=result, error=error)
+                supervisor.after_agent(
+                    kind,
+                    round_label,
+                    result=result,
+                    error=error,
+                    execution_id=execution_id,
+                )
 
     def chat(self, question: str) -> str:
         """Ask a read-only peer agent about the live experiment."""
@@ -1349,16 +1358,25 @@ class _RunContext:
                 return f"Chat agent did not return an answer.\n\nFallback diagnostic:\n{diagnostic}"
 
             assert self.supervisor is not None  # noqa: S101  # tracked: #288
-            invocation_id = uuid.uuid4().hex
             system_prompt = (
                 _EXPERIMENT_CHAT_CONTINUATION_PROMPT
                 if self._chat_history
                 else _EXPERIMENT_CHAT_SYSTEM_PROMPT
             )
+            execution = self.supervisor.start_agent_execution(
+                "chat",
+                "experiment-chat",
+                question,
+                system_prompt,
+                consume_steering=False,
+                participates_in_run_control=False,
+            )
+            answer: str | None = None
+            error: BaseException | None = None
             with self.supervisor.presentation_scope(
                 agent_kind="chat",
                 round_label="experiment-chat",
-                invocation_id=invocation_id,
+                invocation_id=execution.execution_id,
             ):
                 try:
                     answer = self.agent_client.invoke_text(
@@ -1368,11 +1386,25 @@ class _RunContext:
                         env=self.gpu_env(),
                         user_prompt=question,
                         round_label="experiment chat",
-                        invocation_id=invocation_id,
+                        invocation_id=execution.execution_id,
                         progress=self.current_progress(),
                     )
-                except Exception as exc:
-                    raise RuntimeError(f"Chat agent failed: {type(exc).__name__}: {exc}") from exc  # noqa: TRY003  # tracked: #288
+                except BaseException as exc:
+                    error = exc
+                    if isinstance(exc, Exception):
+                        raise RuntimeError(  # noqa: TRY003, TRY004  # tracked: #288
+                            f"Chat agent failed: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    raise
+                finally:
+                    self.supervisor.after_agent(
+                        "chat",
+                        "experiment-chat",
+                        result=answer,
+                        error=error,
+                        execution_id=execution.execution_id,
+                    )
+            assert answer is not None  # noqa: S101  # successful invoke_text returns str
             if not answer.strip():
                 answer = fallback()
             self._chat_history.append((question, answer))

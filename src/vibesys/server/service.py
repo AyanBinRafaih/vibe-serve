@@ -8,6 +8,7 @@ from vibesys.server.events import EventType, RunEvent
 from vibesys.server.experiments import apply_baselines, build_experiment_log
 from vibesys.server.inspector import RunInspector
 from vibesys.server.protocol import (
+    ActiveAgentExecution,
     ChatQuery,
     ChatResult,
     CommandAck,
@@ -94,6 +95,12 @@ class SupervisionService:
 
     def events(self, after_sequence: int = 0) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.read_events(after_sequence)
+
+    def subscription_checkpoint(
+        self, after_sequence: int
+    ) -> tuple[int, list[RunEvent], list[ActiveAgentExecution]]:
+        """Return one sequence-consistent replay and activity checkpoint."""
+        return self.supervisor.subscription_checkpoint(after_sequence)
 
     def history_events(self) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.read_history_events()

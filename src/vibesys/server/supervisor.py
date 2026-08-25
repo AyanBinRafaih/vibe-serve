@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import threading
 import uuid
 from collections.abc import Callable, Generator  # noqa: TC003  # tracked: #288
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from vibesys.server.diagnostics import (
     Diagnostic,
@@ -20,6 +22,9 @@ from vibesys.server.diagnostics import (
     exception_to_diagnostic,
 )
 from vibesys.server.events import (
+    AgentExecutionActivityData,
+    AgentExecutionFinishedData,
+    AgentExecutionStartedData,
     AgentOutputChannel,
     AgentOutputChunkData,
     ChatData,
@@ -33,22 +38,32 @@ from vibesys.server.events import (
     OutputStream,
     PhaseData,
     RunEvent,
+    TodoUpdateData,
+    ToolCallData,
+    ToolResultData,
     json_value,
     make_event,
 )
-from vibesys.server.protocol import RunSnapshot
+from vibesys.server.protocol import ActiveAgentExecution, RunSnapshot
 
 _MAX_EXCEPTION_CHAIN = 8
 _DIAGNOSTIC_FAILURE_EVENTS = frozenset(
     {
         EventType.CONFIGURATION_FAILED,
         EventType.INVOCATION_FINISHED,
+        EventType.AGENT_EXECUTION_FINISHED,
         EventType.PHASE_FINISHED,
         EventType.RUN_FAILED,
         EventType.RUN_INTERRUPTED,
     }
 )
-_NONTERMINAL_FAILURE_EVENTS = frozenset({EventType.INVOCATION_FINISHED, EventType.PHASE_FINISHED})
+_NONTERMINAL_FAILURE_EVENTS = frozenset(
+    {
+        EventType.INVOCATION_FINISHED,
+        EventType.AGENT_EXECUTION_FINISHED,
+        EventType.PHASE_FINISHED,
+    }
+)
 
 if TYPE_CHECKING:
     from vs_project import Project, StateSnapshot
@@ -69,6 +84,14 @@ class ProjectRunState:
         )
 
 
+@dataclass(frozen=True)
+class AgentExecutionHandle:
+    """Identity and effective prompt returned by an execution start boundary."""
+
+    execution_id: str
+    user_prompt: str
+
+
 class RunSupervisor:
     """Own pause state, invocation metadata, and the run audit store."""
 
@@ -77,7 +100,12 @@ class RunSupervisor:
         self._pause_after_call = False
         self._paused = False
         self._pending_steer: list[str] = []
-        self._active_invocation: str | None = None
+        self._active_executions: dict[str, ActiveAgentExecution] = {}
+        self._execution_todo_summaries: dict[str, str] = {}
+        self._execution_active_tools: dict[str, list[str]] = {}
+        self._run_control_execution_ids: set[str] = set()
+        self._canonical_execution_ids: set[str] = set()
+        self._legacy_invocation_ids: set[str] = set()
         self._run_status = "starting"
         self._store: EventStore | None = None
         self._audit_store: EventStore | None = None
@@ -88,6 +116,7 @@ class RunSupervisor:
         self._current_round: str | None = None
         self._chat_handler: Callable[[str], str] | None = None
         self._presentation_local = threading.local()
+        self._legacy_execution_local = threading.local()
         # An invocation and its terminal run failure often carry the same
         # exception. Keep one diagnostic object so both events identify the
         # same operator-visible failure without reformatting it at each layer.
@@ -133,6 +162,7 @@ class RunSupervisor:
             if store is None:
                 store = EventStore(events_path, run_id=run_id or log_dir.parent.name)
                 self._store = store
+                self._index_execution_lifecycle(store.read())
                 pending, self._pending_events = self._pending_events, []
             else:
                 self._audit_store = EventStore(events_path, run_id=run_id or log_dir.parent.name)
@@ -184,13 +214,91 @@ class RunSupervisor:
         scoped_kind = getattr(self._presentation_local, "agent_kind", None)
         scoped_round = getattr(self._presentation_local, "round_label", None)
         scoped_invocation = getattr(self._presentation_local, "invocation_id", None)
+        execution_id = invocation_id or scoped_invocation
+        if execution_id is not None:
+            activity = self._activity_for_presentation(event_type, data, execution_id)
+            if activity is not None:
+                self.update_agent_execution_activity(execution_id, activity)
         self.record(
             event_type,
             agent_kind=agent_kind or scoped_kind or self._current_kind,
             round_label=round_label or scoped_round or self._current_round,
-            invocation_id=invocation_id or scoped_invocation or self._active_invocation,
+            execution_id=execution_id,
             data=data,
         )
+
+    def _activity_for_presentation(
+        self, event_type: EventType, data: EventData, execution_id: str
+    ) -> AgentExecutionActivityData | None:
+        if event_type is EventType.AGENT_OUTPUT_CHUNK and isinstance(data, AgentOutputChunkData):
+            with self._condition:
+                if self._execution_active_tools.get(execution_id):
+                    return None
+            return _text_activity(data)
+        if event_type is EventType.TOOL_CALL and isinstance(data, ToolCallData):
+            return self._tool_call_activity(execution_id, data)
+        if event_type is EventType.TODO_UPDATE and isinstance(data, TodoUpdateData):
+            return self._todo_activity(execution_id, data)
+        if event_type is EventType.TOOL_RESULT and isinstance(data, ToolResultData):
+            return self._tool_result_activity(execution_id, data)
+        return None
+
+    def _tool_call_activity(
+        self, execution_id: str, data: ToolCallData
+    ) -> AgentExecutionActivityData:
+        with self._condition:
+            self._execution_active_tools.setdefault(execution_id, []).append(data.tool)
+        return AgentExecutionActivityData(mode="tool", summary=f"Using {data.tool}", tool=data.tool)
+
+    def _todo_activity(
+        self, execution_id: str, data: TodoUpdateData
+    ) -> AgentExecutionActivityData | None:
+        current = next((todo.content for todo in data.todos if todo.status == "in_progress"), None)
+        with self._condition:
+            if current is None:
+                self._execution_todo_summaries.pop(execution_id, None)
+                if self._execution_active_tools.get(execution_id):
+                    return None
+                return AgentExecutionActivityData(mode="thinking", summary="Thinking")
+            self._execution_todo_summaries[execution_id] = current
+            if self._execution_active_tools.get(execution_id):
+                return None
+        return AgentExecutionActivityData(mode="thinking", summary=current)
+
+    def _tool_result_activity(
+        self, execution_id: str, data: ToolResultData
+    ) -> AgentExecutionActivityData | None:
+        with self._condition:
+            if execution_id not in self._active_executions:
+                return None
+            tools = self._execution_active_tools.get(execution_id, [])
+            if data.tool in tools:
+                tools.remove(data.tool)
+            remaining_tool = tools[-1] if tools else None
+            todo_summary = self._execution_todo_summaries.get(execution_id)
+        if remaining_tool is not None:
+            return AgentExecutionActivityData(
+                mode="tool", summary=f"Using {remaining_tool}", tool=remaining_tool
+            )
+        return AgentExecutionActivityData(mode="thinking", summary=todo_summary or "Thinking")
+
+    def update_agent_execution_activity(
+        self, execution_id: str, activity: AgentExecutionActivityData
+    ) -> None:
+        """Replace one active execution's semantic activity and publish it once."""
+        with self._condition:
+            active = self._active_executions.get(execution_id)
+            if active is None or active.activity == activity:
+                return
+            self.record(
+                EventType.AGENT_EXECUTION_ACTIVITY_CHANGED,
+                status=EventStatus.ACTIVE,
+                agent_kind=active.agent_kind,
+                round_label=active.round_label,
+                execution_id=execution_id,
+                data=activity,
+            )
+            self._active_executions[execution_id] = active.model_copy(update={"activity": activity})
 
     def record(  # noqa: D102  # tracked: #288
         self,
@@ -212,11 +320,12 @@ class RunSupervisor:
             if store is None:
                 self._pending_events.append(event)
                 return event
-        recorded = store.append(event)
-        audit_store = self._audit_store
-        if audit_store is not None:
-            audit_store.append(event)
-        return recorded
+            recorded = store.append(event)
+            self._index_execution_lifecycle([recorded])
+            audit_store = self._audit_store
+            if audit_store is not None:
+                audit_store.append(event)
+            return recorded
 
     def record_failure(  # noqa: PLR0913  # failure event fields belong at this boundary
         self,
@@ -228,6 +337,7 @@ class RunSupervisor:
         data: EventData | Callable[[Diagnostic], EventData] | None = None,
         text: str | None = None,
         severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
+        status: EventStatus = EventStatus.FAILED,
         diagnostic: Diagnostic | None = None,
         **fields: Any,  # noqa: ANN401  # tracked: #288
     ) -> RunEvent:
@@ -247,6 +357,7 @@ class RunSupervisor:
             data=data,
             text=text,
             severity=severity,
+            status=status,
             diagnostic=diagnostic,
             **fields,
         )
@@ -261,6 +372,7 @@ class RunSupervisor:
         data: EventData | Callable[[Diagnostic], EventData] | None = None,
         text: str | None = None,
         severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
+        status: EventStatus = EventStatus.FAILED,
         diagnostic: Diagnostic | None = None,
         **fields: Any,  # noqa: ANN401  # tracked: #288
     ) -> RunEvent:
@@ -274,7 +386,7 @@ class RunSupervisor:
         return self.record(
             event_type,
             diagnostic.summary if text is None else text,
-            status=EventStatus.FAILED,
+            status=status,
             data=event_data,
             diagnostic=diagnostic,
             **fields,
@@ -317,17 +429,32 @@ class RunSupervisor:
             raise
 
     def read_events(self, after_sequence: int = 0) -> list[RunEvent]:  # noqa: D102  # tracked: #288
-        store = self._store
-        return store.read(after_sequence) if store else []
+        with self._condition:
+            store = self._store
+            if store is None:
+                return []
+            return _canonical_execution_events(
+                store.read(after_sequence),
+                canonical_lifecycle_ids=self._canonical_execution_ids,
+                invocation_lifecycle_ids=self._legacy_invocation_ids,
+            )
 
     def read_history_events(self) -> list[RunEvent]:
         """Return the durable session history, including earlier attachments."""
         store = self._audit_store or self._store
-        return store.read() if store else []
+        return _canonical_execution_events(store.read()) if store else []
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         store = self._store
-        return store.wait(after_sequence, timeout) if store else []
+        if store is None:
+            return []
+        store.wait(after_sequence, timeout)
+        with self._condition:
+            return _canonical_execution_events(
+                store.read(after_sequence),
+                canonical_lifecycle_ids=self._canonical_execution_ids,
+                invocation_lifecycle_ids=self._legacy_invocation_ids,
+            )
 
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         with self._condition:
@@ -338,7 +465,42 @@ class RunSupervisor:
                 status="paused" if self._paused else self._run_status,
                 agent_kind=self._current_kind,
                 round_label=self._current_round,
+                active_executions=[
+                    execution.model_copy(deep=True)
+                    for execution in self._active_executions.values()
+                ],
             )
+
+    def subscription_checkpoint(
+        self, after_sequence: int
+    ) -> tuple[int, list[RunEvent], list[ActiveAgentExecution]]:
+        """Atomically capture replay events and active state at one watermark."""
+        with self._condition:
+            store = self._store
+            through_sequence = store.last_sequence if store else 0
+            events = store.read(after_sequence) if store else []
+            events = _canonical_execution_events(
+                events,
+                canonical_lifecycle_ids=self._canonical_execution_ids,
+                invocation_lifecycle_ids=self._legacy_invocation_ids,
+            )
+            events = [event for event in events if event.sequence <= through_sequence]
+            active = [
+                execution.model_copy(deep=True) for execution in self._active_executions.values()
+            ]
+            return through_sequence, events, active
+
+    def _index_execution_lifecycle(self, events: list[RunEvent]) -> None:
+        for event in events:
+            if event.execution_id is None:
+                continue
+            if event.type in {
+                EventType.AGENT_EXECUTION_STARTED,
+                EventType.AGENT_EXECUTION_FINISHED,
+            }:
+                self._canonical_execution_ids.add(event.execution_id)
+            elif event.type in {EventType.INVOCATION_STARTED, EventType.INVOCATION_FINISHED}:
+                self._legacy_invocation_ids.add(event.execution_id)
 
     def chat_agent_available(self) -> bool:
         """True when an agent-backed chat handler is installed for this run.
@@ -433,47 +595,97 @@ class RunSupervisor:
             self._pending_steer.append(text)
         self.record(EventType.CONTROL, f"/steer: {text}", status=EventStatus.PENDING)
 
-    def before_agent(  # noqa: D102  # tracked: #288
-        self, kind: str, round_label: str, user_prompt: str, system_prompt: str = ""
-    ) -> str:
+    def start_agent_execution(  # noqa: PLR0913  # lifecycle and control semantics meet here
+        self,
+        kind: str,
+        round_label: str,
+        user_prompt: str,
+        system_prompt: str = "",
+        *,
+        consume_steering: bool = True,
+        participates_in_run_control: bool = True,
+    ) -> AgentExecutionHandle:
+        """Start one prompt-to-result execution and return its explicit identity."""
         with self._condition:
-            while self._paused:
+            while participates_in_run_control and self._paused:
                 self._condition.wait()
-            steer_messages = self._pending_steer
-            self._pending_steer = []
-            self._current_kind, self._current_round = kind, round_label
-            invocation_id = uuid.uuid4().hex
-            self._active_invocation = invocation_id
-
-        effective_prompt = _with_steering(user_prompt, steer_messages)
-
-        phase = PhaseData(phase=kind, attempt=_attempt_from_label(round_label))
-        self.record(
-            EventType.PHASE_STARTED,
-            status=EventStatus.ACTIVE,
-            agent_kind=kind,
-            round_label=round_label,
-            invocation_id=invocation_id,
-            data=phase,
-        )
-        self.record(
-            EventType.INVOCATION_STARTED,
-            status=EventStatus.ACTIVE,
-            agent_kind=kind,
-            round_label=round_label,
-            invocation_id=invocation_id,
-            data=InvocationStartedData(system_prompt=system_prompt, user_prompt=effective_prompt),
-        )
-        if steer_messages:
-            self.record(
-                EventType.CONTROL,
-                "/steer",
-                status=EventStatus.CONSUMED,
+            steer_messages = (
+                self._pending_steer if consume_steering and participates_in_run_control else []
+            )
+            if consume_steering and participates_in_run_control:
+                self._pending_steer = []
+            if participates_in_run_control:
+                self._current_kind, self._current_round = kind, round_label
+            execution_id = uuid.uuid4().hex
+            effective_prompt = _with_steering(user_prompt, steer_messages)
+            attempt = _attempt_from_label(round_label)
+            activity = AgentExecutionActivityData(
+                mode="thinking", summary=_initial_activity_summary(kind)
+            )
+            active = ActiveAgentExecution(
+                execution_id=execution_id,
                 agent_kind=kind,
                 round_label=round_label,
-                invocation_id=invocation_id,
+                stage=kind,
+                attempt=attempt,
+                assignment=effective_prompt,
+                started_at=datetime.now(UTC),
+                activity=activity,
             )
-        return effective_prompt
+            self.record(
+                EventType.AGENT_EXECUTION_STARTED,
+                status=EventStatus.ACTIVE,
+                agent_kind=kind,
+                round_label=round_label,
+                execution_id=execution_id,
+                data=AgentExecutionStartedData(
+                    stage=kind,
+                    attempt=attempt,
+                    system_prompt=system_prompt,
+                    user_prompt=effective_prompt,
+                    activity=activity,
+                ),
+            )
+            self._active_executions[execution_id] = active
+            if participates_in_run_control:
+                self._run_control_execution_ids.add(execution_id)
+            legacy_phase = PhaseData(phase=kind, attempt=attempt)
+            self.record(
+                EventType.PHASE_STARTED,
+                status=EventStatus.ACTIVE,
+                agent_kind=kind,
+                round_label=round_label,
+                execution_id=execution_id,
+                data=legacy_phase,
+            )
+            self.record(
+                EventType.INVOCATION_STARTED,
+                status=EventStatus.ACTIVE,
+                agent_kind=kind,
+                round_label=round_label,
+                execution_id=execution_id,
+                data=InvocationStartedData(
+                    system_prompt=system_prompt, user_prompt=effective_prompt
+                ),
+            )
+            if steer_messages:
+                self.record(
+                    EventType.CONTROL,
+                    "/steer",
+                    status=EventStatus.CONSUMED,
+                    agent_kind=kind,
+                    round_label=round_label,
+                    execution_id=execution_id,
+                )
+        return AgentExecutionHandle(execution_id=execution_id, user_prompt=effective_prompt)
+
+    def before_agent(
+        self, kind: str, round_label: str, user_prompt: str, system_prompt: str = ""
+    ) -> str:
+        """Compatibility wrapper for callers not yet carrying execution identity."""
+        execution = self.start_agent_execution(kind, round_label, user_prompt, system_prompt)
+        self._legacy_execution_local.execution_id = execution.execution_id
+        return execution.user_prompt
 
     def after_agent(  # noqa: D102  # tracked: #288
         self,
@@ -482,67 +694,115 @@ class RunSupervisor:
         *,
         result: Any = None,  # noqa: ANN401  # tracked: #288
         error: BaseException | None = None,  # noqa: ANN401, RUF100  # tracked: #288
+        execution_id: str | None = None,
     ) -> None:
+        del kind, round_label
+        execution_id = execution_id or getattr(self._legacy_execution_local, "execution_id", None)
+        if execution_id is None:
+            # Compatibility for an old boundary-only caller that reports a
+            # safe point without first opening an invocation.
+            with self._condition:
+                if self._pause_after_call:
+                    self._pause_after_call = False
+                    self._paused = True
+            return
         with self._condition:
-            invocation_id = self._active_invocation
-            self._active_invocation = None
-            should_pause = self._pause_after_call
+            active = self._active_executions.get(execution_id)
+            if active is None:
+                return
+            participates_in_run_control = execution_id in self._run_control_execution_ids
+            should_pause = participates_in_run_control and self._pause_after_call
+            terminal_status = (
+                _execution_error_status(error) if error is not None else EventStatus.COMPLETED
+            )
+            if error is not None:
+                execution_event = self.record_failure(
+                    EventType.AGENT_EXECUTION_FINISHED,
+                    error,
+                    scope=DiagnosticScope.INVOCATION,
+                    operation="Agent execution",
+                    status=terminal_status,
+                    data=lambda diagnostic: AgentExecutionFinishedData(
+                        result=json_value(result), error=diagnostic.summary
+                    ),
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                )
+                diagnostic = execution_event.diagnostic
+            else:
+                self.record(
+                    EventType.AGENT_EXECUTION_FINISHED,
+                    status=EventStatus.COMPLETED,
+                    data=AgentExecutionFinishedData(result=json_value(result)),
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                )
+                diagnostic = None
+            self._active_executions.pop(execution_id, None)
+            self._run_control_execution_ids.discard(execution_id)
+            self._execution_todo_summaries.pop(execution_id, None)
+            self._execution_active_tools.pop(execution_id, None)
             if should_pause:
                 self._pause_after_call = False
                 self._paused = True
-
-        phase = PhaseData(phase=kind, attempt=_attempt_from_label(round_label))
-        if error is not None:
-            invocation_event = self.record_failure(
-                EventType.INVOCATION_FINISHED,
-                error,
-                scope=DiagnosticScope.INVOCATION,
-                operation="Agent invocation",
-                data=lambda diagnostic: InvocationFinishedData(
-                    result=json_value(result), error=diagnostic.summary
-                ),
-                agent_kind=kind,
-                round_label=round_label,
-                invocation_id=invocation_id,
+            legacy_finished = InvocationFinishedData(
+                result=json_value(result), error=diagnostic.summary if diagnostic else None
             )
-            invocation_diagnostic = cast("Diagnostic", invocation_event.diagnostic)
-            self.record_failure(
-                EventType.PHASE_FINISHED,
-                error,
-                scope=DiagnosticScope.INVOCATION,
-                operation="Agent invocation",
-                data=phase,
-                diagnostic=invocation_diagnostic,
-                agent_kind=kind,
-                round_label=round_label,
-                invocation_id=invocation_id,
-            )
-        else:
-            self.record(
-                EventType.INVOCATION_FINISHED,
-                status=EventStatus.COMPLETED,
-                data=InvocationFinishedData(result=json_value(result)),
-                agent_kind=kind,
-                round_label=round_label,
-                invocation_id=invocation_id,
-            )
-            self.record(
-                EventType.PHASE_FINISHED,
-                status=EventStatus.COMPLETED,
-                data=phase,
-                agent_kind=kind,
-                round_label=round_label,
-                invocation_id=invocation_id,
-            )
-        if should_pause:
-            self.record(
-                EventType.CONTROL,
-                "/pause",
-                status=EventStatus.CONSUMED,
-                agent_kind=kind,
-                round_label=round_label,
-                invocation_id=invocation_id,
-            )
+            if error is not None:
+                self.record_failure(
+                    EventType.INVOCATION_FINISHED,
+                    error,
+                    scope=DiagnosticScope.INVOCATION,
+                    operation="Agent execution",
+                    status=terminal_status,
+                    data=legacy_finished,
+                    diagnostic=diagnostic,
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                )
+                self.record_failure(
+                    EventType.PHASE_FINISHED,
+                    error,
+                    scope=DiagnosticScope.INVOCATION,
+                    operation="Agent execution",
+                    status=terminal_status,
+                    data=PhaseData(phase=active.stage, attempt=active.attempt),
+                    diagnostic=diagnostic,
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                )
+            else:
+                self.record(
+                    EventType.INVOCATION_FINISHED,
+                    status=EventStatus.COMPLETED,
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                    data=legacy_finished,
+                )
+                self.record(
+                    EventType.PHASE_FINISHED,
+                    status=EventStatus.COMPLETED,
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                    data=PhaseData(phase=active.stage, attempt=active.attempt),
+                )
+            if should_pause:
+                self.record(
+                    EventType.CONTROL,
+                    "/pause",
+                    status=EventStatus.CONSUMED,
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                )
+        if getattr(self._legacy_execution_local, "execution_id", None) == execution_id:
+            self._legacy_execution_local.execution_id = None
 
     def status(self) -> str:  # noqa: D102  # tracked: #288
         with self._condition:
@@ -561,6 +821,39 @@ class RunSupervisor:
         with self._condition:
             if self._run_status in {"completed", "failed"}:
                 return
+            for execution_id, active in tuple(self._active_executions.items()):
+                message = "Run ended before the agent execution completed"
+                self.record(
+                    EventType.AGENT_EXECUTION_FINISHED,
+                    message,
+                    status=EventStatus.INTERRUPTED,
+                    data=AgentExecutionFinishedData(error=message),
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                )
+                self._active_executions.pop(execution_id, None)
+                self._run_control_execution_ids.discard(execution_id)
+                self._execution_todo_summaries.pop(execution_id, None)
+                self._execution_active_tools.pop(execution_id, None)
+                self.record(
+                    EventType.INVOCATION_FINISHED,
+                    message,
+                    status=EventStatus.INTERRUPTED,
+                    data=InvocationFinishedData(error=message),
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                )
+                self.record(
+                    EventType.PHASE_FINISHED,
+                    message,
+                    status=EventStatus.INTERRUPTED,
+                    data=PhaseData(phase=active.stage, attempt=active.attempt),
+                    agent_kind=active.agent_kind,
+                    round_label=active.round_label,
+                    execution_id=execution_id,
+                )
             self._run_status = "failed" if error else "completed"
             self._condition.notify_all()
 
@@ -626,6 +919,37 @@ def _attempt_from_label(round_label: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _execution_error_status(error: BaseException) -> EventStatus:
+    if isinstance(error, asyncio.CancelledError) or type(error).__name__ == "CancelledError":
+        return EventStatus.CANCELLED
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return EventStatus.INTERRUPTED
+    return EventStatus.FAILED
+
+
+def _initial_activity_summary(kind: str) -> str:
+    normalized = kind.lower()
+    if "orchestrat" in normalized or "plan" in normalized:
+        return "Planning"
+    if "implement" in normalized:
+        return "Implementing"
+    if "judge" in normalized or "review" in normalized:
+        return "Reviewing"
+    if "profil" in normalized or "benchmark" in normalized:
+        return "Profiling"
+    if normalized == "chat":
+        return "Answering question"
+    return f"Running {kind}"
+
+
+def _text_activity(data: AgentOutputChunkData) -> AgentExecutionActivityData | None:
+    if data.channel == "analysis":
+        return AgentExecutionActivityData(mode="thinking", summary="Thinking")
+    if data.channel == "assistant":
+        return AgentExecutionActivityData(mode="responding", summary="Responding")
+    return None
+
+
 def _exception_chain(error: BaseException) -> list[BaseException]:
     """Follow causes and contexts without depending on diagnostic internals."""
     chain: list[BaseException] = []
@@ -658,3 +982,109 @@ def _with_steering(user_prompt: str, messages: list[str]) -> str:
         "Treat them as high-priority guidance for the work you do now:\n\n"
         f"{block}\n"
     )
+
+
+def _canonical_execution_events(
+    events: list[RunEvent],
+    *,
+    canonical_lifecycle_ids: set[str] | None = None,
+    invocation_lifecycle_ids: set[str] | None = None,
+) -> list[RunEvent]:
+    """Translate persisted legacy lifecycle events without rewriting their log."""
+    if canonical_lifecycle_ids is None:
+        canonical_lifecycle_ids = {
+            event.execution_id
+            for event in events
+            if event.type in {EventType.AGENT_EXECUTION_STARTED, EventType.AGENT_EXECUTION_FINISHED}
+            and event.execution_id is not None
+        }
+    if invocation_lifecycle_ids is None:
+        invocation_lifecycle_ids = {
+            event.execution_id
+            for event in events
+            if event.type in {EventType.INVOCATION_STARTED, EventType.INVOCATION_FINISHED}
+            and event.execution_id is not None
+        }
+    canonical: list[RunEvent] = []
+    for event in events:
+        if event.execution_id in canonical_lifecycle_ids and event.type in {
+            EventType.INVOCATION_STARTED,
+            EventType.INVOCATION_FINISHED,
+        }:
+            continue
+        if event.type is EventType.INVOCATION_STARTED and isinstance(
+            event.data, InvocationStartedData
+        ):
+            canonical.append(
+                event.model_copy(
+                    update={
+                        "type": EventType.AGENT_EXECUTION_STARTED,
+                        "data": AgentExecutionStartedData(
+                            stage=event.agent_kind or "agent",
+                            attempt=_attempt_from_label(event.round_label or ""),
+                            system_prompt=event.data.system_prompt,
+                            user_prompt=event.data.user_prompt,
+                            activity=AgentExecutionActivityData(
+                                mode="thinking",
+                                summary=_initial_activity_summary(event.agent_kind or "agent"),
+                            ),
+                        ),
+                    }
+                )
+            )
+            continue
+        if event.type is EventType.INVOCATION_FINISHED and isinstance(
+            event.data, InvocationFinishedData
+        ):
+            canonical.append(
+                event.model_copy(
+                    update={
+                        "type": EventType.AGENT_EXECUTION_FINISHED,
+                        "data": AgentExecutionFinishedData(
+                            result=event.data.result, error=event.data.error
+                        ),
+                    }
+                )
+            )
+            continue
+        if event.type in {EventType.PHASE_STARTED, EventType.PHASE_FINISHED} and isinstance(
+            event.data, PhaseData
+        ):
+            if (
+                event.execution_id is not None
+                and event.execution_id not in invocation_lifecycle_ids
+                and event.execution_id not in canonical_lifecycle_ids
+                and event.type is EventType.PHASE_STARTED
+            ):
+                canonical.append(
+                    event.model_copy(
+                        update={
+                            "type": EventType.AGENT_EXECUTION_STARTED,
+                            "data": AgentExecutionStartedData(
+                                stage=event.data.phase,
+                                attempt=event.data.attempt,
+                                activity=AgentExecutionActivityData(
+                                    mode="thinking",
+                                    summary=_initial_activity_summary(event.data.phase),
+                                ),
+                            ),
+                        }
+                    )
+                )
+            elif (
+                event.execution_id is not None
+                and event.execution_id not in invocation_lifecycle_ids
+                and event.execution_id not in canonical_lifecycle_ids
+            ):
+                canonical.append(
+                    event.model_copy(
+                        update={
+                            "type": EventType.AGENT_EXECUTION_FINISHED,
+                            "data": AgentExecutionFinishedData(error=event.text or None),
+                        }
+                    )
+                )
+            canonical.append(event)
+            continue
+        canonical.append(event)
+    return canonical

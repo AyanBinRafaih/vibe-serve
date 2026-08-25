@@ -1,5 +1,5 @@
 import {afterEach, describe, expect, it} from 'bun:test';
-import {InputRenderable, rgbToHex, ScrollBoxRenderable} from '@opentui/core';
+import {CliRenderEvents, InputRenderable, rgbToHex, ScrollBoxRenderable} from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
 import type {HypothesisEntry} from '../protocol.js';
 import type {SessionController} from '../session-controller.js';
@@ -214,6 +214,19 @@ describe('OpenTUI presentation', () => {
         {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
         {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
       ],
+      activeExecutions: {
+        'judge-1': {
+          executionId: 'judge-1',
+          agentKind: 'judge',
+          roundLabel: 'round-1-judge',
+          roundNumber: 1,
+          stage: 'evaluation',
+          attempt: 1,
+          assignment: 'Evaluate the candidate',
+          startedAt: new Date().toISOString(),
+          activity: {mode: 'thinking', summary: 'Checking the diff'},
+        },
+      },
       selectedRound: 1,
       conversation: [
         {
@@ -237,9 +250,11 @@ describe('OpenTUI presentation', () => {
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
 
-    // A phase is running, so the newest entry is marked as still working.
+    // A phase is running, but individual turn cards do not claim ownership of
+    // that activity because the transcript may be filtered to another agent.
     const live = await testRenderer.waitForFrame(value => value.includes('checking the diff'));
-    expect(live).toContain('Working');
+    expect(live).toContain('Judge · Working');
+    expect(live).not.toContain('Judge · Checking the diff');
 
     // Arrows put a cursor on an entry without touching the input.
     testRenderer.mockInput.pressKey('ARROW_UP');
@@ -252,6 +267,236 @@ describe('OpenTUI presentation', () => {
     const filtered = await frameAfter(testRenderer);
     expect(filtered).toContain('edited the kernel');
     expect(filtered).not.toContain('checking the diff');
+    // A completed filtered transcript must not inherit another agent's live
+    // activity. The global working indicator remains available on the experiment log.
+    expect(filtered).not.toContain('Judge · Working');
+  });
+
+  it('summarizes concurrent executions and disappears when they finish', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const base = initialSessionState();
+    const controller = new FakeController({
+      ...base,
+      selectedRound: 2,
+      activeExecutions: {
+        implementer: {
+          executionId: 'implementer',
+          agentKind: 'implementer',
+          roundLabel: 'round-2-implementer',
+          roundNumber: 2,
+          stage: 'implementation',
+          attempt: 1,
+          assignment: 'Implement the queue',
+          startedAt: new Date().toISOString(),
+          activity: {mode: 'tool', summary: 'Running queue tests', tool: 'Bash'},
+        },
+        reviewer: {
+          executionId: 'reviewer',
+          agentKind: 'reviewer',
+          roundLabel: 'round-2-review',
+          roundNumber: 2,
+          stage: 'review',
+          attempt: 1,
+          assignment: 'Review the diff',
+          startedAt: new Date().toISOString(),
+          activity: {mode: 'thinking', summary: 'Inspecting the diff'},
+        },
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const active = await testRenderer.waitForFrame(value => value.includes('2 agents active'));
+    expect(active).toContain('Implementer: Working');
+    expect(active).toContain('Reviewer: Working');
+    expect(active).not.toContain('Running queue tests');
+    expect(active).not.toContain('Inspecting the diff');
+
+    controller.publish({...controller.state, activeExecutions: {}});
+    const finished = await frameAfter(testRenderer);
+    expect(finished).not.toContain('agents active');
+    expect(finished).not.toContain('Running queue tests');
+  });
+
+  it('shows activity when an execution starts after its agent conversation is opened', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      phases: [
+        {
+          kind: 'implementer',
+          status: 'pending',
+          roundNumber: 1,
+          roundLabel: 'round-1-implementer',
+        },
+      ],
+      selectedRound: 1,
+      selectedAgentKind: 'implementer',
+      conversation: [
+        {
+          id: 'prompt',
+          kind: 'prompt',
+          content: 'Implement the queue',
+          agentKind: 'implementer',
+          roundNumber: 1,
+        },
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    const idle = await testRenderer.waitForFrame(value => value.includes('Implement the queue'));
+    expect(idle).not.toContain('Implementer · Working');
+
+    controller.publish({
+      ...controller.state,
+      activeExecutions: {
+        'impl-1': {
+          executionId: 'impl-1',
+          agentKind: 'implementer',
+          roundLabel: 'round-1-implementer',
+          roundNumber: 1,
+          stage: 'implementation',
+          attempt: 1,
+          assignment: 'Implement the queue',
+          startedAt: new Date().toISOString(),
+          activity: {mode: 'responding', summary: 'Editing the queue'},
+        },
+      },
+    });
+
+    const active = await testRenderer.waitForFrame(value =>
+      value.includes('Implementer · Working'),
+    );
+    expect(active).toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Implementer · Working · \d+s/);
+    expect(active).not.toContain('Editing the queue');
+    const activityLine = active.split('\n').find(line => line.includes('Implementer · Working'));
+    expect(activityLine?.indexOf('Implementer')).toBeGreaterThan(20);
+    const lines = active.split('\n');
+    const promptLine = lines.findIndex(line => line.includes('Implement the queue'));
+    const activityLineIndex = lines.findIndex(line => line.includes('Implementer · Working'));
+    const helpLine = lines.findIndex(line => line.includes('[/]: round'));
+    const viewportBottomBorder = lines.findIndex(
+      (line, index) =>
+        index > activityLineIndex && index < helpLine && line.trimEnd().endsWith('╯'),
+    );
+    expect(activityLineIndex).toBeGreaterThan(promptLine);
+    expect(activityLine?.trimEnd().endsWith('│')).toBe(true);
+    expect(viewportBottomBorder).toBeGreaterThan(activityLineIndex);
+    expect(viewportBottomBorder).toBeLessThan(helpLine);
+    const transcriptColumn = Math.max(0, (activityLine?.indexOf('Implementer') ?? 2) - 2);
+    expect(
+      lines
+        .slice(activityLineIndex + 1, viewportBottomBorder)
+        .every(line => line.slice(transcriptColumn).replaceAll('│', '').trim() === ''),
+    ).toBe(true);
+
+    controller.selectAgent('implementer');
+    await frameAfter(testRenderer);
+    controller.selectAgent('implementer');
+    const reopened = await frameAfter(testRenderer);
+    expect(reopened).toContain('Implementer · Working');
+  });
+
+  it('keeps activity fixed and aligned while a new turn changes the scroll height', async () => {
+    const conversation = Array.from({length: 12}, (_, index) => ({
+      id: `turn-${index}`,
+      kind: 'status' as const,
+      content: `recorded turn ${index}`,
+      agentKind: 'implementer',
+      roundNumber: 1,
+    }));
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      rounds: [{number: 1, status: 'active'}],
+      selectedRound: 1,
+      selectedAgentKind: 'implementer',
+      conversation,
+      activeExecutions: {
+        'impl-1': {
+          executionId: 'impl-1',
+          agentKind: 'implementer',
+          roundLabel: 'round-1-implementer',
+          roundNumber: 1,
+          stage: 'implementation',
+          attempt: 1,
+          assignment: 'Implement the queue',
+          startedAt: new Date().toISOString(),
+          activity: {mode: 'thinking', summary: 'Thinking'},
+        },
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Implementer · Working'));
+
+    const frames: string[] = [];
+    const captureFrame = (): void => {
+      frames.push(testRenderer.captureCharFrame());
+    };
+    testRenderer.renderer.on(CliRenderEvents.FRAME, captureFrame);
+    controller.publish({
+      ...controller.state,
+      conversation: [
+        ...conversation,
+        {
+          id: 'new-turn',
+          kind: 'assistant',
+          content: 'newly rendered turn',
+          agentKind: 'implementer',
+          roundNumber: 1,
+        },
+      ],
+    });
+    await testRenderer.waitForVisualIdle();
+    testRenderer.renderer.off(CliRenderEvents.FRAME, captureFrame);
+
+    expect(frames.length).toBeGreaterThan(0);
+    const activityRows = frames.map(frame =>
+      frame.split('\n').findIndex(line => line.includes('Implementer · Working')),
+    );
+    expect(activityRows.every(row => row >= 0)).toBe(true);
+    expect(new Set(activityRows).size).toBe(1);
+    expect(frames.at(-1)).toContain('newly rendered turn');
+
+    const frame = testRenderer.renderer.root.findDescendantById('viewport');
+    const scroll = testRenderer.renderer.root.findDescendantById('transcript-scroll');
+    const activity = testRenderer.renderer.root.findDescendantById('conversation-activity-bar');
+    const firstTurn = testRenderer.renderer.root.findDescendantById('event-turn-0');
+    if (frame === undefined || activity === undefined)
+      throw new Error('transcript frame was missing');
+    if (!(scroll instanceof ScrollBoxRenderable)) throw new Error('transcript was not scrollable');
+    expect(scroll.parent).toBe(frame);
+    expect(activity?.parent).toBe(frame);
+    expect(firstTurn?.x).toBe(activity.x);
+  });
+
+  it('keeps the global working indicator on the hypothesis log', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      activeExecutions: {
+        'impl-1': {
+          executionId: 'impl-1',
+          agentKind: 'implementer',
+          roundLabel: 'round-1-implementer',
+          roundNumber: 1,
+          stage: 'implementation',
+          attempt: 1,
+          assignment: 'Implement the queue',
+          startedAt: new Date().toISOString(),
+          activity: {mode: 'responding', summary: 'Editing the queue'},
+        },
+      },
+    });
+    controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('Implementer · Working'));
+    expect(frame).toContain('Experiments');
+    expect(frame).not.toContain('Editing the queue');
   });
 
   it('shows the whole run in the strip and keeps early rounds reachable', async () => {
@@ -1034,6 +1279,21 @@ describe('OpenTUI presentation', () => {
     expect(answer).toContain('Inspecting configuration events');
     expect(answer).toContain('→ Read(run-events.jsonl)');
 
+    const overlay = testRenderer.renderer.root.findDescendantById('chat-overlay');
+    const transcript = testRenderer.renderer.root.findDescendantById('chat-transcript');
+    const turn = testRenderer.renderer.root.findDescendantById('event-chat-user');
+    const input = testRenderer.renderer.root.findDescendantById('chat-input-box');
+    if (
+      overlay === undefined ||
+      transcript === undefined ||
+      turn === undefined ||
+      input === undefined
+    )
+      throw new Error('modal chat geometry was missing');
+    expect(transcript.x).toBe(overlay.x + 2);
+    expect(turn.x).toBe(transcript.x);
+    expect(input.x).toBe(transcript.x);
+
     testRenderer.mockInput.pressKey('ESCAPE');
     await testRenderer.waitForFrame(value => !value.includes('Experiment chat'));
     expect(controller.state.chatOpen).toBe(false);
@@ -1275,6 +1535,8 @@ describe('theming', () => {
       phases: [
         {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
         {kind: 'judge', status: 'failed', roundNumber: 1, roundLabel: 'round-1'},
+        {kind: 'profiler', status: 'cancelled', roundNumber: 1, roundLabel: 'round-1'},
+        {kind: 'reviewer', status: 'interrupted', roundNumber: 1, roundLabel: 'round-1'},
       ],
       todoPhases: [
         {
@@ -1296,6 +1558,10 @@ describe('theming', () => {
     expect(frame).toContain('× judge');
     expect(frame).toContain('completed');
     expect(frame).toContain('failed');
+    expect(frame).toContain('■ profiler');
+    expect(frame).toContain('cancelled');
+    expect(frame).toContain('! reviewer');
+    expect(frame).toContain('interrupted');
     expect(frame).toContain('✓ write the kernel');
     expect(frame).toContain('▶ benchmark it');
   });
@@ -1671,6 +1937,14 @@ describe('theming', () => {
     expect(answered).toContain('Prefill dominates.');
     expect(answered).toContain('H-07');
     expect(answered).toContain('Implementation Details');
+
+    const pane = testRenderer.renderer.root.findDescendantById('chat-pane');
+    const scroll = testRenderer.renderer.root.findDescendantById('chat-pane-scroll');
+    const turn = testRenderer.renderer.root.findDescendantById('event-q');
+    if (pane === undefined || scroll === undefined || turn === undefined)
+      throw new Error('docked chat geometry was missing');
+    expect(scroll.x).toBe(pane.x + 2);
+    expect(turn.x).toBe(scroll.x);
   });
 
   it('keeps the chat, the table, and the visualization on screen together', async () => {

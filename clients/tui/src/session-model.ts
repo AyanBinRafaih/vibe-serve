@@ -19,6 +19,8 @@ export interface SessionState {
   /** Rounds the run intends to reach, from ``run_started``; null until it arrives. */
   maxRounds: number | null;
   phases: AgentPhase[];
+  /** Backend-authoritative agent executions that have started but not finished. */
+  activeExecutions: Record<string, ActiveAgentExecution>;
   selectedRound: number | null;
   selectedAgentKind: string | null;
   /** Transcript entry the arrow keys are on, so a trace is readable without a mouse. */
@@ -64,6 +66,27 @@ export interface SessionState {
   errorBanner: ErrorBannerState | null;
 }
 
+export type AgentExecutionMode = 'thinking' | 'responding' | 'tool' | 'waiting';
+
+export interface AgentExecutionActivity {
+  mode: AgentExecutionMode;
+  summary: string;
+  tool?: string | null;
+}
+
+/** Semantic execution state. Spinner frames and elapsed-time formatting stay in the UI. */
+export interface ActiveAgentExecution {
+  executionId: string;
+  agentKind: string;
+  roundLabel: string | null;
+  roundNumber: number | null;
+  stage: string;
+  attempt: number | null;
+  assignment: string;
+  startedAt: string;
+  activity: AgentExecutionActivity;
+}
+
 export type ErrorSeverity = 'recoverable' | 'fatal';
 export type ErrorScope =
   | 'configuration'
@@ -100,11 +123,11 @@ export interface TodoItem {
 }
 
 /**
- * One agent phase's latest todo-list snapshot. Todos are keyed per
- * (round, agent) so concurrent or successive phases never clobber each
- * other's lists, mirroring how the conversation filter scopes entries.
+ * One agent execution's latest todo-list snapshot. Canonical events are keyed
+ * by execution ID; legacy streams without one retain their round/agent scope.
  */
 export interface PhaseTodos {
+  executionId?: string | null;
   agentKind: string | null;
   roundNumber: number | null;
   items: TodoItem[];
@@ -232,6 +255,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     rounds: [],
     maxRounds: null,
     phases: [],
+    activeExecutions: {},
     selectedRound: null,
     selectedAgentKind: null,
     selectedEntryId: null,
@@ -823,7 +847,48 @@ export function applySnapshot(state: SessionState, snapshot: RunSnapshot): Sessi
     agentKind: snapshot.agent_kind ?? null,
     roundLabel: snapshot.round_label ?? null,
     terminal: snapshot.status === 'completed' || snapshot.status === 'failed',
+    activeExecutions: activeExecutionsFromCheckpoint(snapshot.active_executions ?? []),
   };
+}
+
+type ActiveExecutionCheckpoint = NonNullable<RunSnapshot['active_executions']>;
+
+/** Replace activity with the backend checkpoint without advancing the event replay cursor. */
+export function applyActiveExecutionCheckpoint(
+  state: SessionState,
+  executions: ActiveExecutionCheckpoint,
+  throughSequence?: number,
+): SessionState {
+  if (throughSequence !== undefined && throughSequence < state.sequence) return state;
+  return {
+    ...state,
+    activeExecutions: activeExecutionsFromCheckpoint(executions),
+  };
+}
+
+function activeExecutionsFromCheckpoint(
+  executions: ActiveExecutionCheckpoint,
+): Record<string, ActiveAgentExecution> {
+  return Object.fromEntries(
+    executions.map(execution => [
+      execution.execution_id,
+      {
+        executionId: execution.execution_id,
+        agentKind: execution.agent_kind,
+        roundLabel: execution.round_label ?? null,
+        roundNumber: roundNumberFromLabel(execution.round_label),
+        stage: execution.stage,
+        attempt: execution.attempt ?? null,
+        assignment: execution.assignment,
+        startedAt: execution.started_at,
+        activity: {
+          mode: execution.activity.mode,
+          summary: execution.activity.summary,
+          tool: execution.activity.tool ?? null,
+        },
+      },
+    ]),
+  );
 }
 
 export function applyEvent(state: SessionState, event: RunEvent): SessionState {
@@ -831,6 +896,7 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
   if (sequence > 0 && sequence <= state.sequence) return state;
   let next = {...state, sequence: Math.max(state.sequence, sequence)};
   next = applyFailureEvent(next, event);
+  next = applyAgentExecutionEvent(next, event);
   if (event.agent_kind === 'chat') return applyChatEvent(next, event);
   if (event.agent_kind) next.agentKind = event.agent_kind;
   if (event.round_label) next.roundLabel = event.round_label;
@@ -853,11 +919,16 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
     }));
     const agentKind = event.agent_kind ?? null;
     const roundNumber = roundNumberFromLabel(event.round_label);
+    const todoExecutionId = event.execution_id ?? event.invocation_id ?? null;
     next.todoPhases = [
-      ...next.todoPhases.filter(
-        phase => phase.agentKind !== agentKind || phase.roundNumber !== roundNumber,
+      ...next.todoPhases.filter(phase =>
+        todoExecutionId === null
+          ? phase.executionId != null ||
+            phase.agentKind !== agentKind ||
+            phase.roundNumber !== roundNumber
+          : phase.executionId !== todoExecutionId,
       ),
-      {agentKind, roundNumber, items},
+      {executionId: todoExecutionId, agentKind, roundNumber, items},
     ].slice(-100);
   }
   if (data?.kind === 'usage_update') {
@@ -884,16 +955,68 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
   if (event.type === 'configuration_failed') {
     next.status = 'failed';
     next.terminal = true;
+    next.activeExecutions = {};
   }
   if (event.type === 'run_finished') {
     next.status = 'completed';
     next.terminal = true;
+    next.activeExecutions = {};
   }
   if (event.type === 'run_failed' || event.type === 'run_interrupted') {
     next.status = 'failed';
     next.terminal = true;
+    next.activeExecutions = {};
   }
   return next;
+}
+
+/** Reduce canonical execution lifecycle before agent-specific transcript routing. */
+function applyAgentExecutionEvent(state: SessionState, event: RunEvent): SessionState {
+  const data = event.data;
+  const executionId = event.execution_id;
+  if (executionId == null) return state;
+  if (data?.kind === 'agent_execution_started') {
+    return {
+      ...state,
+      activeExecutions: {
+        ...state.activeExecutions,
+        [executionId]: {
+          executionId,
+          agentKind: event.agent_kind ?? 'agent',
+          roundLabel: event.round_label ?? null,
+          roundNumber: roundNumberFromLabel(event.round_label),
+          stage: data.stage,
+          attempt: data.attempt ?? null,
+          assignment: data.user_prompt ?? '',
+          startedAt: event.timestamp,
+          activity: {
+            mode: data.activity.mode,
+            summary: data.activity.summary,
+            tool: data.activity.tool ?? null,
+          },
+        },
+      },
+    };
+  }
+  if (data?.kind === 'agent_execution_activity_changed') {
+    const current = state.activeExecutions[executionId];
+    if (current === undefined) return state;
+    return {
+      ...state,
+      activeExecutions: {
+        ...state.activeExecutions,
+        [executionId]: {
+          ...current,
+          activity: {mode: data.mode, summary: data.summary, tool: data.tool ?? null},
+        },
+      },
+    };
+  }
+  if (data?.kind === 'agent_execution_finished') {
+    const {[executionId]: _finished, ...remaining} = state.activeExecutions;
+    return {...state, activeExecutions: remaining};
+  }
+  return state;
 }
 
 /**
@@ -1550,7 +1673,7 @@ export function toggleTodos(state: SessionState): SessionState {
 }
 
 /**
- * The todo list for the phase the operator is looking at, following the same
+ * The todo list for the execution the operator is looking at, following the same
  * scoping rules as the conversation filter. Entries whose events carried no
  * agent or round stamp (legacy streams) match any scope rather than vanish.
  */

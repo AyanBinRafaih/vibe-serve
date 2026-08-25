@@ -21,6 +21,8 @@ const STATUS_MARKER: Record<AgentPhase['status'], string> = {
   active: '●',
   completed: '✓',
   failed: '×',
+  cancelled: '■',
+  interrupted: '!',
 };
 
 /** Width the stacked fallback uses, and the width this pane had before. */
@@ -34,6 +36,7 @@ function statusColor(theme: Theme, status: AgentPhase['status']): string {
   if (status === 'active') return theme.success;
   if (status === 'completed') return theme.info;
   if (status === 'failed') return theme.error;
+  if (status === 'cancelled' || status === 'interrupted') return theme.warning;
   return theme.textSubtle;
 }
 
@@ -388,6 +391,8 @@ export function phaseSummary(phases: AgentPhase[]): string {
     `${count('completed')} done`,
   ];
   if (count('failed') > 0) parts.push(`${count('failed')} failed`);
+  if (count('cancelled') > 0) parts.push(`${count('cancelled')} cancelled`);
+  if (count('interrupted') > 0) parts.push(`${count('interrupted')} interrupted`);
   const pending = count('pending');
   if (pending > 0) parts.push(`${pending} waiting`);
   return parts.join(' · ');

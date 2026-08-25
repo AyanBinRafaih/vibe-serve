@@ -92,6 +92,18 @@ export type Sequence = number;
 export type Status1 = string;
 export type AgentKind = string | null;
 export type RoundLabel = string | null;
+export type ExecutionId = string;
+export type AgentKind1 = string;
+export type RoundLabel1 = string;
+export type Stage = string;
+export type Attempt = number | null;
+export type Assignment = string;
+export type StartedAt = string;
+export type Kind = "agent_execution_activity_changed";
+export type Mode1 = "thinking" | "responding" | "tool" | "waiting";
+export type Summary1 = string;
+export type Tool = string | null;
+export type ActiveExecutions = ActiveAgentExecution[];
 export type ProtocolVersion12 = 1;
 export type Sequence1 = number;
 export type RunId1 = string;
@@ -108,6 +120,9 @@ export type EventType =
   | "control"
   | "invocation_started"
   | "invocation_finished"
+  | "agent_execution_started"
+  | "agent_execution_activity_changed"
+  | "agent_execution_finished"
   | "phase_started"
   | "phase_finished"
   | "agent_output_chunk"
@@ -123,15 +138,20 @@ export type EventType =
   | "todo_update"
   | "usage_update";
 export type Text2 = string;
-export type EventStatus = "active" | "answered" | "pending" | "consumed" | "completed" | "failed";
-export type RoundLabel1 = string | null;
-export type AgentKind1 = string | null;
+export type EventStatus =
+  "active" | "answered" | "pending" | "consumed" | "completed" | "failed" | "cancelled" | "interrupted";
+export type RoundLabel2 = string | null;
+export type AgentKind2 = string | null;
 export type InvocationId = string | null;
+export type ExecutionId1 = string | null;
 export type Data =
   | (
       | ChatData
       | InvocationStartedData
       | InvocationFinishedData
+      | AgentExecutionStartedData
+      | AgentExecutionActivityData
+      | AgentExecutionFinishedData
       | OutputData
       | ServerReadyData
       | RunStartedData
@@ -150,38 +170,45 @@ export type Data =
       | UsageUpdateData
     )
   | null;
-export type Kind = "chat";
+export type Kind1 = "chat";
 export type Answer1 = string;
-export type Kind1 = "invocation_started";
+export type Kind2 = "invocation_started";
 export type SystemPrompt = string;
 export type UserPrompt = string;
-export type Kind2 = "invocation_finished";
+export type Kind3 = "invocation_finished";
 export type Error1 = string | null;
-export type Kind3 = "output";
+export type Kind4 = "agent_execution_started";
+export type Stage1 = string;
+export type Attempt1 = number | null;
+export type SystemPrompt1 = string;
+export type UserPrompt1 = string;
+export type Kind5 = "agent_execution_finished";
+export type Error2 = string | null;
+export type Kind6 = "output";
 export type Stream = "stdout" | "stderr";
 export type Source = string;
 export type Content = string;
-export type Kind4 = "server_ready";
+export type Kind7 = "server_ready";
 export type SocketProtocol = "jsonl";
-export type Kind5 = "run_started";
+export type Kind8 = "run_started";
 export type OuterLoop = string;
 export type Input = string;
 export type MaxRounds = number;
-export type Kind6 = "run_interrupted";
+export type Kind9 = "run_interrupted";
 export type Reason = string;
 export type Signal = string | null;
-export type Kind7 = "experiments_changed";
+export type Kind10 = "experiments_changed";
 export type Reason1 = "project_attached" | "active_hypothesis_changed" | "round_persisted";
-export type Kind8 = "configuration_failed";
+export type Kind11 = "configuration_failed";
 export type Code1 = string;
-export type Stage = string;
+export type Stage2 = string;
 export type Message = string;
 export type Usage = string | null;
 export type ExitCode = number;
-export type Kind9 = "phase";
+export type Kind12 = "phase";
 export type Phase = string;
-export type Attempt = number | null;
-export type Kind10 = "agent_output_chunk";
+export type Attempt2 = number | null;
+export type Kind13 = "agent_output_chunk";
 export type Channel = "assistant" | "analysis" | "tool" | "diagnostic" | "prompt";
 export type Content1 = string;
 export type Progress = string | null;
@@ -189,37 +216,37 @@ export type AgentLabel = string | null;
 export type ElapsedSeconds = number;
 export type InputTokens = number;
 export type ContextWindow = number | null;
-export type Kind11 = "subprocess_output";
+export type Kind14 = "subprocess_output";
 export type ProcessId = string;
 export type ProcessKind = string;
 export type Stream1 = "stdout" | "stderr";
 export type Content2 = string;
-export type Kind12 = "judge_result";
+export type Kind15 = "judge_result";
 export type Verdict = "pass" | "fail";
 export type Feedback = string;
-export type Attempt1 = number;
-export type Kind13 = "benchmark_result";
+export type Attempt3 = number;
+export type Kind16 = "benchmark_result";
 export type Metric = string;
 export type Value = number;
 export type Unit = string;
-export type Kind14 = "round_finished";
+export type Kind17 = "round_finished";
 export type Attempts = number;
 export type JudgeVerdict = "pass" | "fail" | "skipped";
 export type PerfMetric = number | null;
 export type PerfUnit = string | null;
-export type Kind15 = "tool_call";
-export type Tool = string;
-export type CallId = string | null;
-export type Kind16 = "tool_result";
+export type Kind18 = "tool_call";
 export type Tool1 = string;
+export type CallId = string | null;
+export type Kind19 = "tool_result";
+export type Tool2 = string;
 export type CallId1 = string | null;
 export type Content3 = string;
 export type IsError = boolean;
-export type Kind17 = "todo_update";
+export type Kind20 = "todo_update";
 export type Content4 = string;
 export type Status2 = string;
 export type Todos = TodoItemData[];
-export type Kind18 = "usage_update";
+export type Kind21 = "usage_update";
 export type InputTokens1 = number;
 export type ContextWindow1 = number | null;
 export type Model = string | null;
@@ -263,6 +290,8 @@ export type LatestSequence = number;
 export type Type11 = "event";
 export type Type12 = "event_batch";
 export type Events1 = RunEvent[];
+export type ThroughSequence = number;
+export type ActiveExecutions1 = ActiveAgentExecution[];
 export type Type13 = "protocol_error";
 export type RequestId12 = string | null;
 export type Code2 = string;
@@ -391,6 +420,30 @@ export interface RunSnapshot {
   status: Status1;
   agent_kind?: AgentKind;
   round_label?: RoundLabel;
+  active_executions?: ActiveExecutions;
+}
+/**
+ * Authoritative activity checkpoint for one running agent execution.
+ */
+export interface ActiveAgentExecution {
+  execution_id: ExecutionId;
+  agent_kind: AgentKind1;
+  round_label: RoundLabel1;
+  stage: Stage;
+  attempt?: Attempt;
+  assignment: Assignment;
+  started_at: StartedAt;
+  activity: AgentExecutionActivityData;
+}
+/**
+ * Complete current activity for an active agent execution.
+ */
+export interface AgentExecutionActivityData {
+  kind?: Kind;
+  mode: Mode1;
+  summary: Summary1;
+  tool?: Tool;
+  [k: string]: unknown;
 }
 /**
  * One reproducible human, control, or invocation event.
@@ -404,24 +457,25 @@ export interface RunEvent {
   text?: Text2;
   diagnostic?: Diagnostic | null;
   status?: EventStatus | null;
-  round_label?: RoundLabel1;
-  agent_kind?: AgentKind1;
+  round_label?: RoundLabel2;
+  agent_kind?: AgentKind2;
   invocation_id?: InvocationId;
+  execution_id?: ExecutionId1;
   data?: Data;
 }
 export interface ChatData {
-  kind?: Kind;
+  kind?: Kind1;
   answer: Answer1;
   [k: string]: unknown;
 }
 export interface InvocationStartedData {
-  kind?: Kind1;
+  kind?: Kind2;
   system_prompt: SystemPrompt;
   user_prompt: UserPrompt;
   [k: string]: unknown;
 }
 export interface InvocationFinishedData {
-  kind?: Kind2;
+  kind?: Kind3;
   result?: Result;
   error?: Error1;
   [k: string]: unknown;
@@ -429,53 +483,77 @@ export interface InvocationFinishedData {
 export interface Result {
   [k: string]: unknown;
 }
+/**
+ * Semantic context for one prompt-to-result agent execution.
+ */
+export interface AgentExecutionStartedData {
+  kind?: Kind4;
+  stage: Stage1;
+  attempt?: Attempt1;
+  system_prompt?: SystemPrompt1;
+  user_prompt?: UserPrompt1;
+  activity: AgentExecutionActivityData;
+  [k: string]: unknown;
+}
+/**
+ * Terminal result for one agent execution.
+ */
+export interface AgentExecutionFinishedData {
+  kind?: Kind5;
+  result?: Result1;
+  error?: Error2;
+  [k: string]: unknown;
+}
+export interface Result1 {
+  [k: string]: unknown;
+}
 export interface OutputData {
-  kind?: Kind3;
+  kind?: Kind6;
   stream: Stream;
   source?: Source;
   content: Content;
   [k: string]: unknown;
 }
 export interface ServerReadyData {
-  kind?: Kind4;
+  kind?: Kind7;
   socket_protocol?: SocketProtocol;
   [k: string]: unknown;
 }
 export interface RunStartedData {
-  kind?: Kind5;
+  kind?: Kind8;
   outer_loop: OuterLoop;
   input: Input;
   max_rounds: MaxRounds;
   [k: string]: unknown;
 }
 export interface RunInterruptedData {
-  kind?: Kind6;
+  kind?: Kind9;
   reason: Reason;
   signal?: Signal;
   [k: string]: unknown;
 }
 export interface ExperimentsChangedData {
-  kind?: Kind7;
+  kind?: Kind10;
   reason: Reason1;
   [k: string]: unknown;
 }
 export interface ConfigurationFailedData {
-  kind?: Kind8;
+  kind?: Kind11;
   code: Code1;
-  stage: Stage;
+  stage: Stage2;
   message: Message;
   usage?: Usage;
   exit_code: ExitCode;
   [k: string]: unknown;
 }
 export interface PhaseData {
-  kind?: Kind9;
+  kind?: Kind12;
   phase: Phase;
-  attempt?: Attempt;
+  attempt?: Attempt2;
   [k: string]: unknown;
 }
 export interface AgentOutputChunkData {
-  kind?: Kind10;
+  kind?: Kind13;
   channel: Channel;
   content: Content1;
   status?: AgentStatusData | null;
@@ -497,7 +575,7 @@ export interface AgentStatusData {
   [k: string]: unknown;
 }
 export interface SubprocessOutputData {
-  kind?: Kind11;
+  kind?: Kind14;
   process_id: ProcessId;
   process_kind: ProcessKind;
   stream: Stream1;
@@ -505,21 +583,21 @@ export interface SubprocessOutputData {
   [k: string]: unknown;
 }
 export interface JudgeResultData {
-  kind?: Kind12;
+  kind?: Kind15;
   verdict: Verdict;
   feedback: Feedback;
-  attempt: Attempt1;
+  attempt: Attempt3;
   [k: string]: unknown;
 }
 export interface BenchmarkResultData {
-  kind?: Kind13;
+  kind?: Kind16;
   metric: Metric;
   value: Value;
   unit: Unit;
   [k: string]: unknown;
 }
 export interface RoundFinishedData {
-  kind?: Kind14;
+  kind?: Kind17;
   attempts: Attempts;
   judge_verdict: JudgeVerdict;
   perf_metric?: PerfMetric;
@@ -527,8 +605,8 @@ export interface RoundFinishedData {
   [k: string]: unknown;
 }
 export interface ToolCallData {
-  kind?: Kind15;
-  tool: Tool;
+  kind?: Kind18;
+  tool: Tool1;
   call_id?: CallId;
   args?: Args;
   status?: AgentStatusData | null;
@@ -538,15 +616,15 @@ export interface Args {
   [k: string]: unknown;
 }
 export interface ToolResultData {
-  kind?: Kind16;
-  tool: Tool1;
+  kind?: Kind19;
+  tool: Tool2;
   call_id?: CallId1;
   content: Content3;
   is_error?: IsError;
   [k: string]: unknown;
 }
 export interface TodoUpdateData {
-  kind?: Kind17;
+  kind?: Kind20;
   todos?: Todos;
   [k: string]: unknown;
 }
@@ -556,7 +634,7 @@ export interface TodoItemData {
   [k: string]: unknown;
 }
 export interface UsageUpdateData {
-  kind?: Kind18;
+  kind?: Kind21;
   input_tokens: InputTokens1;
   context_window?: ContextWindow1;
   model?: Model;
@@ -620,6 +698,8 @@ export interface EventMessage {
 export interface EventBatchMessage {
   type?: Type12;
   events: Events1;
+  through_sequence?: ThroughSequence;
+  active_executions?: ActiveExecutions1;
 }
 export interface ProtocolErrorMessage {
   type?: Type13;

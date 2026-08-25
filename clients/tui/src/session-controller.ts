@@ -3,6 +3,7 @@ import {helpText, parseInput} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
 import {
+  applyActiveExecutionCheckpoint,
   applyEvent,
   applySnapshot,
   type ConversationEntry,
@@ -151,12 +152,14 @@ export class SocketSessionController implements SessionController {
           // closing afterward is lifecycle cleanup, not a second failure that
           // should replace the useful diagnostic in the banner.
           if (!this.#state.terminal && !this.#streamProtocolError) {
-            this.#setState(reportCaughtError(this.#state, error, 'transport'));
+            this.#setState(
+              reportCaughtError({...this.#state, activeExecutions: {}}, error, 'transport'),
+            );
           }
         },
       );
     } catch (error) {
-      this.#setState(reportCaughtError(this.#state, error, 'transport'));
+      this.#setState(reportCaughtError({...this.#state, activeExecutions: {}}, error, 'transport'));
     }
   }
 
@@ -553,6 +556,16 @@ export class SocketSessionController implements SessionController {
     if (message.type === 'event_batch') {
       let state = this.#state;
       for (const event of message.events) state = applyEvent(state, event);
+      // Replay first, then reconcile with the checkpoint captured at the
+      // batch's watermark. This closes dangling starts from interrupted logs
+      // without letting the replay overwrite authoritative live state.
+      if (message.active_executions !== undefined) {
+        state = applyActiveExecutionCheckpoint(
+          state,
+          message.active_executions,
+          message.through_sequence,
+        );
+      }
       this.#setState(state);
       this.#refreshExperimentsFor(message.events);
       this.#refreshPaneFor(message.events);
@@ -560,7 +573,7 @@ export class SocketSessionController implements SessionController {
     if (message.type === 'protocol_error') {
       this.#streamProtocolError = true;
       this.#setState(
-        reportError(this.#state, message.message, {
+        reportError({...this.#state, activeExecutions: {}}, message.message, {
           scope: 'protocol',
           diagnostic: message.diagnostic ?? null,
         }),

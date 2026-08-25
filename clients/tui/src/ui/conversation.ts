@@ -7,7 +7,7 @@ import {
 } from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
 import type {ConversationEntry, SessionState} from '../session-model.js';
-import {visibleConversation, visiblePhases} from '../session-model.js';
+import {visibleConversation} from '../session-model.js';
 import {promptPreview, toolOutputPreview} from './previews.js';
 import {entryPalette} from './styles.js';
 import type {Theme} from './theme.js';
@@ -16,12 +16,9 @@ export interface ConversationViewOptions {
   selectConversation?: (state: SessionState) => ConversationEntry[];
   emptyContent?: string;
   renderMarkdown?: boolean;
-  /** Whether this view draws the entry cursor and the working marker. */
+  /** Whether this view draws the entry cursor. */
   showsSelection?: boolean;
 }
-
-/** Braille dots: one cell wide in every terminal, unlike a spinner of glyphs. */
-const WORKING_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 export class ConversationView {
   readonly output: BoxRenderable;
@@ -35,12 +32,7 @@ export class ConversationView {
   #renderedConversation: ConversationEntry[] = [];
   #renderedCards: BoxRenderable[] = [];
   #renderedSelection: string | null = null;
-  #renderedPending = false;
   #selectedId: string | null = null;
-  /** True while the run is still producing output for the last entry. */
-  #pending = false;
-  #workingFrame = 0;
-  #workingTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
@@ -55,46 +47,30 @@ export class ConversationView {
     this.#emptyContent = options.emptyContent ?? 'Waiting for run events…';
     this.#renderMarkdown = options.renderMarkdown ?? true;
     this.#showsSelection = options.showsSelection ?? false;
+    // The bordered surface owns horizontal inset so transcript siblings, such
+    // as a fixed footer, share the same content origin as these turn cards.
     this.output = new BoxRenderable(renderer, {
       id: 'output',
       width: '100%',
       flexDirection: 'column',
-      paddingLeft: 1,
-      paddingRight: 1,
     });
   }
 
   render(state: SessionState): void {
     const selection = this.#selectionFor(state);
-    const pending = this.#pendingFor(state);
-    if (selection !== this.#renderedSelection || pending !== this.#renderedPending) {
-      // The cursor and the working marker are drawn into the cards, so a change
-      // to either has to redraw them even when the entries are identical.
+    if (selection !== this.#renderedSelection) {
+      // The cursor is drawn into the cards, so a change has to redraw them even
+      // when the entries are identical.
       this.#renderedConversation = [];
       this.#renderedSelection = selection;
-      this.#renderedPending = pending;
     }
     this.#selectedId = selection;
-    this.#pending = pending;
     this.#renderConversation(this.#selectConversation(state));
-    this.#syncWorkingTimer();
   }
 
   /** The transcript owns the entry cursor; the chat panes never show one. */
   #selectionFor(state: SessionState): string | null {
     return this.#showsSelection ? state.selectedEntryId : null;
-  }
-
-  /**
-   * An agent that has started and not finished is still working, so its last
-   * entry carries a marker. Read from the phases rather than from the text, so
-   * it clears the moment the phase does.
-   */
-  #pendingFor(state: SessionState): boolean {
-    // Only the round transcript carries it: in the chat the marker sat on the
-    // answer, where an agent's phase says nothing about the reply.
-    if (!this.#showsSelection) return false;
-    return visiblePhases(state).some(phase => phase.status === 'active');
   }
 
   /**
@@ -113,37 +89,6 @@ export class ConversationView {
     if (this.#selectedId === null) return null;
     const index = this.#renderedConversation.findIndex(entry => entry.id === this.#selectedId);
     return index === -1 ? null : (this.#renderedCards[index] ?? null);
-  }
-
-  /**
-   * The marker animates on its own clock: nothing else about the transcript
-   * changes between frames, so redrawing the whole view would be waste.
-   */
-  #syncWorkingTimer(): void {
-    if (!this.#pending) {
-      this.#stopWorkingTimer();
-      return;
-    }
-    if (this.#workingTimer !== null) return;
-    this.#workingTimer = setInterval(() => {
-      this.#workingFrame = (this.#workingFrame + 1) % WORKING_FRAMES.length;
-      const card = this.#renderedCards.at(-1);
-      const heading = card?.getChildren()[0];
-      const marker = heading?.getChildren()[1];
-      if (marker instanceof TextRenderable) {
-        marker.content = ` ${WORKING_FRAMES[this.#workingFrame]} Working `;
-      }
-    }, 120);
-  }
-
-  #stopWorkingTimer(): void {
-    if (this.#workingTimer === null) return;
-    clearInterval(this.#workingTimer);
-    this.#workingTimer = null;
-  }
-
-  destroy(): void {
-    this.#stopWorkingTimer();
   }
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
@@ -176,7 +121,7 @@ export class ConversationView {
       return;
     if (isEntryPrefix(this.#renderedConversation, entries)) {
       for (const entry of entries.slice(this.#renderedConversation.length)) {
-        const card = this.#renderEntry(entry, entry === entries.at(-1));
+        const card = this.#renderEntry(entry);
         this.output.add(card);
         this.#renderedCards.push(card);
       }
@@ -190,7 +135,7 @@ export class ConversationView {
       if (previousCard !== undefined && entry !== undefined) {
         this.output.remove(previousCard);
         previousCard.destroyRecursively();
-        const card = this.#renderEntry(entry, changedIndex === entries.length - 1);
+        const card = this.#renderEntry(entry);
         this.output.add(card, changedIndex);
         this.#renderedCards[changedIndex] = card;
         this.#renderedConversation = entries;
@@ -208,7 +153,7 @@ export class ConversationView {
       return;
     }
     for (const entry of entries) {
-      const card = this.#renderEntry(entry, entry === entries.at(-1));
+      const card = this.#renderEntry(entry);
       this.output.add(card);
       this.#renderedCards.push(card);
     }
@@ -221,7 +166,7 @@ export class ConversationView {
     this.#renderConversation(this.#selectConversation(this.controller.state));
   }
 
-  #renderEntry(entry: ConversationEntry, isLast = false): BoxRenderable {
+  #renderEntry(entry: ConversationEntry): BoxRenderable {
     const palette = entryPalette(entry, this.#theme);
     const selected = this.#selectedId === entry.id;
     const card = new BoxRenderable(this.renderer, {
@@ -262,18 +207,6 @@ export class ConversationView {
         height: 1,
       }),
     );
-    // The last entry of an agent that is still running gets a marker, so a
-    // transcript that has paused mid-turn is told apart from one that is done.
-    if (isLast && this.#pending) {
-      heading.add(
-        new TextRenderable(this.renderer, {
-          content: ` ${WORKING_FRAMES[this.#workingFrame]} Working `,
-          fg: this.#theme.canvas,
-          bg: this.#theme.success,
-          height: 1,
-        }),
-      );
-    }
     card.add(heading);
     if (
       this.#renderMarkdown &&

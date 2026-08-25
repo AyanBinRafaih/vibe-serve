@@ -7,6 +7,7 @@ import {
   stripRounds,
   visibleRoundNumber,
 } from '../session-model.js';
+import {ActivityBarView} from './activity-bar.js';
 import {AgentMapView} from './agent-map.js';
 import {ChatOverlayView} from './chat-overlay.js';
 import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
@@ -76,13 +77,21 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     fg: theme.accent,
     content: 'VibeSys · connecting',
   });
-  const viewport = new ScrollBoxRenderable(renderer, {
+  const transcriptFrame = new BoxRenderable(renderer, {
     id: 'viewport',
     width: 'auto',
     flexGrow: 1,
+    flexDirection: 'column',
+    paddingLeft: 1,
+    paddingRight: 1,
     border: true,
     borderStyle: 'rounded',
     borderColor: theme.border,
+  });
+  const viewport = new ScrollBoxRenderable(renderer, {
+    id: 'transcript-scroll',
+    width: '100%',
+    flexGrow: 1,
     stickyScroll: true,
     stickyStart: 'bottom',
     viewportCulling: true,
@@ -105,6 +114,8 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   const todoStrip = new TodoStripView(renderer, controller, theme);
   const errorBanner = new ErrorBannerView(renderer, theme);
   const agentMap = new AgentMapView(renderer, controller, theme);
+  const globalActivityBar = new ActivityBarView(renderer, theme, 'global-activity-bar');
+  const conversationActivityBar = new ActivityBarView(renderer, theme, 'conversation-activity-bar');
   const overlay = new OverlayView(renderer, theme);
   const experimentLog = new ExperimentLogView(renderer, controller, theme);
   const rightPane = new RightPaneView(renderer, theme);
@@ -164,11 +175,16 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   // request, the transcript decides which prompt it applies to.
   controller.onTogglePrompt(() => conversation.toggleLatestPrompt());
   viewport.add(conversation.output);
+  transcriptFrame.add(viewport);
+  // The frame owns the shared horizontal inset for both turn cards and the
+  // fixed activity row. Activity stays outside scrolling content, so a new
+  // turn can change scroll height without moving the line.
+  transcriptFrame.add(conversationActivityBar.output);
   main.add(agentMap.output);
   // The chat is the leftmost column of the landing view, so it is added before
   // the surfaces it sits beside.
   main.add(chatPane.output);
-  main.add(viewport);
+  main.add(transcriptFrame);
   // The log lives in the main pane rather than floating over it: it is the
   // landing view, not a dialog.
   main.add(experimentLog.output);
@@ -187,6 +203,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   root.add(roundStrip.output);
   root.add(main);
   root.add(todoStrip.output);
+  root.add(globalActivityBar.output);
   root.add(bottom);
   root.add(overlay.output);
   root.add(themePicker.output);
@@ -201,12 +218,14 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     markdownStyle = createMarkdownStyle(theme);
     root.backgroundColor = theme.canvas;
     header.fg = theme.accent;
-    viewport.borderColor = theme.border;
+    transcriptFrame.borderColor = theme.border;
     help.fg = theme.textSubtle;
     roundStrip.applyTheme(theme);
     todoStrip.applyTheme(theme);
     errorBanner.applyTheme(theme);
     agentMap.applyTheme(theme);
+    globalActivityBar.applyTheme(theme);
+    conversationActivityBar.applyTheme(theme);
     overlay.applyTheme(theme);
     experimentLog.applyTheme(theme);
     rightPane.applyTheme(theme);
@@ -267,7 +286,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     // The round strip and agent map are per-round detail. They belong to a
     // hypothesis trajectory, not to the list of claims.
     agentMap.output.visible = !showLog;
-    viewport.visible = !showLog;
+    transcriptFrame.visible = !showLog;
     roundStrip.output.visible = !showLog;
     todoStrip.output.visible = !showLog;
     if (!showLog) {
@@ -292,7 +311,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     const transcriptFocused = showLog
       ? showSplit && state.layout.focus === 'left'
       : state.roundFocus === 'transcript';
-    viewport.borderColor = transcriptFocused ? theme.borderFocus : theme.border;
+    transcriptFrame.borderColor = transcriptFocused ? theme.borderFocus : theme.border;
     // Match the chat to the left pane's rectangle so it sits beside the
     // visualization instead of over it. Bounds come from the siblings that
     // actually occupy those rows, so a taller todo strip still fits.
@@ -334,6 +353,8 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     );
     themePicker.render(state);
     chat.render(state);
+    globalActivityBar.render(state, 'global', showLog);
+    conversationActivityBar.render(state, 'conversation', !showLog);
     // One cursor, three places it can be. The modal owns it while it is open;
     // otherwise it belongs to whichever input the pane focus points at.
     const target: FocusTarget = state.chatOpen ? 'modal' : chatInputFocused ? 'chat' : 'command';
@@ -380,7 +401,8 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
       input.destroy();
       chatInput.destroy();
       chat.destroy();
-      conversation.destroy();
+      globalActivityBar.destroy();
+      conversationActivityBar.destroy();
       roundStrip.destroy();
       agentMap.destroy();
       experimentLog.destroy();

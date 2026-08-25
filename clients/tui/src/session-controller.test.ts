@@ -48,6 +48,46 @@ describe('session controller', () => {
     expect(transport.closed).toBe(true);
   });
 
+  it('applies a replay batch before reconciling its active execution checkpoint', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emit({
+      type: 'event_batch',
+      events: [
+        {
+          sequence: 1,
+          timestamp: '2026-01-01T00:00:00Z',
+          type: 'agent_execution_started',
+          execution_id: 'stale-execution',
+          agent_kind: 'implementer',
+          round_label: 'round-1-implementer',
+          data: {
+            kind: 'agent_execution_started',
+            stage: 'implementation',
+            attempt: 1,
+            system_prompt: '',
+            user_prompt: 'Implement the queue',
+            activity: {
+              kind: 'agent_execution_activity_changed',
+              mode: 'thinking',
+              summary: 'Inspecting the queue',
+              tool: null,
+            },
+          },
+        },
+        event(2, 'agent_output_chunk', 'persisted output\n'),
+      ],
+      through_sequence: 2,
+      active_executions: [],
+    });
+
+    expect(controller.state.sequence).toBe(2);
+    expect(controller.state.conversation.at(-1)?.content).toBe('persisted output\n');
+    expect(controller.state.activeExecutions).toEqual({});
+  });
+
   it('keeps terminal state when the stream closes after completion', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
@@ -58,6 +98,42 @@ describe('session controller', () => {
     expect(controller.state.status).toBe('completed');
     expect(controller.state.overlay).toBeNull();
     expect(controller.state.errorBanner).toBeNull();
+  });
+
+  it('clears active executions when the event stream disconnects unexpectedly', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emit({
+      type: 'event',
+      event: {
+        sequence: 1,
+        timestamp: '2026-01-01T00:00:00Z',
+        type: 'agent_execution_started',
+        execution_id: 'impl-1',
+        agent_kind: 'implementer',
+        round_label: 'round-1-implementer',
+        data: {
+          kind: 'agent_execution_started',
+          stage: 'implementation',
+          attempt: 1,
+          system_prompt: '',
+          user_prompt: 'Implement the queue',
+          activity: {
+            kind: 'agent_execution_activity_changed',
+            mode: 'thinking',
+            summary: 'Inspecting the queue',
+            tool: null,
+          },
+        },
+      },
+    });
+    expect(controller.state.activeExecutions['impl-1']).toBeDefined();
+
+    transport.disconnect(new Error('Supervision event stream disconnected'));
+
+    expect(controller.state.activeExecutions).toEqual({});
+    expect(controller.state.errorBanner).toMatchObject({scope: 'transport'});
   });
 
   it('prefers structured response and protocol diagnostics over legacy messages', async () => {

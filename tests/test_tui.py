@@ -111,7 +111,7 @@ def test_chat_is_audited_but_not_injected(tmp_path):  # noqa: ANN001, ANN201  # 
     supervisor.record(EventType.CHAT, "What is happening?", status="answered")
     supervisor.before_agent("judge", "round 2", "original prompt")
     started = next(
-        event for event in supervisor.read_events() if event.type == "invocation_started"
+        event for event in supervisor.read_events() if event.type == "agent_execution_started"
     )
     assert started.data.user_prompt == "original prompt"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
     event_types = [event["type"] for event in _events(tmp_path / "run-events.jsonl")]
@@ -146,7 +146,7 @@ def test_steer_injects_into_next_invocation(tmp_path):  # noqa: ANN001, ANN201  
     assert "Do the work" in effective
     assert "focus on the KV cache" in effective
     assert "Operator steering" in effective
-    started = next(e for e in supervisor.read_events() if e.type == "invocation_started")
+    started = next(e for e in supervisor.read_events() if e.type == "agent_execution_started")
     assert started.data.user_prompt == effective  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
     # Steering is one-shot: a later invocation without a new /steer is unchanged.
     supervisor.after_agent("implementer", "round 1")
@@ -397,7 +397,7 @@ def test_chat_reports_structured_failed_invocation(tmp_path):  # noqa: ANN001, A
     supervisor.before_agent("implementer", "round 5", "prompt")
     supervisor.after_agent("implementer", "round 5", error=RuntimeError("agent process exited"))
     answer = supervisor.chat("why did the agent fail?")
-    assert "Latest failed agent invocation" in answer
+    assert "Latest failed agent execution" in answer
     assert "agent process exited" in answer
 
 
@@ -409,28 +409,28 @@ def test_failure_events_share_and_promote_a_human_facing_diagnostic(tmp_path):  
     supervisor.after_agent("implementer", "round 5", error=error)
     supervisor.finish(error)
 
-    invocation, phase, terminal = [
+    execution, phase, terminal = [
         event
         for event in supervisor.read_events()
         if event.type
         in {
-            EventType.INVOCATION_FINISHED,
+            EventType.AGENT_EXECUTION_FINISHED,
             EventType.PHASE_FINISHED,
             EventType.RUN_FAILED,
         }
     ]
-    assert invocation.diagnostic is not None
-    assert phase.diagnostic == invocation.diagnostic
+    assert execution.diagnostic is not None
+    assert phase.diagnostic == execution.diagnostic
     assert terminal.diagnostic is not None
-    assert terminal.diagnostic.id == invocation.diagnostic.id
+    assert terminal.diagnostic.id == execution.diagnostic.id
     assert terminal.diagnostic.scope is DiagnosticScope.INVOCATION
-    assert terminal.diagnostic.summary == invocation.diagnostic.summary
-    assert terminal.diagnostic.detail == invocation.diagnostic.detail
-    assert invocation.diagnostic.severity is DiagnosticSeverity.ERROR
+    assert terminal.diagnostic.summary == execution.diagnostic.summary
+    assert terminal.diagnostic.detail == execution.diagnostic.detail
+    assert execution.diagnostic.severity is DiagnosticSeverity.ERROR
     assert terminal.diagnostic.severity is DiagnosticSeverity.FATAL
     assert terminal.diagnostic.retryability is DiagnosticRetryability.UNKNOWN
-    assert invocation.data.error == "Agent invocation failed"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
-    assert terminal.text == "Agent invocation failed"
+    assert execution.data.error == "Agent execution failed"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert terminal.text == "Agent execution failed"
     assert terminal.diagnostic.detail == "RuntimeError: token=[REDACTED] agent process exited"
     assert "RuntimeError(" not in terminal.text
 
@@ -589,14 +589,14 @@ def test_terminal_wrapper_reuses_an_invocation_diagnostic(tmp_path):  # noqa: AN
     wrapper.__cause__ = cause
     supervisor.finish(wrapper)
 
-    invocation, terminal = [
+    execution, terminal = [
         event
         for event in supervisor.read_events()
-        if event.type in {EventType.INVOCATION_FINISHED, EventType.RUN_FAILED}
+        if event.type in {EventType.AGENT_EXECUTION_FINISHED, EventType.RUN_FAILED}
     ]
-    assert invocation.diagnostic is not None
+    assert execution.diagnostic is not None
     assert terminal.diagnostic is not None
-    assert terminal.diagnostic.id == invocation.diagnostic.id
+    assert terminal.diagnostic.id == execution.diagnostic.id
     assert terminal.diagnostic.detail == (
         "RuntimeError: run cleanup failed <- RuntimeError: token=[REDACTED] agent process exited"
     )
@@ -864,7 +864,7 @@ def test_socket_subscription_reports_structured_stream_failures(tmp_path, monkey
         del after_sequence
         raise RuntimeError("event store is unavailable")  # noqa: TRY003  # tracked: #288
 
-    monkeypatch.setattr(service, "events", fail_replay)
+    monkeypatch.setattr(service, "subscription_checkpoint", fail_replay)
     with SupervisionSocketServer(socket_path, service):  # noqa: SIM117  # tracked: #288
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(2)

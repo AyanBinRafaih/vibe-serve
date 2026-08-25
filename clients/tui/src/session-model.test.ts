@@ -2,6 +2,7 @@ import {describe, expect, it, test} from 'bun:test';
 import type {RunEvent} from './protocol.js';
 import type {SessionState} from './session-model.js';
 import {
+  applyActiveExecutionCheckpoint,
   applyEvent,
   chatDocked,
   chatPaneVisible,
@@ -206,6 +207,197 @@ describe('unowned rounds', () => {
 });
 
 describe('session event model', () => {
+  it('tracks concurrent agent executions independently through activity and finish events', () => {
+    let state = initialSessionState();
+    state = applyEvent(
+      state,
+      executionEvent(
+        1,
+        'agent_execution_started',
+        'impl-1',
+        {
+          kind: 'agent_execution_started',
+          stage: 'implementation',
+          attempt: 1,
+          system_prompt: '',
+          user_prompt: 'Implement the queue',
+          activity: {
+            kind: 'agent_execution_activity_changed',
+            mode: 'thinking',
+            summary: 'Inspecting the queue',
+            tool: null,
+          },
+        },
+        'implementer',
+      ),
+    );
+    state = applyEvent(
+      state,
+      executionEvent(
+        2,
+        'agent_execution_started',
+        'review-1',
+        {
+          kind: 'agent_execution_started',
+          stage: 'review',
+          attempt: null,
+          system_prompt: '',
+          user_prompt: 'Review the diff',
+          activity: {
+            kind: 'agent_execution_activity_changed',
+            mode: 'waiting',
+            summary: 'Waiting for the implementation',
+            tool: null,
+          },
+        },
+        'reviewer',
+      ),
+    );
+    state = applyEvent(
+      state,
+      executionEvent(
+        3,
+        'agent_execution_activity_changed',
+        'impl-1',
+        {
+          kind: 'agent_execution_activity_changed',
+          mode: 'tool',
+          summary: 'Running queue tests',
+          tool: 'Bash',
+        },
+        'implementer',
+      ),
+    );
+
+    expect(Object.keys(state.activeExecutions)).toEqual(['impl-1', 'review-1']);
+    expect(state.activeExecutions['impl-1']?.activity).toEqual({
+      mode: 'tool',
+      summary: 'Running queue tests',
+      tool: 'Bash',
+    });
+    expect(state.activeExecutions['review-1']?.activity.summary).toBe(
+      'Waiting for the implementation',
+    );
+
+    state = applyEvent(
+      state,
+      executionEvent(
+        4,
+        'agent_execution_finished',
+        'impl-1',
+        {
+          kind: 'agent_execution_finished',
+          error: null,
+        },
+        'implementer',
+      ),
+    );
+    expect(Object.keys(state.activeExecutions)).toEqual(['review-1']);
+  });
+
+  it('reconciles from a checkpoint without advancing the replay cursor', () => {
+    const state = applyActiveExecutionCheckpoint(initialSessionState(), [
+      {
+        execution_id: 'judge-2',
+        agent_kind: 'judge',
+        round_label: 'round-2-judge',
+        stage: 'evaluation',
+        attempt: 1,
+        assignment: 'Evaluate the candidate',
+        started_at: '2026-01-01T00:00:00Z',
+        activity: {
+          kind: 'agent_execution_activity_changed',
+          mode: 'thinking',
+          summary: 'Inspecting the diff',
+          tool: null,
+        },
+      },
+    ]);
+
+    expect(state.sequence).toBe(0);
+    expect(state.activeExecutions['judge-2']).toMatchObject({
+      agentKind: 'judge',
+      roundNumber: 2,
+      activity: {summary: 'Inspecting the diff'},
+    });
+
+    const newer = {...state, sequence: 5};
+    expect(applyActiveExecutionCheckpoint(newer, [], 4).activeExecutions).toEqual(
+      state.activeExecutions,
+    );
+  });
+
+  it('clears every active execution when the run is interrupted', () => {
+    const active = applyEvent(
+      initialSessionState(),
+      executionEvent(
+        1,
+        'agent_execution_started',
+        'impl-1',
+        {
+          kind: 'agent_execution_started',
+          stage: 'implementation',
+          attempt: 1,
+          system_prompt: '',
+          user_prompt: 'Implement the queue',
+          activity: {
+            kind: 'agent_execution_activity_changed',
+            mode: 'thinking',
+            summary: 'Inspecting the queue',
+            tool: null,
+          },
+        },
+        'implementer',
+      ),
+    );
+    const interrupted = applyEvent(active, {
+      sequence: 2,
+      timestamp: '2026-01-01T00:00:01Z',
+      type: 'run_interrupted',
+      data: {kind: 'run_interrupted', reason: 'SIGINT', signal: 'SIGINT'},
+    });
+
+    expect(interrupted.activeExecutions).toEqual({});
+  });
+
+  it('tracks and finishes chat executions before routing their transcript', () => {
+    let state = applyEvent(
+      initialSessionState(),
+      executionEvent(
+        1,
+        'agent_execution_started',
+        'chat-execution',
+        {
+          kind: 'agent_execution_started',
+          stage: 'chat',
+          attempt: null,
+          system_prompt: '',
+          user_prompt: 'What is running?',
+          activity: {
+            kind: 'agent_execution_activity_changed',
+            mode: 'thinking',
+            summary: 'Inspecting the run',
+            tool: null,
+          },
+        },
+        'chat',
+      ),
+    );
+
+    expect(state.activeExecutions['chat-execution']?.activity.summary).toBe('Inspecting the run');
+    state = applyEvent(
+      state,
+      executionEvent(
+        2,
+        'agent_execution_finished',
+        'chat-execution',
+        {kind: 'agent_execution_finished', error: null},
+        'chat',
+      ),
+    );
+    expect(state.activeExecutions).toEqual({});
+  });
+
   it('reduces semantic events into a presentation-neutral transcript', () => {
     let state = initialSessionState();
     state = applyEvent(
@@ -691,6 +883,7 @@ describe('session event model', () => {
 
     expect(state.todoPhases).toEqual([
       {
+        executionId: null,
         agentKind: 'judge',
         roundNumber: 1,
         items: [
@@ -737,6 +930,42 @@ describe('session event model', () => {
     // Selecting only a round shows the round's most recently updated list.
     const withRound = {...state, selectedRound: 1};
     expect(visibleTodos(withRound)).toEqual([{content: 'Check behavior', status: 'pending'}]);
+  });
+
+  it('keeps todos separate for concurrent executions of the same agent role', () => {
+    let state = initialSessionState();
+    state = applyEvent(
+      state,
+      executionEvent(
+        1,
+        'todo_update',
+        'impl-a',
+        {
+          kind: 'todo_update',
+          todos: [{content: 'Edit implementation A', status: 'in_progress'}],
+        },
+        'implementer',
+      ),
+    );
+    state = applyEvent(
+      state,
+      executionEvent(
+        2,
+        'todo_update',
+        'impl-b',
+        {
+          kind: 'todo_update',
+          todos: [{content: 'Edit implementation B', status: 'in_progress'}],
+        },
+        'implementer',
+      ),
+    );
+
+    expect(state.todoPhases).toHaveLength(2);
+    expect(state.todoPhases.map(phase => phase.executionId)).toEqual(['impl-a', 'impl-b']);
+    expect(visibleTodos({...state, selectedRound: 1, selectedAgentKind: 'implementer'})).toEqual([
+      {content: 'Edit implementation B', status: 'in_progress'},
+    ]);
   });
 
   it('hides todos when the active phase has not emitted any', () => {
@@ -1079,6 +1308,24 @@ function event(
     ...(type === 'run_started' ? {} : {agent_kind: 'judge'}),
     ...(invocationId === undefined ? {} : {invocation_id: invocationId}),
     ...(data === undefined ? {} : {data}),
+  };
+}
+
+function executionEvent(
+  sequence: number,
+  type: RunEvent['type'],
+  executionId: string,
+  data: NonNullable<RunEvent['data']>,
+  agentKind: string,
+): RunEvent {
+  return {
+    sequence,
+    timestamp: '2026-01-01T00:00:00Z',
+    type,
+    execution_id: executionId,
+    round_label: 'round-1',
+    agent_kind: agentKind,
+    data,
   };
 }
 

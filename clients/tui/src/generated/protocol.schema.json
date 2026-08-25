@@ -1,5 +1,180 @@
 {
   "$defs": {
+    "ActiveAgentExecution": {
+      "additionalProperties": false,
+      "description": "Authoritative activity checkpoint for one running agent execution.",
+      "properties": {
+        "execution_id": {
+          "title": "Execution Id",
+          "type": "string"
+        },
+        "agent_kind": {
+          "title": "Agent Kind",
+          "type": "string"
+        },
+        "round_label": {
+          "title": "Round Label",
+          "type": "string"
+        },
+        "stage": {
+          "title": "Stage",
+          "type": "string"
+        },
+        "attempt": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempt"
+        },
+        "assignment": {
+          "title": "Assignment",
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        },
+        "activity": {
+          "$ref": "#/$defs/AgentExecutionActivityData"
+        }
+      },
+      "required": [
+        "execution_id",
+        "agent_kind",
+        "round_label",
+        "stage",
+        "assignment",
+        "started_at",
+        "activity"
+      ],
+      "title": "ActiveAgentExecution",
+      "type": "object"
+    },
+    "AgentExecutionActivityData": {
+      "description": "Complete current activity for an active agent execution.",
+      "properties": {
+        "kind": {
+          "const": "agent_execution_activity_changed",
+          "default": "agent_execution_activity_changed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "thinking",
+            "responding",
+            "tool",
+            "waiting"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool"
+        }
+      },
+      "required": [
+        "mode",
+        "summary"
+      ],
+      "title": "AgentExecutionActivityData",
+      "type": "object"
+    },
+    "AgentExecutionFinishedData": {
+      "description": "Terminal result for one agent execution.",
+      "properties": {
+        "kind": {
+          "const": "agent_execution_finished",
+          "default": "agent_execution_finished",
+          "title": "Kind",
+          "type": "string"
+        },
+        "result": {
+          "default": null,
+          "title": "Result"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        }
+      },
+      "title": "AgentExecutionFinishedData",
+      "type": "object"
+    },
+    "AgentExecutionStartedData": {
+      "description": "Semantic context for one prompt-to-result agent execution.",
+      "properties": {
+        "kind": {
+          "const": "agent_execution_started",
+          "default": "agent_execution_started",
+          "title": "Kind",
+          "type": "string"
+        },
+        "stage": {
+          "title": "Stage",
+          "type": "string"
+        },
+        "attempt": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempt"
+        },
+        "system_prompt": {
+          "default": "",
+          "title": "System Prompt",
+          "type": "string"
+        },
+        "user_prompt": {
+          "default": "",
+          "title": "User Prompt",
+          "type": "string"
+        },
+        "activity": {
+          "$ref": "#/$defs/AgentExecutionActivityData"
+        }
+      },
+      "required": [
+        "stage",
+        "activity"
+      ],
+      "title": "AgentExecutionStartedData",
+      "type": "object"
+    },
     "AgentOutputChunkData": {
       "properties": {
         "kind": {
@@ -411,6 +586,19 @@
           },
           "title": "Events",
           "type": "array"
+        },
+        "through_sequence": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Through Sequence",
+          "type": "integer"
+        },
+        "active_executions": {
+          "items": {
+            "$ref": "#/$defs/ActiveAgentExecution"
+          },
+          "title": "Active Executions",
+          "type": "array"
         }
       },
       "required": [
@@ -445,7 +633,9 @@
         "pending",
         "consumed",
         "completed",
-        "failed"
+        "failed",
+        "cancelled",
+        "interrupted"
       ],
       "title": "EventStatus",
       "type": "string"
@@ -463,6 +653,9 @@
         "control",
         "invocation_started",
         "invocation_finished",
+        "agent_execution_started",
+        "agent_execution_activity_changed",
+        "agent_execution_finished",
         "phase_started",
         "phase_finished",
         "agent_output_chunk",
@@ -1413,11 +1606,26 @@
           "default": null,
           "title": "Invocation Id"
         },
+        "execution_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Execution Id"
+        },
         "data": {
           "anyOf": [
             {
               "discriminator": {
                 "mapping": {
+                  "agent_execution_activity_changed": "#/$defs/AgentExecutionActivityData",
+                  "agent_execution_finished": "#/$defs/AgentExecutionFinishedData",
+                  "agent_execution_started": "#/$defs/AgentExecutionStartedData",
                   "agent_output_chunk": "#/$defs/AgentOutputChunkData",
                   "benchmark_result": "#/$defs/BenchmarkResultData",
                   "chat": "#/$defs/ChatData",
@@ -1449,6 +1657,15 @@
                 },
                 {
                   "$ref": "#/$defs/InvocationFinishedData"
+                },
+                {
+                  "$ref": "#/$defs/AgentExecutionStartedData"
+                },
+                {
+                  "$ref": "#/$defs/AgentExecutionActivityData"
+                },
+                {
+                  "$ref": "#/$defs/AgentExecutionFinishedData"
                 },
                 {
                   "$ref": "#/$defs/OutputData"
@@ -1590,6 +1807,13 @@
           ],
           "default": null,
           "title": "Round Label"
+        },
+        "active_executions": {
+          "items": {
+            "$ref": "#/$defs/ActiveAgentExecution"
+          },
+          "title": "Active Executions",
+          "type": "array"
         }
       },
       "required": [

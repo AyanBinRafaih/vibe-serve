@@ -11,6 +11,7 @@ export interface RoundTimingState {
 export interface AgentTimingEvent {
   agent_kind?: string | null;
   invocation_id?: string | null;
+  execution_id?: string | null;
   timestamp: string;
 }
 
@@ -78,7 +79,7 @@ export function hasActiveAgentTiming(state: RoundTimingState): boolean {
 
 function timingKey(event: AgentTimingEvent): string | null {
   if (!event.agent_kind) return null;
-  return `${event.agent_kind}:${event.invocation_id ?? ''}`;
+  return `${event.agent_kind}:${event.execution_id ?? event.invocation_id ?? ''}`;
 }
 
 function findActiveTimingKey(

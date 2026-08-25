@@ -67,11 +67,17 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 latest_sequence=snapshot.sequence,
             )
         )
-        cursor = request.after_sequence
-        replay = service.events(cursor)
-        if replay:
-            self._write_message(EventBatchMessage(events=replay))
-            cursor = max(event.sequence for event in replay)
+        through_sequence, replay, active_executions = service.subscription_checkpoint(
+            request.after_sequence
+        )
+        self._write_message(
+            EventBatchMessage(
+                events=replay,
+                through_sequence=through_sequence,
+                active_executions=active_executions,
+            )
+        )
+        cursor = through_sequence
         while True:
             events = service.wait_for_events(cursor, timeout=1.0)
             if not events:

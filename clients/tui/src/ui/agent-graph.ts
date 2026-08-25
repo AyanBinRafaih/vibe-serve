@@ -282,7 +282,12 @@ function direction(deltaX: number, deltaY: number): number {
 }
 
 function edgeTone(source: AgentPhase, target: AgentPhase): EdgeTone {
-  if (source.status === 'failed') return 'failed';
+  if (
+    source.status === 'failed' ||
+    source.status === 'cancelled' ||
+    source.status === 'interrupted'
+  )
+    return 'failed';
   if (source.status === 'active' || (source.status === 'completed' && target.status === 'active')) {
     return 'live';
   }
