@@ -1,4 +1,4 @@
-"""Tests for the :mod:`vibesys.agents` runner abstraction."""
+"""Tests for application-level agent clients."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vibesys.agent_runner import log_json_and_print, log_prompt_markdown_and_print
-from vibesys.agents import ResponseFallback, build_agent_runner
+from vibesys.agents import ResponseFallback, build_agent_client
 from vibesys.agents.callbacks import AgentLogger
 from vibesys.agents.cli_runner import CliAgentRunner
-from vibesys.agents.deepagents_runner import DeepAgentsRunner
+from vibesys.agents.client import AgentClient
+from vibesys.agents.deepagents_runner import DeepAgentsClient
+from vibesys.agents.drivers.agentshim import AgentShimDriver
 from vibesys.agents.progress import RoundProgress
 from vibesys.config import Config
 from vibesys.constants import ComputeBackend
@@ -68,8 +70,8 @@ def test_json_emitter_preserves_raw_log(capsys):  # noqa: ANN001, ANN201  # trac
     assert log.getvalue() == raw_json + "\n"
 
 
-class TestDeepAgentsRunner:
-    """Tests for :class:`DeepAgentsRunner`."""
+class TestDeepAgentsClient:
+    """Tests for :class:`DeepAgentsClient`."""
 
     def test_deepagents_runner_invoke_returns_structured_response(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         pass_response = JudgeResponse(
@@ -84,7 +86,7 @@ class TestDeepAgentsRunner:
             mock_create.return_value = MagicMock(name="deep_agent")
             mock_run.return_value = pass_response
 
-            runner = DeepAgentsRunner(
+            runner = DeepAgentsClient(
                 model="m",
                 backends={
                     "implementer": MagicMock(name="impl-backend"),
@@ -136,7 +138,7 @@ class TestDeepAgentsRunner:
                 return_value=_judge_fallback(),
             ),
         ):
-            runner = DeepAgentsRunner(
+            runner = DeepAgentsClient(
                 model="m",
                 backends={
                     "implementer": impl_backend,
@@ -170,7 +172,7 @@ class TestDeepAgentsRunner:
             ) as mock_run,
         ):
             mock_create.return_value = MagicMock(name="chat-agent")
-            runner = DeepAgentsRunner(
+            runner = DeepAgentsClient(
                 model="m",
                 backends={"chat": MagicMock(name="chat-backend")},
                 skills=[],
@@ -191,7 +193,7 @@ class TestDeepAgentsRunner:
         assert mock_run.call_args.args[1] == "what happened?"
 
     def test_deepagents_runner_sessions_are_explicit_and_role_scoped(self):  # noqa: ANN201  # tracked: #288
-        runner = DeepAgentsRunner(
+        runner = DeepAgentsClient(
             model="m",
             backends={},
             skills=[],
@@ -225,7 +227,7 @@ class TestDeepAgentsRunner:
             ) as mock_run,
         ):
             mock_create.return_value = MagicMock(name="deep_agent")
-            runner = DeepAgentsRunner(
+            runner = DeepAgentsClient(
                 model="m",
                 backends={"judge": MagicMock(name="judge-backend")},
                 skills=[],
@@ -258,7 +260,7 @@ class TestDeepAgentsRunner:
             ),
         ):
             mock_create.return_value = MagicMock(name="deep_agent")
-            runner = DeepAgentsRunner(
+            runner = DeepAgentsClient(
                 model="m",
                 backends={"judge": MagicMock(name="judge-backend")},
                 skills=[],
@@ -308,7 +310,7 @@ class TestDeepAgentsRunner:
             ),
         ):
             mock_create.return_value = MagicMock(name="deep_agent")
-            runner = DeepAgentsRunner(
+            runner = DeepAgentsClient(
                 model="m",
                 backends={"judge": MagicMock(name="judge-backend")},
                 skills=[],
@@ -343,7 +345,7 @@ class TestDeepAgentsRunner:
             ),
         ):
             mock_create.return_value = MagicMock(name="deep_agent")
-            runner = DeepAgentsRunner(
+            runner = DeepAgentsClient(
                 model="m",
                 backends={"judge": MagicMock(name="judge-backend")},
                 skills=[],
@@ -2057,11 +2059,11 @@ class TestCliAgentRunner:
         assert agent.event_log == ["generate"]
 
 
-class TestBuildAgentRunner:
-    """Tests for :func:`build_agent_runner`."""
+class TestBuildAgentClient:
+    """Tests for :func:`build_agent_client`."""
 
-    def test_build_agent_runner_default_is_cli(self):  # noqa: ANN201  # tracked: #288
-        runner = build_agent_runner(
+    def test_build_agent_client_default_is_cli(self):  # noqa: ANN201  # tracked: #288
+        runner = build_agent_client(
             _agent_config(),
             agent_backend=None,
             cli_provider=None,
@@ -2080,8 +2082,8 @@ class TestBuildAgentRunner:
         assert runner.backend_name == "cli"
         assert runner._provider == "codex"  # noqa: SLF001  # tracked: #288
 
-    def test_build_agent_runner_cli_provider_from_config(self):  # noqa: ANN201  # tracked: #288
-        runner = build_agent_runner(
+    def test_build_agent_client_cli_provider_from_config(self):  # noqa: ANN201  # tracked: #288
+        runner = build_agent_client(
             _agent_config(backend="cli", cli_provider="claude"),
             agent_backend=None,
             cli_provider=None,
@@ -2096,9 +2098,9 @@ class TestBuildAgentRunner:
         assert runner.backend_name == "cli"
         assert runner._provider == "claude"  # noqa: SLF001  # tracked: #288
 
-    def test_build_agent_runner_cli_defaults_to_codex(self):  # noqa: ANN201  # tracked: #288
+    def test_build_agent_client_cli_defaults_to_codex(self):  # noqa: ANN201  # tracked: #288
         """When backend=cli and no provider specified, defaults to codex."""
-        runner = build_agent_runner(
+        runner = build_agent_client(
             _agent_config(backend="cli"),
             agent_backend=None,
             cli_provider=None,
@@ -2113,7 +2115,7 @@ class TestBuildAgentRunner:
         assert runner.backend_name == "cli"
         assert runner._provider == "codex"  # noqa: SLF001  # tracked: #288
 
-    def test_build_agent_runner_cli_docker_returns_cli_runner(self):  # noqa: ANN201  # tracked: #288
+    def test_build_agent_client_cli_docker_returns_cli_runner(self):  # noqa: ANN201  # tracked: #288
         """cli backend + docker now returns a CliAgentRunner with docker_sandboxes."""
         from unittest.mock import MagicMock  # noqa: PLC0415  # tracked: #288
 
@@ -2122,7 +2124,7 @@ class TestBuildAgentRunner:
             "judge": MagicMock(),
             "perf_eval": MagicMock(),
         }
-        runner = build_agent_runner(
+        runner = build_agent_client(
             _agent_config(),
             agent_backend="cli",
             cli_provider="claude",
@@ -2134,12 +2136,13 @@ class TestBuildAgentRunner:
             run_log_file=None,
             use_docker=True,
         )
-        assert isinstance(runner, CliAgentRunner)
-        assert runner._docker_sandboxes is mock_backends  # noqa: SLF001  # tracked: #288
+        assert isinstance(runner, AgentClient)
+        assert isinstance(runner._driver, AgentShimDriver)  # noqa: SLF001
+        assert runner._driver._docker_sandboxes is mock_backends  # noqa: SLF001
 
-    def test_build_agent_runner_rejects_unsupported_docker_provider(self):  # noqa: ANN201  # tracked: #288
+    def test_build_agent_client_rejects_unsupported_docker_provider(self):  # noqa: ANN201  # tracked: #288
         with pytest.raises(SystemExit, match="not yet supported with --docker"):
-            build_agent_runner(
+            build_agent_client(
                 _agent_config(),
                 agent_backend="cli",
                 cli_provider="nonexistent",
@@ -2152,9 +2155,9 @@ class TestBuildAgentRunner:
                 use_docker=True,
             )
 
-    def test_build_agent_runner_rejects_unknown_backend(self):  # noqa: ANN201  # tracked: #288
+    def test_build_agent_client_rejects_unknown_backend(self):  # noqa: ANN201  # tracked: #288
         with pytest.raises(SystemExit, match="unknown agent backend"):
-            build_agent_runner(
+            build_agent_client(
                 _agent_config(),
                 agent_backend="bogus",
                 cli_provider=None,
@@ -2169,7 +2172,7 @@ class TestBuildAgentRunner:
 
     def test_required_project_enforcement_rejects_deepagents(self):  # noqa: ANN201  # tracked: #288
         with pytest.raises(SystemExit, match="requires the CLI agent backend"):
-            build_agent_runner(
+            build_agent_client(
                 _agent_config(backend="deepagents"),
                 agent_backend=None,
                 cli_provider=None,
@@ -2183,7 +2186,7 @@ class TestBuildAgentRunner:
                 require_host_sandbox=True,
             )
 
-    def test_required_project_enforcement_rejects_omnigent(self):  # noqa: ANN201  # tracked: #288
+    def test_required_workspace_enforcement_permits_omnigent(self):  # noqa: ANN201
         config = Config.model_validate(
             {
                 "model": {"name": "m"},
@@ -2192,23 +2195,25 @@ class TestBuildAgentRunner:
             }
         )
 
-        with pytest.raises(SystemExit, match="does not yet support the Omnigent backend"):
-            build_agent_runner(
-                config,
-                agent_backend=None,
-                cli_provider=None,
-                backends=None,
-                skills=[],
-                skill_source_dirs=[],
-                model=None,
-                model_name="m",
-                run_log_file=None,
-                use_docker=False,
-                require_host_sandbox=True,
-            )
+        runner = build_agent_client(
+            config,
+            agent_backend=None,
+            cli_provider=None,
+            backends=None,
+            skills=[],
+            skill_source_dirs=[],
+            model=None,
+            model_name="m",
+            run_log_file=None,
+            use_docker=False,
+            require_host_sandbox=True,
+        )
+
+        assert isinstance(runner, AgentClient)
+        assert type(runner._driver).__name__ == "OmnigentDriver"  # noqa: SLF001
 
     def test_required_project_enforcement_permits_stub(self):  # noqa: ANN201  # tracked: #288
-        runner = build_agent_runner(
+        runner = build_agent_client(
             _agent_config(backend="stub"),
             agent_backend=None,
             cli_provider=None,
@@ -2224,13 +2229,13 @@ class TestBuildAgentRunner:
 
         assert runner.backend_name == "stub"
 
-    def test_build_agent_runner_forwards_project_policy_to_cli(self):  # noqa: ANN201  # tracked: #288
+    def test_build_agent_client_forwards_project_policy_to_cli(self):  # noqa: ANN201  # tracked: #288
         policy = ProjectPathPolicy(
             read_only_paths=(".state",),
             hidden_paths=(".state/local",),
         )
 
-        runner = build_agent_runner(
+        runner = build_agent_client(
             _agent_config(backend="cli", cli_provider="codex"),
             agent_backend=None,
             cli_provider=None,
@@ -2245,9 +2250,9 @@ class TestBuildAgentRunner:
             require_host_sandbox=True,
         )
 
-        assert isinstance(runner, CliAgentRunner)
-        assert runner._project_path_policy is policy  # noqa: SLF001  # tracked: #288
-        assert runner._require_host_sandbox is True  # noqa: SLF001  # tracked: #288
+        assert isinstance(runner, AgentClient)
+        assert runner._policy.project_paths is policy  # noqa: SLF001
+        assert runner._policy.require_enforcement is True  # noqa: SLF001
 
     # --- model resolution for the cli backend ---------------------------------
     #
@@ -2258,7 +2263,7 @@ class TestBuildAgentRunner:
 
     @staticmethod
     def _cli_runner(config, *, model_name):  # noqa: ANN001, ANN205  # tracked: #288
-        return build_agent_runner(
+        return build_agent_client(
             config,
             agent_backend=None,
             cli_provider=None,
@@ -2277,7 +2282,7 @@ class TestBuildAgentRunner:
             _agent_config(backend="cli", cli_provider=provider),
             model_name="gpt-5.4",
         )
-        assert runner._model == "gpt-5.4"  # noqa: SLF001  # tracked: #288
+        assert runner._model_name == "gpt-5.4"  # noqa: SLF001  # tracked: #288
 
     def test_displayed_model_name_matches_model_passed(self):  # noqa: ANN201  # tracked: #288
         # The run-log header prints _model_name; it must equal the model
@@ -2287,7 +2292,7 @@ class TestBuildAgentRunner:
             _agent_config(backend="cli", cli_provider="codex"),
             model_name="gpt-5.4",
         )
-        assert runner._model_name == runner._model == "gpt-5.4"  # noqa: SLF001  # tracked: #288
+        assert runner._model_name == "gpt-5.4"  # noqa: SLF001  # tracked: #288
 
     def test_cli_backend_carries_outer_and_inner_role_configuration(self):  # noqa: ANN201  # tracked: #288
         config = _agent_config(
@@ -2363,8 +2368,8 @@ class TestAgentLoggerEventHandler:
         assert logger._latest_usage == usage  # noqa: SLF001  # tracked: #288
 
 
-class TestBuildAgentRunnerBackendSelection:
-    """``build_agent_runner`` backend resolution.
+class TestBuildAgentClientBackendSelection:
+    """``build_agent_client`` backend resolution.
 
     The default agent backend is ``"cli"`` (provider ``"codex"``) when neither
     the ``--agent-backend`` flag nor an ``[agent].backend`` config key is set.
@@ -2372,7 +2377,7 @@ class TestBuildAgentRunnerBackendSelection:
     """
 
     def _build(self, config, *, agent_backend=None, cli_provider=None):  # noqa: ANN001, ANN202  # tracked: #288
-        return build_agent_runner(
+        return build_agent_client(
             config,
             agent_backend=agent_backend,
             cli_provider=cli_provider,
@@ -2387,20 +2392,20 @@ class TestBuildAgentRunnerBackendSelection:
 
     def test_default_backend_is_cli_with_empty_config(self):  # noqa: ANN201  # tracked: #288
         runner = self._build(_agent_config())
-        assert isinstance(runner, CliAgentRunner)
+        assert isinstance(runner, AgentClient)
         assert runner._provider == "codex"  # noqa: SLF001  # tracked: #288
 
     def test_empty_agent_section_defaults_to_cli(self):  # noqa: ANN201  # tracked: #288
         runner = self._build(_agent_config())
-        assert isinstance(runner, CliAgentRunner)
+        assert isinstance(runner, AgentClient)
         assert runner._provider == "codex"  # noqa: SLF001  # tracked: #288
 
     def test_agent_backend_flag_overrides_config(self):  # noqa: ANN201  # tracked: #288
         # An explicit --agent-backend flag wins over [agent].backend.
         runner = self._build(_agent_config(backend="deepagents"), agent_backend="cli")
-        assert isinstance(runner, CliAgentRunner)
+        assert isinstance(runner, AgentClient)
 
     def test_config_can_select_cli_provider(self):  # noqa: ANN201  # tracked: #288
         runner = self._build(_agent_config(backend="cli", cli_provider="claude"))
-        assert isinstance(runner, CliAgentRunner)
+        assert isinstance(runner, AgentClient)
         assert runner._provider == "claude"  # noqa: SLF001  # tracked: #288

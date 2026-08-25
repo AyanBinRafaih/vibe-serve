@@ -17,6 +17,7 @@ from pathlib import Path  # noqa: TC003  # tracked: #288
 from typing import Any, Literal
 
 from vibesys.agents.base import ResponseFallback
+from vibesys.agents.factory import resolve_agent_driver
 from vibesys.agents.progress import RoundProgress
 from vibesys.config import Config, as_config
 from vibesys.constants import DEFAULT_AGENT_BACKEND, DEFAULT_COMPUTE_BACKEND, ComputeBackend
@@ -2091,7 +2092,7 @@ def _run_framework_gates(  # noqa: PLR0913  # tracked: #288
     carry its complete metric row to the round record; it is empty whenever the
     benchmark did not run.
     """
-    if ctx.agent_runner.backend_name == "stub":
+    if ctx.agent_client.backend_name == "stub":
         return None, FrameworkBenchmarkOutcome(), False
     resource_feedback = _reconcile_model_requests(ctx)
     if resource_feedback is not None:
@@ -2248,16 +2249,20 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         modality = "text_generation"
     run_environment = run_environment or make_run_environment_spec()
     normalized_config = as_config(config)
+    resolved_agent_backend = (
+        "stub"
+        if agent_backend == "stub"
+        else agent_backend or normalized_config.agent.backend or DEFAULT_AGENT_BACKEND
+    )
     project_configuration = AgentRunConfiguration(
         outer_loop="agent",
         run_environment=run_environment_record(run_environment),
         inner_loop=inner_loop,
         interface=interface,
         model=normalized_config.model.name,
-        agent_backend=(
-            "stub"
-            if agent_backend == "stub"
-            else agent_backend or normalized_config.agent.backend or DEFAULT_AGENT_BACKEND
+        agent_backend=resolved_agent_backend,
+        agent_driver=(
+            resolve_agent_driver(normalized_config) if resolved_agent_backend == "cli" else None
         ),
         cli_provider=(
             cli_provider or normalized_config.agent.cli_provider or "codex"
@@ -3104,13 +3109,13 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     official_evaluation=(
                         passed
                         and completed_official_evaluation_reason is not None
-                        and ctx.agent_runner.backend_name != "stub"
+                        and ctx.agent_client.backend_name != "stub"
                         and (bool(ctx.judge_accuracy_command) or framework_benchmark_configured)
                     ),
                     official_evaluation_reason=(
                         completed_official_evaluation_reason
                         if (
-                            ctx.agent_runner.backend_name != "stub"
+                            ctx.agent_client.backend_name != "stub"
                             and (bool(ctx.judge_accuracy_command) or framework_benchmark_configured)
                         )
                         else None
