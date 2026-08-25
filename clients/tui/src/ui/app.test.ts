@@ -741,21 +741,23 @@ describe('OpenTUI presentation', () => {
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
     await controller.openExperimentLog();
-    const docked = await testRenderer.waitForFrame(value => value.includes('Type a question'));
+    const docked = await testRenderer.waitForFrame(value =>
+      value.includes('Ask about this experiment'),
+    );
     // The hint says the keys are elsewhere, which is the state being reported.
     expect(docked).toContain('Ctrl+W to type here');
 
     // Click the box the operator types into, not the conversation above it.
     const lines = docked.split('\n');
-    const row = lines.findIndex(line => line.includes('Type a question'));
-    const column = (lines[row]?.indexOf('Type a question') ?? 0) + 2;
+    const row = lines.findIndex(line => line.includes('Ask about this experiment'));
+    const column = (lines[row]?.indexOf('Ask about this experiment') ?? 0) + 2;
     await testRenderer.mockMouse.click(column, row);
     const focused = await frameAfter(testRenderer);
 
     expect(controller.state.layout.focus).toBe('chat');
     // And the box says so: clicking must move the border, not only the cursor.
     expect(focused).not.toContain('Ctrl+W to type here');
-    expect(spanColors(testRenderer, 'Chat')?.fg).toBe(resolveTheme('dark').borderFocus);
+    expect(spanColors(testRenderer, 'Message')?.fg).toBe(resolveTheme('dark').borderFocus);
   });
 
   it('gives the chat the keys when it is clicked, not only on Ctrl+W', async () => {
@@ -1363,7 +1365,7 @@ describe('OpenTUI presentation', () => {
     const overlay = testRenderer.renderer.root.findDescendantById('chat-overlay');
     const transcript = testRenderer.renderer.root.findDescendantById('chat-transcript');
     const turn = testRenderer.renderer.root.findDescendantById('event-chat-user');
-    const input = testRenderer.renderer.root.findDescendantById('chat-input-box');
+    const input = testRenderer.renderer.root.findDescendantById('chat-modal-composer-box');
     if (
       overlay === undefined ||
       transcript === undefined ||
@@ -1916,9 +1918,10 @@ describe('theming', () => {
     expect(landing).toContain('Ctrl+W to type here');
     const lines = landing.split('\n');
     const paneTop = lines.find(line => line.includes('╭─ Experiment chat')) ?? '';
-    const inputTop = lines.find(line => line.includes('╭─ Chat ')) ?? '';
-    expect(inputTop).toContain('╭─ Ask or command');
-    expect(inputTop.indexOf('╭─ Ask or command')).toBe(paneTop.indexOf('╭─ ▸ Experiments'));
+    const messageTop = lines.find(line => line.includes('╭─ Message ')) ?? '';
+    const commandTop = lines.find(line => line.includes('╭─ Ask or command')) ?? '';
+    expect(messageTop).not.toBe('');
+    expect(commandTop.indexOf('╭─ Ask or command')).toBe(paneTop.indexOf('╭─ ▸ Experiments'));
   });
 
   it('routes typing to whichever input Ctrl+W points at', async () => {
@@ -1949,6 +1952,100 @@ describe('theming', () => {
     expect(controller.chatSubmissions).toHaveLength(1);
   });
 
+  it('wraps a long docked question, caps its growth, and submits every character', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 22});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    const question = Array.from({length: 28}, (_, index) => `word-${index}`).join(' ');
+    await testRenderer.mockInput.typeText(question);
+    await frameAfter(testRenderer);
+
+    const composer = testRenderer.renderer.root.findDescendantById('chat-dock-composer');
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    if (composer === undefined || editor === undefined)
+      throw new Error('chat composer was missing');
+    expect(composer.height).toBe(9);
+    expect(editor.height).toBe(6);
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual([question]);
+    await frameAfter(testRenderer);
+    expect(composer.height).toBe(4);
+  });
+
+  it('keeps multiline editor keys out of experiment navigation', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20, kittyKeyboard: true});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+    const selected = controller.state.experimentLog?.selectedId;
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('first line');
+    testRenderer.mockInput.pressEnter({shift: true});
+    await testRenderer.mockInput.typeText('second line');
+    testRenderer.mockInput.pressArrow('up');
+    await frameAfter(testRenderer);
+
+    expect(controller.state.experimentLog?.selectedId).toBe(selected);
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length >= 1);
+    expect(controller.chatSubmissions).toEqual(['first line\nsecond line']);
+  });
+
+  it('preserves a draft when a resize moves chat from dock to modal', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('draft survives the layout change');
+    testRenderer.renderer.resize(80, 20);
+    await frameAfter(testRenderer);
+    controller.publish({...controller.state, chatOpen: true});
+    const modal = await testRenderer.waitForFrame(value =>
+      value.includes('draft survives the layout change'),
+    );
+
+    expect(modal).toContain('Experiment chat');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual(['draft survives the layout change']);
+  });
+
+  it('lets the docked chat span the table and command surface', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    const chatPane = testRenderer.renderer.root.findDescendantById('chat-pane');
+    const workspace = testRenderer.renderer.root.findDescendantById('workspace');
+    const composer = testRenderer.renderer.root.findDescendantById('chat-dock-composer-box');
+    if (chatPane === undefined || workspace === undefined || composer === undefined)
+      throw new Error('landing layout was missing');
+    expect(chatPane.y).toBe(workspace.y);
+    expect(chatPane.y + chatPane.height).toBe(workspace.y + workspace.height);
+    expect(composer.x).toBeGreaterThan(chatPane.x);
+    expect(composer.x + composer.width).toBeLessThan(chatPane.x + chatPane.width);
+  });
+
   it('raises the command list out of the command input, clear of the chat', async () => {
     const testRenderer = await createTestRenderer({width: 140, height: 20});
     const controller = logController();
@@ -1965,7 +2062,7 @@ describe('theming', () => {
     const commandInput = lines.find(line => line.includes('╭─ Ask or command')) ?? '';
     // The list belongs to the box it completes, so it starts where that box
     // starts rather than running back across the chat column.
-    expect(suggestion.indexOf('│')).toBe(commandInput.indexOf('╭─ Ask or command'));
+    expect(suggestion.indexOf('/perf')).toBeGreaterThan(commandInput.indexOf('╭─ Ask or command'));
   });
 
   it('drops /chat from the command surface while the chat is already docked', async () => {

@@ -6,6 +6,7 @@ import {
 } from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
 import {type ConversationEntry, chatPaneFocused, type SessionState} from '../session-model.js';
+import {ChatComposerView, type ChatDraft} from './chat-composer.js';
 import {ConversationView} from './conversation.js';
 import {LOG_CLAIM_PANEL_WIDTH, LOG_COMPACT_PANEL_WIDTH} from './experiment-log.js';
 import type {Theme} from './theme.js';
@@ -53,6 +54,7 @@ export class ChatPaneView {
   readonly output: BoxRenderable;
   readonly #scroll: ScrollBoxRenderable;
   readonly #conversation: ConversationView;
+  readonly #composer: ChatComposerView;
   #theme: Theme;
   #renderedConversation: ConversationEntry[] | null = null;
 
@@ -61,6 +63,7 @@ export class ChatPaneView {
     controller: SessionController,
     markdownStyle: SyntaxStyle,
     theme: Theme,
+    draft: ChatDraft,
   ) {
     this.#theme = theme;
     this.output = new BoxRenderable(renderer, {
@@ -99,20 +102,38 @@ export class ChatPaneView {
       renderMarkdown: false,
       onFocusRequest: () => controller.focusPane('chat'),
     });
+    this.#composer = new ChatComposerView(
+      renderer,
+      draft,
+      value => void controller.submitChat(value),
+      theme,
+      'chat-dock',
+      () => controller.focusPane('chat'),
+    );
     this.#scroll.add(this.#conversation.output);
     this.output.add(this.#scroll);
+    this.output.add(this.#composer.output);
   }
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.#theme = theme;
     this.output.borderColor = theme.border;
     this.#conversation.applyTheme(theme, markdownStyle);
+    this.#composer.applyTheme(theme);
     this.#renderedConversation = null;
   }
 
   /** Scrolled by Page Up/Page Down while this pane holds focus. */
   scrollBy(delta: number): void {
     this.#scroll.scrollBy(delta, 'viewport');
+  }
+
+  isComposerEmpty(): boolean {
+    return this.#composer.isEmpty();
+  }
+
+  focusComposer(): void {
+    this.#composer.focus();
   }
 
   render(state: SessionState, visible: boolean, width: number): void {
@@ -127,6 +148,7 @@ export class ChatPaneView {
     // costs the title itself: a box with no title reads as nothing at all. The
     // marker is the one the table already uses for the row that has the keys.
     this.output.title = focused ? ' ▸ Experiment chat ' : ' Experiment chat ';
+    this.#composer.activate(Math.max(1, width - 4), focused, state.chatPending);
     if (state.chatConversation === this.#renderedConversation) return;
     this.#renderedConversation = state.chatConversation;
     this.#conversation.render(state);

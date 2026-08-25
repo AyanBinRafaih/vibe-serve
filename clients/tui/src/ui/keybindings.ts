@@ -93,6 +93,10 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
+    // Every remaining editor key belongs to the composer while the docked chat
+    // has focus. In particular, arrows move its multiline cursor and Enter is
+    // handled by its submit binding instead of navigating the experiment log.
+    if (chatPaneFocused(controller.state)) return;
     // The theme picker owns its navigation keys wherever it was opened from,
     // so arrows never reach the view behind it. A typed command still belongs
     // to the input, which is why Enter is claimed only on an empty line.
