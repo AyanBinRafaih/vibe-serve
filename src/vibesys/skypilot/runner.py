@@ -75,6 +75,20 @@ class JobStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class RemoteJobStatus(StrEnum):
+    """SkyPilot queue status used for recovery decisions."""
+
+    INIT = "INIT"
+    PENDING = "PENDING"
+    SETTING_UP = "SETTING_UP"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    FAILED_SETUP = "FAILED_SETUP"
+    FAILED_DRIVER = "FAILED_DRIVER"
+    CANCELLED = "CANCELLED"
+
+
 @dataclass(frozen=True)
 class ProcessResult:
     """Captured result from one external process."""
@@ -126,6 +140,8 @@ class SubprocessCommandRunner:
         )
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
+        sink_errors: list[Exception] = []
+        sink_errors_lock = threading.Lock()
 
         def forward(
             stream: object,
@@ -136,7 +152,12 @@ class SubprocessCommandRunner:
             while line := stream.readline():  # type: ignore[attr-defined]
                 parts.append(line)
                 if sink is not None:
-                    sink(line)
+                    try:
+                        sink(line)
+                    except Exception as exc:  # noqa: BLE001  # keep draining both pipes
+                        with sink_errors_lock:
+                            if not sink_errors:
+                                sink_errors.append(exc)
 
         assert process.stdout is not None  # noqa: S101  # requested PIPE
         assert process.stderr is not None  # noqa: S101  # requested PIPE
@@ -157,6 +178,8 @@ class SubprocessCommandRunner:
         finally:
             stdout_thread.join()
             stderr_thread.join()
+        if sink_errors:
+            raise sink_errors[0]
         return ProcessResult(normalized, returncode, "".join(stdout_parts), "".join(stderr_parts))
 
 
@@ -178,6 +201,15 @@ class JobResult:
     stdout: str
     stderr: str
     cluster_name: str
+
+
+@dataclass(frozen=True)
+class RemoteJobInfo:
+    """Recoverable identity and queue state for one remote job."""
+
+    job_id: int
+    job_name: str
+    status: RemoteJobStatus
 
 
 def _resource_fingerprint(resources: ResolvedSkyPilotResources) -> str:
@@ -342,37 +374,42 @@ class SkyPilotJobRunner:
         stdout_sink: Callable[[str], None] | None = None,
         stderr_sink: Callable[[str], None] | None = None,
         job_started: Callable[[int], None] | None = None,
+        job_name: str | None = None,
+        existing_job_id: int | None = None,
+        log_tail: int = 0,
     ) -> JobResult:
         """Submit a detached task, identify it, then stream logs to completion."""
+        if log_tail < 0:
+            raise ValueError("SkyPilot log tail must be nonnegative")  # noqa: TRY003
         deadline = None if timeout is None else self._monotonic() + timeout
-        job_name = self._job_name_factory()
-        task = build_task_document(resources, command=command, workdir=workdir, name=job_name)
-        with self._task_file(task) as task_path:
-            try:
+        resolved_job_name = job_name or self._job_name_factory()
+        if existing_job_id is None:
+            task = build_task_document(
+                resources, command=command, workdir=workdir, name=resolved_job_name
+            )
+            with self._task_file(task) as task_path:
                 self._control(
                     ["exec", "-d", cluster_name, str(task_path)],
                     timeout=self._remaining(deadline),
                 )
-            except (SkyPilotControlPlaneError, SkyPilotTimeoutError):
-                self.release(cluster_name)
-                raise
-        try:
-            job_id = self._discover_job_id(cluster_name, job_name, deadline)
-        except SkyPilotCLIError:
-            self.release(cluster_name)
-            raise
+            job_id = self._discover_job_id(cluster_name, resolved_job_name, deadline)
+        else:
+            job_id = existing_job_id
         if job_started is not None:
             job_started(job_id)
-        try:
-            result = self._invoke(
-                [self._executable, "logs", cluster_name, str(job_id), "--tail", "0"],
-                timeout=self._remaining(deadline),
-                stdout_sink=stdout_sink,
-                stderr_sink=stderr_sink,
-            )
-        except SkyPilotTimeoutError:
-            self._cancel_or_release(cluster_name, job_id)
-            raise
+        result = self._invoke(
+            [
+                self._executable,
+                "logs",
+                cluster_name,
+                str(job_id),
+                "--tail",
+                str(log_tail),
+            ],
+            timeout=self._remaining(deadline),
+            stdout_sink=stdout_sink,
+            stderr_sink=stderr_sink,
+        )
         if result.returncode == 0:
             status = JobStatus.COMPLETED
         elif result.returncode == _SKY_JOB_FAILED:
@@ -380,12 +417,10 @@ class SkyPilotJobRunner:
         elif result.returncode == _SKY_JOB_CANCELLED:
             status = JobStatus.CANCELLED
         elif result.returncode in {_SKY_JOB_NOT_FINISHED, _SKY_JOB_NOT_FOUND}:
-            self._cancel_or_release(cluster_name, job_id)
             raise SkyPilotJobStateError(  # noqa: TRY003
                 f"SkyPilot logs returned job state code {result.returncode} for job {job_id}"
             )
         else:
-            self._cancel_or_release(cluster_name, job_id)
             raise SkyPilotControlPlaneError(  # noqa: TRY003
                 f"SkyPilot logs failed with exit code {result.returncode}"
             )
@@ -397,6 +432,38 @@ class SkyPilotJobRunner:
             stderr=result.stderr,
             cluster_name=cluster_name,
         )
+
+    def query_job(
+        self,
+        cluster_name: str,
+        *,
+        job_name: str,
+        job_id: int | None = None,
+        timeout: float = 60,
+    ) -> RemoteJobInfo | None:
+        """Find exactly one job by caller-owned name and optional persisted ID."""
+        result = self._control(["queue", cluster_name, "--output", "json"], timeout=timeout)
+        records = self._queue_records(result.stdout, cluster_name)
+        matches = [record for record in records if record.get("job_name") == job_name]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise SkyPilotOutputError(  # noqa: TRY003
+                f"SkyPilot queue returned duplicate jobs named {job_name!r}"
+            )
+        record = matches[0]
+        remote_id = record.get("job_id")
+        if not isinstance(remote_id, int) or isinstance(remote_id, bool):
+            raise SkyPilotOutputError("SkyPilot queue returned a non-integer job ID")  # noqa: TRY003
+        if job_id is not None and remote_id != job_id:
+            raise SkyPilotOutputError(  # noqa: TRY003
+                f"SkyPilot job {job_name!r} changed ID from {job_id} to {remote_id}"
+            )
+        try:
+            status = RemoteJobStatus(str(record.get("status", "RUNNING")).upper())
+        except ValueError as exc:
+            raise SkyPilotOutputError("SkyPilot queue returned an unknown job status") from exc  # noqa: TRY003
+        return RemoteJobInfo(remote_id, job_name, status)
 
     def _wait_for_cluster(self, name: str, deadline: float | None) -> ClusterInfo:
         while True:
@@ -416,38 +483,27 @@ class SkyPilotJobRunner:
         if deadline is not None:
             discovery_deadline = min(discovery_deadline, deadline)
         while True:
-            result = self._control(
-                ["queue", cluster_name, "--output", "json"],
-                timeout=self._remaining(discovery_deadline, default=60),
+            found = self.query_job(
+                cluster_name,
+                job_name=job_name,
+                timeout=self._remaining(discovery_deadline, default=60) or 60,
             )
-            try:
-                payload = json.loads(result.stdout)
-            except json.JSONDecodeError as exc:
-                raise SkyPilotOutputError(  # noqa: TRY003
-                    "SkyPilot queue returned invalid JSON"
-                ) from exc
-            records = payload.get(cluster_name) if isinstance(payload, dict) else None
-            if not isinstance(records, list):
-                raise SkyPilotOutputError(  # noqa: TRY003
-                    "SkyPilot queue JSON must map the cluster name to a job list"
-                )
-            matches = [
-                record
-                for record in records
-                if isinstance(record, dict) and record.get("job_name") == job_name
-            ]
-            if len(matches) > 1:
-                raise SkyPilotOutputError(  # noqa: TRY003
-                    f"SkyPilot queue returned duplicate jobs named {job_name!r}"
-                )
-            if matches:
-                job_id = matches[0].get("job_id")
-                if not isinstance(job_id, int) or isinstance(job_id, bool):
-                    raise SkyPilotOutputError(  # noqa: TRY003
-                        "SkyPilot queue returned a non-integer job ID"
-                    )
-                return job_id
+            if found is not None:
+                return found.job_id
             self._pause(discovery_deadline, f"SkyPilot did not expose job {job_name!r}")
+
+    @staticmethod
+    def _queue_records(stdout: str, cluster_name: str) -> list[dict[str, object]]:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise SkyPilotOutputError("SkyPilot queue returned invalid JSON") from exc  # noqa: TRY003
+        records = payload.get(cluster_name) if isinstance(payload, dict) else None
+        if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+            raise SkyPilotOutputError(  # noqa: TRY003
+                "SkyPilot queue JSON must map the cluster name to a job list"
+            )
+        return records
 
     def _cancel_or_release(self, cluster_name: str, job_id: int) -> None:
         try:

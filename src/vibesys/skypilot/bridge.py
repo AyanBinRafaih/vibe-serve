@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
 import re
 import secrets
@@ -11,19 +13,36 @@ import shlex
 import shutil
 import socket
 import socketserver
-import tempfile
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from vibesys.skypilot.protocol import (
+    AckedFrame,
     ArtifactFrame,
     ErrorFrame,
     EvaluationRequest,
     OutputFrame,
     ResultFrame,
+    decode_ack,
     decode_request,
     encode_message,
+)
+from vibesys.skypilot.recovery import (
+    ArtifactRecord,
+    AttemptResourcesRecord,
+    InvocationJournal,
+    InvocationPhase,
+    InvocationProvenance,
+    InvocationRecord,
+    InvocationResultRecord,
+)
+from vibesys.skypilot.runner import (
+    ClusterStatus,
+    RemoteJobInfo,
+    RemoteJobStatus,
+    SkyPilotControlPlaneError,
+    SkyPilotJobStateError,
 )
 
 if TYPE_CHECKING:
@@ -31,6 +50,7 @@ if TYPE_CHECKING:
 
     from vibesys.skypilot.config import ResolvedSkyPilotResources
     from vibesys.skypilot.runner import SkyPilotJobRunner
+    from vs_project import StateNamespace
 
 _MAX_REQUEST_BYTES = 4096
 _OUTPUT_CHUNK_CHARACTERS = 64 * 1024
@@ -115,6 +135,82 @@ class _ArtifactStream:
         return data
 
 
+class _DecodedLogSpool:
+    """Persist decoded remote stdout and suppress replayed Sky log prefixes."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        journal: InvocationJournal,
+        invocation_id: str,
+        sink: Callable[[str], None],
+    ) -> None:
+        self._path = path
+        self._journal = journal
+        self._invocation_id = invocation_id
+        self._sink = sink
+        self._seen = 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._persisted = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            self._persisted = ""
+        record = self._record()
+        if len(self._persisted) < record.remote_read_offset:
+            raise ValueError("SkyPilot log spool is shorter than its journal offset")  # noqa: TRY003
+        if len(self._persisted) > record.remote_read_offset:
+            record = self._journal.offsets(
+                record,
+                remote_read=len(self._persisted),
+                client_delivered=record.client_delivered_offset,
+            )
+        if record.client_delivered_offset < len(self._persisted):
+            self._sink(self._persisted[record.client_delivered_offset :])
+            self._journal.offsets(
+                self._record(),
+                remote_read=len(self._persisted),
+                client_delivered=len(self._persisted),
+            )
+
+    def feed(self, data: str) -> None:
+        """Accept Sky's from-origin log stream and deliver only its new suffix."""
+        overlap = min(len(data), max(0, len(self._persisted) - self._seen))
+        if data[:overlap] != self._persisted[self._seen : self._seen + overlap]:
+            raise ValueError("SkyPilot replayed log prefix changed")  # noqa: TRY003
+        suffix = data[overlap:]
+        self._seen += len(data)
+        if not suffix:
+            return
+        with self._path.open("a", encoding="utf-8") as spool:
+            spool.write(suffix)
+            spool.flush()
+            os.fsync(spool.fileno())
+        self._persisted += suffix
+        record = self._journal.offsets(
+            self._record(),
+            remote_read=len(self._persisted),
+            client_delivered=self._record().client_delivered_offset,
+        )
+        self._sink(suffix)
+        self._journal.offsets(
+            record,
+            remote_read=len(self._persisted),
+            client_delivered=len(self._persisted),
+        )
+
+    def finish(self) -> None:
+        """Require a terminal from-origin stream to cover the durable prefix."""
+        if self._seen < len(self._persisted):
+            raise ValueError("SkyPilot terminal log replay was truncated")  # noqa: TRY003
+
+    def _record(self) -> InvocationRecord:
+        record = self._journal.load(self._invocation_id)
+        if record is None:
+            raise ValueError("SkyPilot invocation journal disappeared")  # noqa: TRY003
+        return record
+
+
 class SkyPilotBridge:
     """Serve a fixed evaluator allowlist over a host-owned Unix socket."""
 
@@ -129,8 +225,10 @@ class SkyPilotBridge:
         hidden_paths: Sequence[Path],
         commands: Mapping[str, Sequence[str]],
         benchmark_output_argument: str | None,
+        state_namespace: StateNamespace,
         socket_path: Path,
         log: Callable[[str], None],
+        max_infrastructure_retries: int = 1,
     ) -> None:
         """Bind fixed host policy and trusted evaluator commands."""
         self._runner = runner
@@ -141,17 +239,23 @@ class SkyPilotBridge:
         self._hidden_paths = tuple(hidden_paths)
         self._commands = {kind: tuple(command) for kind, command in commands.items()}
         self._benchmark_output_argument = benchmark_output_argument
+        self._state_namespace = state_namespace
+        self._journal = InvocationJournal(state_namespace)
         self.socket_path = socket_path
         self._log = log
+        self._max_infrastructure_retries = max_infrastructure_retries
         self._server: _BridgeServer | None = None
         self._thread: threading.Thread | None = None
         self._closed = False
-        self._active_jobs: set[int] = set()
+        self._active_jobs: set[tuple[str, int]] = set()
         self._active_lock = threading.Lock()
         self._handler_condition = threading.Condition()
         self._active_handlers = 0
         self._evaluation_lock = threading.Lock()
         self._closing = threading.Event()
+        self._cluster_replaced_on_start = False
+        self._locally_prepared_invocations: set[str] = set()
+        self._touched_clusters = {cluster_name}
 
     def start(self) -> None:
         """Allocate or reuse compute, then start accepting requests."""
@@ -164,6 +268,15 @@ class SkyPilotBridge:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.socket_path.unlink(missing_ok=True)
         try:
+            previous_cluster = self._runner.inspect_cluster(self._cluster_name)
+            self._cluster_replaced_on_start = (
+                previous_cluster is None
+                or previous_cluster.status
+                in {
+                    ClusterStatus.DOWN,
+                    ClusterStatus.STOPPED,
+                }
+            )
             self._runner.ensure_cluster(self._cluster_name, self._resources)
             bridge = self
 
@@ -189,27 +302,35 @@ class SkyPilotBridge:
             return
         self._closed = True
         self._closing.set()
-        if self._server is not None:
+        if self._server is not None and self._thread is not None and self._thread.is_alive():
             self._server.shutdown()
-        with self._active_lock:
-            active_jobs = tuple(self._active_jobs)
-        for job_id in active_jobs:
-            try:
-                self._runner.cancel(self._cluster_name, job_id)
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"[warn] SkyPilot job cancellation failed: {type(exc).__name__}")
-        try:
-            self._runner.release(self._cluster_name)
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"[warn] SkyPilot allocation release failed: {type(exc).__name__}")
+        self._cancel_active_jobs()
         if self._server is not None:
             self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
         with self._handler_condition:
             if not self._handler_condition.wait_for(lambda: self._active_handlers == 0, timeout=10):
-                self._log("[warn] SkyPilot bridge handler did not stop after allocation release")
+                self._log("[warn] SkyPilot bridge handler did not stop before allocation release")
+        self._cancel_active_jobs()
+        with self._active_lock:
+            touched_clusters = tuple(self._touched_clusters)
+        for cluster_name in touched_clusters:
+            try:
+                self._runner.release(cluster_name)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[warn] SkyPilot allocation release failed: {type(exc).__name__}")
         self.socket_path.unlink(missing_ok=True)
+
+    def _cancel_active_jobs(self) -> None:
+        """Best-effort cancel every job known at this point in teardown."""
+        with self._active_lock:
+            active_jobs = tuple(self._active_jobs)
+        for cluster_name, job_id in active_jobs:
+            try:
+                self._runner.cancel(cluster_name, job_id)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[warn] SkyPilot job cancellation failed: {type(exc).__name__}")
 
     def _handle(self, reader: object, writer: object, connection: socket.socket) -> None:
         with self._handler_condition:
@@ -250,12 +371,36 @@ class SkyPilotBridge:
                 raise ValueError("invalid evaluator arguments")  # noqa: TRY003
         elif request.artifacts:
             raise ValueError("invalid evaluator artifact")  # noqa: TRY003
-        self._run(request, (*command, *request.arguments), writer, connection)
+        effective_command = (*command, *request.arguments)
+        staging = self._snapshot(request.invocation_id)
+        snapshot_digest = self._snapshot_digest(staging)
+        request_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "request": request.model_dump(mode="json", exclude={"invocation_id"}),
+                    "command": effective_command,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        existing_record = self._journal.load(request.invocation_id)
+        record = self._journal.prepare(request.invocation_id, request_digest, snapshot_digest)
+        if existing_record is None:
+            self._locally_prepared_invocations.add(request.invocation_id)
+        if record.phase in {InvocationPhase.COMPLETED, InvocationPhase.ACKNOWLEDGED}:
+            self._track_record_cluster(record)
+            self._deliver(record, reader, writer)
+            return
+        self._run(request, effective_command, record, staging, reader, writer, connection)
 
-    def _run(
+    def _run(  # noqa: C901, PLR0913, PLR0915
         self,
         request: EvaluationRequest,
         command: tuple[str, ...],
+        record: InvocationRecord,
+        staging: Path,
+        reader: object,
         writer: object,
         connection: socket.socket,
     ) -> None:
@@ -278,18 +423,280 @@ class SkyPilotBridge:
                 except OSError:
                     pass
                 disconnected.set()
-                with self._active_lock:
-                    active = tuple(self._active_jobs)
-                for job_id in active:
-                    self._runner.cancel(self._cluster_name, job_id)
                 return
 
         monitor = threading.Thread(target=monitor_disconnect, daemon=True)
-        with tempfile.TemporaryDirectory(
-            prefix=f"vibesys-skypilot-{request.kind}-"
-        ) as staging_text:
+        try:
+            monitor.start()
+            active_record = record
+            try:
+                while True:
+                    self._require_open_for_remote_action()
+                    nonce = hashlib.sha256(
+                        f"{request.invocation_id}:{active_record.job_name}".encode()
+                    ).hexdigest()[:32]
+                    begin_marker = f"__VIBESYS_SKYPILOT_ARTIFACT_BEGIN_{nonce}__"
+                    end_marker = f"__VIBESYS_SKYPILOT_ARTIFACT_END_{nonce}__"
+                    log_spool = _DecodedLogSpool(
+                        path=self._state_namespace.external_directory(
+                            f"logs/{request.invocation_id}/{active_record.job_name}"
+                        )
+                        / "stdout",
+                        journal=self._journal,
+                        invocation_id=request.invocation_id,
+                        sink=lambda data: self._write_output(writer, "stdout", data, write_lock),
+                    )
+                    artifact_stream = _ArtifactStream(
+                        log_spool.feed,
+                        expected=bool(request.artifacts),
+                        begin_marker=begin_marker,
+                        end_marker=end_marker,
+                    )
+                    effective_command = self._with_artifact_transport(
+                        command,
+                        request.artifacts,
+                        begin_marker=begin_marker,
+                        end_marker=end_marker,
+                    )
+                    try:
+                        found = self._reconcile(active_record)
+                        self._require_open_for_remote_action()
+                        if found is not None and found.status is RemoteJobStatus.FAILED_DRIVER:
+                            failed_cluster = active_record.active_cluster_name or self._cluster_name
+                            active_record = self._retry_after_infrastructure_failure(active_record)
+                            self._runner.release(failed_cluster)
+                            self._ensure_current_cluster_for_work()
+                            continue
+                        if found is None:
+                            if active_record.phase is InvocationPhase.SUBMITTING:
+                                if not self._allocation_was_replaced(active_record):
+                                    raise RuntimeError(  # noqa: TRY003
+                                        "SkyPilot submission outcome is ambiguous; reconcile later"
+                                    )
+                                active_record = self._retry_after_infrastructure_failure(
+                                    active_record
+                                )
+                                continue
+                            if active_record.phase in {
+                                InvocationPhase.SUBMITTED,
+                                InvocationPhase.RUNNING,
+                            }:
+                                if not self._allocation_was_replaced(active_record):
+                                    raise RuntimeError(  # noqa: TRY003
+                                        "persisted SkyPilot job disappeared from an active allocation"
+                                    )
+                                active_record = self._retry_after_infrastructure_failure(
+                                    active_record
+                                )
+                                continue
+                            self._require_open_for_remote_action()
+                            active_record = self._journal.submitting(
+                                active_record,
+                                self._cluster_name,
+                                self._attempt_resources(),
+                            )
+                            self._track_cluster(self._cluster_name)
+                        self._require_open_for_remote_action()
+                        result = self._runner.run(
+                            active_record.active_cluster_name or self._cluster_name,
+                            self._resources,
+                            workdir=staging,
+                            command=effective_command,
+                            stdout_sink=artifact_stream.feed,
+                            stderr_sink=lambda data: self._write_output(
+                                writer, "stderr", data, write_lock
+                            ),
+                            job_started=lambda job_id, invocation=active_record: self._job_started(
+                                invocation,
+                                job_id,
+                                invocation.active_cluster_name or self._cluster_name,
+                                disconnected,
+                            ),
+                            job_name=active_record.job_name,
+                            existing_job_id=found.job_id if found is not None else None,
+                        )
+                        log_spool.finish()
+                        break
+                    except (SkyPilotControlPlaneError, SkyPilotJobStateError):
+                        latest = self._journal.load(request.invocation_id) or active_record
+                        attempted_cluster = latest.active_cluster_name or self._cluster_name
+                        cluster = self._runner.inspect_cluster(attempted_cluster)
+                        allocation_expired = cluster is None or cluster.status in {
+                            ClusterStatus.DOWN,
+                            ClusterStatus.STOPPED,
+                        }
+                        if not allocation_expired:
+                            raise
+                        self._require_open_for_remote_action()
+                        active_record = self._recover_after_allocation_loss(latest)
+                        self._ensure_current_cluster_for_work()
+            finally:
+                finished.set()
+                monitor.join(timeout=1)
+            with self._active_lock:
+                self._active_jobs.discard((result.cluster_name, result.remote_job_id))
+            artifact = artifact_stream.result() if result.status.value == "COMPLETED" else None
+            latest = self._journal.load(request.invocation_id) or record
+            attempt_resources = latest.attempt_resources
+            if attempt_resources is None:
+                raise ValueError("completed invocation is missing attempt resources")  # noqa: TRY003
+            artifact_record = (
+                ArtifactRecord.create(request.artifacts[0], artifact)
+                if artifact is not None
+                else None
+            )
+            terminal = InvocationResultRecord(
+                status=result.status.value,
+                sky_exit_code=result.sky_exit_code,
+                artifact=artifact_record,
+                provenance=InvocationProvenance(
+                    profile_name=attempt_resources.profile_name,
+                    infra=attempt_resources.infra,
+                    cluster_name=result.cluster_name,
+                    job_name=latest.job_name,
+                    remote_job_id=result.remote_job_id,
+                    attempt=latest.attempt,
+                    accelerator_type=attempt_resources.accelerator_type,
+                    nodes=attempt_resources.nodes,
+                    accelerators_per_node=attempt_resources.accelerators_per_node,
+                    runtime_image=attempt_resources.runtime_image,
+                ),
+            )
+            completed = self._journal.completed(latest, terminal)
+            self._deliver(completed, reader, writer, write_lock)
+        finally:
+            finished.set()
+
+    def _retry_after_infrastructure_failure(self, record: InvocationRecord) -> InvocationRecord:
+        """Create one evidence-backed retry while enforcing a restart-stable bound."""
+        if record.attempt >= 1 + self._max_infrastructure_retries:
+            raise RuntimeError("SkyPilot infrastructure retry limit was exhausted")  # noqa: TRY003
+        return self._journal.retry(record)
+
+    def _recover_after_allocation_loss(self, record: InvocationRecord) -> InvocationRecord:
+        """Keep an unsubmitted request, or advance a remotely attempted request."""
+        if record.phase is InvocationPhase.PREPARED:
+            return record
+        return self._retry_after_infrastructure_failure(record)
+
+    def _allocation_was_replaced(self, record: InvocationRecord) -> bool:
+        """Return whether the persisted attempt's allocation is provably gone."""
+        cluster_name = record.active_cluster_name or self._cluster_name
+        if (
+            cluster_name == self._cluster_name
+            and self._cluster_replaced_on_start
+            and record.invocation_id not in self._locally_prepared_invocations
+        ):
+            return True
+        cluster = self._runner.inspect_cluster(cluster_name)
+        return cluster is None or cluster.status in {ClusterStatus.DOWN, ClusterStatus.STOPPED}
+
+    def _reconcile(self, record: InvocationRecord) -> RemoteJobInfo | None:
+        """Attach to an exact prior job before any new submission."""
+        cluster_name = record.active_cluster_name or self._cluster_name
+        self._track_cluster(cluster_name)
+        return self._runner.query_job(
+            cluster_name,
+            job_name=record.job_name,
+            job_id=record.remote_job_id,
+        )
+
+    def _track_record_cluster(self, record: InvocationRecord) -> None:
+        """Retain allocation ownership carried by a persisted invocation."""
+        cluster_name = record.active_cluster_name
+        if cluster_name is None and record.result is not None:
+            cluster_name = record.result.provenance.cluster_name
+        if cluster_name is not None:
+            self._track_cluster(cluster_name)
+
+    def _track_cluster(self, cluster_name: str) -> None:
+        with self._active_lock:
+            self._touched_clusters.add(cluster_name)
+
+    def _require_open_for_remote_action(self) -> None:
+        if self._closing.is_set():
+            raise RuntimeError("SkyPilot bridge is closing")  # noqa: TRY003
+
+    def _ensure_current_cluster_for_work(self) -> None:
+        """Ensure compute unless teardown started, cleaning up a racing launch."""
+        self._require_open_for_remote_action()
+        self._runner.ensure_cluster(self._cluster_name, self._resources)
+        if not self._closing.is_set():
+            return
+        try:
+            self._runner.release(self._cluster_name)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[warn] SkyPilot allocation release failed: {type(exc).__name__}")
+        self._require_open_for_remote_action()
+
+    def _attempt_resources(self) -> AttemptResourcesRecord:
+        """Freeze the effective resources used by the next submission attempt."""
+        return AttemptResourcesRecord(
+            profile_name=self._resources.profile_name,
+            infra=self._resources.infra,
+            accelerator_type=self._resources.accelerator_type,
+            nodes=self._resources.nodes,
+            accelerators_per_node=self._resources.accelerators_per_node,
+            runtime_image=self._resources.remote_runtime_image,
+        )
+
+    def _deliver(
+        self,
+        record: InvocationRecord,
+        reader: object,
+        writer: object,
+        lock: threading.Lock | None = None,
+    ) -> None:
+        """Replay a durable terminal payload and persist explicit acknowledgement."""
+        result = record.result
+        if result is None:
+            raise ValueError("terminal invocation is missing its result")  # noqa: TRY003
+        if result.artifact is not None:
+            artifact = result.artifact
+            self._write(
+                writer,
+                ArtifactFrame(
+                    path=artifact.path,
+                    size=artifact.size,
+                    sha256=artifact.sha256,
+                    data_base64=artifact.data_base64,
+                ),
+                lock,
+            )
+        self._write(
+            writer,
+            ResultFrame(
+                status=result.status,
+                sky_exit_code=result.sky_exit_code,
+                remote_job_id=result.provenance.remote_job_id,
+            ),
+            lock,
+        )
+        payload = reader.readline(_MAX_REQUEST_BYTES + 1)  # type: ignore[attr-defined]
+        acknowledgement = decode_ack(payload)
+        if acknowledgement.invocation_id != record.invocation_id:
+            raise ValueError("acknowledgement invocation mismatch")  # noqa: TRY003
+        if record.phase is InvocationPhase.COMPLETED:
+            record = self._journal.acknowledge(record)
+        self._write(
+            writer,
+            AckedFrame(invocation_id=record.invocation_id),
+            lock,
+        )
+
+    def _snapshot(self, invocation_id: str) -> Path:
+        """Create or reuse the immutable machine-local input snapshot."""
+        root = self._state_namespace.external_directory(f"snapshots/{invocation_id}")
+        ready = root / ".ready"
+        if ready.exists():
+            return root
+        if root.exists():
+            shutil.rmtree(root)
+        root.parent.mkdir(parents=True, exist_ok=True)
+        staging = root.parent / f".{invocation_id}.staging-{secrets.token_hex(8)}"
+        staging.mkdir()
+        try:
             self._validate_workspace_symlinks()
-            staging = Path(staging_text)
             self._stage_workspace(staging)
             if self._evaluator_package_root is not None:
                 shutil.copytree(
@@ -297,56 +704,36 @@ class SkyPilotBridge:
                     staging / ".vibesys-evaluator-package",
                     symlinks=True,
                 )
-            nonce = secrets.token_hex(16)
-            begin_marker = f"__VIBESYS_SKYPILOT_ARTIFACT_BEGIN_{nonce}__"
-            end_marker = f"__VIBESYS_SKYPILOT_ARTIFACT_END_{nonce}__"
-            artifact_stream = _ArtifactStream(
-                lambda data: self._write_output(writer, "stdout", data, write_lock),
-                expected=bool(request.artifacts),
-                begin_marker=begin_marker,
-                end_marker=end_marker,
-            )
-            effective_command = self._with_artifact_transport(
-                command,
-                request.artifacts,
-                begin_marker=begin_marker,
-                end_marker=end_marker,
-            )
-            monitor.start()
-            try:
-                result = self._runner.run(
-                    self._cluster_name,
-                    self._resources,
-                    workdir=staging,
-                    command=effective_command,
-                    stdout_sink=artifact_stream.feed,
-                    stderr_sink=lambda data: self._write_output(writer, "stderr", data, write_lock),
-                    job_started=lambda job_id: self._job_started(job_id, disconnected),
-                )
-            finally:
-                finished.set()
-                monitor.join(timeout=1)
-            with self._active_lock:
-                self._active_jobs.discard(result.remote_job_id)
-            artifact = artifact_stream.result() if result.status.value == "COMPLETED" else None
-            if artifact is not None:
-                self._write(
-                    writer,
-                    ArtifactFrame(
-                        path=request.artifacts[0],
-                        data_base64=base64.b64encode(artifact).decode("ascii"),
-                    ),
-                    write_lock,
-                )
-        self._write(
-            writer,
-            ResultFrame(
-                status=result.status.value,
-                sky_exit_code=result.sky_exit_code,
-                remote_job_id=result.remote_job_id,
-            ),
-            write_lock,
-        )
+            (staging / ".ready").write_text("1\n", encoding="utf-8")
+            staging.replace(root)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+        return root
+
+    @staticmethod
+    def _snapshot_digest(root: Path) -> str:
+        """Hash the staged path names, symlink targets, and regular-file contents."""
+        digest = hashlib.sha256()
+        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+            relative = path.relative_to(root).as_posix().encode()
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            if path.is_symlink():
+                target = str(path.readlink()).encode()
+                digest.update(b"L")
+                digest.update(len(target).to_bytes(8, "big"))
+                digest.update(target)
+            elif path.is_file():
+                digest.update(b"F")
+                with path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+            elif path.is_dir():
+                digest.update(b"D")
+            else:
+                raise ValueError("snapshot contains an unsupported file type")  # noqa: TRY003
+        return digest.hexdigest()
 
     @staticmethod
     def _with_artifact_transport(
@@ -374,11 +761,28 @@ class SkyPilotBridge:
         )
         return ("sh", "-c", script)
 
-    def _job_started(self, job_id: int, disconnected: threading.Event) -> None:
+    def _job_started(
+        self,
+        record: InvocationRecord,
+        job_id: int,
+        cluster_name: str,
+        disconnected: threading.Event,
+    ) -> None:
+        self._journal.submitted(record, job_id, cluster_name)
         with self._active_lock:
-            self._active_jobs.add(job_id)
-        if disconnected.is_set() or self._closing.is_set():
-            self._runner.cancel(self._cluster_name, job_id)
+            self._active_jobs.add((cluster_name, job_id))
+            self._touched_clusters.add(cluster_name)
+        if self._closing.is_set():
+            try:
+                self._runner.cancel(cluster_name, job_id)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[warn] SkyPilot job cancellation failed: {type(exc).__name__}")
+            self._require_open_for_remote_action()
+        if disconnected.is_set():
+            self._log(
+                f"[skypilot] client disconnected; invocation {record.invocation_id} "
+                "remains recoverable"
+            )
 
     def _validate_workspace_symlinks(self) -> None:
         root = self._workspace.resolve()
@@ -462,7 +866,7 @@ class SkyPilotBridge:
     @staticmethod
     def _write(
         writer: object,
-        message: OutputFrame | ArtifactFrame | ResultFrame | ErrorFrame,
+        message: OutputFrame | ArtifactFrame | ResultFrame | AckedFrame | ErrorFrame,
         lock: threading.Lock | None = None,
     ) -> None:
         context = lock or threading.Lock()

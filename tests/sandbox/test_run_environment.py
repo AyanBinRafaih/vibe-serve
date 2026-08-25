@@ -995,6 +995,7 @@ remote_artifact_root = "/remote/vibesys"
             accuracy_command="python checker.py ${PROJECT_ROOT}/candidate.json",
             benchmark_command="python benchmark.py",
             benchmark_output_argument="--output-json",
+            state_namespace=MagicMock(),
         )
     )
 

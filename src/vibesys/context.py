@@ -777,6 +777,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 log=logger.lprint,
                 framework_root=PROJECT_ROOT,
                 project_path_policy=project_path_policy,
+                state_namespace=project_state.local_namespace(run_id, "skypilot"),
             )
         )
     )
@@ -1003,6 +1004,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
                 log=logger.lprint,
                 framework_root=PROJECT_ROOT,
                 project_path_policy=project_path_policy,
+                state_namespace=parent.state.local(RunStateNamespace.SKYPILOT),
             )
         )
     )

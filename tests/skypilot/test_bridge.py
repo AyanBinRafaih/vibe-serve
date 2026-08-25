@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import os
 import re
 import socket
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,13 +16,20 @@ import vibesys.skypilot.bridge as bridge_module
 from vibesys.skypilot.bridge import SkyPilotBridge
 from vibesys.skypilot.config import ResolvedSkyPilotResources
 from vibesys.skypilot.protocol import (
+    AckRequest,
     ArtifactFrame,
     ErrorFrame,
     EvaluationRequest,
     decode_response,
     encode_message,
 )
-from vibesys.skypilot.runner import JobResult, JobStatus
+from vibesys.skypilot.recovery import (
+    AttemptResourcesRecord,
+    InvocationJournal,
+    InvocationProvenance,
+    InvocationResultRecord,
+)
+from vibesys.skypilot.runner import ClusterInfo, ClusterStatus, JobResult, JobStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -37,15 +48,33 @@ def _resources() -> ResolvedSkyPilotResources:
     )
 
 
+def _attempt_resources() -> AttemptResourcesRecord:
+    return AttemptResourcesRecord(
+        profile_name="test",
+        infra="slurm/example/gpu",
+        accelerator_type="MI300A",
+        nodes=1,
+        accelerators_per_node=4,
+    )
+
+
 class FakeRunner:
     def __init__(self) -> None:
         self.ensure_calls = 0
         self.release_calls = 0
+        self.release_names: list[str] = []
+        self.cancel_calls: list[tuple[str, int]] = []
         self.workdirs: list[Path] = []
         self.commands: list[tuple[str, ...]] = []
+        self.cluster_status: ClusterStatus | None = ClusterStatus.UP
 
     def ensure_cluster(self, name: str, resources: object) -> None:  # noqa: ARG002
         self.ensure_calls += 1
+
+    def inspect_cluster(self, name: str) -> ClusterInfo | None:
+        if self.cluster_status is None:
+            return None
+        return ClusterInfo(name, self.cluster_status)
 
     def run(  # noqa: PLR0913
         self,
@@ -57,9 +86,13 @@ class FakeRunner:
         stdout_sink: Callable[[str], None],
         stderr_sink: Callable[[str], None],
         job_started: Callable[[int], None],
+        job_name: str,
+        existing_job_id: int | None,
     ) -> JobResult:
         self.workdirs.append(workdir)
         self.commands.append(tuple(command))
+        assert job_name.startswith("vibesys-inv-")
+        assert existing_job_id is None
         assert not (workdir / ".env").exists()
         assert not (workdir / ".venv").exists()
         assert not (workdir / "private").exists()
@@ -77,11 +110,247 @@ class FakeRunner:
         stderr_sink("err\n")
         return JobResult(JobStatus.COMPLETED, 0, 9, "out\n", "err\n", cluster_name)
 
-    def cancel(self, cluster_name: str, job_id: int) -> None:  # noqa: ARG002
-        return
+    def query_job(self, *args: object, **kwargs: object) -> None:  # noqa: ARG002
+        return None
 
-    def release(self, cluster_name: str) -> None:  # noqa: ARG002
+    def cancel(self, cluster_name: str, job_id: int) -> None:
+        self.cancel_calls.append((cluster_name, job_id))
+
+    def release(self, cluster_name: str) -> None:
         self.release_calls += 1
+        self.release_names.append(cluster_name)
+
+
+class _Slot:
+    def __init__(self) -> None:
+        self.value: object | None = None
+
+    def load_optional(self) -> object | None:
+        return self.value
+
+    def save(self, value: object) -> None:
+        self.value = value
+
+
+class _Namespace:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.slots: dict[str, _Slot] = {}
+
+    def slot(self, path: str, model: object) -> _Slot:  # noqa: ARG002
+        return self.slots.setdefault(path, _Slot())
+
+    def external_directory(self, relative: str) -> Path:
+        path = self.root / relative
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+
+def test_decoded_log_spool_resumes_from_durable_character_offset(tmp_path: Path) -> None:
+    namespace = _Namespace(tmp_path / "state")
+    journal = InvocationJournal(namespace)  # pyright: ignore[reportArgumentType]
+    invocation_id = "a" * 32
+    record = journal.prepare(invocation_id, "b" * 64, "e" * 64)
+    record = journal.submitting(record, "lease", _attempt_resources())
+    journal.submitted(record, 9, "lease")
+    path = tmp_path / "state" / "logs" / "stdout"
+    first_output: list[str] = []
+    first = bridge_module._DecodedLogSpool(  # noqa: SLF001
+        path=path,
+        journal=journal,
+        invocation_id=invocation_id,
+        sink=first_output.append,
+    )
+    first.feed("one\n")
+
+    resumed_output: list[str] = []
+    resumed = bridge_module._DecodedLogSpool(  # noqa: SLF001
+        path=path,
+        journal=journal,
+        invocation_id=invocation_id,
+        sink=resumed_output.append,
+    )
+    resumed.feed("one\ntwo\n")
+    resumed.finish()
+
+    assert first_output == ["one\n"]
+    assert resumed_output == ["two\n"]
+    recovered = journal.load(invocation_id)
+    assert recovered is not None
+    assert recovered.remote_read_offset == len("one\ntwo\n")
+    assert recovered.client_delivered_offset == len("one\ntwo\n")
+
+
+def test_decoded_log_spool_replays_persisted_undelivered_suffix(tmp_path: Path) -> None:
+    namespace = _Namespace(tmp_path / "state")
+    journal = InvocationJournal(namespace)  # pyright: ignore[reportArgumentType]
+    invocation_id = "c" * 32
+    record = journal.prepare(invocation_id, "d" * 64, "e" * 64)
+    record = journal.submitting(record, "lease", _attempt_resources())
+    journal.submitted(record, 9, "lease")
+    path = tmp_path / "state" / "logs" / "stdout"
+
+    def disconnect(_: str) -> None:
+        raise BrokenPipeError
+
+    spool = bridge_module._DecodedLogSpool(  # noqa: SLF001
+        path=path,
+        journal=journal,
+        invocation_id=invocation_id,
+        sink=disconnect,
+    )
+    with pytest.raises(BrokenPipeError):
+        spool.feed("durable\n")
+
+    replayed: list[str] = []
+    bridge_module._DecodedLogSpool(  # noqa: SLF001
+        path=path,
+        journal=journal,
+        invocation_id=invocation_id,
+        sink=replayed.append,
+    )
+    assert replayed == ["durable\n"]
+
+
+def test_startup_replacement_evidence_applies_only_to_preexisting_invocations(
+    tmp_path: Path,
+) -> None:
+    namespace = _Namespace(tmp_path / "state")
+    runner = FakeRunner()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge = SkyPilotBridge(
+        runner=runner,  # pyright: ignore[reportArgumentType]
+        cluster_name="lease",
+        resources=_resources(),
+        workspace=workspace,
+        evaluator_package_root=None,
+        hidden_paths=(),
+        commands={"accuracy": ("true",)},
+        benchmark_output_argument=None,
+        state_namespace=namespace,  # pyright: ignore[reportArgumentType]
+        socket_path=tmp_path / "bridge.sock",
+        log=lambda _: None,
+    )
+    journal = InvocationJournal(namespace)  # pyright: ignore[reportArgumentType]
+    invocation_id = "f" * 32
+    prepared = journal.prepare(invocation_id, "1" * 64, "2" * 64)
+    bridge._cluster_replaced_on_start = True  # noqa: SLF001
+    bridge._locally_prepared_invocations.add(invocation_id)  # noqa: SLF001
+
+    assert bridge._recover_after_allocation_loss(prepared) is prepared  # noqa: SLF001
+    submitting = journal.submitting(prepared, "lease", _attempt_resources())
+    assert not bridge._allocation_was_replaced(submitting)  # noqa: SLF001
+
+    bridge._locally_prepared_invocations.clear()  # noqa: SLF001
+    assert bridge._allocation_was_replaced(submitting)  # noqa: SLF001
+    bridge._touched_clusters.add("old-lease")  # noqa: SLF001
+    bridge.close()
+    assert set(runner.release_names) == {"lease", "old-lease"}
+
+
+def test_terminal_replay_tracks_persisted_cluster_for_release(tmp_path: Path) -> None:
+    namespace = _Namespace(tmp_path / "state")
+    runner = FakeRunner()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge = SkyPilotBridge(
+        runner=runner,  # pyright: ignore[reportArgumentType]
+        cluster_name="new-lease",
+        resources=_resources(),
+        workspace=workspace,
+        evaluator_package_root=None,
+        hidden_paths=(),
+        commands={"accuracy": ("true",)},
+        benchmark_output_argument=None,
+        state_namespace=namespace,  # pyright: ignore[reportArgumentType]
+        socket_path=tmp_path / "bridge.sock",
+        log=lambda _: None,
+    )
+    request = EvaluationRequest(kind="accuracy", invocation_id="e" * 32)
+    staging = bridge._snapshot(request.invocation_id)  # noqa: SLF001
+    snapshot_digest = bridge._snapshot_digest(staging)  # noqa: SLF001
+    request_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "request": request.model_dump(mode="json", exclude={"invocation_id"}),
+                "command": ("true",),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    journal = InvocationJournal(namespace)  # pyright: ignore[reportArgumentType]
+    record = journal.prepare(request.invocation_id, request_digest, snapshot_digest)
+    record = journal.submitting(record, "old-lease", _attempt_resources())
+    record = journal.submitted(record, 9, "old-lease")
+    journal.completed(
+        record,
+        InvocationResultRecord(
+            status="COMPLETED",
+            sky_exit_code=0,
+            provenance=InvocationProvenance(
+                profile_name="old-profile",
+                infra="slurm/old/gpu",
+                cluster_name="old-lease",
+                job_name=record.job_name,
+                remote_job_id=9,
+                attempt=1,
+                accelerator_type="MI300A",
+                nodes=1,
+                accelerators_per_node=4,
+            ),
+        ),
+    )
+    reader = io.BytesIO(
+        encode_message(request) + encode_message(AckRequest(invocation_id=request.invocation_id))
+    )
+
+    connection, peer = socket.socketpair()
+    try:
+        bridge._handle_request(reader, io.BytesIO(), connection)  # noqa: SLF001
+    finally:
+        connection.close()
+        peer.close()
+    bridge.close()
+
+    assert set(runner.release_names) == {"new-lease", "old-lease"}
+
+
+def test_job_discovered_during_close_is_cancelled_and_released(tmp_path: Path) -> None:
+    namespace = _Namespace(tmp_path / "state")
+    runner = FakeRunner()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge = SkyPilotBridge(
+        runner=runner,  # pyright: ignore[reportArgumentType]
+        cluster_name="new-lease",
+        resources=_resources(),
+        workspace=workspace,
+        evaluator_package_root=None,
+        hidden_paths=(),
+        commands={"accuracy": ("true",)},
+        benchmark_output_argument=None,
+        state_namespace=namespace,  # pyright: ignore[reportArgumentType]
+        socket_path=tmp_path / "bridge.sock",
+        log=lambda _: None,
+    )
+    journal = InvocationJournal(namespace)  # pyright: ignore[reportArgumentType]
+    record = journal.prepare("d" * 32, "1" * 64, "2" * 64)
+    record = journal.submitting(record, "old-lease", _attempt_resources())
+    bridge._closing.set()  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="closing"):
+        bridge._job_started(  # noqa: SLF001
+            record,
+            11,
+            "old-lease",
+            threading.Event(),
+        )
+    bridge.close()
+
+    assert ("old-lease", 11) in runner.cancel_calls
+    assert set(runner.release_names) == {"new-lease", "old-lease"}
 
 
 def test_bridge_stages_allowlisted_command_streams_and_cleans_up(tmp_path: Path) -> None:
@@ -106,6 +375,7 @@ def test_bridge_stages_allowlisted_command_streams_and_cleans_up(tmp_path: Path)
         hidden_paths=(Path("private"),),
         commands={"benchmark": ("python", ".vibesys-evaluator-package/checker.py")},
         benchmark_output_argument="--output-json",
+        state_namespace=_Namespace(tmp_path / "state"),  # pyright: ignore[reportArgumentType]
         socket_path=tmp_path / "bridge.sock",
         log=lambda _: None,
     )
@@ -118,6 +388,7 @@ def test_bridge_stages_allowlisted_command_streams_and_cleans_up(tmp_path: Path)
                 encode_message(
                     EvaluationRequest(
                         kind="benchmark",
+                        invocation_id="1" * 32,
                         arguments=("--output-json", remote_result),
                         artifacts=(remote_result,),
                     )
@@ -125,6 +396,8 @@ def test_bridge_stages_allowlisted_command_streams_and_cleans_up(tmp_path: Path)
             )
             reader = client.makefile("rb")
             frames = [decode_response(reader.readline()) for _ in range(4)]
+            client.sendall(encode_message(AckRequest(invocation_id="1" * 32)))
+            assert decode_response(reader.readline()).type == "acked"
         assert [frame.type for frame in frames] == ["stdout", "stderr", "artifact", "result"]
         assert isinstance(frames[2], ArtifactFrame)
         assert runner.commands[0][:2] == ("sh", "-c")
@@ -158,6 +431,7 @@ def test_bridge_releases_cluster_when_socket_startup_fails(
         hidden_paths=(),
         commands={"accuracy": ("true",)},
         benchmark_output_argument=None,
+        state_namespace=_Namespace(tmp_path / "state"),  # pyright: ignore[reportArgumentType]
         socket_path=tmp_path / "bridge.sock",
         log=lambda _: None,
     )
@@ -184,6 +458,7 @@ def test_bridge_rejects_special_workspace_file(tmp_path: Path) -> None:
         hidden_paths=(),
         commands={"accuracy": ("true",)},
         benchmark_output_argument=None,
+        state_namespace=_Namespace(tmp_path / "state"),  # pyright: ignore[reportArgumentType]
         socket_path=tmp_path / "bridge.sock",
         log=lambda _: None,
     )
@@ -191,7 +466,9 @@ def test_bridge_rejects_special_workspace_file(tmp_path: Path) -> None:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(bridge.socket_path))
-            client.sendall(encode_message(EvaluationRequest(kind="accuracy")))
+            client.sendall(
+                encode_message(EvaluationRequest(kind="accuracy", invocation_id="2" * 32))
+            )
             frame = decode_response(client.makefile("rb").readline())
         assert isinstance(frame, ErrorFrame)
         assert frame.error == "ValueError"
@@ -221,6 +498,7 @@ def test_bridge_rejects_workspace_symlink_escape(tmp_path: Path) -> None:
         hidden_paths=(),
         commands={"accuracy": ("python", "checker.py")},
         benchmark_output_argument=None,
+        state_namespace=_Namespace(tmp_path / "state"),  # pyright: ignore[reportArgumentType]
         socket_path=tmp_path / "bridge.sock",
         log=lambda _: None,
     )
@@ -228,7 +506,9 @@ def test_bridge_rejects_workspace_symlink_escape(tmp_path: Path) -> None:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(bridge.socket_path))
-            client.sendall(encode_message(EvaluationRequest(kind="accuracy")))
+            client.sendall(
+                encode_message(EvaluationRequest(kind="accuracy", invocation_id="3" * 32))
+            )
             frame = decode_response(client.makefile("rb").readline())
         assert isinstance(frame, ErrorFrame)
         assert frame.error == "ValueError"

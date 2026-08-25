@@ -7,19 +7,20 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 class _Message(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    version: Literal[1] = PROTOCOL_VERSION
+    version: Literal[2] = PROTOCOL_VERSION
 
 
 class EvaluationRequest(_Message):
     """Request one server-selected trusted evaluator."""
 
     kind: Literal["accuracy", "benchmark"]
+    invocation_id: Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
     arguments: tuple[str, ...] = ()
     artifacts: tuple[str, ...] = ()
 
@@ -45,7 +46,23 @@ class ArtifactFrame(_Message):
 
     type: Literal["artifact"] = "artifact"
     path: str
+    size: Annotated[int, Field(ge=0)]
+    sha256: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
     data_base64: str
+
+
+class AckRequest(_Message):
+    """Confirm atomic client delivery of one terminal result."""
+
+    type: Literal["ack"] = "ack"
+    invocation_id: Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
+
+
+class AckedFrame(_Message):
+    """Confirm that acknowledgement is durable."""
+
+    type: Literal["acked"] = "acked"
+    invocation_id: Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 
 
 class ErrorFrame(_Message):
@@ -56,7 +73,8 @@ class ErrorFrame(_Message):
 
 
 ResponseFrame = Annotated[
-    OutputFrame | ArtifactFrame | ResultFrame | ErrorFrame, Field(discriminator="type")
+    OutputFrame | ArtifactFrame | ResultFrame | AckedFrame | ErrorFrame,
+    Field(discriminator="type"),
 ]
 _RESPONSE_ADAPTER = TypeAdapter(ResponseFrame)
 
@@ -69,6 +87,11 @@ def encode_message(message: _Message) -> bytes:
 def decode_request(payload: bytes) -> EvaluationRequest:
     """Decode and strictly validate one request line."""
     return EvaluationRequest.model_validate_json(payload, strict=True)
+
+
+def decode_ack(payload: bytes) -> AckRequest:
+    """Decode and strictly validate a terminal acknowledgement."""
+    return AckRequest.model_validate_json(payload, strict=True)
 
 
 def decode_response(payload: bytes) -> ResponseFrame:

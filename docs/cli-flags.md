@@ -303,6 +303,7 @@ prompts and input-owned candidate-contract documentation.
 | Backend | Intended target | Sandbox support | Device handling | Default profiler behavior |
 | --- | --- | --- | --- | --- |
 | `cuda` | NVIDIA GPU serving systems. | Local, Docker, Modal. | Selects/reselects a GPU and can monitor contention. | Local/Docker use `nsys`; Modal uses `torch` when `--profiler auto`. |
+| `rocm` | AMD GPU serving systems. | Local, Docker, SkyPilot. | Selects a visible ROCm device locally; a SkyPilot profile declares remote capacity. | Use `none` unless the runtime provides a compatible profiler. |
 | `metal` | Apple Silicon / MPS targets. | Local only. | No device selection or monitor. | Local `auto` resolves through the local runtime default. |
 | `trainium` | AWS Trainium / NeuronCore targets. | Local and Docker; Modal unsupported. | Forwards `/dev/neuron*` in Docker; no per-device selection. | `auto` resolves to `neuron`. |
 | `cpu` | CPU-only service/data-structure targets. | Local and Docker. | No device selection or monitor. | Generic workloads on Linux select `linux_cpu`; macOS selects `macos_cpu`; other systems select no profiler. |
@@ -317,9 +318,10 @@ starts with an actionable error.
 | neither `--docker` nor `--modal` | Local host. | Requires bubblewrap on Linux or Seatbelt on macOS. Enforces the project path policy. `VIBESYS_AGENT_SANDBOX=landlock` trades the nested read-only and hidden tiers for a backend that runs without user namespaces. |
 | `--docker` | Docker container. | Mounts the project with the same hidden and read-only overlays. Backend controls GPU/device passthrough. |
 | `--modal` | Modal workflow. | Mutually exclusive with `--docker`. Intended for remote GPU dispatch. |
+| `--run-environment skypilot` | Local CPU editor with SkyPilot evaluators. | Requires portable task resources and an operator-owned cluster profile. See [Remote Slurm execution](remote-slurm-execution.md). |
 
 `--docker-image` overrides the backend's default container image when Docker or
-Modal is active.
+Modal is active, and the local CPU editor image for SkyPilot.
 
 The selected environment and its options (`--docker-image`, `--modal-gpu`,
 `--modal-model-volume`, `--modal-app`) are recorded in the run configuration.
@@ -329,6 +331,10 @@ authoritative. Omitting the runtime-environment flags restores it, and passing
 a flag that contradicts the recording is rejected like any other immutable
 configuration field. The candidate's Modal entrypoint is declared by the task,
 not recorded, so it follows the current input bundle.
+
+SkyPilot profile selection, profiles-file path, and executable are machine-local
+launch policy. Supply them again on resume when they are not available from the
+current CLI/config file.
 
 Run schema version 1 has no recorded environment. Version 2 has no portable
 compute-resource request. VibeSys refuses to load either rather than infer

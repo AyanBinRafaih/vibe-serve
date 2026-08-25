@@ -19,6 +19,7 @@ class RunStateNamespace(StrEnum):
     EVOLVE = "evolve"
     PLAIN = "plain"
     RUNTIME = "runtime"
+    SKYPILOT = "skypilot"
 
 
 @dataclass(frozen=True)

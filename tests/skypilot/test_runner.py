@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,7 @@ from vibesys.skypilot.runner import (
     SkyPilotJobStateError,
     SkyPilotOutputError,
     SkyPilotTimeoutError,
+    SubprocessCommandRunner,
     build_task_document,
     stable_cluster_name,
 )
@@ -77,6 +79,27 @@ class FakeCommandRunner:
 
 def _result(returncode: int = 0, stdout: str = "", stderr: str = "") -> ProcessResult:
     return ProcessResult(("sky",), returncode, stdout, stderr)
+
+
+def test_subprocess_runner_drains_pipes_and_propagates_sink_failure() -> None:
+    calls = 0
+
+    def broken_sink(_: str) -> None:
+        nonlocal calls
+        calls += 1
+        raise BrokenPipeError
+
+    with pytest.raises(BrokenPipeError):
+        SubprocessCommandRunner().run(
+            (
+                sys.executable,
+                "-c",
+                "import sys; [print(i) for i in range(1000)]; print('err', file=sys.stderr)",
+            ),
+            stdout_sink=broken_sink,
+        )
+
+    assert calls == 1000
 
 
 def test_stable_name_uses_effective_resources_not_profile_alias() -> None:
@@ -248,7 +271,7 @@ def test_ensure_rejects_abnormal_init_transition() -> None:
         SkyPilotJobRunner(fake).ensure_cluster("lease", _resources())
 
 
-def test_run_timeout_cancels_discovered_job(tmp_path: Path) -> None:
+def test_run_timeout_preserves_discovered_job_for_recovery(tmp_path: Path) -> None:
     fake = FakeCommandRunner(
         [
             _result(),
@@ -267,7 +290,7 @@ def test_run_timeout_cancels_discovered_job(tmp_path: Path) -> None:
             timeout=10,
         )
 
-    assert fake.calls[-1] == ("sky", "cancel", "-y", "lease", "7")
+    assert fake.calls[-1] == ("sky", "logs", "lease", "7", "--tail", "0")
 
 
 @pytest.mark.parametrize("returncode", [2, 101, 102])
@@ -289,7 +312,7 @@ def test_run_does_not_classify_cli_or_indeterminate_codes_as_application_failure
             "lease", _resources(), workdir=tmp_path, command=("benchmark",)
         )
 
-    assert fake.calls[-1] == ("sky", "cancel", "-y", "lease", "7")
+    assert fake.calls[-1] == ("sky", "logs", "lease", "7", "--tail", "0")
 
 
 def test_cancel_and_release_use_noninteractive_control_commands() -> None:
