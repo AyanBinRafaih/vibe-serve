@@ -24,6 +24,32 @@ def resolve_agent_driver(config: Config) -> str:
     return config.agent.driver or DEFAULT_AGENT_DRIVER
 
 
+def agent_driver_supports_mcp_servers(
+    config: Config,
+    *,
+    agent_backend: str | None,
+) -> bool | None:
+    """Return whether the configured external driver supports session MCP.
+
+    This query has no runtime side effects, so wiring code can reject an
+    incompatible feature before creating a project or driver resources.
+    Non-CLI backends do not use the external-driver contract.
+    """
+    backend = agent_backend or config.agent.backend or DEFAULT_AGENT_BACKEND
+    if backend != "cli":
+        return None
+
+    driver_name = resolve_agent_driver(config)
+    if driver_name == "omnigent":
+        from vibesys.agents.drivers.omnigent import OMNIGENT_CAPABILITIES  # noqa: PLC0415
+
+        return OMNIGENT_CAPABILITIES.mcp_servers
+
+    from vibesys.agents.drivers.agentshim import AGENTSHIM_CAPABILITIES  # noqa: PLC0415
+
+    return AGENTSHIM_CAPABILITIES.mcp_servers
+
+
 def build_agent_client(  # noqa: C901, PLR0912, PLR0913
     config: Config,
     *,

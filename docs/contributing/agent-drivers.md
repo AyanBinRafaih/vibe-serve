@@ -27,8 +27,19 @@ uv sync --extra omnigent
   Gemini harness, and its `opencode-native` executor cannot run a headless
   VibeSys turn.
 - `--docker` is rejected because the integration has no container launcher.
-- MCP server setup is rejected because the driver does not translate VibeSys
-  MCP specifications.
+- Session-scoped stdio MCP servers use Omnigent's native MCP manager. VibeSys
+  translates its provider-independent server declarations into Omnigent
+  `MCPServerConfig` values, discovers namespaced tools before the first turn,
+  and owns each session's MCP connections and subprocess cleanup.
+  These generated specs declare no Omnigent guardrails; VibeSys remains the
+  authority for which session-scoped servers are supplied to each role.
+  Omnigent 0.10 launches stdio MCP subprocesses directly as children of the
+  VibeSys process, outside the agent's OS-tool sandbox. Session MCP specs must
+  therefore remain trusted framework configuration, not candidate input. With
+  an explicit server `env`, the subprocess inherits the VibeSys process
+  environment after Omnigent removes runner authentication secrets, then
+  overlays those values. Without an explicit `env`, Omnigent delegates to the
+  MCP SDK's restricted default environment.
 - Extra host resource grants are rejected. The Omnigent path imports only the
   installed Rust toolchain automatically.
 - Hidden project paths become explicit Omnigent masks. Read-only declarations

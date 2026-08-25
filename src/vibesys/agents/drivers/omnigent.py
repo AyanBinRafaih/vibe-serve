@@ -30,6 +30,7 @@ from vibesys.agents.contracts import (
 )
 from vibesys.agents.drivers._omnigent_lifecycle import CloseLifecycle as _CloseLifecycle
 from vibesys.agents.drivers._omnigent_lifecycle import LifecycleState as _LifecycleState
+from vibesys.agents.drivers._omnigent_mcp import OmnigentMCPTools as _OmnigentMCPTools
 from vibesys.agents.drivers._omnigent_runtime import (
     OmnigentAsyncRuntime as _OmnigentAsyncRuntime,
 )
@@ -66,6 +67,13 @@ _OMNIGENT_INTERNAL_HIDDEN = frozenset({".codex-tmp"})
 
 _SESSION_SHUTDOWN_TIMEOUT = 5.0
 
+OMNIGENT_CAPABILITIES = AgentCapabilities(
+    mcp_servers=True,
+    timeouts=True,
+    session_reuse=True,
+)
+"""Capabilities available before constructing Omnigent runtime resources."""
+
 
 def _unwrap_turn(
     outcome: tuple[AgentTurnResult | None, BaseException | None],
@@ -101,6 +109,10 @@ class _OwnedOSTools:
     schemas: list[dict[str, Any]]
     dispatch: Callable[[str, dict[str, Any]], Any]
     environments: tuple[Any, ...]
+
+    def handles(self, name: str) -> bool:
+        """Return whether ``name`` belongs to this sandboxed tool surface."""
+        return any(schema.get("name") == name for schema in self.schemas)
 
     def close(self) -> None:
         """Close every environment exactly once and preserve the first failure."""
@@ -416,13 +428,14 @@ async def _drive_turn(
 class OmnigentSession:
     """One configured Omnigent executor and provider conversation."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         driver: OmnigentDriver,
         spec: AgentSessionSpec,
         executor: Any,  # noqa: ANN401
         tool_schemas: list[dict[str, Any]],
+        mcp_tools: _OmnigentMCPTools | None = None,
         resources: _ExecutorResources | None = None,
     ) -> None:
         """Own ``executor`` until this session is closed."""
@@ -430,6 +443,7 @@ class OmnigentSession:
         self._spec = spec
         self._executor = executor
         self._tool_schemas = tool_schemas
+        self._mcp_tools = mcp_tools
         self._resources: _ExecutorResources | None = resources or _ExecutorResources()
         self._lifecycle = threading.Condition()
         self._close_lifecycle = _CloseLifecycle(self._lifecycle)
@@ -563,7 +577,7 @@ class OmnigentSession:
             return None, exc
 
     async def _shutdown(self) -> BaseException | None:
-        """Close this session's executor on the driver runtime."""
+        """Close this session's native resources on the driver runtime."""
         first_error: BaseException | None = None
         try:
             close = getattr(self._executor, "close", None)
@@ -573,16 +587,20 @@ class OmnigentSession:
                     await result
         except BaseException as exc:  # noqa: BLE001
             first_error = exc
+        mcp_tools = self._mcp_tools
+        if mcp_tools is not None:
+            try:
+                await mcp_tools.close()
+            except BaseException as exc:  # noqa: BLE001
+                if first_error is None:
+                    first_error = exc
+            else:
+                self._mcp_tools = None
         return first_error
 
 
 class OmnigentDriver:
     """Create sandboxed Omnigent sessions and own their native resources."""
-
-    _CAPABILITIES = AgentCapabilities(
-        timeouts=True,
-        session_reuse=True,
-    )
 
     def __init__(self) -> None:
         """Create a driver with no live sessions."""
@@ -596,7 +614,7 @@ class OmnigentDriver:
     @property
     def capabilities(self) -> AgentCapabilities:
         """Describe the requirements Omnigent 0.10.0 can satisfy."""
-        return self._CAPABILITIES
+        return OMNIGENT_CAPABILITIES
 
     def create_session(self, spec: AgentSessionSpec) -> OmnigentSession:
         """Validate setup requirements and create a confined session."""
@@ -606,12 +624,13 @@ class OmnigentDriver:
             self._creating_sessions += 1
         try:
             self._validate_spec(spec)
-            executor, schemas, resources = self._build_executor(spec)
+            executor, schemas, mcp_tools, resources = self._build_executor(spec)
             session = OmnigentSession(
                 driver=self,
                 spec=spec,
                 executor=executor,
                 tool_schemas=schemas,
+                mcp_tools=mcp_tools,
                 resources=resources,
             )
             with self._lifecycle:
@@ -668,9 +687,6 @@ class OmnigentDriver:
 
     def _validate_spec(self, spec: AgentSessionSpec) -> None:
         _resolve_executor_spec(spec.provider)
-        if spec.mcp_servers:
-            names = [server.name for server in spec.mcp_servers]
-            raise OmnigentDriverError(f"Omnigent cannot install session MCP servers: {names}")
         if spec.policy.host_resources:
             raise OmnigentDriverError("Omnigent cannot enforce VibeSys host-resource grants")
         if spec.policy.containerized:
@@ -688,8 +704,13 @@ class OmnigentDriver:
             )
 
     def run_awaitable(self, awaitable: Any) -> Any:  # noqa: ANN401
-        """Run isolated cleanup on the driver-owned async runtime."""
-        return self.submit(awaitable).result()
+        """Run and drain one coroutine on the driver-owned async runtime."""
+        task = self.start_task(awaitable)
+        try:
+            return task.result()
+        except BaseException:
+            task.cancel_and_wait()
+            raise
 
     def submit[Result](
         self,
@@ -779,9 +800,9 @@ class OmnigentDriver:
             sandbox=sandbox,
         )
 
-    def _build_executor(
+    def _build_executor(  # noqa: C901, PLR0915
         self, spec: AgentSessionSpec
-    ) -> tuple[Any, list[dict[str, Any]], _ExecutorResources]:
+    ) -> tuple[Any, list[dict[str, Any]], _OmnigentMCPTools | None, _ExecutorResources]:
         executor_spec = _resolve_executor_spec(spec.provider)
         executor_cls = self._executor_class(executor_spec)
         os_env_spec = self._build_os_env(spec)
@@ -874,6 +895,7 @@ class OmnigentDriver:
                 description="Omnigent executor cleanup",
             )
             raise
+        mcp_tools: _OmnigentMCPTools | None = None
         try:
             os_tools = _build_os_tools(
                 os_env_spec,
@@ -882,15 +904,56 @@ class OmnigentDriver:
                 shell_os_env_spec,
             )
             resources.os_tools = os_tools
-            setattr(executor, _TOOL_EXECUTOR_ATTR, os_tools.dispatch)
+            mcp_tools = _OmnigentMCPTools.build(
+                servers=spec.mcp_servers,
+                workspace=spec.workspace,
+                harness=executor_spec.harness,
+                session_id=lambda: cast("str | None", getattr(executor, "thread_id", None)),
+            )
+            if mcp_tools is not None:
+                self.run_awaitable(mcp_tools.initialize())
+
+            async def dispatch(name: str, args: dict[str, Any]) -> Any:  # noqa: ANN401
+                if mcp_tools is not None and mcp_tools.handles(name):
+                    return await mcp_tools.dispatch(name, args)
+                if os_tools.handles(name):
+                    return await os_tools.dispatch(name, args)
+                return {"error": f"unknown tool {name!r}"}
+
+            setattr(executor, _TOOL_EXECUTOR_ATTR, dispatch)
         except BaseException as error:
+            if mcp_tools is not None:
+                try:
+                    self.run_awaitable(mcp_tools.close())
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    error.add_note(f"Omnigent MCP cleanup also failed: {cleanup_error}")
             _cleanup_after_failure(
                 error,
                 lambda: self.close_executor(executor, resources=resources),
                 description="Omnigent executor cleanup",
             )
             raise
-        return executor, os_tools.schemas, resources
+        mcp_schemas = [] if mcp_tools is None else mcp_tools.schemas
+        duplicate_names = {schema["name"] for schema in os_tools.schemas} & {
+            schema["name"] for schema in mcp_schemas
+        }
+        if duplicate_names:
+            error = OmnigentDriverError(
+                f"Omnigent MCP tools conflict with OS tools: {sorted(duplicate_names)}"
+            )
+            assert mcp_tools is not None  # noqa: S101  # duplicate MCP schema implies owner
+            _cleanup_after_failure(
+                error,
+                lambda: self.run_awaitable(mcp_tools.close()),
+                description="Omnigent MCP cleanup",
+            )
+            _cleanup_after_failure(
+                error,
+                lambda: self.close_executor(executor, resources=resources),
+                description="Omnigent executor cleanup",
+            )
+            raise error
+        return executor, [*os_tools.schemas, *mcp_schemas], mcp_tools, resources
 
     def release_session(self, session: OmnigentSession) -> None:
         """Forget a closed session after it has released its owned resources."""

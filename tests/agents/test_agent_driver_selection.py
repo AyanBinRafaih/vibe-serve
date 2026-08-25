@@ -10,6 +10,7 @@ import pytest
 from vibesys.agents import build_agent_client
 from vibesys.agents.drivers.agentshim import AgentShimDriver
 from vibesys.agents.drivers.omnigent import OmnigentDriver, OmnigentDriverError
+from vibesys.agents.factory import agent_driver_supports_mcp_servers
 from vibesys.agents.omnigent import supported_providers
 from vibesys.agents.omnigent.providers import OMNIGENT_PROVIDER_EXECUTORS
 from vibesys.config import Config
@@ -69,6 +70,28 @@ def test_omnigent_driver_can_be_selected() -> None:
     client = _build(_config(driver="omnigent", backend="cli", cli_provider="claude"))
 
     assert isinstance(client._driver, OmnigentDriver)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("driver", "supports_mcp"),
+    [(None, True), ("agentshim", True), ("omnigent", True)],
+)
+def test_preflight_capabilities_match_constructed_driver(
+    driver: str | None,
+    supports_mcp: object,
+) -> None:
+    config = _config(driver=driver, backend="cli", cli_provider="codex")
+    declared = agent_driver_supports_mcp_servers(config, agent_backend=None)
+    client = _build(config)
+
+    assert declared is supports_mcp
+    assert declared is client.capabilities.mcp_servers
+
+
+def test_non_cli_backend_has_no_external_driver_capabilities() -> None:
+    config = _config(backend="deepagents")
+
+    assert agent_driver_supports_mcp_servers(config, agent_backend=None) is None
 
 
 def test_omnigent_selection_passes_model_and_log_dir(tmp_path) -> None:  # noqa: ANN001
