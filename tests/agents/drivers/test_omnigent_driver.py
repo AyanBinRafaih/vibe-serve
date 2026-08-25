@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
+import shutil
+import sys
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
@@ -19,10 +22,13 @@ from vibesys.agents.contracts import (
     MCPServerSpec,
 )
 from vibesys.agents.drivers.omnigent import (
+    _TOOL_EXECUTOR_ATTR,
     OmnigentDriver,
     OmnigentDriverError,
     OmnigentSession,
+    _build_os_tools,
 )
+from vibesys.agents.omnigent.providers import OMNIGENT_PROVIDER_EXECUTORS
 from vibesys.schemas import JudgeResponse
 from vs_sandbox import HostResource, ProjectPathPolicy
 
@@ -31,6 +37,57 @@ TextChunk = omnigent.TextChunk
 ToolCallComplete = omnigent.ToolCallComplete
 ToolCallRequest = omnigent.ToolCallRequest
 TurnComplete = omnigent.TurnComplete
+
+
+def _sandbox_backend_available() -> bool:
+    if os.environ.get("VIBESYS_REQUIRE_SANDBOX_TESTS") == "1":
+        return True
+    if sys.platform.startswith("linux"):
+        return shutil.which("bwrap") is not None
+    if sys.platform == "darwin":
+        return shutil.which("sandbox-exec") is not None
+    return False
+
+
+requires_sandbox_backend = pytest.mark.skipif(
+    not _sandbox_backend_available(),
+    reason="requires the platform sandbox backend (bwrap / sandbox-exec)",
+)
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_registered_executor_matches_pinned_omnigent_api(provider: str) -> None:
+    driver = OmnigentDriver()
+    executor_spec = OMNIGENT_PROVIDER_EXECUTORS[provider]
+
+    executor_class = driver._executor_class(executor_spec)  # noqa: SLF001
+    parameters = inspect.signature(executor_class.__init__).parameters
+
+    assert executor_class.__name__ == executor_spec.class_name
+    assert "cwd" in parameters
+    assert "model" in parameters
+
+
+@pytest.mark.parametrize(
+    ("provider", "required_binary"),
+    [("claude", None), ("codex", "codex")],
+)
+def test_registered_executor_exposes_tool_dispatch_seam(
+    provider: str,
+    required_binary: str | None,
+) -> None:
+    if required_binary is not None and shutil.which(required_binary) is None:
+        pytest.skip(f"{provider} executor needs the {required_binary!r} CLI to construct")
+    driver = OmnigentDriver()
+    executor_class = driver._executor_class(  # noqa: SLF001
+        OMNIGENT_PROVIDER_EXECUTORS[provider]
+    )
+
+    executor = executor_class(cwd=".", model=None)
+    try:
+        assert hasattr(executor, _TOOL_EXECUTOR_ATTR)
+    finally:
+        driver.close_executor(executor)
 
 
 class _FakeExecutor:
@@ -217,20 +274,21 @@ def test_create_session_accepts_supported_top_level_project_policy(
     driver.close()
 
 
-def test_create_session_rejects_non_dot_hidden_path(
+def test_create_session_accepts_non_dot_hidden_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     driver = OmnigentDriver()
-    monkeypatch.setattr(
-        driver,
-        "_build_executor",
-        lambda _spec: pytest.fail("executor must not be built"),
-    )
+    executor = _FakeExecutor([])
+    monkeypatch.setattr(driver, "_build_executor", lambda _spec: (executor, []))
     policy = ProjectPathPolicy(hidden_paths=("agent.toml",))
 
-    with pytest.raises(OmnigentDriverError, match=r"agent\.toml"):
-        driver.create_session(_spec(tmp_path, policy=AgentExecutionPolicy(project_paths=policy)))
+    session = driver.create_session(
+        _spec(tmp_path, policy=AgentExecutionPolicy(project_paths=policy))
+    )
+
+    session.close()
+    driver.close()
 
 
 def test_driver_owns_session_cleanup(
@@ -289,13 +347,16 @@ def test_os_policy_exposes_control_dotdirs_and_keeps_hidden_dotfiles_masked(
     (tmp_path / ".vibesys").mkdir()
     (tmp_path / ".codex-tmp").mkdir()
     (tmp_path / ".env").write_text("secret", encoding="utf-8")
+    (tmp_path / "agent.toml").write_text("secret", encoding="utf-8")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "secret").write_text("secret", encoding="utf-8")
     (tmp_path / "src").mkdir()
     (tmp_path / "Cargo.toml").write_text("[package]", encoding="utf-8")
     toolchain = tmp_path.parent / "toolchain"
     toolchain.mkdir(exist_ok=True)
     policy = ProjectPathPolicy(
         read_only_paths=(".git", ".vibesys"),
-        hidden_paths=(".env",),
+        hidden_paths=(".env", "agent.toml", "config/secret"),
     )
     driver = OmnigentDriver()
     monkeypatch.setattr(
@@ -314,13 +375,39 @@ def test_os_policy_exposes_control_dotdirs_and_keeps_hidden_dotfiles_masked(
     assert spec.sandbox.write_files is None
     assert spec.sandbox.read_paths == [str(toolchain)]
     assert spec.sandbox.env_passthrough == ["CARGO_HOME"]
-    assert set(spec.sandbox.cwd_allow_hidden or ()) == {
-        ".cargo-lock",
-        ".fingerprint",
-        ".git",
-        ".rustc_info.json",
-        ".vibesys",
-    }
+    assert set(spec.sandbox.cwd_allow_hidden or ()) == {".git", ".vibesys"}
+    assert spec.sandbox.cwd_hidden_scan_recursive is False
+    assert spec.sandbox.cwd_hidden_scan_overflow == "error"
+    assert spec.sandbox.mask_paths == [
+        ".codex-tmp",
+        ".env",
+        "agent.toml",
+        "config/secret",
+    ]
+
+
+@requires_sandbox_backend
+def test_os_policy_masks_declared_non_dot_and_nested_paths(tmp_path: Path) -> None:
+    (tmp_path / "public.txt").write_text("public-4417", encoding="utf-8")
+    (tmp_path / "agent.toml").write_text("secret-9913", encoding="utf-8")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "secret").write_text("secret-7729", encoding="utf-8")
+    policy = ProjectPathPolicy(hidden_paths=("agent.toml", "config/secret"))
+    driver = OmnigentDriver()
+    spec = driver._build_os_env(  # noqa: SLF001
+        _spec(tmp_path, policy=AgentExecutionPolicy(project_paths=policy))
+    )
+    _, dispatch = _build_os_tools(spec, tmp_path)
+
+    public = asyncio.run(dispatch("sys_os_read", {"path": "public.txt"}))
+    hidden = asyncio.run(dispatch("sys_os_read", {"path": "agent.toml"}))
+    nested = asyncio.run(dispatch("sys_os_read", {"path": "config/secret"}))
+
+    assert "public-4417" in str(public)
+    assert "secret-9913" not in str(hidden)
+    assert "error" in str(hidden).lower()
+    assert "secret-7729" not in str(nested)
+    assert "error" in str(nested).lower()
 
 
 def test_codex_executor_disables_native_tools(
@@ -342,11 +429,6 @@ def test_codex_executor_disables_native_tools(
     monkeypatch.setattr(
         "vibesys.agents.drivers.omnigent.resolve_active_rust_toolchain",
         lambda _context, *, workspace: (rust_sysroot, target_libdir),  # noqa: ARG005
-    )
-    monkeypatch.setattr("vibesys.agents.drivers.omnigent.sys.platform", "linux")
-    monkeypatch.setattr(
-        "vibesys.agents.drivers.omnigent.shutil.which",
-        lambda name, *, path: "/usr/bin/gcc" if name == "gcc" else None,  # noqa: ARG005
     )
 
     def build_tools(
@@ -374,8 +456,6 @@ def test_codex_executor_disables_native_tools(
     assert cargo_home.parent.is_dir()
     assert not cargo_home.is_relative_to(tmp_path)
     assert "CARGO_TARGET_DIR" not in captured["tool_environment"]
-    assert captured["tool_environment"]["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"] == str(
-        Path("/usr/bin/gcc").resolve()
-    )
+    assert not any(key.endswith("_LINKER") for key in captured["tool_environment"])
     driver.close_executor(executor)
     assert not cargo_home.parent.exists()

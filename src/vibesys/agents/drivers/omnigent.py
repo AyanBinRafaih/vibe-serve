@@ -8,7 +8,6 @@ import asyncio
 import contextlib
 import json
 import os
-import shutil
 import sys
 import tempfile
 from importlib import import_module
@@ -41,13 +40,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
 _TOOL_EXECUTOR_ATTR = "_tool_executor"
-"""Private Omnigent 0.6.0 tool-dispatch seam, guarded before assignment."""
+"""Private Omnigent 0.10.0 tool-dispatch seam, guarded before assignment."""
 
 _OMNIGENT_INTERNAL_HIDDEN = frozenset({".codex-tmp"})
 """Runtime-owned workspace paths that OS tools must not traverse."""
-
-_CARGO_GENERATED_HIDDEN = frozenset({".cargo-lock", ".fingerprint", ".rustc_info.json"})
-"""Cargo-generated basenames needed beneath the conventional target directory."""
 
 
 class OmnigentDriverError(RuntimeError):
@@ -327,7 +323,7 @@ class OmnigentDriver:
 
     @property
     def capabilities(self) -> AgentCapabilities:
-        """Describe the requirements Omnigent 0.6.0 can satisfy."""
+        """Describe the requirements Omnigent 0.10.0 can satisfy."""
         return self._CAPABILITIES
 
     def create_session(self, spec: AgentSessionSpec) -> OmnigentSession:
@@ -384,13 +380,11 @@ class OmnigentDriver:
             )
         project_paths = spec.policy.project_paths
         read_only_paths = () if project_paths is None else project_paths.read_only_paths
-        hidden_paths = () if project_paths is None else project_paths.hidden_paths
         unsupported_paths = [path for path in read_only_paths if not _is_top_level_dot_path(path)]
-        unsupported_paths.extend(path for path in hidden_paths if not _is_top_level_dot_path(path))
         if unsupported_paths:
             raise OmnigentDriverError(
-                "Omnigent 0.6.0 can support only top-level dot paths in the "
-                "VibeSys project policy; unsupported paths: "
+                "Omnigent 0.10.0 can accept only top-level dot paths as "
+                "contract-protected read-only project paths; unsupported paths: "
                 f"{[str(path) for path in unsupported_paths]}"
             )
 
@@ -412,7 +406,7 @@ class OmnigentDriver:
         except AttributeError as exc:
             raise OmnigentDriverError(
                 f"Omnigent module {spec.module!r} has no {spec.class_name!r}; "
-                "this integration requires the Omnigent 0.6.0 executor API"
+                "this integration requires the Omnigent 0.10.0 executor API"
             ) from exc
 
     def _build_os_env(
@@ -437,7 +431,6 @@ class OmnigentDriver:
             and entry.name not in _OMNIGENT_INTERNAL_HIDDEN
             and Path(entry.name) not in hidden
         ]
-        allow_hidden.extend(sorted(_CARGO_GENERATED_HIDDEN))
         environment = {**os.environ, **dict(spec.environment)}
         read_paths = None
         if include_toolchain:
@@ -457,6 +450,9 @@ class OmnigentDriver:
             read_paths=read_paths,
             write_paths=[str(workspace), *(str(path) for path in additional_write_paths)],
             cwd_allow_hidden=allow_hidden,
+            cwd_hidden_scan_recursive=False,
+            cwd_hidden_scan_overflow="error",
+            mask_paths=sorted({str(path) for path in hidden} | _OMNIGENT_INTERNAL_HIDDEN),
             env_passthrough=list(env_passthrough) or None,
         )
         return OSEnvSpec(
@@ -488,13 +484,6 @@ class OmnigentDriver:
                     "RUSTUP_AUTO_INSTALL": "0",
                 }
             )
-            if sys.platform.startswith("linux"):
-                linker = shutil.which("cc", path=environment.get("PATH")) or shutil.which(
-                    "gcc", path=environment.get("PATH")
-                )
-                if linker is not None:
-                    host = rust_toolchain[1].parent.name.upper().replace("-", "_")
-                    tool_environment[f"CARGO_TARGET_{host}_LINKER"] = str(Path(linker).resolve())
         try:
             shell_os_env_spec = self._build_os_env(
                 spec,
@@ -531,7 +520,7 @@ class OmnigentDriver:
             scratch.cleanup()
             raise OmnigentDriverError(
                 f"{executor_cls.__name__} has no {_TOOL_EXECUTOR_ATTR!r} slot; "
-                "this integration requires the private Omnigent 0.6.0 tool-dispatch seam"
+                "this integration requires the private Omnigent 0.10.0 tool-dispatch seam"
             )
         try:
             schemas, dispatch = _build_os_tools(
