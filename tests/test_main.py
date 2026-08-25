@@ -127,6 +127,42 @@ def test_run_environment_spec_uses_task_modal_entrypoint(tmp_path: Path) -> None
     assert spec.options["entrypoint"] == "deploy/service.py"
 
 
+def test_cli_selects_documented_skypilot_environment(tmp_path: Path) -> None:
+    project = _write_input_project(tmp_path)
+    with (project / "vibesys.input.toml").open("a") as manifest:
+        manifest.write(
+            """
+[resources]
+nodes = 1
+accelerators_per_node = 4
+accelerator_backend = "rocm"
+"""
+        )
+
+    invocation = parse_cli_invocation(
+        [
+            "--input",
+            str(project),
+            "--run-environment",
+            "skypilot",
+            "--cluster-profile",
+            "remote-gpu",
+        ]
+    )
+    spec = run_environment_spec_from_args(invocation.args)
+
+    assert spec.name == "skypilot"
+    assert spec.options["profile"] == "remote-gpu"
+    assert spec.resources is not None
+    assert spec.resources.accelerators_per_node == 4
+
+
+def test_cli_rejects_mixed_generic_and_compatibility_environment_flags(tmp_path: Path) -> None:
+    project = _write_input_project(tmp_path)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        parse_cli_invocation(["--input", str(project), "--run-environment", "local", "--modal"])
+
+
 class _CommonConfiguration(TypedDict):
     run_environment: RunEnvironmentRecord
     model: str

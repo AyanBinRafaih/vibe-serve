@@ -1,0 +1,31 @@
+import pytest
+from pydantic import ValidationError
+
+from vibesys.skypilot.protocol import (
+    EvaluationRequest,
+    OutputFrame,
+    decode_request,
+    decode_response,
+    encode_message,
+)
+
+
+def test_protocol_round_trips_strict_versioned_messages() -> None:
+    request = EvaluationRequest(kind="benchmark")
+    frame = OutputFrame(type="stdout", data="measurement\n")
+
+    assert decode_request(encode_message(request)) == request
+    assert decode_response(encode_message(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"version":2,"kind":"accuracy"}\n',
+        b'{"version":1,"kind":"shell"}\n',
+        b'{"version":1,"kind":"accuracy","host":"login"}\n',
+    ],
+)
+def test_protocol_rejects_version_operation_and_policy_overrides(payload: bytes) -> None:
+    with pytest.raises(ValidationError):
+        decode_request(payload)

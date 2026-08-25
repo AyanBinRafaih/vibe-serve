@@ -43,6 +43,9 @@ from vibesys.evaluators import PROJECT_ROOT_TOKEN, load_evaluator_package
 from vibesys.input_manifest import WorkspaceSource  # noqa: TC001  # tracked: #288
 from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, render_template
+from vibesys.skypilot.bridge import SkyPilotBridge
+from vibesys.skypilot.config import load_cluster_profiles, resolve_profile
+from vibesys.skypilot.runner import SkyPilotJobRunner, stable_cluster_name
 from vs_project import RunEnvironmentRecord, RunResourceRequest
 from vs_sandbox import ProjectPathPolicy
 
@@ -129,6 +132,7 @@ class RunEnvironmentRequest:  # noqa: D101  # tracked: #288
     objective_document: Path | None = None
     accuracy_command: str | None = None
     benchmark_command: str | None = None
+    benchmark_output_argument: str | None = None
     evaluator_package_root: Path | None = None
     profiler_support_path: str | None = None
     profiler_support_name: str | None = None
@@ -388,6 +392,185 @@ class ModalEnvironmentConfig:  # noqa: D101  # tracked: #288
     model_volume: str | None = None
     app: str = "vibesys"
     entrypoint: str | None = None
+
+
+@dataclass(frozen=True)
+class SkyPilotEnvironmentConfig:
+    """Operator selection for SkyPilot-backed remote evaluation."""
+
+    image: str | None
+    profile: str
+    profiles_file: Path
+    executable: str = "sky"
+    resources: RunResourceRequest | None = None
+
+
+@dataclass
+class _SkyPilotRunEnvironmentSession:
+    sandbox: SandboxBackendProtocol
+    view: RunEnvironmentView
+    bridge: SkyPilotBridge
+    _closed: bool = False
+
+    def __enter__(self) -> _SkyPilotRunEnvironmentSession:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if hasattr(self.sandbox, "stop"):
+                self.sandbox.stop()  # pyright: ignore[reportAttributeAccessIssue]
+        finally:
+            self.bridge.close()
+
+
+class SkyPilotEnvironment(DockerEnvironment):
+    """CPU-only Docker editor with host-mediated SkyPilot evaluation."""
+
+    materialize_local_model_weights = False
+    default_profiler_kind = ProfilerKind.NONE
+    supported_profiler_kinds: frozenset[ProfilerKind] | None = frozenset(
+        {ProfilerKind.AUTO, ProfilerKind.NONE}
+    )
+
+    def __init__(self, config: SkyPilotEnvironmentConfig) -> None:
+        """Create an environment from operator-owned settings."""
+        self.config = config
+        self.backend_image = config.image
+
+    @classmethod
+    def from_options(
+        cls,
+        options: Mapping[str, object],
+        resources: RunResourceRequest | None = None,
+    ) -> SkyPilotEnvironment:
+        """Validate environment-specific launch options."""
+        profile = options.get("profile")
+        if not isinstance(profile, str) or not profile:
+            raise ValueError("SkyPilot requires a non-empty cluster profile")  # noqa: TRY003
+        raw_path = options.get("profiles_file")
+        profiles_file = (
+            Path(str(raw_path)).expanduser()
+            if raw_path
+            else Path("~/.config/vibesys/clusters.toml").expanduser()
+        )
+        return cls(
+            SkyPilotEnvironmentConfig(
+                image=str(options["image"]) if options.get("image") else None,
+                profile=profile,
+                profiles_file=profiles_file,
+                executable=str(options.get("executable") or "sky"),
+                resources=resources,
+            )
+        )
+
+    def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:
+        """Open the bridge and CPU-only local editor container."""
+        if self.config.resources is None:
+            raise ValueError("SkyPilot requires portable run resources")  # noqa: TRY003
+        profiles = load_cluster_profiles(self.config.profiles_file)
+        resources = resolve_profile(profiles, self.config.profile, self.config.resources)
+        cluster_name = stable_cluster_name(request.run_id, resources)
+        commands: dict[str, tuple[str, ...]] = {}
+        for kind, raw_command in (
+            ("accuracy", request.accuracy_command),
+            ("benchmark", request.benchmark_command),
+        ):
+            command = _remote_evaluator_command(request, raw_command)
+            if command is not None:
+                commands[kind] = command
+
+        log = request.log or _noop_log
+        bridge = SkyPilotBridge(
+            runner=SkyPilotJobRunner(executable=self.config.executable),
+            cluster_name=cluster_name,
+            resources=resources,
+            workspace=request.workspace,
+            evaluator_package_root=request.evaluator_package_root,
+            hidden_paths=request.project_path_policy.hidden_paths,
+            commands=commands,
+            benchmark_output_argument=request.benchmark_output_argument,
+            socket_path=request.log_dir / "skypilot-bridge.sock",
+            log=log,
+        )
+        try:
+            bridge.start()
+            bind_mounts, docker_symlinks, passthrough = _container_mount_plan(request)
+            extra_init_commands, cli_provider_env = _cli_container_setup(request)
+            extra_init_commands.extend(_evaluator_container_setup(request))
+            cli_provider_env.setdefault("UV_CACHE_DIR", "/workspace/.cache/uv")
+            helper_source = Path(__file__).with_name("skypilot_evaluator.py")
+            helper_path = "/opt/vibesys-skypilot-evaluator.py"
+            socket_path = "/opt/vibesys-skypilot/bridge.sock"
+            bind_mounts.extend(
+                [
+                    (str(helper_source), helper_path, True),
+                    (str(bridge.socket_path), socket_path, False),
+                ]
+            )
+            runtime_document = request.log_dir / "runtime-environment.md"
+            runtime_document.write_text(
+                render_template(
+                    "skypilot/runtime_notes.j2",
+                    template_dir=_ENVIRONMENTS_TEMPLATE_DIR,
+                    nodes=resources.nodes,
+                    accelerators_per_node=resources.accelerators_per_node,
+                    accelerator_type=resources.accelerator_type,
+                    profile_name=resources.profile_name,
+                )
+            )
+            runtime_path = "/opt/vibesys-runtime/environment.md"
+            bind_mounts.append((str(runtime_document), runtime_path, True))
+            passthrough.extend(["/opt/vibesys-runtime", "/opt/vibesys-skypilot"])
+            sandbox = request.backend.make_sandbox(
+                SandboxKind.DOCKER,
+                host_workspace=str(request.workspace),
+                log_path=request.log_dir / "docker.log",
+                bind_mounts=_dedupe_mounts(bind_mounts),
+                passthrough_paths=passthrough,
+                extra_env=cli_provider_env,
+                extra_init_commands=extra_init_commands,
+                setup_fns=_symlink_setup_fns(docker_symlinks),
+                attach_accelerator=False,
+            )
+            sandbox.start()  # pyright: ignore[reportAttributeAccessIssue]
+        except Exception:
+            bridge.close()
+            raise
+
+        prefix = f"python {helper_path} --socket {socket_path}"
+        return _SkyPilotRunEnvironmentSession(
+            sandbox=sandbox,
+            bridge=bridge,
+            view=RunEnvironmentView(
+                paths=AgentPaths(
+                    objective=(
+                        "/opt/vibesys-runtime/objective.md"
+                        if request.objective is not None
+                        else "OBJECTIVE.md"
+                    ),
+                    accuracy_command=(f"{prefix} accuracy" if "accuracy" in commands else None),
+                    benchmark_command=(f"{prefix} benchmark" if "benchmark" in commands else None),
+                    profiler_support=None,
+                ),
+                prompt_notes=render_template(
+                    "skypilot/prompt_notes.j2",
+                    template_dir=_ENVIRONMENTS_TEMPLATE_DIR,
+                    runtime_container_path=runtime_path,
+                ),
+                isolated=True,
+                cli_sandboxed=True,
+                host_device_reselect=False,
+                env_kind="skypilot",
+                profile_execution="remote",
+                supports_parallel_candidate_evaluation=False,
+            ),
+        )
 
 
 class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
@@ -697,6 +880,8 @@ def build_run_environment(spec: RunEnvironmentSpec) -> RunEnvironment:  # noqa: 
         return DockerEnvironment.from_options(spec.options)
     if spec.name == "modal":
         return ModalEnvironment.from_options(spec.options)
+    if spec.name == "skypilot":
+        return SkyPilotEnvironment.from_options(spec.options, spec.resources)
     raise ValueError(f"unknown run environment: {spec.name!r}")  # noqa: TRY003  # tracked: #288
 
 
@@ -709,6 +894,10 @@ def make_run_environment_spec(  # noqa: PLR0913  # tracked: #288
     modal_model_volume: str | None = None,
     modal_app: str = "vibesys",
     modal_entrypoint: str | None = None,
+    use_skypilot: bool = False,
+    cluster_profile: str | None = None,
+    cluster_profiles_file: Path | None = None,
+    skypilot_executable: str = "sky",
     resources: RunResourceRequest | None = None,
 ) -> RunEnvironmentSpec:
     """Build a spec from the current CLI compatibility flags.
@@ -720,8 +909,25 @@ def make_run_environment_spec(  # noqa: PLR0913  # tracked: #288
     ``@app.function(timeout=...)`` / ``@app.cls(container_idle_timeout=...)``
     decorators instead.
     """
-    if use_docker and use_modal:
-        raise ValueError("--docker and --modal are mutually exclusive")  # noqa: TRY003  # tracked: #288
+    if sum((use_docker, use_modal, use_skypilot)) > 1:
+        raise ValueError(  # noqa: TRY003
+            "--docker, --modal, and --skypilot are mutually exclusive"
+        )
+    if use_skypilot:
+        if not cluster_profile:
+            raise ValueError("--skypilot requires --cluster-profile")  # noqa: TRY003
+        if resources is None:
+            raise ValueError("--skypilot requires input [resources]")  # noqa: TRY003
+        return RunEnvironmentSpec(
+            name="skypilot",
+            options={
+                "image": docker_image,
+                "profile": cluster_profile,
+                "profiles_file": cluster_profiles_file,
+                "executable": skypilot_executable,
+            },
+            resources=resources,
+        )
     if use_modal:
         options: dict[str, object] = {
             "image": docker_image,
@@ -818,6 +1024,10 @@ def _prefix_command(prefix: str, command: str | None) -> str | None:
     return f"{prefix} {command}"
 
 
+def _noop_log(message: str) -> None:
+    del message
+
+
 def _environment_command(
     request: RunEnvironmentRequest,
     command: str | None,
@@ -847,6 +1057,21 @@ def _environment_command(
     _reject_semantic_tokens_in_source(arguments, replacements)
     arguments = [_translate_command_argument(argument, replacements) for argument in arguments]
     return shlex.join(arguments)
+
+
+def _remote_evaluator_command(
+    request: RunEnvironmentRequest, command: str | None
+) -> tuple[str, ...] | None:
+    """Translate a trusted command into the synchronized remote workdir."""
+    rendered = _environment_command(request, command, isolated=True)
+    if rendered is None:
+        return None
+    arguments = shlex.split(rendered)
+    replacements = [
+        ("/opt/vibesys-evaluator-package", ".vibesys-evaluator-package"),
+        ("/workspace", "."),
+    ]
+    return tuple(_translate_command_argument(argument, replacements) for argument in arguments)
 
 
 def _translate_command_argument(

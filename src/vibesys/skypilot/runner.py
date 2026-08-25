@@ -341,6 +341,7 @@ class SkyPilotJobRunner:
         timeout: float | None = None,
         stdout_sink: Callable[[str], None] | None = None,
         stderr_sink: Callable[[str], None] | None = None,
+        job_started: Callable[[int], None] | None = None,
     ) -> JobResult:
         """Submit a detached task, identify it, then stream logs to completion."""
         deadline = None if timeout is None else self._monotonic() + timeout
@@ -360,6 +361,8 @@ class SkyPilotJobRunner:
         except SkyPilotCLIError:
             self.release(cluster_name)
             raise
+        if job_started is not None:
+            job_started(job_id)
         try:
             result = self._invoke(
                 [self._executable, "logs", cluster_name, str(job_id), "--tail", "0"],

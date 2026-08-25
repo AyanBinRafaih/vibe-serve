@@ -483,6 +483,15 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--run-environment",
+        choices=("local", "docker", "modal", "skypilot"),
+        default=None,
+        help=(
+            "Select where trusted work runs. SkyPilot and Modal keep the agent "
+            "in a local CPU-only Docker editor."
+        ),
+    )
+    parser.add_argument(
         "--docker",
         action="store_true",
         help=(
@@ -537,6 +546,33 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default="vibesys",
         help="Default Modal App name (suggested to the implementer). Default: vibesys.",
+    )
+    parser.add_argument(
+        "--skypilot",
+        action="store_true",
+        help=(
+            "Use a CPU-only Docker editor and dispatch trusted evaluator commands "
+            "through a host-owned SkyPilot allocation."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-profile",
+        default=None,
+        help=(
+            "Operator-owned SkyPilot cluster profile name. Select it on each "
+            "fresh or resumed SkyPilot launch; it is not an immutable run input."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-profiles-file",
+        type=Path,
+        default=None,
+        help="Cluster profile TOML file (default: ~/.config/vibesys/clusters.toml).",
+    )
+    parser.add_argument(
+        "--skypilot-executable",
+        default="sky",
+        help="SkyPilot CLI executable. Default: sky.",
     )
     parser.add_argument(
         "--debug",
@@ -855,14 +891,24 @@ def _prepare_stub_agent_smoke_defaults(argv: list[str]) -> list[str]:
 
 def run_environment_spec_from_args(args: argparse.Namespace) -> RunEnvironmentSpec:  # tracked: #288
     bundle = getattr(args, "input_bundle", None)
+    selected = getattr(args, "run_environment", None)
+    explicit = getattr(args, "explicit_cli_dests", frozenset())
+    if "run_environment" in explicit and {"docker", "modal", "skypilot"} & explicit:
+        raise ValueError(  # noqa: TRY003
+            "--run-environment cannot be combined with --docker, --modal, or --skypilot"
+        )
     return make_run_environment_spec(
-        use_docker=args.docker,
+        use_docker=args.docker or selected == "docker",
         docker_image=args.docker_image,
-        use_modal=args.modal,
+        use_modal=args.modal or selected == "modal",
         modal_gpu=args.modal_gpu,
         modal_model_volume=args.modal_model_volume,
         modal_app=args.modal_app,
         modal_entrypoint=bundle.modal_entrypoint if bundle is not None else None,
+        use_skypilot=getattr(args, "skypilot", False) or selected == "skypilot",
+        cluster_profile=getattr(args, "cluster_profile", None),
+        cluster_profiles_file=getattr(args, "cluster_profiles_file", None),
+        skypilot_executable=getattr(args, "skypilot_executable", "sky"),
         resources=bundle.manifest.resources if bundle is not None else None,
     )
 
@@ -1223,7 +1269,7 @@ def _restore_resume_constraints(
     return requested != recorded.operator_constraints
 
 
-def _restore_resume_run_environment(
+def _restore_resume_run_environment(  # noqa: C901
     args: argparse.Namespace,
     recorded: RunConfiguration,
     explicit: frozenset[str],
@@ -1239,13 +1285,29 @@ def _restore_resume_run_environment(
     changed: list[str] = []
     if not hasattr(args, "docker") or not hasattr(args, "modal"):
         return changed
-    if {"docker", "modal"} & explicit:
-        requested = "modal" if args.modal else "docker" if args.docker else "local"
+    skypilot = bool(getattr(args, "skypilot", False))
+    generic = getattr(args, "run_environment", None)
+    if {"docker", "modal", "skypilot", "run_environment"} & explicit:
+        requested = (
+            generic
+            if "run_environment" in explicit
+            else "skypilot"
+            if skypilot
+            else "modal"
+            if args.modal
+            else "docker"
+            if args.docker
+            else "local"
+        )
         if requested != record.name:
             changed.append("run_environment")
     else:
         args.docker = record.name == "docker"
         args.modal = record.name == "modal"
+        if hasattr(args, "skypilot"):
+            args.skypilot = record.name == "skypilot"
+        if hasattr(args, "run_environment"):
+            args.run_environment = record.name
 
     for destination, field in _RUN_ENVIRONMENT_OPTION_CLI_FIELDS.items():
         if not hasattr(args, destination):
@@ -1960,6 +2022,7 @@ def _resolve_implicit_input(args: argparse.Namespace, standalone: list[str]) -> 
 
 
 def _validate_agent(args: argparse.Namespace) -> None:
+    _validate_target_inputs(args)
     _validate_run_environment_profiler(args)
     if args.max_retries_per_round < 1:
         _configuration_error("Error: --max-retries-per-round must be >= 1.")
@@ -1967,7 +2030,6 @@ def _validate_agent(args: argparse.Namespace) -> None:
         _configuration_error("Error: --judge-every must be >= 1.")
     if args.official_eval_every < 1:
         _configuration_error("Error: --official-eval-every must be >= 1.")
-    _validate_target_inputs(args)
 
 
 def _run_agent(args: argparse.Namespace) -> None:
@@ -2201,8 +2263,8 @@ def _build_evolve_parser() -> argparse.ArgumentParser:
 
 
 def _validate_evolve(args: argparse.Namespace) -> None:  # noqa: C901  # tracked: #288
-    _validate_run_environment_profiler(args)
     _validate_target_inputs(args)
+    _validate_run_environment_profiler(args)
     if args.children_per_generation < 1:
         _configuration_error("--children-per-generation must be >= 1.")
     if args.max_generations < 1:
@@ -2367,8 +2429,8 @@ def _build_plain_parser() -> argparse.ArgumentParser:
 
 
 def _validate_plain(args: argparse.Namespace) -> None:
-    _validate_run_environment_profiler(args)
     _validate_target_inputs(args)
+    _validate_run_environment_profiler(args)
 
 
 def _run_plain(args: argparse.Namespace) -> None:

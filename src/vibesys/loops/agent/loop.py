@@ -2297,6 +2297,13 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         workspace_sources=workspace_sources,
         evaluator_path=evaluator_path,
         evaluator_package_root=evaluator_package_root,
+        benchmark_output_argument=(
+            benchmark_result.json_argument
+            if benchmark_result is not None
+            else _PROTOCOL_OUTPUT_FLAG
+            if benchmark_result_protocol is not None
+            else None
+        ),
         objective=objective,
         existing=existing,
         project_configuration=project_configuration,
