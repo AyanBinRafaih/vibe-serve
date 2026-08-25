@@ -84,6 +84,8 @@ class AgentLogger(BaseCallbackHandler):
         invocation_id: str | None = None,
     ):
         self._streaming = False
+        self._external_text_streaming = False
+        self._external_text_ends_with_newline = False
         self._log_file = log_file
         self._call_count = 0
         self._model_name = model_name
@@ -448,17 +450,26 @@ class AgentLogger(BaseCallbackHandler):
             self._publish_usage()
 
     def log_text(self, text: str) -> None:
-        """Emit *text* as one complete assistant line.
-
-        Mirrors how ``on_llm_new_token`` streams tokens, but for complete
-        chunks of text emitted by the cli backend — hence the appended
-        newline, which the streaming path only adds at stream end.
-        """
+        """Emit one exact assistant-text delta from an external driver."""
         if not text:
             return
         status = self._status()
-        self._publish(text + "\n", "assistant", status=status)
-        self._log_line(f"{format_status_prefix(status)}{text}")
+        self._publish(text, "assistant", status=status)
+        if not self._external_text_streaming:
+            self._log_write(format_status_prefix(status))
+        self._log_write(text)
+        self._external_text_streaming = True
+        self._external_text_ends_with_newline = text.endswith("\n")
+
+    def end_text(self) -> None:
+        """Close the current external-driver assistant-text segment."""
+        if not self._external_text_streaming:
+            return
+        if not self._external_text_ends_with_newline:
+            self._publish("\n", "assistant")
+            self._log_write("\n")
+        self._external_text_streaming = False
+        self._external_text_ends_with_newline = False
 
     def log_tool_call(self, name: str, args: dict[str, Any]) -> None:
         """Emit a tool invocation the same way the deepagents path does."""

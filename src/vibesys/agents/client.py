@@ -77,7 +77,10 @@ class _LoggerObserver:
         """Render one normalized driver event."""
         if event.kind is AgentEventKind.TEXT:
             self._logger.log_text(event.text or "")
-        elif event.kind is AgentEventKind.THINKING:
+            return
+
+        self._logger.end_text()
+        if event.kind is AgentEventKind.THINKING:
             self._logger.on_thinking(event.text or "")
         elif event.kind is AgentEventKind.TOOL_CALL:
             tool = str(event.payload.get("tool", "unknown"))
@@ -95,6 +98,10 @@ class _LoggerObserver:
             )
         elif event.kind is AgentEventKind.USAGE and event.usage is not None:
             self._logger.update_usage(_usage_dict(event.usage))
+
+    def close(self) -> None:
+        """Close any assistant-text segment left open at turn completion."""
+        self._logger.end_text()
 
 
 def _usage_dict(usage: AgentUsage) -> dict[str, int | float | None]:
@@ -342,18 +349,21 @@ class AgentClient:
         reuse = kind != "chat" and (reuse_session if reuse_session is not None else True)
         cache_key = session_key or kind
         result: AgentTurnResult | None = None
+        observer = _LoggerObserver(logger)
         try:
             result = self.run(
                 session_spec=spec,
                 turn=turn,
                 session_key=cache_key if reuse else None,
-                observer=_LoggerObserver(logger),
+                observer=observer,
             )
         except Exception as exc:
+            observer.close()
             log_and_print(f"\n=== {label} ROUND ERROR: {round_label} ===", self._run_log_file)
             log_and_print(f"{type(exc).__name__}: {exc}", self._run_log_file)
             raise
         finally:
+            observer.close()
             # The result may not exist after a setup/turn failure. The empty
             # record preserves one audit row per attempted invocation.
             self._write_usage_record(
