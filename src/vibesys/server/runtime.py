@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import signal
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
+from contextlib import suppress
 from pathlib import Path  # noqa: TC003  # tracked: #288
 from typing import Any
 
@@ -28,7 +29,7 @@ from vibesys.server.supervisor import RunSupervisor
 from vibesys.server.transport import SupervisionSocketServer
 
 
-def run_server(
+def run_server(  # noqa: PLR0915
     run: Callable[[], Any],
     *,
     socket_path: Path,
@@ -43,6 +44,7 @@ def run_server(
 
     signal.signal(signal.SIGTERM, interrupt_from_launcher)
     service = SupervisionService(supervisor)
+    supervisor.enable_terminal_chat_retention()
     REGISTRY.activate(supervisor)
     supervisor.attach(socket_path.parent)
     supervisor.record(
@@ -50,10 +52,11 @@ def run_server(
         status=EventStatus.ACTIVE,
         data=ServerReadyData(),
     )
+    run_error: BaseException | None = None
     try:
         with SupervisionSocketServer(socket_path, service) as server:
             if not server.wait_for_subscriber(timeout=30.0):
-                raise RuntimeError("Timed out waiting for a supervision client")  # noqa: TRY003  # tracked: #288
+                raise RuntimeError("Timed out waiting for a supervision client")  # noqa: TRY003, TRY301  # tracked: #288
             try:
                 value = run()
             except KeyboardInterrupt:
@@ -114,6 +117,29 @@ def run_server(
             supervisor.finish()
             server.wait_for_subscriber_disconnect()
             return value
+    except BaseException as exc:
+        run_error = exc
+        raise
     finally:
-        REGISTRY.deactivate(supervisor)
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        try:
+            try:
+                supervisor.close_terminal_chat_resource()
+            except BaseException as cleanup_error:  # noqa: BLE001  # presentation cleanup is optional
+                message = (
+                    "Terminal chat cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                if run_error is not None:
+                    run_error.add_note(message)
+                else:
+                    # Terminal chat is a presentation facility. Its cleanup
+                    # cannot retroactively fail a completed experiment.
+                    with suppress(BaseException):
+                        supervisor.publish_output(
+                            "stderr",
+                            f"{message}\n",
+                            source="terminal-chat",
+                        )
+        finally:
+            REGISTRY.deactivate(supervisor)
+            signal.signal(signal.SIGTERM, previous_sigterm)

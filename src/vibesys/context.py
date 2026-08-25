@@ -5,7 +5,7 @@ import shutil
 import threading
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
 from pathlib import Path
@@ -90,6 +90,8 @@ T = TypeVar("T", bound=BaseModel)
 
 _CHAT_STATE_DIR = "_vibesys_chat"
 _CHAT_TRAJECTORY_SUFFIXES = frozenset({".json", ".jsonl", ".log", ".md", ".txt"})
+# This is an agent instruction, not a filesystem guarantee. ProjectPathPolicy
+# cannot currently express a read-only workspace root.
 _EXPERIMENT_CHAT_SYSTEM_PROMPT = """\
 You are the read-only investigation agent for a live VibeSys experiment. Answer the
 user's question by examining evidence instead of relying on a precomputed summary.
@@ -293,12 +295,12 @@ def create_run_context(  # noqa: PLR0913  # tracked: #288
 def _close_after_construction_failure(
     teardown_stack: ExitStack, construction_error: BaseException
 ) -> None:
-    """Unwind partial construction without replacing its root-cause error."""
+    """Unwind partial resource construction without replacing its root cause."""
     try:
         teardown_stack.close()
     except BaseException as cleanup_error:  # noqa: BLE001  # tracked: #288
         construction_error.add_note(
-            "Additional error while cleaning up partial context construction: "
+            "Additional error while cleaning up partial resource construction: "
             f"{type(cleanup_error).__name__}: {cleanup_error}"
         )
 
@@ -761,34 +763,31 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
 
         teardown_stack.callback(_push_experiment_repository)
 
-    session = teardown_stack.enter_context(
-        environment.open(
-            RunEnvironmentRequest(
-                log_dir=log_dir,
-                workspace=project_root,
-                workspace_sources=(),
-                ref_dir=ref_dir,
-                backend=backend_impl,
-                agent_backend=resolved_backend,
-                cli_provider=resolved_cli_provider,
-                run_id=run_id,
-                objective=objective,
-                objective_document=objective_document,
-                accuracy_command=accuracy_command,
-                benchmark_command=benchmark_command,
-                benchmark_output_argument=benchmark_output_argument,
-                evaluator_package_root=evaluator_package_root,
-                profiler_support_path=profiler_support_path,
-                profiler_support_name=profiler_support_name,
-                git_history_root=git.history_root,
-                environment_bind_mounts=environment_patch.bind_mounts,
-                log=logger.lprint,
-                framework_root=PROJECT_ROOT,
-                project_path_policy=project_path_policy,
-                state_namespace=project_state.local_namespace(run_id, "skypilot"),
-            )
-        )
+    run_environment_request = RunEnvironmentRequest(
+        log_dir=log_dir,
+        workspace=project_root,
+        workspace_sources=(),
+        ref_dir=ref_dir,
+        backend=backend_impl,
+        agent_backend=resolved_backend,
+        cli_provider=resolved_cli_provider,
+        run_id=run_id,
+        objective=objective,
+        objective_document=objective_document,
+        accuracy_command=accuracy_command,
+        benchmark_command=benchmark_command,
+        benchmark_output_argument=benchmark_output_argument,
+        evaluator_package_root=evaluator_package_root,
+        profiler_support_path=profiler_support_path,
+        profiler_support_name=profiler_support_name,
+        git_history_root=git.history_root,
+        environment_bind_mounts=environment_patch.bind_mounts,
+        log=logger.lprint,
+        framework_root=PROJECT_ROOT,
+        project_path_policy=project_path_policy,
+        state_namespace=project_state.local_namespace(run_id, "skypilot"),
     )
+    session = teardown_stack.enter_context(environment.open(run_environment_request))
     # Snapshot the agent-facing commands once the session is open; the
     # view's paths are fixed for the session lifetime.
     commands = RunCommands(
@@ -814,8 +813,6 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         backends={
             "implementer": session.sandbox,
             "judge": session.sandbox,
-            # TUI chat is a read-only peer agent over the current workspace.
-            "chat": session.sandbox,
             # Perf eval reuses the implementer's backend today (loop.py:564),
             # so the runner picks the same one when kind="perf_eval".
             "perf_eval": session.sandbox,
@@ -842,44 +839,134 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     if callable(close_agent_client):
         teardown_stack.callback(close_agent_client)
 
-    result = _RunContext(
-        backend=backend,
-        run_environment=environment,
-        supervisor=supervisor,
-        logger=logger,
-        paths=paths,
-        debug=debug,
-        backend_impl=backend_impl,
-        model=model,
-        model_name=model_name,
-        input_path=input_path_str,
-        workspace_sources=(),
-        evaluator_path=evaluator_source,
-        evaluator_package_root=evaluator_package_root,
-        effective_objective=objective,
-        accuracy_command=accuracy_command,
-        benchmark_command=benchmark_command,
-        profiler_kind=resolved_profiler_kind,
-        profiler_support_path=profiler_support_path,
-        profiler_support_name=profiler_support_name,
-        skill_source_paths=skill_source_paths,
-        ref_name=ref_name,
-        environment_hooks=hooks,
-        environment_context=environment_context,
-        environment_patch=environment_patch,
-        workspace_files=workspace_files,
-        git=git,
-        experiment_repository=tracked_experiment_repository,
-        teardown_stack=teardown_stack,
-        run_environment_session=session,
-        commands=commands,
-        device=device,
-        agent_client=agent_client,
-        project=project,
-        state=RunState(project, git, run_id),
-        run_id=run_id,
-        round_transaction_coordinator=round_transaction_coordinator,
-    )
+    experiment_chat: _ExperimentChatService | None = None
+    experiment_chat_owner = ExitStack()
+    if supervisor is not None:
+
+        def _build_experiment_chat() -> _ExperimentChatService:
+            """Build resources owned only by the experiment chat service."""
+            resources = ExitStack()
+            try:
+                chat_logger = RunLogger(log_dir, tee_stderr=False)
+                resources.callback(chat_logger.close)
+                chat_logger.switch("experiment-chat")
+
+                chat_backends: dict[str, Any] | None = None
+                chat_use_docker = False
+                if resolved_backend == "deepagents" or session.view.cli_sandboxed:
+                    chat_environment_session = resources.enter_context(
+                        environment.open(replace(run_environment_request, log=chat_logger.lprint))
+                    )
+                    chat_backends = {"chat": chat_environment_session.sandbox}
+                    chat_use_docker = chat_environment_session.view.cli_sandboxed
+
+                chat_client = build_agent_client(
+                    config,
+                    agent_backend=agent_backend,
+                    cli_provider=cli_provider,
+                    backends=chat_backends,
+                    skills=[src.name for src in skill_source_paths],
+                    skill_source_dirs=skill_source_paths,
+                    compute_backend=backend,
+                    model=model,
+                    model_name=model_name,
+                    run_log_file=chat_logger.writer,
+                    use_docker=chat_use_docker,
+                    log_dir=log_dir,
+                    project_path_policy=project_path_policy,
+                    require_host_sandbox=not chat_use_docker,
+                )
+                resources.callback(chat_client.close)
+                return _ExperimentChatService(
+                    _ExperimentChatDependencies(
+                        supervisor=supervisor,
+                        agent_client=chat_client,
+                        workspace=project_root,
+                        log_dir=log_dir,
+                        project=project,
+                        run_id=run_id,
+                        log=chat_logger.lprint,
+                        flush_logs=chat_logger.writer.flush,
+                        environment=dict,
+                        progress=lambda: None,
+                    ),
+                    resources.pop_all(),
+                )
+            except BaseException as construction_error:
+                _close_after_construction_failure(resources, construction_error)
+                raise
+
+        try:
+            experiment_chat = _build_experiment_chat()
+        except Exception as exc:  # noqa: BLE001  # experiment chat is an optional surface
+            supervisor.publish_output(
+                "stderr",
+                f"Experiment chat is unavailable: {type(exc).__name__}: {exc}\n",
+                source="experiment-chat",
+            )
+        else:
+            from vibesys.server.supervisor import TerminalChatResource  # noqa: PLC0415
+
+            experiment_chat_owner.callback(experiment_chat.close)
+            resource = TerminalChatResource(
+                handler=experiment_chat.ask,
+                close=experiment_chat.close,
+            )
+            try:
+                retained = supervisor.retain_terminal_chat_resource(resource)
+            except BaseException as transfer_error:
+                _close_after_construction_failure(experiment_chat_owner, transfer_error)
+                raise
+            if retained:
+                # Presentation lifetime now owns the session. Primary teardown
+                # must neither drain nor close it.
+                experiment_chat_owner.pop_all()
+                experiment_chat = None
+
+    try:
+        result = _RunContext(
+            backend=backend,
+            run_environment=environment,
+            supervisor=supervisor,
+            logger=logger,
+            paths=paths,
+            debug=debug,
+            backend_impl=backend_impl,
+            model=model,
+            model_name=model_name,
+            input_path=input_path_str,
+            workspace_sources=(),
+            evaluator_path=evaluator_source,
+            evaluator_package_root=evaluator_package_root,
+            effective_objective=objective,
+            accuracy_command=accuracy_command,
+            benchmark_command=benchmark_command,
+            profiler_kind=resolved_profiler_kind,
+            profiler_support_path=profiler_support_path,
+            profiler_support_name=profiler_support_name,
+            skill_source_paths=skill_source_paths,
+            ref_name=ref_name,
+            environment_hooks=hooks,
+            environment_context=environment_context,
+            environment_patch=environment_patch,
+            workspace_files=workspace_files,
+            git=git,
+            experiment_repository=tracked_experiment_repository,
+            teardown_stack=teardown_stack,
+            run_environment_session=session,
+            commands=commands,
+            device=device,
+            agent_client=agent_client,
+            project=project,
+            state=RunState(project, git, run_id),
+            run_id=run_id,
+            round_transaction_coordinator=round_transaction_coordinator,
+            experiment_chat=experiment_chat,
+        )
+    except BaseException as construction_error:
+        _close_after_construction_failure(experiment_chat_owner, construction_error)
+        raise
+    experiment_chat_owner.pop_all()
     construction_complete = True
     return result
 
@@ -1097,6 +1184,193 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
     )
 
 
+@dataclass(frozen=True)
+class _ExperimentChatDependencies:
+    supervisor: "RunSupervisor"
+    agent_client: AgentClient
+    workspace: Path
+    log_dir: Path
+    project: Project
+    run_id: str
+    log: Callable[[str], None]
+    flush_logs: Callable[[], None]
+    environment: Callable[[], dict[str, str]]
+    progress: Callable[[], AgentProgress | None]
+
+
+class _ExperimentChatService:
+    """Own one chat agent and the durable evidence it may inspect."""
+
+    def __init__(
+        self, dependencies: _ExperimentChatDependencies, resources: ExitStack | None = None
+    ) -> None:
+        self._supervisor = dependencies.supervisor
+        self._agent_client = dependencies.agent_client
+        self._workspace = dependencies.workspace
+        self._log_dir = dependencies.log_dir
+        self._project = dependencies.project
+        self._run_id = dependencies.run_id
+        self._log = dependencies.log
+        self._flush_logs = dependencies.flush_logs
+        self._environment = dependencies.environment
+        self._progress = dependencies.progress
+        self._resources = resources
+        self._lock = threading.Lock()
+        self._history = self._load_history()
+
+    def ask(self, question: str) -> str:
+        """Answer one question from current run evidence."""
+        from vibesys.server.inspector import RunInspector  # noqa: PLC0415
+
+        with self._lock:
+            self._sync_trajectory()
+
+            def fallback() -> str:
+                diagnostic = RunInspector(self._supervisor).answer(question)
+                return f"Chat agent did not return an answer.\n\nFallback diagnostic:\n{diagnostic}"
+
+            system_prompt = (
+                _EXPERIMENT_CHAT_CONTINUATION_PROMPT
+                if self._history
+                else _EXPERIMENT_CHAT_SYSTEM_PROMPT
+            )
+            execution = self._supervisor.start_agent_execution(
+                "chat",
+                "experiment-chat",
+                question,
+                system_prompt,
+                consume_steering=False,
+                participates_in_run_control=False,
+            )
+            answer: str | None = None
+            error: BaseException | None = None
+            with self._supervisor.presentation_scope(
+                agent_kind="chat",
+                round_label="experiment-chat",
+                invocation_id=execution.execution_id,
+            ):
+                try:
+                    answer = self._agent_client.invoke_text(
+                        kind="chat",
+                        workspace=self._workspace,
+                        system_prompt=system_prompt,
+                        env=self._environment(),
+                        user_prompt=question,
+                        round_label="experiment chat",
+                        invocation_id=execution.execution_id,
+                        progress=self._progress(),
+                    )
+                except BaseException as exc:
+                    error = exc
+                    if isinstance(exc, Exception):
+                        raise RuntimeError(  # noqa: TRY003, TRY004
+                            f"Chat agent failed: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    raise
+                finally:
+                    self._supervisor.after_agent(
+                        "chat",
+                        "experiment-chat",
+                        result=answer,
+                        error=error,
+                        execution_id=execution.execution_id,
+                    )
+            assert answer is not None  # noqa: S101
+            if not answer.strip():
+                answer = fallback()
+            self._history.append((question, answer))
+            self._append_exchange(question, answer)
+            return answer
+
+    def close(self) -> None:
+        """Close resources owned by a dedicated terminal chat session."""
+        resources, self._resources = self._resources, None
+        if resources is not None:
+            resources.close()
+
+    @property
+    def _state_dir(self) -> Path:
+        return self._workspace / _CHAT_STATE_DIR
+
+    def _load_history(self) -> list[tuple[str, str]]:
+        transcript = self._state_dir / "conversation.jsonl"
+        if not transcript.is_file():
+            return []
+        history: list[tuple[str, str]] = []
+        try:
+            for line in transcript.read_text(encoding="utf-8").splitlines():
+                payload = json.loads(line)
+                question = payload.get("question")
+                answer = payload.get("answer")
+                if isinstance(question, str) and isinstance(answer, str):
+                    history.append((question, answer))
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return []
+        return history
+
+    def _append_exchange(self, question: str, answer: str) -> None:
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            with (self._state_dir / "conversation.jsonl").open("a", encoding="utf-8") as transcript:
+                transcript.write(
+                    json.dumps({"question": question, "answer": answer}, ensure_ascii=False) + "\n"
+                )
+        except OSError as exc:
+            self._log(f"[warn] could not persist experiment chat: {exc}")
+
+    def _sync_trajectory(self) -> None:
+        trajectory_dir = self._state_dir / "trajectory"
+        if self._state_dir.is_symlink():
+            self._log(f"[warn] experiment chat state is a symlink: {self._state_dir}")
+            return
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            if trajectory_dir.is_symlink():
+                trajectory_dir.unlink()
+            elif trajectory_dir.exists():
+                shutil.rmtree(trajectory_dir)
+            trajectory_dir.mkdir(parents=True, exist_ok=True)
+            (self._state_dir / "instructions.md").write_text(
+                _EXPERIMENT_CHAT_SYSTEM_PROMPT, encoding="utf-8"
+            )
+            self._flush_logs()
+            self._write_trajectory_snapshot(
+                self._project.state.portable_run_export(self._run_id),
+                trajectory_dir / "state",
+            )
+            self._copy_trajectory_files(self._log_dir, trajectory_dir / "logs")
+        except (OSError, ValueError) as exc:
+            self._log(f"[warn] could not refresh experiment chat trajectory: {exc}")
+
+    @staticmethod
+    def _write_trajectory_snapshot(snapshot: StateSnapshot, destination_root: Path) -> None:
+        for state_file in snapshot.files:
+            if state_file.relative_path.suffix not in _CHAT_TRAJECTORY_SUFFIXES:
+                continue
+            destination = destination_root.joinpath(*state_file.relative_path.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(f".{destination.name}.tmp")
+            temporary.write_bytes(state_file.contents)
+            temporary.replace(destination)
+
+    @staticmethod
+    def _copy_trajectory_files(source_root: Path, destination_root: Path) -> None:
+        if not source_root.is_dir():
+            return
+        for source in sorted(source_root.rglob("*")):
+            if (
+                not source.is_file()
+                or source.is_symlink()
+                or source.suffix not in _CHAT_TRAJECTORY_SUFFIXES
+            ):
+                continue
+            destination = destination_root / source.relative_to(source_root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(f".{destination.name}.tmp")
+            shutil.copyfile(source, temporary)
+            temporary.replace(destination)
+
+
 class _RunContext:
     """Experiment lifecycle owner shared by simple, orchestrate, and issue loops.
 
@@ -1152,6 +1426,7 @@ class _RunContext:
         state: RunState,
         run_id: str,
         round_transaction_coordinator: RoundTransactionCoordinator | None = None,
+        experiment_chat: _ExperimentChatService | None = None,
     ):
         self.backend = backend
         self.run_environment = run_environment
@@ -1198,11 +1473,10 @@ class _RunContext:
         self.selected_gpu = device.selected_device
         self.agent_client = agent_client
         self._closed = False
+        self._experiment_chat = experiment_chat
         self._progress_stack: list[AgentProgress] = []
-        self._chat_lock = threading.Lock()
-        self._chat_history = self._load_chat_history()
-        if self.supervisor is not None:
-            self.supervisor.set_chat_handler(self.chat)
+        if self.supervisor is not None and self._experiment_chat is not None:
+            self.supervisor.set_chat_handler(self._experiment_chat.ask)
 
     # -- path passthroughs ----------------------------------------------------
     # Canonical values live in the frozen ``RunPaths`` record.
@@ -1346,162 +1620,12 @@ class _RunContext:
                 )
 
     def chat(self, question: str) -> str:
-        """Ask a read-only peer agent about the live experiment."""
-        from vibesys.server.inspector import RunInspector  # noqa: PLC0415  # tracked: #288
-
-        with self._chat_lock:
-            self._sync_chat_trajectory()
-
-            def fallback() -> str:
-                assert self.supervisor is not None  # noqa: S101  # tracked: #288
-                diagnostic = RunInspector(self.supervisor).answer(question)
-                return f"Chat agent did not return an answer.\n\nFallback diagnostic:\n{diagnostic}"
-
-            assert self.supervisor is not None  # noqa: S101  # tracked: #288
-            system_prompt = (
-                _EXPERIMENT_CHAT_CONTINUATION_PROMPT
-                if self._chat_history
-                else _EXPERIMENT_CHAT_SYSTEM_PROMPT
+        """Ask the experiment analysis agent about current run evidence."""
+        if self._experiment_chat is None:
+            raise RuntimeError(  # noqa: TRY003
+                "Experiment chat is not owned by this run context"
             )
-            execution = self.supervisor.start_agent_execution(
-                "chat",
-                "experiment-chat",
-                question,
-                system_prompt,
-                consume_steering=False,
-                participates_in_run_control=False,
-            )
-            answer: str | None = None
-            error: BaseException | None = None
-            with self.supervisor.presentation_scope(
-                agent_kind="chat",
-                round_label="experiment-chat",
-                invocation_id=execution.execution_id,
-            ):
-                try:
-                    answer = self.agent_client.invoke_text(
-                        kind="chat",
-                        workspace=self.workspace,
-                        system_prompt=system_prompt,
-                        env=self.gpu_env(),
-                        user_prompt=question,
-                        round_label="experiment chat",
-                        invocation_id=execution.execution_id,
-                        progress=self.current_progress(),
-                    )
-                except BaseException as exc:
-                    error = exc
-                    if isinstance(exc, Exception):
-                        raise RuntimeError(  # noqa: TRY003, TRY004  # tracked: #288
-                            f"Chat agent failed: {type(exc).__name__}: {exc}"
-                        ) from exc
-                    raise
-                finally:
-                    self.supervisor.after_agent(
-                        "chat",
-                        "experiment-chat",
-                        result=answer,
-                        error=error,
-                        execution_id=execution.execution_id,
-                    )
-            assert answer is not None  # noqa: S101  # successful invoke_text returns str
-            if not answer.strip():
-                answer = fallback()
-            self._chat_history.append((question, answer))
-            self._append_chat_exchange(question, answer)
-            return answer
-
-    @property
-    def _chat_state_dir(self) -> Path:
-        return self.workspace / _CHAT_STATE_DIR
-
-    def _load_chat_history(self) -> list[tuple[str, str]]:
-        """Load successful prior exchanges so reopening a run resumes its chat."""
-        transcript = self._chat_state_dir / "conversation.jsonl"
-        if not transcript.is_file():
-            return []
-        history: list[tuple[str, str]] = []
-        try:
-            for line in transcript.read_text(encoding="utf-8").splitlines():
-                payload = json.loads(line)
-                question = payload.get("question")
-                answer = payload.get("answer")
-                if isinstance(question, str) and isinstance(answer, str):
-                    history.append((question, answer))
-        except (OSError, json.JSONDecodeError, AttributeError):
-            return []
-        return history
-
-    def _append_chat_exchange(self, question: str, answer: str) -> None:
-        """Persist one successful exchange for later agent investigation."""
-        try:
-            self._chat_state_dir.mkdir(parents=True, exist_ok=True)
-            with (self._chat_state_dir / "conversation.jsonl").open(
-                "a", encoding="utf-8"
-            ) as transcript:
-                transcript.write(
-                    json.dumps({"question": question, "answer": answer}, ensure_ascii=False) + "\n"
-                )
-        except OSError as exc:
-            self.logger.lprint(f"[warn] could not persist experiment chat: {exc}")
-
-    def _sync_chat_trajectory(self) -> None:
-        """Refresh canonical portable state and local logs for experiment chat."""
-        trajectory_dir = self._chat_state_dir / "trajectory"
-        if self._chat_state_dir.is_symlink():
-            self.logger.lprint(f"[warn] experiment chat state is a symlink: {self._chat_state_dir}")
-            return
-        try:
-            self._chat_state_dir.mkdir(parents=True, exist_ok=True)
-            if trajectory_dir.is_symlink():
-                trajectory_dir.unlink()
-            elif trajectory_dir.exists():
-                shutil.rmtree(trajectory_dir)
-            trajectory_dir.mkdir(parents=True, exist_ok=True)
-            (self._chat_state_dir / "instructions.md").write_text(
-                _EXPERIMENT_CHAT_SYSTEM_PROMPT, encoding="utf-8"
-            )
-            self.run_log_file.flush()
-            self._write_chat_trajectory_snapshot(
-                self.project.state.portable_run_export(self.run_id),
-                trajectory_dir / "state",
-            )
-            self._copy_chat_trajectory_files(self.log_dir, trajectory_dir / "logs")
-        except OSError as exc:
-            self.logger.lprint(f"[warn] could not refresh experiment chat trajectory: {exc}")
-
-    @staticmethod
-    def _write_chat_trajectory_snapshot(
-        snapshot: StateSnapshot,
-        destination_root: Path,
-    ) -> None:
-        """Write textual files from an immutable portable-state export."""
-        for state_file in snapshot.files:
-            if state_file.relative_path.suffix not in _CHAT_TRAJECTORY_SUFFIXES:
-                continue
-            destination = destination_root.joinpath(*state_file.relative_path.parts)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(f".{destination.name}.tmp")
-            temporary.write_bytes(state_file.contents)
-            temporary.replace(destination)
-
-    @staticmethod
-    def _copy_chat_trajectory_files(source_root: Path, destination_root: Path) -> None:
-        """Copy textual regular files from one canonical state tree."""
-        if not source_root.is_dir():
-            return
-        for source in sorted(source_root.rglob("*")):
-            if (
-                not source.is_file()
-                or source.is_symlink()
-                or source.suffix not in _CHAT_TRAJECTORY_SUFFIXES
-            ):
-                continue
-            destination = destination_root / source.relative_to(source_root)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(f".{destination.name}.tmp")
-            shutil.copyfile(source, temporary)
-            temporary.replace(destination)
+        return self._experiment_chat.ask(question)
 
     def wait_for_debug(self, step: str) -> None:
         if self.debug:
@@ -1562,16 +1686,44 @@ class _RunContext:
         # Mirror backend state on _RunContext for legacy callers/tests.
         self.selected_gpu = self.device.selected_device
 
-    def close(self) -> None:
+    def close(self) -> None:  # noqa: C901  # preserve independent cleanup failures
         if self._closed:
             return
         self._closed = True
-        if self.supervisor is not None:
-            self.supervisor.set_chat_handler(None)
-        # Unwinds in reverse construction order: device monitor stop +
-        # gpu.json finalization, environment hook teardown, run-environment
-        # session exit, stderr restore + log file close.
-        self._teardown_stack.close()
+        chat_error: BaseException | None = None
+        experiment_chat, self._experiment_chat = self._experiment_chat, None
+        if self.supervisor is not None and experiment_chat is not None:
+            try:
+                self.supervisor.clear_chat_handler_and_drain()
+            except BaseException as exc:  # noqa: BLE001  # resource close must still run
+                chat_error = exc
+        if experiment_chat is not None:
+            try:
+                experiment_chat.close()
+            except BaseException as exc:  # noqa: BLE001  # primary teardown must still run
+                if chat_error is None:
+                    chat_error = exc
+                else:
+                    chat_error.add_note(
+                        f"Experiment chat cleanup also failed: {type(exc).__name__}: {exc}"
+                    )
+        primary_error: BaseException | None = None
+        try:
+            # Unwinds in reverse construction order: device monitor stop +
+            # gpu.json finalization, environment hook teardown, run-environment
+            # session exit, stderr restore + log file close.
+            self._teardown_stack.close()
+        except BaseException as exc:  # noqa: BLE001
+            primary_error = exc
+        if primary_error is not None:
+            if chat_error is not None:
+                primary_error.add_note(
+                    "Experiment chat teardown also failed: "
+                    f"{type(chat_error).__name__}: {chat_error}"
+                )
+            raise primary_error
+        if chat_error is not None:
+            raise chat_error
 
     def __enter__(self) -> "_RunContext":
         return self

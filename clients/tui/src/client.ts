@@ -44,6 +44,7 @@ export class SupervisionClient {
   >();
   readonly #connectTimeoutMs: number;
   readonly #requestTimeoutMs: number;
+  readonly #longRunningSockets = new Set<Socket>();
   #buffer = '';
 
   private constructor(socket: Socket, path: string, options: SupervisionClientOptions) {
@@ -92,6 +93,7 @@ export class SupervisionClient {
       timestamp: new Date().toISOString(),
       ...input,
     } as ProtocolRequest;
+    if (input.type === 'query.chat') return this.#requestLongRunning(request);
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.#pending.delete(requestId);
@@ -192,10 +194,90 @@ export class SupervisionClient {
   }
 
   close(): Promise<void> {
+    for (const socket of this.#longRunningSockets) socket.destroy();
+    this.#longRunningSockets.clear();
     return new Promise(resolve => {
       if (this.#socket.destroyed) return resolve();
       this.#socket.once('close', resolve);
       this.#socket.end();
+    });
+  }
+
+  /**
+   * Run an agent-backed request on its own connection without a response timer.
+   *
+   * Chat duration is bounded by the configured agent, not by the control RPC
+   * timeout. A dedicated connection also prevents a long chat from blocking
+   * pause, resume, and snapshot requests in the server's per-connection loop.
+   */
+  #requestLongRunning(request: ProtocolRequest): Promise<ProtocolResponse> {
+    return new Promise((resolve, reject) => {
+      const socket = createConnection(this.#path);
+      this.#longRunningSockets.add(socket);
+      let buffer = '';
+      let settled = false;
+      const connectTimeout = setTimeout(() => {
+        fail(
+          new Error(`Timed out connecting to supervision server after ${this.#connectTimeoutMs}ms`),
+        );
+      }, this.#connectTimeoutMs);
+
+      const cleanup = (): void => {
+        clearTimeout(connectTimeout);
+        this.#longRunningSockets.delete(socket);
+        socket.off('error', fail);
+        socket.off('close', disconnected);
+      };
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        socket.destroy();
+        reject(error);
+      };
+      const disconnected = (): void =>
+        fail(new Error('Supervision server disconnected during chat'));
+      const finish = (response: ProtocolResponse): void => {
+        if (settled) return;
+        if (response.request_id !== request.request_id) {
+          fail(new Error('Supervision chat response has an unexpected request ID'));
+          return;
+        }
+        settled = true;
+        cleanup();
+        // Keep the one-shot error listener until the socket actually closes.
+        // A peer reset during the FIN handshake must not become an unhandled
+        // EventEmitter error after the response promise has settled.
+        socket.once('error', fail);
+        socket.once('close', () => socket.off('error', fail));
+        socket.end();
+        if (response.ok) resolve(response);
+        else reject(responseError(response));
+      };
+
+      socket.setEncoding('utf8');
+      socket.once('connect', () => {
+        clearTimeout(connectTimeout);
+        socket.write(`${JSON.stringify(request)}\n`, error => {
+          if (error) fail(error);
+        });
+      });
+      socket.on('data', chunk => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line) continue;
+          try {
+            finish(parseProtocolResponse(line));
+          } catch (error) {
+            fail(error instanceof Error ? error : new Error(String(error)));
+          }
+          return;
+        }
+      });
+      socket.once('error', fail);
+      socket.once('close', disconnected);
     });
   }
 
@@ -219,13 +301,7 @@ export class SupervisionClient {
       this.#pending.delete(response.request_id);
       clearTimeout(pending.timeout);
       if (response.ok) pending.resolve(response);
-      else
-        pending.reject(
-          new SupervisionError(
-            response.error ?? 'Unknown supervision error',
-            response.diagnostic ?? null,
-          ),
-        );
+      else pending.reject(responseError(response));
     }
   }
 
@@ -244,6 +320,13 @@ export class SupervisionClient {
     clearTimeout(pending.timeout);
     pending.reject(error);
   }
+}
+
+function responseError(response: ProtocolResponse): SupervisionError {
+  return new SupervisionError(
+    response.error ?? 'Unknown supervision error',
+    response.diagnostic ?? null,
+  );
 }
 
 function closeSocket(socket: Socket): Promise<void> {

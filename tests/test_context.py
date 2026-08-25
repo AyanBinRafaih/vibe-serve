@@ -237,6 +237,71 @@ def test_run_context_announces_canonical_experiment_state(tmp_path):  # noqa: AN
         REGISTRY.deactivate(supervisor)
 
 
+def test_retained_experiment_chat_uses_one_dedicated_client_across_run_teardown(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    supervisor.enable_terminal_chat_retention()
+    primary_client = MagicMock()
+    chat_client = MagicMock()
+    chat_client.invoke_text.side_effect = ["live answer", "terminal answer"]
+    REGISTRY.activate(supervisor)
+    try:
+        with patch(
+            "vibesys.context.build_agent_client",
+            side_effect=[primary_client, chat_client],
+        ) as build_client:
+            ctx = _create_context(project, evaluator=evaluator)
+            assert build_client.call_count == 2
+            assert "chat" not in build_client.call_args_list[0].kwargs["backends"]
+            assert supervisor.chat("what is happening?") == "live answer"
+
+            ctx.close()
+
+            primary_client.close.assert_called_once_with()
+            chat_client.close.assert_not_called()
+            assert supervisor.chat("what happened?") == "terminal answer"
+            assert chat_client.invoke_text.call_count == 2
+
+        supervisor.close_terminal_chat_resource()
+        chat_client.close.assert_called_once_with()
+    finally:
+        supervisor.close_terminal_chat_resource()
+        REGISTRY.deactivate(supervisor)
+
+
+def test_nonretained_experiment_chat_closes_when_context_construction_fails(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    primary_client = MagicMock()
+    chat_client = MagicMock()
+    construction_error = RuntimeError("context construction failed")
+    REGISTRY.activate(supervisor)
+    try:
+        with (
+            patch(
+                "vibesys.context.build_agent_client",
+                side_effect=[primary_client, chat_client],
+            ),
+            patch("vibesys.context._RunContext", side_effect=construction_error),
+            pytest.raises(RuntimeError) as raised,
+        ):
+            _create_context(project, evaluator=evaluator)
+
+        assert raised.value is construction_error
+        primary_client.close.assert_called_once_with()
+        chat_client.close.assert_called_once_with()
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+
 def test_repository_task_exposes_its_actual_reference_path(tmp_path: Path) -> None:
     project = tmp_path / "queue"
     evaluator = _write_project(project)
