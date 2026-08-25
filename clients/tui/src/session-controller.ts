@@ -51,6 +51,7 @@ import {
   setTheme,
   showDetail,
   showLive,
+  togglePaneZoom,
   toggleTodos,
 } from './session-model.js';
 import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
@@ -87,6 +88,7 @@ export interface SessionController {
   closeOverlays(): void;
   cyclePaneFocus(): void;
   focusPane(focus: PaneFocus): void;
+  togglePaneZoom(): void;
   setChatDockFits(fits: boolean): void;
   moveExperimentSelection(delta: number): void;
   selectExperimentActivity(): void;
@@ -318,6 +320,10 @@ export class SocketSessionController implements SessionController {
 
   focusPane(focus: PaneFocus): void {
     this.#setState(focusPane(this.#state, focus));
+  }
+
+  togglePaneZoom(): void {
+    this.#setState(togglePaneZoom(this.#state));
   }
 
   /**

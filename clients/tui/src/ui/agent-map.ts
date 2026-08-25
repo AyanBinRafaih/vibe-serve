@@ -90,6 +90,7 @@ export class AgentMapView {
       borderStyle: 'rounded',
       borderColor: theme.border,
       title: ' Agents ',
+      onMouseUp: () => this.controller.focusRound('agents'),
     });
   }
 
@@ -99,11 +100,12 @@ export class AgentMapView {
     this.#renderedState = null;
   }
 
-  render(state: SessionState): void {
+  render(state: SessionState, widthOverride?: number): void {
     const phases = visiblePhases(state);
     // The pane's width follows the terminal, so a resize has to redraw even
     // when the state is unchanged.
-    const width = agentPaneWidth(this.renderer.terminalWidth, stageKinds(phases).length);
+    const width =
+      widthOverride ?? agentPaneWidth(this.renderer.terminalWidth, stageKinds(phases).length);
     const paneWidth = width ?? STACKED_WIDTH;
     if (state === this.#renderedState && paneWidth === this.#renderedWidth) return;
     // Selection and focus are drawn into the nodes, so a change to either is a
@@ -198,12 +200,14 @@ export class AgentMapView {
       flexShrink: 1,
       flexDirection: 'column',
       justifyContent: 'center',
+      onMouseUp: () => this.controller.focusRound('agents'),
     });
     const canvas = new BoxRenderable(this.renderer, {
       id: 'agent-graph-canvas',
       width: '100%',
       height: graph.height,
       flexShrink: 0,
+      onMouseUp: () => this.controller.focusRound('agents'),
     });
     this.output.add(area);
     area.add(canvas);
@@ -303,6 +307,7 @@ export class AgentMapView {
           }
         : {}),
       ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
+      onMouseUp: () => this.controller.selectAgent(phase.kind),
     });
     const color = statusColor(this.#theme, phase.status);
     row.add(

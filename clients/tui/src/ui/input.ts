@@ -23,6 +23,7 @@ export interface InputPanel {
   /** True when nothing is typed, so Enter belongs to whatever pane is behind. */
   isEmpty(): boolean;
   focus(): void;
+  setFocused(focused: boolean): void;
   applyTheme(theme: Theme): void;
   destroy(): void;
 }
@@ -123,7 +124,7 @@ export function createInputPanel(
     width: '100%',
     border: true,
     borderStyle: 'rounded',
-    borderColor: theme.success,
+    borderColor: theme.borderFocus,
     title: ' Ask or command ',
     paddingLeft: 1,
     paddingRight: 1,
@@ -197,6 +198,8 @@ export function createInputPanel(
   input.on(InputRenderableEvents.INPUT, updateDecorations);
   input.on(InputRenderableEvents.ENTER, submit);
   box.add(input);
+  let focused = true;
+  let current = theme;
   return {
     box,
     suggestions,
@@ -213,8 +216,13 @@ export function createInputPanel(
     },
     isEmpty: () => input.value.trim() === '',
     focus: () => input.focus(),
+    setFocused(next: boolean): void {
+      focused = next;
+      box.borderColor = next ? current.borderFocus : current.border;
+    },
     applyTheme(next: Theme): void {
-      box.borderColor = next.success;
+      current = next;
+      box.borderColor = focused ? next.borderFocus : next.border;
       input.textColor = next.textStrong;
       input.focusedTextColor = next.textStrong;
       suggestions.borderColor = next.border;

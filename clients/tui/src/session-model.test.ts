@@ -13,7 +13,9 @@ import {
   enterExperimentRound,
   enterUnownedExperimentRound,
   failPane,
+  focusedPane,
   focusPane,
+  focusRound,
   hypothesisPlanningActivity,
   initialSessionState,
   leaveExperimentDrilldown,
@@ -32,6 +34,7 @@ import {
   setTheme,
   showDetail,
   statusText,
+  togglePaneZoom,
   toggleTodos,
   unownedExperimentRounds,
   visibleConversation,
@@ -1291,6 +1294,39 @@ describe('right pane layout', () => {
 
     expect(closed.chatOpen).toBe(true);
     expect(closed.chatConversation).toEqual(withChat.chatConversation);
+  });
+
+  it('zooms the semantic focused pane and restores the unchanged split state', () => {
+    const split = setPaneContent(openPane(initialSessionState(), 'perf'), 'perf', 'chart');
+    const chat = focusPane(split, 'chat');
+    const zoomed = togglePaneZoom(chat);
+
+    expect(focusedPane(zoomed)).toBe('chat');
+    expect(zoomed.layout.zoomedPane).toBe('chat');
+    expect(zoomed.layout.right).toBe(split.layout.right);
+    expect(zoomed.chatConversation).toBe(split.chatConversation);
+    expect(cyclePaneFocus(zoomed)).toBe(zoomed);
+
+    const restored = togglePaneZoom(zoomed);
+    expect(restored.layout).toEqual(chat.layout);
+  });
+
+  it('uses round focus to zoom agents and transcript', () => {
+    const round = {...initialSessionState(), experimentLog: null};
+    const agents = focusRound(round, 'agents');
+
+    expect(togglePaneZoom(agents).layout.zoomedPane).toBe('agents');
+    expect(togglePaneZoom(round).layout.zoomedPane).toBe('transcript');
+  });
+
+  it('never reports the hidden agents pane as focused beside a visualization', () => {
+    const agents = focusRound({...initialSessionState(), experimentLog: null}, 'agents');
+    const split = focusPane(openPane(agents, 'perf'), 'left');
+
+    expect(split.roundFocus).toBe('agents');
+    expect(focusedPane(split)).toBe('transcript');
+    expect(togglePaneZoom(split).layout.zoomedPane).toBe('transcript');
+    expect(focusedPane(closePane(split))).toBe('agents');
   });
 });
 
