@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import os
 import shutil
@@ -7,18 +8,26 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
-from vibesys.context import _RunContext
+import vibesys.server.supervisor as supervisor_module
+from vibesys.context import (
+    _close_after_construction_failure,
+    _ExperimentChatDependencies,
+    _ExperimentChatService,
+    _RunContext,
+)
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.run import RunPaths
 from vibesys.server import (
     EventType,
     RunInspector,
     RunSupervisor,
+    active_supervisor,
 )
 from vibesys.server.diagnostics import (
     DiagnosticRetryability,
@@ -47,6 +56,7 @@ from vibesys.server.protocol import (
 from vibesys.server.runtime import run_server
 from vibesys.server.schema import ProtocolDocument
 from vibesys.server.service import SupervisionService
+from vibesys.server.supervisor import TerminalChatResource
 from vibesys.server.transport import SupervisionSocketServer
 from vs_loop_state import RoundRecord
 from vs_project import AgentRunConfiguration, Project, RunEnvironmentRecord
@@ -671,6 +681,261 @@ def test_installing_an_agent_handler_takes_over_from_the_fallback(tmp_path):  # 
     assert "chat agent is not available" in supervisor.chat("and round 4?")
 
 
+def test_run_context_retains_agent_chat_until_terminal_presentation_closes(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.enable_terminal_chat_retention()
+    lifecycle: list[str] = []
+    teardown = ExitStack()
+    teardown.callback(lambda: lifecycle.append("main-finalized"))
+    terminal_chat = Mock()
+    terminal_chat.ask.return_value = "terminal agent answer"
+    terminal_chat.close.side_effect = lambda: lifecycle.append("terminal-closed")
+
+    lifecycle.append("terminal-created")
+    assert supervisor.retain_terminal_chat_resource(
+        TerminalChatResource(handler=terminal_chat.ask, close=terminal_chat.close)
+    )
+
+    ctx = _RunContext.__new__(_RunContext)
+    ctx.supervisor = supervisor
+    ctx._teardown_stack = teardown  # noqa: SLF001
+    ctx._closed = False  # noqa: SLF001
+    ctx._experiment_chat = None  # noqa: SLF001
+
+    ctx.close()
+    supervisor.finish()
+
+    assert lifecycle == ["terminal-created", "main-finalized"]
+    assert ctx._closed is True  # noqa: SLF001
+    assert supervisor.chat("what was the result?") == "terminal agent answer"
+
+    supervisor.close_terminal_chat_resource()
+    supervisor.close_terminal_chat_resource()
+
+    assert lifecycle == ["terminal-created", "main-finalized", "terminal-closed"]
+    assert supervisor.chat_agent_available() is False
+
+
+def test_nonretained_run_context_closes_its_dedicated_chat(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    experiment_chat = Mock()
+    experiment_chat.ask.return_value = "agent answer"
+    supervisor.set_chat_handler(experiment_chat.ask)
+    teardown_finished = threading.Event()
+    teardown = ExitStack()
+    teardown.callback(teardown_finished.set)
+    ctx = _RunContext.__new__(_RunContext)
+    ctx.supervisor = supervisor
+    ctx._teardown_stack = teardown  # noqa: SLF001
+    ctx._closed = False  # noqa: SLF001
+    ctx._experiment_chat = experiment_chat  # noqa: SLF001
+
+    ctx.close()
+
+    experiment_chat.close.assert_called_once_with()
+    assert teardown_finished.is_set()
+    assert supervisor.chat_agent_available() is False
+
+
+def test_primary_teardown_error_precedes_nonretained_chat_cleanup(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    chat_error = RuntimeError("experiment chat cleanup failed")
+    primary_error = RuntimeError("primary teardown failed")
+    experiment_chat = Mock()
+    experiment_chat.close.side_effect = chat_error
+    supervisor.set_chat_handler(experiment_chat.ask)
+    teardown = ExitStack()
+    teardown.callback(lambda: (_ for _ in ()).throw(primary_error))
+    ctx = _RunContext.__new__(_RunContext)
+    ctx.supervisor = supervisor
+    ctx._teardown_stack = teardown  # noqa: SLF001
+    ctx._closed = False  # noqa: SLF001
+    ctx._experiment_chat = experiment_chat  # noqa: SLF001
+
+    with pytest.raises(RuntimeError) as raised:
+        ctx.close()
+
+    assert raised.value is primary_error
+    assert raised.value.__notes__ == [
+        "Experiment chat teardown also failed: RuntimeError: experiment chat cleanup failed"
+    ]
+
+
+def test_terminal_chat_cleanup_waits_for_an_in_flight_answer(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.enable_terminal_chat_retention()
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    cleanup_finished = threading.Event()
+
+    def handler(_question: str) -> str:
+        handler_started.set()
+        release_handler.wait()
+        return "finished answer"
+
+    supervisor.set_chat_handler(handler)
+    assert supervisor.retain_terminal_chat_resource(
+        TerminalChatResource(handler=handler, close=cleanup_finished.set)
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        answer = pool.submit(supervisor.chat, "what happened?")
+        assert handler_started.wait(timeout=2)
+        cleanup = pool.submit(supervisor.close_terminal_chat_resource)
+        assert not cleanup_finished.wait(timeout=0.05)
+        assert not cleanup.done()
+        release_handler.set()
+        assert answer.result(timeout=2) == "finished answer"
+        cleanup.result(timeout=2)
+
+    assert cleanup_finished.is_set()
+
+
+def test_run_context_teardown_does_not_wait_for_retained_chat(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    teardown_finished = threading.Event()
+    resource_closed = threading.Event()
+
+    def handler(_question: str) -> str:
+        handler_started.set()
+        release_handler.wait()
+        return "finished answer"
+
+    supervisor.enable_terminal_chat_retention()
+    assert supervisor.retain_terminal_chat_resource(
+        TerminalChatResource(handler=handler, close=resource_closed.set)
+    )
+    teardown = ExitStack()
+    teardown.callback(teardown_finished.set)
+    ctx = _RunContext.__new__(_RunContext)
+    ctx.supervisor = supervisor
+    ctx._teardown_stack = teardown  # noqa: SLF001
+    ctx._closed = False  # noqa: SLF001
+    ctx._experiment_chat = None  # noqa: SLF001
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        answer = pool.submit(supervisor.chat, "what happened?")
+        assert handler_started.wait(timeout=2)
+        cleanup = pool.submit(ctx.close)
+        cleanup.result(timeout=2)
+        assert teardown_finished.is_set()
+        assert not resource_closed.is_set()
+        release_handler.set()
+        assert answer.result(timeout=2) == "finished answer"
+
+    supervisor.close_terminal_chat_resource()
+    assert resource_closed.is_set()
+
+
+def test_terminal_chat_cleanup_bounds_an_in_flight_answer(tmp_path, monkeypatch):  # noqa: ANN001, ANN201
+    monkeypatch.setattr(supervisor_module, "_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS", 0.01)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.enable_terminal_chat_retention()
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    resource_closed = threading.Event()
+
+    def handler(_question: str) -> str:
+        handler_started.set()
+        release_handler.wait()
+        return "late answer"
+
+    assert supervisor.retain_terminal_chat_resource(
+        TerminalChatResource(handler=handler, close=resource_closed.set)
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        answer = pool.submit(supervisor.chat, "what happened?")
+        assert handler_started.wait(timeout=2)
+        started = time.monotonic()
+        supervisor.close_terminal_chat_resource()
+        assert time.monotonic() - started < 0.5
+        assert not resource_closed.is_set()
+        release_handler.set()
+        assert answer.result(timeout=2) == "late answer"
+        assert resource_closed.wait(timeout=2)
+
+
+def test_run_finish_does_not_interrupt_presentation_chat(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    execution = supervisor.start_agent_execution(
+        "chat",
+        "experiment-chat",
+        "what happened?",
+        "inspect the experiment",
+        consume_steering=False,
+        participates_in_run_control=False,
+    )
+
+    supervisor.finish()
+
+    assert [active.execution_id for active in supervisor.snapshot().active_executions] == [
+        execution.execution_id
+    ]
+    supervisor.after_agent(
+        "chat",
+        "experiment-chat",
+        result="answer",
+        execution_id=execution.execution_id,
+    )
+    finished = [
+        event
+        for event in supervisor.read_events()
+        if event.type is EventType.AGENT_EXECUTION_FINISHED
+        and event.execution_id == execution.execution_id
+    ]
+    assert len(finished) == 1
+    assert finished[0].status is EventStatus.COMPLETED
+
+
+def test_run_context_retains_terminal_chat_when_primary_teardown_fails(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.enable_terminal_chat_retention()
+    teardown_failure = RuntimeError("primary teardown failed")
+    teardown = ExitStack()
+    teardown.callback(lambda: (_ for _ in ()).throw(teardown_failure))
+    terminal_chat = Mock()
+    terminal_chat.ask.return_value = "terminal agent answer"
+    assert supervisor.retain_terminal_chat_resource(
+        TerminalChatResource(handler=terminal_chat.ask, close=terminal_chat.close)
+    )
+    ctx = _RunContext.__new__(_RunContext)
+    ctx.supervisor = supervisor
+    ctx._teardown_stack = teardown  # noqa: SLF001
+    ctx._closed = False  # noqa: SLF001
+    ctx._experiment_chat = None  # noqa: SLF001
+
+    with pytest.raises(RuntimeError) as raised:
+        ctx.close()
+
+    assert raised.value is teardown_failure
+    assert supervisor.chat("what happened?") == "terminal agent answer"
+    supervisor.close_terminal_chat_resource()
+    terminal_chat.close.assert_called_once_with()
+
+
+def test_partial_terminal_chat_cleanup_preserves_construction_error() -> None:
+    construction_error = RuntimeError("terminal client construction failed")
+    cleanup_error = RuntimeError("partial terminal cleanup failed")
+    resources = ExitStack()
+    resources.callback(lambda: (_ for _ in ()).throw(cleanup_error))
+
+    _close_after_construction_failure(resources, construction_error)
+
+    assert construction_error.__notes__ == [
+        "Additional error while cleaning up partial resource construction: "
+        "RuntimeError: partial terminal cleanup failed"
+    ]
+
+
 def test_keyword_fallback_does_not_advertise_slash_commands(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
@@ -737,6 +1002,20 @@ def test_run_context_chat_exposes_trajectory_without_inlining_it_in_prompt(tmp_p
     ctx._chat_history = []  # noqa: SLF001  # tracked: #288
     ctx.logger = Mock()
     ctx.logger.file = Mock()
+    ctx._experiment_chat = _ExperimentChatService(  # noqa: SLF001
+        _ExperimentChatDependencies(
+            supervisor=supervisor,
+            agent_client=ctx.agent_client,
+            workspace=store.root,
+            log_dir=store.state.log_directory(run_id),
+            project=store,
+            run_id=run_id,
+            log=ctx.logger.lprint,
+            flush_logs=ctx.logger.file.flush,
+            environment=dict,
+            progress=lambda: None,
+        )
+    )
 
     answer = ctx.chat("what improved?")
 
@@ -768,7 +1047,9 @@ def test_run_context_chat_exposes_trajectory_without_inlining_it_in_prompt(tmp_p
     assert "It improved in round 2." not in continuation["user_prompt"]
     assert "_vibesys_chat/instructions.md" in continuation["system_prompt"]
     assert "Prefer targeted commands" not in continuation["system_prompt"]
-    assert ctx._load_chat_history() == [("what improved?", "It improved in round 2.")]  # noqa: SLF001  # tracked: #288
+    assert ctx._experiment_chat._load_history() == [  # noqa: SLF001
+        ("what improved?", "It improved in round 2.")
+    ]
 
 
 def test_socket_transport_supports_multiple_clients_and_event_replay(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1039,6 +1320,104 @@ def test_supervision_runtime_streams_configuration_failure_before_exiting():  # 
         assert not any(event["type"] == "run_failed" for event in received_events)
         assert chat_responses[0]["ok"] is True
         assert "unknown token=[REDACTED] option --bad" in chat_responses[0]["chat"]["answer"]
+    finally:
+        subscriber.join(timeout=5)
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("run_fails", "cleanup_fails"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_supervision_runtime_releases_terminal_chat_after_disconnect(  # noqa: C901, PLR0915
+    run_fails: bool,  # noqa: FBT001
+    cleanup_fails: bool,  # noqa: FBT001
+) -> None:
+    session_dir = Path("/tmp") / f"vs-terminal-chat-{uuid.uuid4().hex}"  # noqa: S108
+    socket_path = session_dir / "control.sock"
+    cleanup_finished = threading.Event()
+    chat_responses = []
+
+    def subscribe_through_terminal_chat() -> None:
+        deadline = time.monotonic() + 5
+        while not socket_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(str(socket_path))
+            stream = client.makefile("rwb")
+            stream.write(SubscribeRequest(after_sequence=0).model_dump_json().encode() + b"\n")
+            stream.flush()
+            terminal_type = "run_failed" if run_fails else "run_finished"
+            while True:
+                message = json.loads(stream.readline())
+                events = message.get("events", [])
+                if message["type"] == "event":
+                    events = [message["event"]]
+                if any(event["type"] == terminal_type for event in events):
+                    break
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as chat_client:
+                chat_client.settimeout(5)
+                chat_client.connect(str(socket_path))
+                chat_stream = chat_client.makefile("rwb")
+                chat_stream.write(
+                    ChatQuery(text="what happened?").model_dump_json().encode() + b"\n"
+                )
+                chat_stream.flush()
+                chat_responses.append(json.loads(chat_stream.readline()))
+            assert cleanup_finished.is_set()
+
+    subscriber = threading.Thread(target=subscribe_through_terminal_chat)
+    subscriber.start()
+    failure = RuntimeError("run failed after context teardown")
+    cleanup_failure = RuntimeError("terminal chat cleanup failed")
+
+    def close_resources() -> None:
+        cleanup_finished.set()
+
+    def run() -> None:
+        supervisor = active_supervisor()
+        assert supervisor is not None
+        ctx = _RunContext.__new__(_RunContext)
+        ctx.supervisor = supervisor
+        teardown = ExitStack()
+        teardown.callback(close_resources)
+        ctx._teardown_stack = teardown  # noqa: SLF001
+        ctx._closed = False  # noqa: SLF001
+        terminal_chat = Mock()
+        terminal_chat.ask.return_value = "terminal agent answer"
+        if cleanup_fails:
+            terminal_chat.close.side_effect = cleanup_failure
+        assert supervisor.retain_terminal_chat_resource(
+            TerminalChatResource(handler=terminal_chat.ask, close=terminal_chat.close)
+        )
+        ctx._experiment_chat = None  # noqa: SLF001
+        ctx.close()
+        if run_fails:
+            raise failure
+
+    try:
+        if run_fails:
+            with pytest.raises(RuntimeError) as raised:
+                run_server(run, socket_path=socket_path)
+            assert raised.value is failure
+            if cleanup_fails:
+                assert raised.value.__notes__ == [
+                    "Terminal chat cleanup also failed: RuntimeError: terminal chat cleanup failed"
+                ]
+        else:
+            run_server(run, socket_path=socket_path)
+            if cleanup_fails:
+                assert any(
+                    event["type"] == "output"
+                    and "Terminal chat cleanup also failed" in event["data"]["content"]
+                    for event in _events(session_dir / "run-events.jsonl")
+                )
+        subscriber.join(timeout=5)
+        assert not subscriber.is_alive()
+        assert chat_responses[0]["ok"] is True
+        assert chat_responses[0]["chat"]["answer"] == "terminal agent answer"
+        assert cleanup_finished.is_set()
     finally:
         subscriber.join(timeout=5)
         shutil.rmtree(session_dir, ignore_errors=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable, Generator  # noqa: TC003  # tracked: #288
 from contextlib import contextmanager
@@ -47,6 +48,7 @@ from vibesys.server.events import (
 from vibesys.server.protocol import ActiveAgentExecution, RunSnapshot
 
 _MAX_EXCEPTION_CHAIN = 8
+_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS = 5.0
 _DIAGNOSTIC_FAILURE_EVENTS = frozenset(
     {
         EventType.CONFIGURATION_FAILED,
@@ -92,6 +94,14 @@ class AgentExecutionHandle:
     user_prompt: str
 
 
+@dataclass(frozen=True)
+class TerminalChatResource:
+    """Chat handler and resources retained while the terminal UI is open."""
+
+    handler: Callable[[str], str]
+    close: Callable[[], None]
+
+
 class RunSupervisor:
     """Own pause state, invocation metadata, and the run audit store."""
 
@@ -115,6 +125,10 @@ class RunSupervisor:
         self._current_kind: str | None = None
         self._current_round: str | None = None
         self._chat_handler: Callable[[str], str] | None = None
+        self._active_chat_calls = 0
+        self._retain_terminal_chat = False
+        self._terminal_chat_resource: TerminalChatResource | None = None
+        self._retired_terminal_chat_resource: TerminalChatResource | None = None
         self._presentation_local = threading.local()
         self._legacy_execution_local = threading.local()
         # An invocation and its terminal run failure often carry the same
@@ -505,8 +519,8 @@ class RunSupervisor:
     def chat_agent_available(self) -> bool:
         """True when an agent-backed chat handler is installed for this run.
 
-        The handler exists only for the lifetime of the run context, so chat
-        asked during setup or after teardown has no agent to reach.
+        A server-backed run may replace its live handler with a separately
+        owned terminal handler after normal run teardown.
         """
         with self._condition:
             return self._chat_handler is not None
@@ -514,29 +528,55 @@ class RunSupervisor:
     def chat(self, text: str) -> str:  # noqa: D102  # tracked: #288
         with self._condition:
             handler = self._chat_handler
-        if handler is None:
-            from vibesys.server.inspector import RunInspector  # noqa: PLC0415  # tracked: #288
+            if handler is not None:
+                self._active_chat_calls += 1
+        try:
+            if handler is None:
+                from vibesys.server.inspector import RunInspector  # noqa: PLC0415  # tracked: #288
 
-            # No agent is reachable, so say that rather than answering as if
-            # this were the normal path. The keyword diagnostic is still worth
-            # showing, but it is supporting detail, not the answer.
-            answer = (
-                "The experiment chat agent is not available for this run"
-                f" ({self._chat_unavailable_reason()}), so this is a read-only"
-                " summary from the recorded events rather than an answer.\n\n"
-                + RunInspector(self).answer(text)
+                # No agent is reachable, so say that rather than answering as if
+                # this were the normal path. The keyword diagnostic is still worth
+                # showing, but it is supporting detail, not the answer.
+                answer = (
+                    "The experiment chat agent is not available for this run"
+                    f" ({self._chat_unavailable_reason()}), so this is a read-only"
+                    " summary from the recorded events rather than an answer.\n\n"
+                    + RunInspector(self).answer(text)
+                )
+            else:
+                answer = handler(text)
+            self.record(
+                EventType.CHAT,
+                text,
+                status=EventStatus.ANSWERED,
+                agent_kind="chat",
+                round_label="experiment-chat",
+                data=ChatData(answer=answer),
             )
-        else:
-            answer = handler(text)
-        self.record(
-            EventType.CHAT,
-            text,
-            status=EventStatus.ANSWERED,
-            agent_kind="chat",
-            round_label="experiment-chat",
-            data=ChatData(answer=answer),
-        )
-        return answer
+            return answer
+        finally:
+            if handler is not None:
+                self._release_chat_call()
+
+    def _release_chat_call(self) -> None:
+        """Release one handler lease and close a retired resource when safe."""
+        retired: TerminalChatResource | None = None
+        with self._condition:
+            self._active_chat_calls -= 1
+            if self._active_chat_calls == 0:
+                retired = self._retired_terminal_chat_resource
+                self._retired_terminal_chat_resource = None
+            self._condition.notify_all()
+        if retired is None:
+            return
+        try:
+            retired.close()
+        except Exception as exc:  # noqa: BLE001  # deferred cleanup cannot reach its caller
+            self.publish_output(
+                "stderr",
+                f"Terminal experiment chat cleanup failed: {type(exc).__name__}: {exc}\n",
+                source="terminal-chat",
+            )
 
     def _chat_unavailable_reason(self) -> str:
         with self._condition:
@@ -549,6 +589,60 @@ class RunSupervisor:
         """Install the current experiment's agent-backed chat handler."""
         with self._condition:
             self._chat_handler = handler
+
+    def clear_chat_handler_and_drain(self) -> None:
+        """Stop accepting chat and wait until callers release the live handler."""
+        with self._condition:
+            self._chat_handler = None
+            self._wait_for_chat_drain_locked(timeout=None)
+
+    def enable_terminal_chat_retention(self) -> None:
+        """Keep a run context's chat resources until its presentation exits."""
+        with self._condition:
+            self._retain_terminal_chat = True
+
+    def terminal_chat_retention_enabled(self) -> bool:
+        """Return whether the presentation runtime accepts a terminal chat resource."""
+        with self._condition:
+            return self._retain_terminal_chat
+
+    def retain_terminal_chat_resource(self, resource: TerminalChatResource) -> bool:
+        """Take ownership of terminal chat cleanup when retention is enabled."""
+        with self._condition:
+            if not self._retain_terminal_chat:
+                return False
+            if self._terminal_chat_resource is not None:
+                raise RuntimeError(  # noqa: TRY003
+                    "Terminal chat resources are already retained"
+                )
+            self._terminal_chat_resource = resource
+            self._chat_handler = resource.handler
+            return True
+
+    def close_terminal_chat_resource(self) -> None:
+        """Retire the terminal resource, closing it after its last borrower."""
+        with self._condition:
+            resource = self._terminal_chat_resource
+            self._terminal_chat_resource = None
+            self._retain_terminal_chat = False
+            if resource is not None and self._chat_handler == resource.handler:
+                self._chat_handler = None
+            if resource is not None and not self._wait_for_chat_drain_locked(
+                timeout=_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS
+            ):
+                self._retired_terminal_chat_resource = resource
+                resource = None
+        if resource is not None:
+            resource.close()
+
+    def _wait_for_chat_drain_locked(self, *, timeout: float | None) -> bool:
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while self._active_chat_calls > 0:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._condition.wait(timeout=remaining)
+        return True
 
     @contextmanager
     def presentation_scope(
@@ -822,6 +916,8 @@ class RunSupervisor:
             if self._run_status in {"completed", "failed"}:
                 return
             for execution_id, active in tuple(self._active_executions.items()):
+                if execution_id not in self._run_control_execution_ids:
+                    continue
                 message = "Run ended before the agent execution completed"
                 self.record(
                     EventType.AGENT_EXECUTION_FINISHED,

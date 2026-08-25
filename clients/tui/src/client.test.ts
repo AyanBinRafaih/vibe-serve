@@ -146,6 +146,46 @@ describe('SupervisionClient', () => {
     );
   });
 
+  it('runs long agent chat on a dedicated connection without a response timeout', async () => {
+    let connections = 0;
+    let resolveChatSocketClosed: (() => void) | undefined;
+    const chatSocketClosed = new Promise<void>(resolve => {
+      resolveChatSocketClosed = resolve;
+    });
+    await withServer(
+      socket => {
+        connections += 1;
+        respondToLines(socket, request => {
+          if (request['type'] !== 'query.chat') return;
+          socket.once('close', () => resolveChatSocketClosed?.());
+          setTimeout(() => {
+            socket.write(
+              `${JSON.stringify({
+                ...successResponse(request['request_id'] as string),
+                chat: {
+                  question: 'what happened?',
+                  answer: 'The agent finished its investigation.',
+                  effect: 'none',
+                },
+              })}\n`,
+            );
+          }, 50);
+        });
+      },
+      async client => {
+        const chat = client.request({type: 'query.chat', text: 'what happened?'});
+        await expect(client.request({type: 'query.snapshot'})).rejects.toThrow(
+          'Supervision request timed out after 20ms',
+        );
+        const response = await chat;
+        expect(response.chat?.answer).toBe('The agent finished its investigation.');
+        expect(connections).toBe(2);
+        await chatSocketClosed;
+      },
+      {requestTimeoutMs: 20},
+    );
+  });
+
   it('reassembles and validates fragmented subscription messages', async () => {
     await withServer(
       socket =>

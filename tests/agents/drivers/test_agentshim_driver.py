@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures
+import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import SimpleNamespace
@@ -181,6 +183,77 @@ def test_turn_forwards_prompt_timeout_events_and_usage(
         subject.AgentEventKind.THINKING,
         subject.AgentEventKind.USAGE,
     ]
+
+
+def test_independent_sessions_overlap_and_chat_cleanup_does_not_interrupt_optimizer(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    barrier = threading.Barrier(2)
+    release_optimizer = threading.Event()
+    optimizer_observer = _Observer()
+    chat_observer = _Observer()
+    driver = subject.AgentShimDriver(provider="codex")
+    optimizer = driver.create_session(_spec(tmp_path, role="implementer"))
+    chat = driver.create_session(
+        _spec(tmp_path, role="chat", environment=(("CHAT_MODE", "read-only"),))
+    )
+
+    def generate_optimizer(
+        _prompt: str,
+        *,
+        cwd: str | None,
+        timeout: int | None,
+        silent: bool,
+    ) -> str:
+        assert cwd == str(tmp_path)
+        assert timeout is None
+        assert silent
+        barrier.wait(timeout=2)
+        assert fake_agent[0].event_handler is not None
+        fake_agent[0].event_handler.on_thinking("optimizer event")
+        assert release_optimizer.wait(timeout=2)
+        return "optimizer result"
+
+    def generate_chat(
+        _prompt: str,
+        *,
+        cwd: str | None,
+        timeout: int | None,
+        silent: bool,
+    ) -> str:
+        assert cwd == str(tmp_path)
+        assert timeout is None
+        assert silent
+        barrier.wait(timeout=2)
+        assert fake_agent[1].event_handler is not None
+        fake_agent[1].event_handler.on_thinking("chat event")
+        return "chat result"
+
+    fake_agent[0].generate = generate_optimizer
+    fake_agent[1].generate = generate_chat
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        optimizer_turn = pool.submit(
+            optimizer.run_turn,
+            AgentTurnRequest(message="optimize"),
+            optimizer_observer,
+        )
+        chat_turn = pool.submit(
+            chat.run_turn,
+            AgentTurnRequest(message="explain the run"),
+            chat_observer,
+        )
+        assert chat_turn.result(timeout=3).text == "chat result"
+        chat.close()
+        assert not optimizer_turn.done()
+        release_optimizer.set()
+        assert optimizer_turn.result(timeout=3).text == "optimizer result"
+
+    assert fake_agent[0].env == {"BASE": "one", "GPU": "0"}
+    assert fake_agent[1].env == {"BASE": "one", "CHAT_MODE": "read-only"}
+    assert [event.text for event in optimizer_observer.events] == ["optimizer event"]
+    assert [event.text for event in chat_observer.events] == ["chat event"]
+    driver.close()
 
 
 def test_mcp_is_session_scoped_but_activated_only_around_turn(
