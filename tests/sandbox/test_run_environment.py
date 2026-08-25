@@ -94,6 +94,34 @@ def test_cli_compatibility_flags_keep_options_scoped_to_selected_environment(): 
     )
     assert configured.options["entrypoint"] == "examples/deployment/service.py"
 
+    resources = RunResourceRequest(nodes=1, accelerators_per_node=4, accelerator_backend="rocm")
+    skypilot = make_run_environment_spec(
+        use_skypilot=True,
+        cluster_profile="remote-gpu",
+        cluster_profiles_file=Path("/operator/clusters.toml"),
+        skypilot_executable="sky-custom",
+        resources=resources,
+    )
+    assert skypilot.name == "skypilot"
+    assert skypilot.options["profile"] == "remote-gpu"
+    assert skypilot.options["profiles_file"] == Path("/operator/clusters.toml")
+    assert skypilot.options["executable"] == "sky-custom"
+
+
+def test_skypilot_selection_requires_profile_and_resources() -> None:
+    resources = RunResourceRequest(accelerators_per_node=1, accelerator_backend="rocm")
+    with pytest.raises(ValueError, match="cluster-profile"):
+        make_run_environment_spec(use_skypilot=True, resources=resources)
+    with pytest.raises(ValueError, match=r"\[resources\]"):
+        make_run_environment_spec(use_skypilot=True, cluster_profile="gpu")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        make_run_environment_spec(
+            use_docker=True,
+            use_skypilot=True,
+            cluster_profile="gpu",
+            resources=resources,
+        )
+
 
 def test_run_environment_record_captures_operator_selected_options():  # noqa: ANN201  # tracked: #288
     assert run_environment_record(make_run_environment_spec()) == RunEnvironmentRecord(name="local")
@@ -917,6 +945,80 @@ def test_modal_environment_with_deepagents_uses_docker_too(tmp_path):  # noqa: A
 def test_unknown_environment_name_raises():  # noqa: ANN201  # tracked: #288
     with pytest.raises(ValueError, match="unknown run environment"):
         build_run_environment(RunEnvironmentSpec("wat"))
+
+
+def test_skypilot_environment_uses_cpu_editor_and_narrow_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profiles = tmp_path / "clusters.toml"
+    profiles.write_text(
+        """schema_version = 1
+[profiles.gpu]
+runner = "skypilot"
+infra = "slurm/example/gpu"
+accelerator_backend = "rocm"
+accelerator_type = "MI300A"
+accelerators_per_node = 4
+remote_artifact_root = "/remote/vibesys"
+"""
+    )
+    resources = RunResourceRequest(nodes=1, accelerators_per_node=4, accelerator_backend="rocm")
+    captures: dict[str, object] = {}
+
+    class FakeBridge:
+        def __init__(self, **kwargs):  # noqa: ANN003, ANN204
+            captures.update(kwargs)
+            self.socket_path = kwargs["socket_path"]
+            self.closed = 0
+
+        def start(self) -> None:
+            self.socket_path.write_text("socket")
+
+        def close(self) -> None:
+            self.closed += 1
+
+    monkeypatch.setattr("vibesys.sandbox.run_environment.SkyPilotBridge", FakeBridge)
+    backend = FakeBackend()
+    environment = build_run_environment(
+        make_run_environment_spec(
+            use_skypilot=True,
+            cluster_profile="gpu",
+            cluster_profiles_file=profiles,
+            resources=resources,
+        )
+    )
+
+    session = environment.open(
+        _request(
+            tmp_path,
+            backend,
+            accuracy_command="python checker.py ${PROJECT_ROOT}/candidate.json",
+            benchmark_command="python benchmark.py",
+            benchmark_output_argument="--output-json",
+        )
+    )
+
+    kind, kwargs = backend.calls[0]
+    assert kind is SandboxKind.DOCKER
+    assert kwargs["attach_accelerator"] is False
+    mounts = kwargs["bind_mounts"]
+    assert any(target == "/opt/vibesys-skypilot/bridge.sock" for _, target, _ in mounts)
+    assert any(target == "/opt/vibesys-skypilot-evaluator.py" for _, target, _ in mounts)
+    assert all(".ssh" not in source and ".sky" not in source for source, _, _ in mounts)
+    assert captures["commands"] == {
+        "accuracy": ("python", "checker.py", "./candidate.json"),
+        "benchmark": ("python", "benchmark.py"),
+    }
+    assert captures["benchmark_output_argument"] == "--output-json"
+    assert session.view.paths.accuracy_command.endswith(" accuracy")  # type: ignore[union-attr]
+    assert session.view.paths.benchmark_command.endswith(" benchmark")  # type: ignore[union-attr]
+    assert session.view.profile_execution == "remote"
+    assert session.view.supports_parallel_candidate_evaluation is False
+
+    session.close()
+    session.close()
+    backend.sandbox.stop.assert_called_once()
+    assert session.bridge.closed == 1
 
 
 def test_docker_remove_workspace_child_quotes_path(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288

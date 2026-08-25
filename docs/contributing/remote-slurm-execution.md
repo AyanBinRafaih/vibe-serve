@@ -293,6 +293,11 @@ the job runner with a focused SSH/Slurm implementation.
 
 ### Phase 2: Host bridge and run environment
 
+Implemented by the `SkyPilotEnvironment`, versioned host bridge, and
+sandbox-side evaluator helper. Remote profiling remains disabled until it has
+its own typed request and artifact contract. Durable invocation recovery and
+reattachment remain Phase 3 work.
+
 1. Add the versioned Unix-socket request and response contract.
 2. Start and stop the host bridge with the run environment session.
 3. Add the sandbox-side evaluator helper.
