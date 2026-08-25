@@ -147,6 +147,12 @@ may increase. Other recorded settings cannot change during a resume, including
 the runtime environment: a run launched with `--modal` resumes on Modal without
 repeating the flag.
 
+For a SkyPilot run, the portable environment choice is recorded, while the
+operator profile and local profiles-file path must be supplied on the resuming
+host. Nonterminal evaluator identity and replayable results live in the run's
+machine-local `skypilot` state namespace. See
+[Remote Slurm execution](remote-slurm-execution.md).
+
 ## Supply an Input with CLI Flags
 
 Automation can supply the input contract without first writing an input

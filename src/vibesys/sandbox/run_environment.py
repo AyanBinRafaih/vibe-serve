@@ -58,6 +58,8 @@ if TYPE_CHECKING:
     from deepagents.backends.protocol import SandboxBackendProtocol
     from deepagents.backends.sandbox import BaseSandbox
 
+    from vs_project import StateNamespace
+
 
 @dataclass(frozen=True)
 class RunEnvironmentSpec:
@@ -142,6 +144,7 @@ class RunEnvironmentRequest:  # noqa: D101  # tracked: #288
     log: Callable[[str], None] | None = None
     framework_root: Path = PROJECT_ROOT
     project_path_policy: ProjectPathPolicy = field(default_factory=ProjectPathPolicy)
+    state_namespace: StateNamespace | None = None
 
 
 class RunEnvironmentSession(Protocol):  # noqa: D101  # tracked: #288
@@ -473,6 +476,8 @@ class SkyPilotEnvironment(DockerEnvironment):
         """Open the bridge and CPU-only local editor container."""
         if self.config.resources is None:
             raise ValueError("SkyPilot requires portable run resources")  # noqa: TRY003
+        if request.state_namespace is None:
+            raise ValueError("SkyPilot requires a machine-local state namespace")  # noqa: TRY003
         profiles = load_cluster_profiles(self.config.profiles_file)
         resources = resolve_profile(profiles, self.config.profile, self.config.resources)
         cluster_name = stable_cluster_name(request.run_id, resources)
@@ -495,6 +500,7 @@ class SkyPilotEnvironment(DockerEnvironment):
             hidden_paths=request.project_path_policy.hidden_paths,
             commands=commands,
             benchmark_output_argument=request.benchmark_output_argument,
+            state_namespace=request.state_namespace,
             socket_path=request.log_dir / "skypilot-bridge.sock",
             log=log,
         )
@@ -507,10 +513,14 @@ class SkyPilotEnvironment(DockerEnvironment):
             helper_source = Path(__file__).with_name("skypilot_evaluator.py")
             helper_path = "/opt/vibesys-skypilot-evaluator.py"
             socket_path = "/opt/vibesys-skypilot/bridge.sock"
+            caller_state_path = "/opt/vibesys-skypilot/caller-state"
+            caller_state = request.state_namespace.external_directory("caller")
+            cli_provider_env["VIBESYS_SKYPILOT_CALLER_STATE"] = caller_state_path
             bind_mounts.extend(
                 [
                     (str(helper_source), helper_path, True),
                     (str(bridge.socket_path), socket_path, False),
+                    (str(caller_state), caller_state_path, False),
                 ]
             )
             runtime_document = request.log_dir / "runtime-environment.md"

@@ -310,6 +310,10 @@ reattachment remain Phase 3 work.
 
 ### Phase 3: Persistence and recovery
 
+Implemented by the machine-local `PREPARED`/`SUBMITTING` invocation journal,
+digest-bound immutable snapshots, deterministic job reconciliation, decoded log spools, bounded
+infrastructure-only retries, and acknowledged artifact delivery.
+
 1. Persist evaluation invocation records under framework-owned local run state.
 2. Stream logs incrementally and resume from recorded offsets after reconnect.
 3. Reattach to running jobs after local interruption when possible.

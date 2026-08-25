@@ -1,0 +1,18 @@
+schema_version = 1
+
+[profiles.beverin-mi300a]
+runner = "skypilot"
+infra = "slurm/beverin/mi300"
+accelerator_backend = "rocm"
+accelerator_type = "MI300A"
+accelerators_per_node = 4
+cpus_per_node = 192
+max_nodes = 1
+exclusive = true
+command_prefix = [
+  "srun",
+  "--overlap",
+  "--environment=/capstor/scratch/cscs/REPLACE_WITH_USERNAME/runtime.toml",
+]
+allocation_time = "24:00:00"
+remote_artifact_root = "/capstor/scratch/cscs/REPLACE_WITH_USERNAME/vibesys"

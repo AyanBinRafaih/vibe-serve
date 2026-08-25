@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import json
 import socket
 import threading
 from pathlib import Path
 
 import pytest
 
+import vibesys.sandbox.skypilot_evaluator as helper_module
 from vibesys.sandbox.skypilot_evaluator import run_evaluator
 from vibesys.skypilot.protocol import (
+    AckedFrame,
     ArtifactFrame,
     ErrorFrame,
     OutputFrame,
@@ -28,9 +32,16 @@ def _serve_frames(socket_path: Path, frames: list[object]) -> threading.Thread:
             ready.set()
             connection, _ = server.accept()
             with connection:
-                connection.makefile("rb").readline()
+                reader = connection.makefile("rb")
+                request = json.loads(reader.readline())
                 for frame in frames:
                     connection.sendall(encode_message(frame))  # type: ignore[arg-type]
+                if any(isinstance(frame, ResultFrame) for frame in frames):
+                    acknowledgement = json.loads(reader.readline())
+                    assert acknowledgement["type"] == "ack"
+                    connection.sendall(
+                        encode_message(AckedFrame(invocation_id=request["invocation_id"]))
+                    )
 
     thread = threading.Thread(target=serve)
     thread.start()
@@ -88,7 +99,7 @@ def test_helper_rejects_incomplete_terminal_result(tmp_path: Path) -> None:
             connection, _ = server.accept()
             with connection:
                 connection.makefile("rb").readline()
-                connection.sendall(b'{"version":1,"type":"result","status":"COMPLETED"}\n')
+                connection.sendall(b'{"version":2,"type":"result","status":"COMPLETED"}\n')
 
     raw_thread = threading.Thread(target=serve)
     raw_thread.start()
@@ -109,6 +120,8 @@ def test_helper_materializes_narrow_framework_result_artifact(tmp_path: Path) ->
         [
             ArtifactFrame(
                 path=str(output_path),
+                size=len(b'{"score": 1}'),
+                sha256=hashlib.sha256(b'{"score": 1}').hexdigest(),
                 data_base64=base64.b64encode(b'{"score": 1}').decode(),
             ),
             ResultFrame(status="COMPLETED", sky_exit_code=0, remote_job_id=7),
@@ -129,3 +142,50 @@ def test_helper_materializes_narrow_framework_result_artifact(tmp_path: Path) ->
         assert output_path.read_text() == '{"score": 1}'
     finally:
         output_path.unlink(missing_ok=True)
+
+
+def test_pending_invocation_identity_survives_helper_process_state_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VIBESYS_SKYPILOT_CALLER_STATE", str(tmp_path))
+
+    first, path = helper_module._pending_invocation("accuracy", ())  # noqa: SLF001
+    second, same_path = helper_module._pending_invocation("accuracy", ())  # noqa: SLF001
+
+    assert first == second
+    assert path == same_path
+    assert path.is_relative_to(tmp_path)
+
+
+def test_acknowledged_pending_invocation_removal_is_directory_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VIBESYS_SKYPILOT_CALLER_STATE", str(tmp_path))
+    _, pending_path = helper_module._pending_invocation("accuracy", ())  # noqa: SLF001
+    fsynced: list[Path] = []
+    monkeypatch.setattr(helper_module, "_fsync_directory", fsynced.append)
+    socket_path = tmp_path / "bridge.sock"
+    thread = _serve_frames(
+        socket_path,
+        [ResultFrame(status="COMPLETED", sky_exit_code=0, remote_job_id=7)],
+    )
+
+    assert run_evaluator("accuracy", socket_path, stdout=io.StringIO(), stderr=io.StringIO()) == 0
+    thread.join()
+
+    assert not pending_path.exists()
+    assert fsynced == [tmp_path]
+
+
+def test_pending_invocation_recovers_an_incomplete_token_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VIBESYS_SKYPILOT_CALLER_STATE", str(tmp_path))
+    _, path = helper_module._pending_invocation("accuracy", ())  # noqa: SLF001
+    path.write_text("partial", encoding="utf-8")
+
+    recovered, same_path = helper_module._pending_invocation("accuracy", ())  # noqa: SLF001
+
+    assert len(recovered) == 32
+    assert same_path == path
+    assert path.read_text(encoding="utf-8") == recovered
