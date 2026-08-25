@@ -15,6 +15,8 @@ from vibesys.loops.agent.model import ActiveHypothesis
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.run import RunLogger, RunPaths, RunStateNamespace
 from vibesys.sandbox.run_environment import RunEnvironmentSpec
+from vibesys.server import EventType, RunSupervisor
+from vibesys.server.registry import REGISTRY
 from vs_loop_state import PlainLoopCursor
 from vs_project import AgentRunConfiguration, Project, RunEnvironmentRecord
 
@@ -209,6 +211,30 @@ def test_direct_run_uses_one_project_root_and_canonical_state(tmp_path):  # noqa
     assert manifest.branch == f"vibesys-runs/{ctx.run_id}"
     assert _git(project, "branch", "--show-current") == manifest.branch
     assert _git(project, "status", "--porcelain") == ""
+
+
+def test_run_context_announces_canonical_experiment_state(tmp_path):  # noqa: ANN001, ANN201
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            changed = [
+                event
+                for event in supervisor.read_events()
+                if event.type is EventType.EXPERIMENTS_CHANGED
+            ]
+
+            assert supervisor.project_run is not None
+            assert supervisor.project_run.run_id == ctx.run_id
+            assert len(changed) == 1
+            assert changed[0].data is not None
+            assert changed[0].data.kind == "experiments_changed"
+            assert changed[0].data.reason == "project_attached"
+    finally:
+        REGISTRY.deactivate(supervisor)
 
 
 def test_repository_task_exposes_its_actual_reference_path(tmp_path: Path) -> None:

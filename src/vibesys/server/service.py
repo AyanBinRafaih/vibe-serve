@@ -70,7 +70,13 @@ class SupervisionService:
             return Response(request_id=request.request_id, performance=self.performance_rounds())
         if isinstance(request, ExperimentQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/experiments")
-            return Response(request_id=request.request_id, experiments=self.experiments())
+            ready = self.supervisor.project_run is not None
+            experiments = self.experiments() if ready else []
+            return Response(
+                request_id=request.request_id,
+                experiments=experiments,
+                experiments_ready=ready,
+            )
         if isinstance(request, SnapshotQuery):
             return Response(request_id=request.request_id, snapshot=self.snapshot())
         if isinstance(request, EventsQuery):

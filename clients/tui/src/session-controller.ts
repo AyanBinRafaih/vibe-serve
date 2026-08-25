@@ -112,8 +112,9 @@ export class SocketSessionController implements SessionController {
   #chatMessageId = 0;
   readonly #chatQueue: Array<{id: string; text: string}> = [];
   #chatDrain: Promise<void> | null = null;
-  /** Single-flight guard: phase events arrive faster than the fetch settles. */
+  /** Single-flight guard for semantic experiment-log invalidations. */
   #experimentFetch: Promise<void> | null = null;
+  #experimentRefreshPending = false;
   #paneFetch: Promise<void> | null = null;
   #streamProtocolError = false;
 
@@ -377,6 +378,10 @@ export class SocketSessionController implements SessionController {
     if (this.#experimentFetch !== null) return this.#experimentFetch;
     const fetch = this.#requestExperiments().finally(() => {
       this.#experimentFetch = null;
+      if (this.#experimentRefreshPending) {
+        this.#experimentRefreshPending = false;
+        void this.#loadExperiments();
+      }
     });
     this.#experimentFetch = fetch;
     return fetch;
@@ -385,6 +390,7 @@ export class SocketSessionController implements SessionController {
   async #requestExperiments(): Promise<void> {
     try {
       const response = await this.client.request({type: 'query.experiments'});
+      if (response.experiments_ready === false) return;
       this.#setState(setExperiments(this.#state, response.experiments ?? []));
     } catch (error) {
       const message = errorMessage(error);
@@ -555,17 +561,15 @@ export class SocketSessionController implements SessionController {
   }
 
   /**
-   * A hypothesis appears when the orchestrator phase finishes writing its plan
-   * and resolves when the round finishes, so those two events bound every
-   * change to the log. Refetching on them keeps the landing view live without
-   * polling; the single-flight guard absorbs bursts.
+   * The backend publishes this semantic event after the canonical project is
+   * attached and whenever persisted hypothesis state changes. The client does
+   * not infer storage readiness or mutations from execution phases.
    */
   #refreshExperimentsFor(events: readonly RunEvent[]): void {
     if (this.#state.experimentLog === null) return;
-    const relevant = events.some(
-      event => event.type === 'round_finished' || event.type === 'phase_finished',
-    );
+    const relevant = events.some(event => event.type === 'experiments_changed');
     if (!relevant) return;
+    if (this.#experimentFetch !== null) this.#experimentRefreshPending = true;
     void this.#loadExperiments();
   }
 

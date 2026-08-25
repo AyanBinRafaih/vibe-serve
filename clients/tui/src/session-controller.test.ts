@@ -500,7 +500,7 @@ describe('session controller', () => {
     expect(controller.state.experimentLog?.entries).toHaveLength(1);
   });
 
-  it('refetches the log when a round finishes and keeps the selected row', async () => {
+  it('refetches the log when experiments change and keeps the selected row', async () => {
     const transport = new FakeTransport();
     transport.experiments = [
       entry('H-01', 1, 1, {resolved_outcome: 'proven'}),
@@ -518,7 +518,7 @@ describe('session controller', () => {
       entry('H-02', 2, 3, {resolved_outcome: 'rejected'}),
       entry('H-03', 4, 4, {active: true}),
     ];
-    transport.emit({type: 'event', event: event(9, 'round_finished')});
+    transport.emit({type: 'event', event: event(9, 'experiments_changed')});
     await Promise.resolve();
     await Promise.resolve();
 
@@ -536,6 +536,8 @@ describe('session controller', () => {
 
     transport.emit({type: 'event', event: event(1, 'agent_output_chunk', 'noise\n')});
     transport.emit({type: 'event', event: event(2, 'tool_call')});
+    transport.emit({type: 'event', event: event(3, 'phase_finished')});
+    transport.emit({type: 'event', event: event(4, 'round_finished')});
     await Promise.resolve();
 
     expect(transport.requests).toHaveLength(before);
@@ -607,7 +609,26 @@ describe('session controller', () => {
     expect(controller.state.experimentLog?.selectedId).toBe('H-01');
   });
 
-  it('coalesces refetches when a burst of phase events lands', async () => {
+  it('keeps bootstrap pending until attached experiments become ready', async () => {
+    const transport = new FakeTransport();
+    transport.experimentsReady = false;
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    expect(controller.state.experimentLog?.pending).toBe(true);
+    expect(controller.state.experimentLog?.entries).toEqual([]);
+
+    transport.experiments = [entry('H-resumed', 1, 1, {active: true})];
+    transport.experimentsReady = true;
+    transport.emit({type: 'event', event: event(1, 'experiments_changed')});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(controller.state.experimentLog?.pending).toBe(false);
+    expect(controller.state.experimentLog?.selectedId).toBe('H-resumed');
+  });
+
+  it('coalesces refetches when a burst of experiment changes lands', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
@@ -615,13 +636,35 @@ describe('session controller', () => {
 
     transport.emit({
       type: 'event_batch',
-      events: [event(1, 'phase_finished'), event(2, 'phase_finished'), event(3, 'round_finished')],
+      events: [event(1, 'experiments_changed'), event(2, 'experiments_changed')],
     });
-    transport.emit({type: 'event', event: event(4, 'phase_finished')});
     await Promise.resolve();
     await Promise.resolve();
 
     expect(transport.requests.length - before).toBe(1);
+  });
+
+  it('refetches again when experiments change during an in-flight fetch', async () => {
+    const transport = new DeferredExperimentsTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emit(event(1, 'experiments_changed'));
+    expect(transport.experimentRequests).toBe(2);
+
+    transport.emit(event(2, 'experiments_changed'));
+    transport.emit(event(3, 'experiments_changed'));
+    transport.resolveExperiment([entry('H-stale', 1, 1, {active: true})]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(transport.experimentRequests).toBe(3);
+    transport.resolveExperiment([entry('H-current', 1, 2, {resolved_outcome: 'proven'})]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(controller.state.experimentLog?.selectedId).toBe('H-current');
+    expect(transport.experimentRequests).toBe(3);
   });
 
   it('opens the selected hypothesis with /open-round', async () => {
@@ -863,6 +906,7 @@ class FakeTransport implements SupervisionTransport {
   closed = false;
   /** Mutable so a test can change what a refetch returns mid-run. */
   experiments: NonNullable<ProtocolResponse['experiments']> = [];
+  experimentsReady = true;
   readonly requests: RequestInput[] = [];
   #message: ((message: ServerMessage) => void) | null = null;
   #disconnect: ((error: Error) => void) | null = null;
@@ -885,6 +929,7 @@ class FakeTransport implements SupervisionTransport {
       events: this.responseEvents,
       performance: this.responsePerformance,
       experiments: this.experiments,
+      experiments_ready: this.experimentsReady,
       ...(input.type === 'query.chat'
         ? {
             chat: this.responseChat ?? {
@@ -919,6 +964,63 @@ class FakeTransport implements SupervisionTransport {
 
   disconnect(error: Error): void {
     this.#disconnect?.(error);
+  }
+}
+
+class DeferredExperimentsTransport implements SupervisionTransport {
+  experimentRequests = 0;
+  readonly #pending: Array<(response: ProtocolResponse) => void> = [];
+  #message: ((message: ServerMessage) => void) | null = null;
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    const base = {
+      protocol_version: 1 as const,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true,
+    };
+    if (input.type === 'query.snapshot') {
+      return Promise.resolve({
+        ...base,
+        snapshot: {run_id: 'run', status: 'running', sequence: 0},
+      });
+    }
+    if (input.type !== 'query.experiments') return Promise.resolve(base);
+    this.experimentRequests += 1;
+    if (this.experimentRequests === 1) {
+      return Promise.resolve({...base, experiments: [], experiments_ready: true});
+    }
+    return new Promise(resolve => this.#pending.push(resolve));
+  }
+
+  resolveExperiment(experiments: NonNullable<ProtocolResponse['experiments']>): void {
+    const resolve = this.#pending.shift();
+    if (!resolve) throw new Error('No pending experiment request');
+    resolve({
+      protocol_version: 1,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true,
+      experiments,
+      experiments_ready: true,
+    });
+  }
+
+  subscribe(
+    _afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    _onDisconnect: (error: Error) => void,
+  ): Promise<EventSubscription> {
+    this.#message = onMessage;
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  emit(runEvent: RunEvent): void {
+    this.#message?.({type: 'event', event: runEvent});
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
   }
 }
 

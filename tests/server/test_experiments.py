@@ -258,16 +258,31 @@ def test_service_reads_rounds_and_the_active_plan_through_the_store(tmp_path: Pa
 
     assert [entry.hypothesis_id for entry in response.experiments] == ["H-01", "H-02"]
     assert response.experiments[1].active is True
+    assert response.experiments_ready is True
     recorded = [event.type for event in supervisor.read_events()]
     assert EventType.STATUS_QUERY.value in recorded
 
 
 def test_service_returns_nothing_before_a_run_is_attached(tmp_path: Path) -> None:
-    """The client queries the log before the run context exists; that is not an error."""
+    """Bootstrap is distinct from an attached run with an empty log."""
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path / "logs")
 
-    assert SupervisionService(supervisor).experiments() == []
+    response = SupervisionService(supervisor).execute(ExperimentQuery())
+
+    assert response.experiments == []
+    assert response.experiments_ready is False
+
+
+def test_service_returns_authoritative_empty_log_after_attach(tmp_path: Path) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+    supervisor = RunSupervisor()
+    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
+
+    response = SupervisionService(supervisor).execute(ExperimentQuery())
+
+    assert response.experiments == []
+    assert response.experiments_ready is True
 
 
 def test_service_returns_nothing_for_a_non_agent_outer_loop(tmp_path: Path) -> None:

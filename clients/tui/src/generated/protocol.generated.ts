@@ -101,6 +101,7 @@ export type EventType =
   | "server_ready"
   | "configuration_failed"
   | "run_started"
+  | "experiments_changed"
   | "run_interrupted"
   | "chat"
   | "status_query"
@@ -135,6 +136,7 @@ export type Data =
       | ServerReadyData
       | RunStartedData
       | RunInterruptedData
+      | ExperimentsChangedData
       | ConfigurationFailedData
       | PhaseData
       | AgentOutputChunkData
@@ -168,16 +170,18 @@ export type MaxRounds = number;
 export type Kind6 = "run_interrupted";
 export type Reason = string;
 export type Signal = string | null;
-export type Kind7 = "configuration_failed";
+export type Kind7 = "experiments_changed";
+export type Reason1 = "project_attached" | "active_hypothesis_changed" | "round_persisted";
+export type Kind8 = "configuration_failed";
 export type Code1 = string;
 export type Stage = string;
 export type Message = string;
 export type Usage = string | null;
 export type ExitCode = number;
-export type Kind8 = "phase";
+export type Kind9 = "phase";
 export type Phase = string;
 export type Attempt = number | null;
-export type Kind9 = "agent_output_chunk";
+export type Kind10 = "agent_output_chunk";
 export type Channel = "assistant" | "analysis" | "tool" | "diagnostic" | "prompt";
 export type Content1 = string;
 export type Progress = string | null;
@@ -185,37 +189,37 @@ export type AgentLabel = string | null;
 export type ElapsedSeconds = number;
 export type InputTokens = number;
 export type ContextWindow = number | null;
-export type Kind10 = "subprocess_output";
+export type Kind11 = "subprocess_output";
 export type ProcessId = string;
 export type ProcessKind = string;
 export type Stream1 = "stdout" | "stderr";
 export type Content2 = string;
-export type Kind11 = "judge_result";
+export type Kind12 = "judge_result";
 export type Verdict = "pass" | "fail";
 export type Feedback = string;
 export type Attempt1 = number;
-export type Kind12 = "benchmark_result";
+export type Kind13 = "benchmark_result";
 export type Metric = string;
 export type Value = number;
 export type Unit = string;
-export type Kind13 = "round_finished";
+export type Kind14 = "round_finished";
 export type Attempts = number;
 export type JudgeVerdict = "pass" | "fail" | "skipped";
 export type PerfMetric = number | null;
 export type PerfUnit = string | null;
-export type Kind14 = "tool_call";
+export type Kind15 = "tool_call";
 export type Tool = string;
 export type CallId = string | null;
-export type Kind15 = "tool_result";
+export type Kind16 = "tool_result";
 export type Tool1 = string;
 export type CallId1 = string | null;
 export type Content3 = string;
 export type IsError = boolean;
-export type Kind16 = "todo_update";
+export type Kind17 = "todo_update";
 export type Content4 = string;
 export type Status2 = string;
 export type Todos = TodoItemData[];
-export type Kind17 = "usage_update";
+export type Kind18 = "usage_update";
 export type InputTokens1 = number;
 export type ContextWindow1 = number | null;
 export type Model = string | null;
@@ -250,6 +254,7 @@ export type PerfDeltaPct = number | null;
 export type Kept = boolean;
 export type Active = boolean;
 export type Experiments = HypothesisEntry[];
+export type ExperimentsReady = boolean | null;
 export type ServerMessage = SubscribedMessage | EventMessage | EventBatchMessage | ProtocolErrorMessage;
 export type Type10 = "subscribed";
 export type RequestId11 = string;
@@ -353,6 +358,7 @@ export interface Response {
   events?: Events;
   performance?: Performance;
   experiments?: Experiments;
+  experiments_ready?: ExperimentsReady;
 }
 /**
  * Structured, provider-neutral description of an operator diagnostic.
@@ -448,8 +454,13 @@ export interface RunInterruptedData {
   signal?: Signal;
   [k: string]: unknown;
 }
-export interface ConfigurationFailedData {
+export interface ExperimentsChangedData {
   kind?: Kind7;
+  reason: Reason1;
+  [k: string]: unknown;
+}
+export interface ConfigurationFailedData {
+  kind?: Kind8;
   code: Code1;
   stage: Stage;
   message: Message;
@@ -458,13 +469,13 @@ export interface ConfigurationFailedData {
   [k: string]: unknown;
 }
 export interface PhaseData {
-  kind?: Kind8;
+  kind?: Kind9;
   phase: Phase;
   attempt?: Attempt;
   [k: string]: unknown;
 }
 export interface AgentOutputChunkData {
-  kind?: Kind9;
+  kind?: Kind10;
   channel: Channel;
   content: Content1;
   status?: AgentStatusData | null;
@@ -486,7 +497,7 @@ export interface AgentStatusData {
   [k: string]: unknown;
 }
 export interface SubprocessOutputData {
-  kind?: Kind10;
+  kind?: Kind11;
   process_id: ProcessId;
   process_kind: ProcessKind;
   stream: Stream1;
@@ -494,21 +505,21 @@ export interface SubprocessOutputData {
   [k: string]: unknown;
 }
 export interface JudgeResultData {
-  kind?: Kind11;
+  kind?: Kind12;
   verdict: Verdict;
   feedback: Feedback;
   attempt: Attempt1;
   [k: string]: unknown;
 }
 export interface BenchmarkResultData {
-  kind?: Kind12;
+  kind?: Kind13;
   metric: Metric;
   value: Value;
   unit: Unit;
   [k: string]: unknown;
 }
 export interface RoundFinishedData {
-  kind?: Kind13;
+  kind?: Kind14;
   attempts: Attempts;
   judge_verdict: JudgeVerdict;
   perf_metric?: PerfMetric;
@@ -516,7 +527,7 @@ export interface RoundFinishedData {
   [k: string]: unknown;
 }
 export interface ToolCallData {
-  kind?: Kind14;
+  kind?: Kind15;
   tool: Tool;
   call_id?: CallId;
   args?: Args;
@@ -527,7 +538,7 @@ export interface Args {
   [k: string]: unknown;
 }
 export interface ToolResultData {
-  kind?: Kind15;
+  kind?: Kind16;
   tool: Tool1;
   call_id?: CallId1;
   content: Content3;
@@ -535,7 +546,7 @@ export interface ToolResultData {
   [k: string]: unknown;
 }
 export interface TodoUpdateData {
-  kind?: Kind16;
+  kind?: Kind17;
   todos?: Todos;
   [k: string]: unknown;
 }
@@ -545,7 +556,7 @@ export interface TodoItemData {
   [k: string]: unknown;
 }
 export interface UsageUpdateData {
-  kind?: Kind17;
+  kind?: Kind18;
   input_tokens: InputTokens1;
   context_window?: ContextWindow1;
   model?: Model;

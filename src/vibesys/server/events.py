@@ -20,6 +20,7 @@ class EventType(StrEnum):  # noqa: D101  # tracked: #288
     SERVER_READY = "server_ready"
     CONFIGURATION_FAILED = "configuration_failed"
     RUN_STARTED = "run_started"
+    EXPERIMENTS_CHANGED = "experiments_changed"
     RUN_INTERRUPTED = "run_interrupted"
     CHAT = "chat"
     STATUS_QUERY = "status_query"
@@ -98,6 +99,11 @@ class RunInterruptedData(BaseModel):  # noqa: D101  # tracked: #288
     kind: Literal["run_interrupted"] = "run_interrupted"
     reason: str
     signal: str | None = None
+
+
+class ExperimentsChangedData(BaseModel):  # noqa: D101  # tracked: #288
+    kind: Literal["experiments_changed"] = "experiments_changed"
+    reason: Literal["project_attached", "active_hypothesis_changed", "round_persisted"]
 
 
 class ConfigurationFailedData(BaseModel):  # noqa: D101  # tracked: #288
@@ -211,6 +217,7 @@ EventData = Annotated[
     | ServerReadyData
     | RunStartedData
     | RunInterruptedData
+    | ExperimentsChangedData
     | ConfigurationFailedData
     | PhaseData
     | AgentOutputChunkData

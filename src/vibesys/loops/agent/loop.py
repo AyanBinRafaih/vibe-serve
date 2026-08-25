@@ -63,6 +63,7 @@ from vibesys.server.events import (
     BenchmarkResultData,
     EventStatus,
     EventType,
+    ExperimentsChangedData,
     JudgeResultData,
     RoundFinishedData,
     SubprocessOutputData,
@@ -2447,6 +2448,11 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         parent_commit=ctx.git.current_sha(),
                     )
                     agent_state.save_active(active_hypothesis)
+                    if ctx.supervisor is not None:
+                        ctx.supervisor.record(
+                            EventType.EXPERIMENTS_CHANGED,
+                            data=ExperimentsChangedData(reason="active_hypothesis_changed"),
+                        )
                 else:
                     plan = active_hypothesis.plan
                     issue_board.append_hypothesis_continuation(
@@ -3252,6 +3258,10 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 agent_state.apply_active_transition(active_transition)
                 ctx.persist_completed_round()
                 if ctx.supervisor is not None:
+                    ctx.supervisor.record(
+                        EventType.EXPERIMENTS_CHANGED,
+                        data=ExperimentsChangedData(reason="round_persisted"),
+                    )
                     ctx.supervisor.record(
                         EventType.ROUND_FINISHED,
                         status=(
