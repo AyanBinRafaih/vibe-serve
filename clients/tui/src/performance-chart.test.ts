@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'bun:test';
+import type {ProtocolResponse, RunEvent} from '@vibesys/backend-client';
 import {renderPerformanceCurve} from './performance-chart.js';
-import type {ProtocolResponse, RunEvent} from './protocol.js';
 
 describe('renderPerformanceCurve', () => {
   it('plots persisted performance records by round', () => {

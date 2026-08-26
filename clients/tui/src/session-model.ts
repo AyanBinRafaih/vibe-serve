@@ -1,26 +1,28 @@
-import type {Diagnostic, HypothesisEntry, RunEvent, RunSnapshot} from './protocol.js';
+import type {Diagnostic, HypothesisEntry, RunEvent, RunSnapshot} from '@vibesys/backend-client';
 import {
+  type ActiveAgentExecution,
+  type ActiveExecutionCheckpoint,
   type AgentPhase,
-  applyRunMapEvent,
+  type CoreDiagnostic,
+  type CoreState,
+  type ExecutionTodos,
+  initialCoreState,
+  latestDiagnosticChange,
+  phasesForRound,
   type RoundSummary,
-  roundNumberFromLabel,
-  visiblePhases as visibleRunMapPhases,
-  visibleRoundNumber as visibleRunMapRoundNumber,
-} from './run-map.js';
+  reconcileActiveExecutions,
+  reduceEvent,
+  reduceSnapshot,
+  type TodoItem,
+  type TranscriptEntry,
+} from '@vibesys/core-state';
 import {DEFAULT_THEME_NAME, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export interface SessionState {
-  sequence: number;
-  status: string;
-  agentKind: string | null;
-  roundLabel: string | null;
-  outerLoop: string | null;
-  rounds: RoundSummary[];
-  /** Rounds the run intends to reach, from ``run_started``; null until it arrives. */
-  maxRounds: number | null;
-  phases: AgentPhase[];
-  /** Backend-authoritative agent executions that have started but not finished. */
-  activeExecutions: Record<string, ActiveAgentExecution>;
+  /** Pure projection of backend snapshots, events, and execution checkpoints. */
+  readonly core: CoreState;
+  /** False after the frontend loses a trustworthy backend event stream. */
+  eventStreamAvailable: boolean;
   selectedRound: number | null;
   selectedAgentKind: string | null;
   /** Transcript entry the arrow keys are on, so a trace is readable without a mouse. */
@@ -33,16 +35,11 @@ export interface SessionState {
    * one of them at a time.
    */
   roundFocus: RoundFocus;
-  conversation: ConversationEntry[];
   overlay: OverlayPanel | null;
   chatOpen: boolean;
   chatConversation: ConversationEntry[];
   chatPending: boolean;
-  chatTypedToolEvents: boolean;
-  terminal: boolean;
-  todoPhases: PhaseTodos[];
   todosExpanded: boolean;
-  usage: UsageMeter | null;
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
   hypothesisScope: HypothesisScope | null;
@@ -56,35 +53,8 @@ export interface SessionState {
   chatDockFits: boolean;
   /** Non-null while the theme list is open as a keyboard selection. */
   themePicker: ThemePicker | null;
-  /**
-   * Set once a typed tool_call/tool_result event is seen. From then on the
-   * legacy tool-channel text chunks (still present in event files recorded
-   * by older backends) are ignored so tool turns never render twice.
-   */
-  typedToolEvents: boolean;
   /** Root-level error state, independent of the active transcript or log view. */
   errorBanner: ErrorBannerState | null;
-}
-
-export type AgentExecutionMode = 'thinking' | 'responding' | 'tool' | 'waiting';
-
-export interface AgentExecutionActivity {
-  mode: AgentExecutionMode;
-  summary: string;
-  tool?: string | null;
-}
-
-/** Semantic execution state. Spinner frames and elapsed-time formatting stay in the UI. */
-export interface ActiveAgentExecution {
-  executionId: string;
-  agentKind: string;
-  roundLabel: string | null;
-  roundNumber: number | null;
-  stage: string;
-  attempt: number | null;
-  assignment: string;
-  startedAt: string;
-  activity: AgentExecutionActivity;
 }
 
 export type ErrorSeverity = 'recoverable' | 'fatal';
@@ -116,22 +86,6 @@ export interface ErrorBannerState {
 
 /** The agent graph on the left, or the transcript on the right. */
 export type RoundFocus = 'agents' | 'transcript';
-
-export interface TodoItem {
-  content: string;
-  status: string;
-}
-
-/**
- * One agent execution's latest todo-list snapshot. Canonical events are keyed
- * by execution ID; legacy streams without one retain their round/agent scope.
- */
-export interface PhaseTodos {
-  executionId?: string | null;
-  agentKind: string | null;
-  roundNumber: number | null;
-  items: TodoItem[];
-}
 
 /**
  * The experiment log is open when this is non-null. Selection is held as a
@@ -214,12 +168,6 @@ export interface ThemePicker {
   selected: ThemeName;
 }
 
-export interface UsageMeter {
-  inputTokens: number;
-  contextWindow: number | null;
-  model: string | null;
-}
-
 export interface OverlayPanel {
   kind: 'detail' | 'help' | 'error';
   content: string;
@@ -250,34 +198,24 @@ export interface ConversationEntry {
   toolResponse?: string;
   toolName?: string;
   toolCallId?: string;
+  toolArguments?: Record<string, unknown>;
+  toolResult?: TranscriptEntry['toolResult'];
 }
 
 export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): SessionState {
   return {
-    sequence: 0,
-    status: 'connecting',
-    agentKind: null,
-    roundLabel: null,
-    outerLoop: null,
-    rounds: [],
-    maxRounds: null,
-    phases: [],
-    activeExecutions: {},
+    core: initialCoreState(),
+    eventStreamAvailable: true,
     selectedRound: null,
     selectedAgentKind: null,
     selectedEntryId: null,
     selectedTodoIndex: null,
     roundFocus: 'transcript',
-    conversation: [],
     overlay: null,
     chatOpen: false,
     chatConversation: [],
     chatPending: false,
-    chatTypedToolEvents: false,
-    terminal: false,
-    todoPhases: [],
     todosExpanded: false,
-    usage: null,
     themeName,
     // The experiment log is the landing view: a run's history reads as a short
     // list of claims before it reads as a long list of rounds.
@@ -288,7 +226,6 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     // the chat from the first frame rather than after a resize.
     chatDockFits: true,
     themePicker: null,
-    typedToolEvents: false,
     errorBanner: null,
   };
 }
@@ -554,7 +491,7 @@ export function enterUnownedExperimentRound(
   state: SessionState,
   roundNumber: number,
 ): SessionState | null {
-  if (!state.rounds.some(round => round.number === roundNumber)) return null;
+  if (!state.core.rounds.some(round => round.number === roundNumber)) return null;
   return {
     ...state,
     overlay: null,
@@ -615,7 +552,7 @@ export function unownedExperimentRounds(
 ): number[] {
   const owned = new Set(entries.flatMap(scopeRounds));
   const planningRound = hypothesisPlanningActivity(state)?.roundNumber;
-  return state.rounds
+  return state.core.rounds
     .filter(
       round =>
         !owned.has(round.number) && round.number !== planningRound && round.status !== 'planned',
@@ -720,8 +657,8 @@ function selectExperimentIndexItem(
  * as hypothesis planning.
  */
 export function hypothesisPlanningActivity(state: SessionState): HypothesisPlanningActivity | null {
-  if (state.terminal || state.experimentLog === null) return null;
-  const phase = [...state.phases]
+  if (state.core.terminal || state.experimentLog === null) return null;
+  const phase = [...state.core.phases]
     .reverse()
     .find(
       candidate =>
@@ -733,7 +670,7 @@ export function hypothesisPlanningActivity(state: SessionState): HypothesisPlann
     return null;
   const stage = planningStage(phase.kind, phase.roundLabel);
   if (stage === null) return null;
-  const startedAt = earliestPlanningStartedAt(state.phases, roundNumber);
+  const startedAt = earliestPlanningStartedAt(state.core.phases, roundNumber);
   return {
     stage,
     roundNumber,
@@ -956,17 +893,25 @@ export function closeThemePicker(state: SessionState): SessionState {
 }
 
 export function applySnapshot(state: SessionState, snapshot: RunSnapshot): SessionState {
-  return {
-    ...state,
-    status: snapshot.status,
-    agentKind: snapshot.agent_kind ?? null,
-    roundLabel: snapshot.round_label ?? null,
-    terminal: snapshot.status === 'completed' || snapshot.status === 'failed',
-    activeExecutions: activeExecutionsFromCheckpoint(snapshot.active_executions ?? []),
-  };
+  const core = reduceSnapshot(state.core, snapshot);
+  return core === state.core ? state : {...state, core};
 }
 
-type ActiveExecutionCheckpoint = NonNullable<RunSnapshot['active_executions']>;
+/** Record transport health as frontend state without rewriting backend-derived facts. */
+export function markEventStreamUnavailable(state: SessionState): SessionState {
+  return state.eventStreamAvailable ? {...state, eventStreamAvailable: false} : state;
+}
+
+/** Active work is presentable only while its source stream remains trustworthy. */
+export function visibleActiveExecutions(state: SessionState): ActiveAgentExecution[] {
+  if (!state.eventStreamAvailable) return [];
+  const roundNumber = visibleRoundNumber(state);
+  return Object.values(state.core.activeExecutions).filter(
+    execution =>
+      (roundNumber === null || execution.roundNumber === roundNumber) &&
+      (state.selectedAgentKind === null || execution.agentKind === state.selectedAgentKind),
+  );
+}
 
 /** Replace activity with the backend checkpoint without advancing the event replay cursor. */
 export function applyActiveExecutionCheckpoint(
@@ -974,191 +919,41 @@ export function applyActiveExecutionCheckpoint(
   executions: ActiveExecutionCheckpoint,
   throughSequence?: number,
 ): SessionState {
-  if (throughSequence !== undefined && throughSequence < state.sequence) return state;
-  return {
-    ...state,
-    activeExecutions: activeExecutionsFromCheckpoint(executions),
-  };
-}
-
-function activeExecutionsFromCheckpoint(
-  executions: ActiveExecutionCheckpoint,
-): Record<string, ActiveAgentExecution> {
-  return Object.fromEntries(
-    executions.map(execution => [
-      execution.execution_id,
-      {
-        executionId: execution.execution_id,
-        agentKind: execution.agent_kind,
-        roundLabel: execution.round_label ?? null,
-        roundNumber: roundNumberFromLabel(execution.round_label),
-        stage: execution.stage,
-        attempt: execution.attempt ?? null,
-        assignment: execution.assignment,
-        startedAt: execution.started_at,
-        activity: {
-          mode: execution.activity.mode,
-          summary: execution.activity.summary,
-          tool: execution.activity.tool ?? null,
-        },
-      },
-    ]),
-  );
+  const core = reconcileActiveExecutions(state.core, executions, throughSequence);
+  return core === state.core ? state : {...state, core};
 }
 
 export function applyEvent(state: SessionState, event: RunEvent): SessionState {
-  const sequence = event.sequence ?? 0;
-  if (sequence > 0 && sequence <= state.sequence) return state;
-  let next = {...state, sequence: Math.max(state.sequence, sequence)};
-  next = applyFailureEvent(next, event);
-  next = applyAgentExecutionEvent(next, event);
-  if (event.agent_kind === 'chat') return applyChatEvent(next, event);
-  if (event.agent_kind) next.agentKind = event.agent_kind;
-  if (event.round_label) next.roundLabel = event.round_label;
-  const runMap = applyRunMapEvent(
-    {outerLoop: next.outerLoop, rounds: next.rounds, phases: next.phases},
-    event,
-  );
-  next.outerLoop = runMap.outerLoop;
-  next.rounds = runMap.rounds;
-  next.phases = runMap.phases;
-
-  const data = event.data;
-  if (data?.kind === 'tool_call' || data?.kind === 'tool_result') {
-    next.typedToolEvents = true;
-  }
-  if (data?.kind === 'todo_update') {
-    const items = (data.todos ?? []).map(todo => ({
-      content: String(todo.content),
-      status: String(todo.status),
-    }));
-    const agentKind = event.agent_kind ?? null;
-    const roundNumber = roundNumberFromLabel(event.round_label);
-    const todoExecutionId = event.execution_id ?? event.invocation_id ?? null;
-    next.todoPhases = [
-      ...next.todoPhases.filter(phase =>
-        todoExecutionId === null
-          ? phase.executionId != null ||
-            phase.agentKind !== agentKind ||
-            phase.roundNumber !== roundNumber
-          : phase.executionId !== todoExecutionId,
-      ),
-      {executionId: todoExecutionId, agentKind, roundNumber, items},
-    ].slice(-100);
-  }
-  if (data?.kind === 'usage_update') {
-    next.usage = {
-      inputTokens: data.input_tokens,
-      contextWindow: data.context_window ?? null,
-      model: data.model ?? null,
-    };
-  }
-
-  // Prefer typed tool events; fall back to legacy tool-channel chunks only
-  // for streams that never produce typed events (old event files / replays).
-  const suppressed =
-    data?.kind === 'agent_output_chunk' && data.channel === 'tool' && next.typedToolEvents;
-  if (!suppressed) {
-    const entry = eventToConversationEntry(event);
-    if (entry !== null) next.conversation = appendConversation(next.conversation, entry);
-  }
-
-  if (event.type === 'run_started') {
-    next.status = 'running';
-    if (event.data?.kind === 'run_started') next.maxRounds = event.data.max_rounds;
-  }
-  if (event.type === 'configuration_failed') {
-    next.status = 'failed';
-    next.terminal = true;
-    next.activeExecutions = {};
-  }
-  if (event.type === 'run_finished') {
-    next.status = 'completed';
-    next.terminal = true;
-    next.activeExecutions = {};
-  }
-  if (event.type === 'run_failed' || event.type === 'run_interrupted') {
-    next.status = 'failed';
-    next.terminal = true;
-    next.activeExecutions = {};
-  }
+  const core = reduceEvent(state.core, event);
+  if (core === state.core) return state;
+  const diagnostic = latestDiagnosticChange(state.core, core);
+  let next: SessionState = {
+    ...state,
+    core,
+    chatConversation: reconcileChatTranscript(state.chatConversation, core.chatTranscript),
+  };
+  if (diagnostic !== null) next = reportProjectedDiagnostic(next, diagnostic);
   return next;
 }
 
-/** Reduce canonical execution lifecycle before agent-specific transcript routing. */
-function applyAgentExecutionEvent(state: SessionState, event: RunEvent): SessionState {
-  const data = event.data;
-  const executionId = event.execution_id;
-  if (executionId == null) return state;
-  if (data?.kind === 'agent_execution_started') {
-    return {
-      ...state,
-      activeExecutions: {
-        ...state.activeExecutions,
-        [executionId]: {
-          executionId,
-          agentKind: event.agent_kind ?? 'agent',
-          roundLabel: event.round_label ?? null,
-          roundNumber: roundNumberFromLabel(event.round_label),
-          stage: data.stage,
-          attempt: data.attempt ?? null,
-          assignment: data.user_prompt ?? '',
-          startedAt: event.timestamp,
-          activity: {
-            mode: data.activity.mode,
-            summary: data.activity.summary,
-            tool: data.activity.tool ?? null,
-          },
-        },
-      },
-    };
+function reconcileChatTranscript(
+  conversation: ConversationEntry[],
+  transcript: TranscriptEntry[],
+): ConversationEntry[] {
+  const byId = new Map(transcript.map(entry => [entry.id, entry]));
+  const present = new Set<string>();
+  const updated = conversation.map(entry => {
+    const replacement = byId.get(entry.id);
+    if (replacement === undefined) return entry;
+    present.add(entry.id);
+    return replacement;
+  });
+  for (const entry of transcript) {
+    if (!present.has(entry.id) && !conversation.some(existing => existing.id === entry.id)) {
+      updated.push(entry);
+    }
   }
-  if (data?.kind === 'agent_execution_activity_changed') {
-    const current = state.activeExecutions[executionId];
-    if (current === undefined) return state;
-    return {
-      ...state,
-      activeExecutions: {
-        ...state.activeExecutions,
-        [executionId]: {
-          ...current,
-          activity: {mode: data.mode, summary: data.summary, tool: data.tool ?? null},
-        },
-      },
-    };
-  }
-  if (data?.kind === 'agent_execution_finished') {
-    const {[executionId]: _finished, ...remaining} = state.activeExecutions;
-    return {...state, activeExecutions: remaining};
-  }
-  return state;
-}
-
-/**
- * The chat shows the exchange: what was asked, and what came back. The chat
- * agent's narration, tool turns, and phase markers are run plumbing; they
- * belong in the transcript, and here they only bury the answer.
- */
-const CHAT_KINDS: ReadonlySet<ConversationEntry['kind']> = new Set(['user', 'assistant', 'result']);
-
-function applyChatEvent(state: SessionState, event: RunEvent): SessionState {
-  const next = {...state};
-  const data = event.data;
-  if (data?.kind === 'tool_call' || data?.kind === 'tool_result') {
-    next.chatTypedToolEvents = true;
-  }
-  const suppressed =
-    data?.kind === 'agent_output_chunk' && data.channel === 'tool' && next.chatTypedToolEvents;
-  if (suppressed) return next;
-  const entry = eventToConversationEntry(event);
-  // The chat is a question and its answer. The chat agent's own diagnostics and
-  // phase markers are run plumbing: they belong in the transcript, and in the
-  // chat they only bury the answer the operator asked for.
-  if (entry !== null && !CHAT_KINDS.has(entry.kind)) return next;
-  if (entry !== null) {
-    next.chatConversation = appendConversation(next.chatConversation, entry);
-  }
-  return next;
+  return updated.slice(-500);
 }
 
 export function selectNextAgent(state: SessionState): SessionState {
@@ -1312,6 +1107,9 @@ export interface ErrorReport {
   severity?: ErrorSeverity;
   title?: string;
   diagnostic?: Diagnostic | null;
+  diagnosticId?: string | null;
+  detail?: string | null;
+  hint?: string | null;
   agentKind?: string | null;
   roundLabel?: string | null;
   invocationId?: string | null;
@@ -1339,9 +1137,9 @@ export function reportError(
   const banner: ErrorBannerState = {
     title: report.title ?? errorTitle(scope),
     message: diagnostic?.summary || message || 'An unknown error occurred.',
-    detail: diagnostic?.detail ?? null,
-    hint: diagnostic?.hint ?? null,
-    diagnosticId: diagnostic?.id ?? null,
+    detail: diagnostic?.detail ?? report.detail ?? null,
+    hint: diagnostic?.hint ?? report.hint ?? null,
+    diagnosticId: diagnostic?.id ?? report.diagnosticId ?? null,
     severity,
     scope,
     agentKind: report.agentKind ?? null,
@@ -1373,53 +1171,23 @@ export function reportError(
   };
 }
 
-function applyFailureEvent(state: SessionState, event: RunEvent): SessionState {
-  const data = event.data;
-  if (event.diagnostic !== null && event.diagnostic !== undefined) {
-    return reportError(state, event.text ?? '', {
-      scope: 'protocol',
-      diagnostic: event.diagnostic,
-      ...(event.type === 'run_interrupted' ? {title: 'Run interrupted'} : {}),
-      agentKind: event.agent_kind ?? null,
-      roundLabel: event.round_label ?? null,
-      invocationId: event.invocation_id ?? null,
-    });
-  }
-  if (data?.kind === 'configuration_failed') {
-    return reportError(state, formatConfigurationFailure(event), {
-      scope: 'configuration',
-      severity: 'fatal',
-      title: 'Configuration failed',
-    });
-  }
-  if (
-    data?.kind === 'invocation_finished' &&
-    ((data.error !== null && data.error !== undefined) || event.status === 'failed')
-  ) {
-    return reportError(state, data.error || event.text || 'Agent invocation failed.', {
-      scope: 'invocation',
-      title: 'Invocation failed',
-      agentKind: event.agent_kind ?? null,
-      roundLabel: event.round_label ?? null,
-      invocationId: event.invocation_id ?? null,
-    });
-  }
-  if (event.type === 'run_failed' || event.type === 'run_interrupted') {
-    const interruption =
-      data?.kind === 'run_interrupted'
-        ? `${data.reason}${data.signal === null ? '' : ` (${data.signal})`}`
-        : '';
-    const fallback = event.type === 'run_failed' ? 'Run failed.' : 'Run interrupted.';
-    return reportError(state, event.text || interruption || fallback, {
-      scope: 'run',
-      severity: 'fatal',
-      title: event.type === 'run_interrupted' ? 'Run interrupted' : 'Run failed',
-      agentKind: event.agent_kind ?? null,
-      roundLabel: event.round_label ?? null,
-      invocationId: event.invocation_id ?? null,
-    });
-  }
-  return state;
+function reportProjectedDiagnostic(state: SessionState, diagnostic: CoreDiagnostic): SessionState {
+  return reportError(state, diagnostic.summary, {
+    scope: diagnostic.scope,
+    severity: diagnostic.severity === 'fatal' ? 'fatal' : 'recoverable',
+    title: projectedDiagnosticTitle(diagnostic.failureKind),
+    diagnosticId: diagnostic.id,
+    detail: diagnostic.detail,
+    hint: diagnostic.hint,
+    agentKind: diagnostic.agentKind,
+    roundLabel: diagnostic.roundLabel,
+    invocationId: diagnostic.invocationId,
+  });
+}
+
+function projectedDiagnosticTitle(kind: CoreDiagnostic['failureKind']): string {
+  if (kind === 'run_interruption') return 'Run interrupted';
+  return errorTitle(kind);
 }
 
 /** Keep a terminal wrapper's extra context when it repeats an invocation error. */
@@ -1465,268 +1233,6 @@ function diagnosticSeverity(
   return severity === 'fatal' ? 'fatal' : 'recoverable';
 }
 
-function formatConfigurationFailure(event: RunEvent): string {
-  const data = event.data;
-  if (data?.kind !== 'configuration_failed') return event.text || 'Configuration failed.';
-  const sections = [data.message];
-  if (data.usage) sections.push(data.usage);
-  sections.push(`Code: ${data.code} · Stage: ${data.stage}`);
-  return sections.join('\n\n');
-}
-
-function eventToConversationEntry(event: RunEvent): ConversationEntry | null {
-  const data = event.data;
-  const id = String(event.sequence ?? `${event.timestamp}-${event.type}`);
-  const agentKind = event.agent_kind ? {agentKind: event.agent_kind} : {};
-  const roundLabel = event.round_label ? {roundLabel: event.round_label} : {};
-  const roundNumber = roundNumberFromLabel(event.round_label);
-  const roundFields = {
-    ...roundLabel,
-    ...(roundNumber === null ? {} : {roundNumber}),
-  };
-  if (data?.kind === 'configuration_failed') {
-    return {
-      id,
-      kind: 'result',
-      content: formatConfigurationFailure(event),
-      label: 'Configuration failed',
-      tone: 'failure',
-    };
-  }
-  if (data?.kind === 'chat') {
-    return {
-      id,
-      kind: 'assistant',
-      content: data.answer,
-      label: 'Answer',
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (data?.kind === 'agent_output_chunk') {
-    const kind =
-      data.channel === 'assistant'
-        ? 'assistant'
-        : data.channel === 'prompt'
-          ? 'prompt'
-          : data.channel === 'analysis'
-            ? 'analysis'
-            : data.channel === 'tool'
-              ? 'tool'
-              : 'diagnostic';
-    const invocationId = event.invocation_id ?? undefined;
-    return {
-      id,
-      kind,
-      content: data.content,
-      label: labelFor(event, data.channel),
-      ...agentKind,
-      ...roundFields,
-      turnId: invocationId ?? id,
-      ...(invocationId === undefined ? {} : {invocationId}),
-      startsTurn:
-        kind === 'tool' && data.channel === 'tool' && data.content.trimStart().startsWith('→ '),
-      ...(kind === 'tool' && data.channel === 'tool' && data.content.trimStart().startsWith('→ ')
-        ? {toolCall: data.content}
-        : {}),
-    };
-  }
-  if (data?.kind === 'tool_call') {
-    const call = formatToolCall(data.tool, data.args ?? {});
-    const invocationId = event.invocation_id ?? undefined;
-    return {
-      id,
-      kind: 'tool',
-      content: call,
-      label: labelFor(event, 'tool'),
-      ...agentKind,
-      ...roundFields,
-      turnId: invocationId ?? id,
-      ...(invocationId === undefined ? {} : {invocationId}),
-      startsTurn: true,
-      toolCall: call,
-      toolName: data.tool,
-      ...(data.call_id === null || data.call_id === undefined ? {} : {toolCallId: data.call_id}),
-    };
-  }
-  if (data?.kind === 'tool_result') {
-    const invocationId = event.invocation_id ?? undefined;
-    return {
-      id,
-      kind: 'tool',
-      content: data.content,
-      label: labelFor(event, 'tool'),
-      ...(data.is_error ? {tone: 'failure' as const} : {}),
-      ...agentKind,
-      ...roundFields,
-      turnId: invocationId ?? id,
-      toolName: data.tool,
-      ...(data.call_id === null || data.call_id === undefined ? {} : {toolCallId: data.call_id}),
-      ...(invocationId === undefined ? {} : {invocationId}),
-    };
-  }
-  if (data?.kind === 'subprocess_output') {
-    return {
-      id,
-      kind: 'subprocess',
-      content: data.content,
-      label: `${data.process_kind} · ${data.stream}`,
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (event.type === 'phase_started') {
-    return {
-      id,
-      kind: 'status',
-      content: 'started',
-      label: labelFor(event, 'phase'),
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (data?.kind === 'judge_result') {
-    return {
-      id,
-      kind: 'result',
-      content: data.feedback || `Judge returned ${data.verdict}.`,
-      label: `Judge · ${data.verdict.toUpperCase()}`,
-      tone: data.verdict === 'pass' ? 'success' : 'failure',
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (data?.kind === 'benchmark_result') {
-    return {
-      id,
-      kind: 'result',
-      content: `${data.metric}: ${data.value} ${data.unit}`,
-      label: 'Benchmark',
-      tone: 'success',
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (data?.kind === 'round_finished') {
-    const tone =
-      data.judge_verdict === 'pass'
-        ? ('success' as const)
-        : data.judge_verdict === 'fail'
-          ? ('failure' as const)
-          : ('normal' as const);
-    return {
-      id,
-      kind: 'result',
-      content: `${data.attempts} attempt(s)`,
-      label: `${event.round_label ?? 'Round'} · ${data.judge_verdict.toUpperCase()}`,
-      tone,
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (event.type === 'run_failed' || event.type === 'run_interrupted') {
-    return {
-      id,
-      kind: 'result',
-      content: event.text || 'Run interrupted.',
-      label: 'Run failed',
-      tone: 'failure',
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  return null;
-}
-
-function labelFor(event: RunEvent, fallback: string): string {
-  const phase = event.agent_kind ?? fallback;
-  return event.round_label ? `${phase} · ${event.round_label}` : phase;
-}
-
-function appendConversation(
-  previous: ConversationEntry[],
-  incoming: ConversationEntry,
-): ConversationEntry[] {
-  if (incoming.kind === 'tool' && !incoming.startsTurn && incoming.toolName !== undefined) {
-    const target = findToolCall(previous, incoming);
-    if (target !== -1) {
-      return previous.map((entry, index) =>
-        index === target ? mergeToolResult(entry, incoming) : entry,
-      );
-    }
-  }
-  const last = previous.at(-1);
-  if (
-    last &&
-    incoming.kind === 'tool' &&
-    last.kind === 'tool' &&
-    last.invocationId === incoming.invocationId &&
-    !incoming.startsTurn
-  ) {
-    return [...previous.slice(0, -1), mergeToolResult(last, incoming)];
-  }
-  if (
-    last &&
-    last.kind === incoming.kind &&
-    last.turnId === incoming.turnId &&
-    (incoming.kind === 'assistant' || incoming.kind === 'prompt' || incoming.kind === 'analysis')
-  ) {
-    return [...previous.slice(0, -1), {...last, content: last.content + incoming.content}];
-  }
-  return capConversation([...previous, incoming]);
-}
-
-/**
- * A run can outlive any fixed number of entries, but a round the operator can
- * still open must keep all of its turns: a half-evicted round reads as a round
- * that never ran. So the cap is generous, and when it is reached the oldest
- * round goes as a whole rather than the oldest few lines.
- */
-const MAX_CONVERSATION_ENTRIES = 20_000;
-
-function capConversation(entries: ConversationEntry[]): ConversationEntry[] {
-  if (entries.length <= MAX_CONVERSATION_ENTRIES) return entries;
-  const oldestRound = entries.find(entry => entry.roundNumber !== undefined)?.roundNumber;
-  if (oldestRound === undefined) return entries.slice(-MAX_CONVERSATION_ENTRIES);
-  const kept = entries.filter(
-    entry => entry.roundNumber === undefined || entry.roundNumber > oldestRound,
-  );
-  // Nothing to drop by round (one huge round): fall back to trimming the front.
-  return kept.length === entries.length ? entries.slice(-MAX_CONVERSATION_ENTRIES) : kept;
-}
-
-function findToolCall(previous: ConversationEntry[], result: ConversationEntry): number {
-  const indices = Array.from(previous.keys());
-  if (result.toolCallId !== undefined) indices.reverse();
-  for (const index of indices) {
-    const candidate = previous[index];
-    if (
-      candidate?.kind !== 'tool' ||
-      candidate.toolCall === undefined ||
-      candidate.toolResponse !== undefined ||
-      candidate.invocationId !== result.invocationId
-    ) {
-      continue;
-    }
-    if (result.toolCallId !== undefined) {
-      if (candidate.toolCallId === result.toolCallId) return index;
-      continue;
-    }
-    if (candidate.toolName === result.toolName) return index;
-  }
-  return -1;
-}
-
-function mergeToolResult(call: ConversationEntry, result: ConversationEntry): ConversationEntry {
-  const separator = call.content.endsWith('\n') || result.content.startsWith('\n') ? '' : '\n';
-  return {
-    ...call,
-    content: call.content + separator + result.content,
-    toolResponse: (call.toolResponse ?? '') + (call.toolResponse ? separator : '') + result.content,
-    ...(result.tone === undefined ? {} : {tone: result.tone}),
-  };
-}
-
 /**
  * Returns to the experiment log. Per-round output is reachable only by opening
  * a hypothesis, so there is no unfiltered live view to fall back to and the
@@ -1758,13 +1264,13 @@ export function showDetail(
 }
 
 export function statusText(state: SessionState): string {
-  const base = `${state.status} · ${state.agentKind ?? 'starting'} · ${state.roundLabel ?? 'no round yet'}`;
-  if (state.usage === null) return base;
-  const used = formatTokenCount(state.usage.inputTokens);
+  const base = `${state.core.status} · ${state.core.agentKind ?? 'starting'} · ${state.core.roundLabel ?? 'no round yet'}`;
+  if (state.core.usage === null) return base;
+  const used = formatTokenCount(state.core.usage.inputTokens);
   const meter =
-    state.usage.contextWindow === null
+    state.core.usage.contextWindow === null
       ? used
-      : `${used}/${formatTokenCount(state.usage.contextWindow)}`;
+      : `${used}/${formatTokenCount(state.core.usage.contextWindow)}`;
   return `${base} · ${meter} tokens`;
 }
 
@@ -1776,7 +1282,7 @@ function formatTokenCount(count: number): string {
 
 export function visibleConversation(state: SessionState): ConversationEntry[] {
   const roundNumber = visibleRoundNumber(state);
-  return state.conversation.filter(entry => {
+  return state.core.transcript.filter(entry => {
     if (roundNumber !== null && entry.roundNumber !== roundNumber) return false;
     if (state.selectedAgentKind !== null && entry.agentKind !== state.selectedAgentKind) {
       return false;
@@ -1786,7 +1292,7 @@ export function visibleConversation(state: SessionState): ConversationEntry[] {
 }
 
 export function visiblePhases(state: SessionState): AgentPhase[] {
-  return visibleRunMapPhases(state.phases, visibleRoundNumber(state));
+  return phasesForRound(state.core.phases, visibleRoundNumber(state));
 }
 
 export function toggleTodos(state: SessionState): SessionState {
@@ -1800,9 +1306,9 @@ export function toggleTodos(state: SessionState): SessionState {
  */
 export function visibleTodos(state: SessionState): TodoItem[] {
   const roundNumber = visibleRoundNumber(state);
-  const matchesRound = (phase: PhaseTodos): boolean =>
+  const matchesRound = (phase: ExecutionTodos): boolean =>
     roundNumber === null || phase.roundNumber === roundNumber || phase.roundNumber === null;
-  const latestFirst = [...state.todoPhases].reverse();
+  const latestFirst = [...state.core.todos].reverse();
   if (state.selectedAgentKind !== null) {
     const selected = state.selectedAgentKind;
     return (
@@ -1821,7 +1327,8 @@ export function visibleTodos(state: SessionState): TodoItem[] {
   return (
     latestFirst.find(
       phase =>
-        (phase.agentKind === state.agentKind || phase.agentKind === null) && matchesRound(phase),
+        (phase.agentKind === state.core.agentKind || phase.agentKind === null) &&
+        matchesRound(phase),
     )?.items ?? []
   );
 }
@@ -1833,18 +1340,21 @@ export function visibleRoundNumber(state: SessionState): number | null {
     // Leaving the round unset used to mean "the whole trajectory", which drew an
     // empty agent strip and an empty transcript for any run whose events are not
     // all round-stamped: a blank view where a round was asked for.
-    const rounds = state.rounds.filter(round => scope.rounds.includes(round.number));
+    const rounds = state.core.rounds.filter(round => scope.rounds.includes(round.number));
     const active = [...rounds].reverse().find(round => round.status === 'active');
     return active?.number ?? rounds.at(-1)?.number ?? scope.rounds.at(-1) ?? null;
   }
-  return visibleRunMapRoundNumber(stripRounds(state), state.selectedRound);
+  if (state.selectedRound !== null) return state.selectedRound;
+  const rounds = stripRounds(state);
+  const active = [...rounds].reverse().find(round => round.status === 'active');
+  return active?.number ?? rounds.at(-1)?.number ?? null;
 }
 
 /** The rounds owned by the hypothesis on screen, or every round outside one. */
 export function scopedRounds(state: SessionState): RoundSummary[] {
   const scope = state.hypothesisScope;
-  if (scope === null) return state.rounds;
-  return state.rounds.filter(round => scope.rounds.includes(round.number));
+  if (scope === null) return state.core.rounds;
+  return state.core.rounds.filter(round => scope.rounds.includes(round.number));
 }
 
 /**
@@ -1856,26 +1366,16 @@ export function scopedRounds(state: SessionState): RoundSummary[] {
  * honest thing to show for a round that has not run.
  */
 export function stripRounds(state: SessionState): RoundSummary[] {
-  const highest = Math.max(state.maxRounds ?? 0, ...state.rounds.map(round => round.number), 0);
-  if (highest === 0) return state.rounds;
-  const known = new Map(state.rounds.map(round => [round.number, round]));
+  const highest = Math.max(
+    state.core.maxRounds ?? 0,
+    ...state.core.rounds.map(round => round.number),
+    0,
+  );
+  if (highest === 0) return state.core.rounds;
+  const known = new Map(state.core.rounds.map(round => [round.number, round]));
   const rounds: RoundSummary[] = [];
   for (let number = 1; number <= highest; number += 1) {
     rounds.push(known.get(number) ?? {number, status: 'planned'});
   }
   return rounds;
-}
-
-const MAX_TOOL_ARG_LEN = 80;
-
-function formatToolCall(tool: string, args: Record<string, unknown>): string {
-  const parts = Object.entries(args).map(([key, value]) => {
-    const isString = typeof value === 'string';
-    let rendered = isString ? value : (JSON.stringify(value) ?? String(value));
-    if (rendered.length > MAX_TOOL_ARG_LEN) {
-      rendered = `${rendered.slice(0, MAX_TOOL_ARG_LEN)}...`;
-    }
-    return isString ? `${key}="${rendered}"` : `${key}=${rendered}`;
-  });
-  return `→ ${tool}(${parts.join(', ')})\n`;
 }

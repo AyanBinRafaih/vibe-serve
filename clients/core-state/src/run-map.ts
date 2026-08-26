@@ -1,4 +1,4 @@
-import type {RunEvent} from './protocol.js';
+import type {RunEvent} from '@vibesys/backend-client';
 import {
   activeTimingElapsedMs,
   closeActiveAgentTimings,
@@ -14,10 +14,6 @@ export type AgentPhaseStatus =
   | 'failed'
   | 'cancelled'
   | 'interrupted';
-/**
- * ``planned`` is not an observed state: it stands for a round the run intends to
- * reach, so the strip can show the whole run rather than only what has happened.
- */
 export type RoundStatus = 'active' | 'completed' | 'failed' | 'planned';
 
 export interface RoundSummary extends RoundTimingState {
@@ -33,7 +29,6 @@ export interface AgentPhase {
   roundNumber: number | null;
   roundLabel: string | null;
   executionId?: string;
-  /** Legacy alias retained while persisted phase events still use it. */
   invocationId?: string;
   startedAt?: string;
   finishedAt?: string;
@@ -55,24 +50,18 @@ export function applyRunMapEvent(state: RunMapState, event: RunEvent): RunMapSta
   return {outerLoop, rounds, phases};
 }
 
-export function visibleRoundNumber(
-  rounds: RoundSummary[],
-  selectedRound: number | null,
-): number | null {
-  if (selectedRound !== null) return selectedRound;
-  const active = [...rounds].reverse().find(round => round.status === 'active');
-  if (active) return active.number;
-  return rounds.at(-1)?.number ?? null;
-}
-
-export function visiblePhases(phases: AgentPhase[], roundNumber: number | null): AgentPhase[] {
-  return phases.filter(phase => phase.roundNumber === roundNumber);
-}
-
 export function roundNumberFromLabel(label: string | null | undefined): number | null {
   if (!label) return null;
   const match = label.match(/(?:round|iter(?:ation)?)\D*(\d+)/i);
   return match ? Number(match[1]) : null;
+}
+
+export function phasesForRound(phases: AgentPhase[], roundNumber: number | null): AgentPhase[] {
+  return phases.filter(phase => phase.roundNumber === roundNumber);
+}
+
+export function roundAgentElapsedMs(round: RoundSummary, now: Date): number {
+  return activeTimingElapsedMs(round, now);
 }
 
 function applyPhaseEvent(state: RunMapState, event: RunEvent): AgentPhase[] {
@@ -92,14 +81,11 @@ function applyPhaseEvent(state: RunMapState, event: RunEvent): AgentPhase[] {
   }
   const started = event.type === 'agent_execution_started' || event.type === 'phase_started';
   const finished = event.type === 'agent_execution_finished' || event.type === 'phase_finished';
-  if (!started && !finished) {
-    return ensurePhase(phases, kind, roundNumber);
-  }
-  const status = started ? 'active' : terminalPhaseStatus(event.status);
+  if (!started && !finished) return ensurePhase(phases, kind, roundNumber);
   const executionId = event.execution_id ?? event.invocation_id ?? undefined;
   return upsertPhase(phases, {
     kind,
-    status,
+    status: started ? 'active' : terminalPhaseStatus(event.status),
     roundNumber,
     roundLabel: event.round_label ?? null,
     ...(executionId ? {executionId, invocationId: executionId} : {}),
@@ -120,9 +106,8 @@ function applyRoundEvent(
   event: RunEvent,
 ): RoundSummary[] {
   const number = roundNumberFromLabel(event.round_label);
-  if (number === null) return rounds;
+  if (number === null || event.type === 'run_finished') return rounds;
   const existing = rounds.find(round => round.number === number);
-  if (event.type === 'run_finished') return rounds;
   const terminalFailure = event.type === 'run_failed' || event.type === 'run_interrupted';
   const status = terminalFailure
     ? 'failed'
@@ -148,25 +133,22 @@ function seedExpectedPhases(
   current: AgentPhase[],
   roundNumber: number,
 ): AgentPhase[] {
-  const expected = expectedRoles(outerLoop);
   let phases = current;
-  for (const kind of expected) phases = ensurePhase(phases, kind, roundNumber);
+  for (const kind of expectedRoles(outerLoop)) {
+    phases = ensurePhase(phases, kind, roundNumber);
+  }
   return phases;
 }
 
 function expectedRoles(outerLoop: string): string[] {
   if (outerLoop === 'agent') return ['orchestrator', 'implementer', 'judge', 'profiler'];
   if (outerLoop === 'plain') return ['implementer', 'judge', 'perf_eval'];
-  if (outerLoop === 'evolve') {
-    return ['implementer', 'judge', 'profiler'];
-  }
+  if (outerLoop === 'evolve') return ['implementer', 'judge', 'profiler'];
   return [];
 }
 
 function ensurePhase(phases: AgentPhase[], kind: string, roundNumber: number | null): AgentPhase[] {
-  if (phases.some(phase => phase.kind === kind && phase.roundNumber === roundNumber)) {
-    return phases;
-  }
+  if (phases.some(phase => phase.kind === kind && phase.roundNumber === roundNumber)) return phases;
   return [...phases, {kind, status: 'pending', roundNumber, roundLabel: null}];
 }
 
@@ -180,15 +162,11 @@ function upsertPhase(phases: AgentPhase[], patch: AgentPhase): AgentPhase[] {
           phase => sameRoleAndRound(phase) && phase.executionId === patch.executionId,
         );
   if (existing === -1 && patch.status === 'active') {
-    // Seeded expected stages have no execution identity. The first execution
-    // claims that placeholder; concurrent same-role executions append nodes.
     existing = phases.findIndex(
       phase => sameRoleAndRound(phase) && phase.executionId === undefined,
     );
   }
   if (existing === -1 && patch.status !== 'active') {
-    // Legacy finishes may omit or disagree on identity. Close one active
-    // execution of the same role rather than creating a completed phantom.
     existing = phases.findIndex(phase => sameRoleAndRound(phase) && phase.status === 'active');
   }
   if (existing === -1) return [...phases, patch];
@@ -213,7 +191,7 @@ function upsertPhase(phases: AgentPhase[], patch: AgentPhase): AgentPhase[] {
 
 function replaceRound(rounds: RoundSummary[], round: RoundSummary): RoundSummary[] {
   const existing = rounds.findIndex(item => item.number === round.number);
-  if (existing === -1) return [...rounds, round].sort((a, b) => a.number - b.number);
+  if (existing === -1) return [...rounds, round].sort((left, right) => left.number - right.number);
   return rounds.map((item, index) => (index === existing ? round : item));
 }
 
@@ -270,10 +248,6 @@ function updateRoundAgentElapsed(
         phase.kind === event.agent_kind &&
         phase.roundNumber === roundNumberFromLabel(event.round_label),
     );
-    // New backends retain phase events for old clients after emitting the
-    // canonical lifecycle event. Do not apply that compatibility duplicate a
-    // second time, especially because role fallback could close a concurrent
-    // same-role execution.
     if (
       (started && existing?.status === 'active') ||
       (finished && existing !== undefined && existing.status !== 'active')
@@ -282,8 +256,4 @@ function updateRoundAgentElapsed(
     }
   }
   return started ? startAgentTiming(round, event) : finishAgentTiming(round, event);
-}
-
-export function roundAgentElapsedMs(round: RoundSummary, now = new Date()): number {
-  return activeTimingElapsedMs(round, now);
 }

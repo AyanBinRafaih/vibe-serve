@@ -1,7 +1,10 @@
 import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
-import {hasActiveAgentTiming} from '../round-timing.js';
-import type {AgentPhase, RoundSummary} from '../run-map.js';
-import {roundAgentElapsedMs} from '../run-map.js';
+import {
+  type AgentPhase,
+  hasActiveAgentTiming,
+  type RoundSummary,
+  roundAgentElapsedMs,
+} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {scopedRounds, stripRounds, visiblePhases, visibleRoundNumber} from '../session-model.js';
@@ -415,7 +418,7 @@ function truncate(text: string, width: number): string {
  */
 function headingLabel(roundNumber: number | null, round: RoundSummary | null): string {
   if (roundNumber === null) return 'Run flow';
-  const elapsedMs = round === null ? 0 : roundAgentElapsedMs(round);
+  const elapsedMs = round === null ? 0 : roundAgentElapsedMs(round, new Date());
   if (elapsedMs <= 0) return `Round ${roundNumber} flow`;
   return `Round ${roundNumber} flow · ${elapsedLabel(elapsedMs)}`;
 }

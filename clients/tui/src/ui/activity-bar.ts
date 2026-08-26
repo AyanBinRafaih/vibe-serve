@@ -1,6 +1,7 @@
 import {type CliRenderer, TextRenderable} from '@opentui/core';
-import type {ActiveAgentExecution, SessionState} from '../session-model.js';
-import {visibleRoundNumber} from '../session-model.js';
+import type {ActiveAgentExecution} from '@vibesys/core-state';
+import type {SessionState} from '../session-model.js';
+import {visibleActiveExecutions} from '../session-model.js';
 import type {Theme} from './theme.js';
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -26,15 +27,7 @@ export class ActivityBarView {
   }
 
   render(state: SessionState, visible = true): void {
-    const all = Object.values(state.activeExecutions);
-    const roundNumber = visibleRoundNumber(state);
-    this.#executions = visible
-      ? all.filter(
-          execution =>
-            (roundNumber === null || execution.roundNumber === roundNumber) &&
-            (state.selectedAgentKind === null || execution.agentKind === state.selectedAgentKind),
-        )
-      : [];
+    this.#executions = visible ? visibleActiveExecutions(state) : [];
     this.output.visible = this.#executions.length > 0;
     this.#refresh();
     this.#syncTimer();

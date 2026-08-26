@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'bun:test';
-import type {HypothesisEntry} from '../protocol.js';
+import type {HypothesisEntry} from '@vibesys/backend-client';
 import {
   entryKey,
   initialSessionState,

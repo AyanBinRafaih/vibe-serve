@@ -1456,5 +1456,5 @@ def test_run_context_records_invocation_boundary(tmp_path):  # noqa: ANN001, ANN
 
 
 def test_committed_protocol_schema_matches_python_contract():  # noqa: ANN201  # tracked: #288
-    schema_path = Path("clients/tui/src/generated/protocol.schema.json")
+    schema_path = Path("clients/backend-client/src/generated/protocol.schema.json")
     assert json.loads(schema_path.read_text()) == ProtocolDocument.model_json_schema()

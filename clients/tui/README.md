@@ -240,10 +240,11 @@ round shows elapsed time.
 ## Architecture
 
 The Python backend owns the validated, append-only event contract and serves it
-as JSONL over a private Unix socket. `src/generated/` is generated from those
-Pydantic models. The TypeScript client owns framing and request correlation,
-`session-controller.ts` owns effects, `session-model.ts` and `run-map.ts` reduce
-events into presentation state, and `ui/` owns OpenTUI rendering and input.
+as JSONL over a private Unix socket. `@vibesys/backend-client` owns the generated
+TypeScript protocol, framing, request correlation, and event subscription.
+`@vibesys/core-state` owns the pure projection of backend messages. This package
+owns UI interaction state, effects, OpenTUI rendering, and input. The detailed
+ownership matrix is in the [TUI architecture guide](../../docs/contributing/tui-architecture.md).
 
 Conversation state retains at most 1,000 semantic entries. Rendering is keyed
 by entry identity: state-only updates reuse existing cards, streamed tail
@@ -258,15 +259,16 @@ From the repository root:
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm --dir clients/tui generate:protocol
-pnpm --dir clients/tui check
-pnpm --dir clients/tui test
-pnpm --dir clients/tui build
+pnpm --dir clients/backend-client generate:protocol
+pnpm check:ts-architecture
+pnpm check:clients
+pnpm test:clients
+pnpm build:clients
 pnpm check:ts
 uv run pytest tests/test_tui.py tests/agents/test_callbacks.py tests/render/test_sink.py
 ```
 
 After changing Python protocol models, regenerate both files in
-`src/generated/` and review their diff. The test suite covers reducer behavior,
+`clients/backend-client/src/generated/` and review their diff. The test suite covers reducer behavior,
 OpenTUI frames and navigation, launcher cleanup, socket fragmentation and
 timeouts, replay/live delivery, and the Python supervision service.

@@ -10,7 +10,7 @@
       "clients/**/*.ts",
       "clients/**/*.tsx",
       "!clients/**/dist",
-      "!clients/tui/src/generated"
+      "!clients/backend-client/src/generated"
     ]
   },
   "formatter": {

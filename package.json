@@ -6,7 +6,11 @@
     "format:ts": "biome format --write .",
     "check:format:ts": "biome format .",
     "lint:ts": "biome lint .",
-    "check:ts": "biome check ."
+    "check:ts": "biome check .",
+    "check:ts-architecture": "python3 scripts/check_ts_architecture.py",
+    "build:clients": "pnpm --filter @vibesys/tui... build",
+    "check:clients": "pnpm --filter @vibesys/backend-client check && pnpm --filter @vibesys/core-state check && pnpm --filter @vibesys/tui check",
+    "test:clients": "pnpm --filter @vibesys/backend-client test && pnpm --filter @vibesys/core-state test && pnpm --filter @vibesys/tui test"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.3"

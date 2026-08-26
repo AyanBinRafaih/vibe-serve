@@ -1,7 +1,20 @@
 import {describe, expect, it} from 'bun:test';
-import {elapsedLabel, promptPreview, toolOutputPreview} from './previews.js';
+import {elapsedLabel, promptPreview, toolCallPreview, toolOutputPreview} from './previews.js';
 
 describe('conversation previews', () => {
+  it('formats and truncates typed tool arguments without changing the source data', () => {
+    const args = {
+      text: 'x'.repeat(200),
+      nested: {count: 3, flags: [true, false]},
+    };
+    const preview = toolCallPreview('Edit', args);
+
+    expect(preview).toContain(`text="${'x'.repeat(80)}..."`);
+    expect(preview).toContain('nested={"count":3,"flags":[true,false]}');
+    expect(args.text).toHaveLength(200);
+    expect(args.nested).toEqual({count: 3, flags: [true, false]});
+  });
+
   it('limits tool output without discarding the underlying content', () => {
     const content = Array.from({length: 20}, (_, index) => `line ${index + 1}`).join('\n');
     const preview = toolOutputPreview(content);

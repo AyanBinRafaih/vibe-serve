@@ -1,4 +1,4 @@
-import type {AgentPhase} from '../run-map.js';
+import type {AgentPhase} from '@vibesys/core-state';
 
 /**
  * Layout for the agent graph drawn in the Agents pane.

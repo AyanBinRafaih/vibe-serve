@@ -353,7 +353,7 @@ def test_ensure_built_runs_pnpm_steps(monkeypatch, tmp_path):  # noqa: ANN001, A
 
     monkeypatch.setattr(cli.subprocess, "run", _run)
     assert cli._ensure_source_tui_built(tmp_path) is True  # noqa: SLF001  # tracked: #288
-    assert [c[1] for c in calls] == ["install", "--dir", "--dir"]
+    assert [c[1] for c in calls] == ["install", "--dir", "build:clients"]
 
 
 def test_ensure_built_reports_failure(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201  # tracked: #288
@@ -429,6 +429,20 @@ def test_needs_rebuild_on_watched_config_file(tmp_path):  # noqa: ANN001, ANN201
     _set_mtime(dist / "launcher.js", 2000)
     _set_mtime(pkg, 3000)  # a watched config file newer than the build
     assert cli._needs_rebuild(root) is True  # noqa: SLF001  # tracked: #288
+
+
+def test_needs_rebuild_on_core_state_source_change(tmp_path):  # noqa: ANN001, ANN201
+    root = _make_checkout(tmp_path)
+    dist = root / "clients" / "tui" / "dist"
+    core_source = root / "clients" / "core-state" / "src" / "index.ts"
+    core_source.parent.mkdir(parents=True)
+    core_source.write_text("export {};\n")
+    _set_mtime(root / "clients" / "tui" / "src" / "app.ts", 1000)
+    _set_mtime(dist / "index.js", 2000)
+    _set_mtime(dist / "launcher.js", 2000)
+    _set_mtime(core_source, 3000)
+
+    assert cli._needs_rebuild(root) is True  # noqa: SLF001
 
 
 def test_source_checkout_build_failure_returns_one(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
