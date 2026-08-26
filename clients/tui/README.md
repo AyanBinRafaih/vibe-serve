@@ -179,7 +179,11 @@ Control chord for itself, and on macOS several do.
 
 Escape unwinds the round view one step at a time: the entry cursor, then the
 agent filter, then the hypothesis. Ctrl+L returns to the experiment log from
-anywhere, and Ctrl+C exits. Rounds and agents can also be clicked: a round chip
+anywhere. Drag to select rendered text, then press Ctrl+C to copy it through
+OSC52; Ctrl+C exits when there is no nonempty selection. If the terminal does
+not support OSC52, VibeSys keeps the selection and shows a status explaining
+that the terminal's native copy command is the fallback. Rounds and agents can
+also be clicked: a round chip
 selects its round, an agent node filters the transcript to that agent, and
 clicking the selected node clears the filter. Commands listed under "Planned" in
 `/help` are not accepted yet.
