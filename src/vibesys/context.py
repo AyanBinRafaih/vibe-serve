@@ -15,10 +15,7 @@ from pydantic import BaseModel
 
 from vibesys import backends
 from vibesys.agents import AgentClient, build_agent_client
-from vibesys.agents.host_resource_declarations import (
-    container_runtime_resources,
-    task_scratch_dir,
-)
+from vibesys.agents.host_resource_declarations import task_agent_host_resources
 from vibesys.agents.progress import AgentProgress
 from vibesys.backends.base import ComputeBackendImpl, ContentionMonitor
 from vibesys.config import Config, as_config
@@ -85,7 +82,7 @@ from vs_project import (
     StateTransition,
     generate_run_id,
 )
-from vs_sandbox import HostResource, HostResourceAccess
+from vs_sandbox import HostResource
 
 if TYPE_CHECKING:
     from vibesys.server.supervisor import RunSupervisor
@@ -807,42 +804,15 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     teardown_stack.callback(device.close)
     device.start_monitor()
 
-    # A microservice candidate is a container topology, so the local agent
-    # needs the Docker socket and a scratch directory that names the same
-    # path inside and outside confinement for container bind mounts to
-    # resolve. Other domains keep the narrower default resource set.
-    agent_host_resources: tuple[HostResource, ...] = ()
-    if profiler_domain is DomainName.MICROSERVICES:
-        scratch_resources: tuple[HostResource, ...] = ()
-        if task_name is not None:
-            scratch = task_scratch_dir(task_name)
-            scratch.mkdir(parents=True, exist_ok=True)
-            scratch_resources = (
-                HostResource(
-                    scratch,
-                    HostResourceAccess.READ_WRITE,
-                    "task container scratch",
-                ),
-            )
-        # Container backends run the agent inside their own image and own
-        # resource exposure themselves, so the declarations are host-only.
-        if not session.view.cli_sandboxed:
-            agent_host_resources = (*container_runtime_resources(), *scratch_resources)
-
-    # A packaged benchmark command names ``${PACKAGE_ROOT}``, and the Profiler
-    # is told to run that command when no capture exists yet. The package lives
-    # outside the workspace, so without importing it the command dies on a
-    # missing directory and the role returns no evidence at all. Read-only: the
-    # evaluator is trusted, integrity-checked input that no role may edit.
-    if not session.view.cli_sandboxed and evaluator_package_root is not None:
-        agent_host_resources = (
-            *agent_host_resources,
-            HostResource(
-                evaluator_package_root,
-                HostResourceAccess.READ_ONLY,
-                "evaluator package",
-            ),
-        )
+    # A microservice candidate is a container topology, so its local agent needs
+    # resources the default confinement withholds. Other domains keep the
+    # narrower default set.
+    agent_host_resources = task_agent_host_resources(
+        container_topology=profiler_domain is DomainName.MICROSERVICES,
+        cli_sandboxed=session.view.cli_sandboxed,
+        task_name=task_name,
+        evaluator_package_root=evaluator_package_root,
+    )
 
     # Build the backend-agnostic agent client. Loops invoke this instead
     # of calling create_deep_agent / vibesys._agent_cli directly. The cli

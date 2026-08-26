@@ -268,6 +268,48 @@ def container_runtime_resources(env: Mapping[str, str] | None = None) -> tuple[H
     )
 
 
+def task_agent_host_resources(
+    *,
+    container_topology: bool,
+    cli_sandboxed: bool,
+    task_name: str | None,
+    evaluator_package_root: Path | None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[HostResource, ...]:
+    """Declare the extra host resources a repository-native task's agent needs.
+
+    Two independent widenings, both host-only. A container topology needs the
+    Docker socket and a scratch directory that names the same path inside and
+    outside confinement, because Docker resolves a bind-mount source in the
+    daemon's namespace rather than the agent's. Separately, a packaged
+    benchmark command names ``${PACKAGE_ROOT}``: the package lives outside the
+    workspace, so without importing it the command dies on a missing directory
+    and the Profiler returns no evidence at all. That import is read-only, since
+    the evaluator is trusted, integrity-checked input no role may edit.
+
+    Container backends run the agent inside their own image and own resource
+    exposure themselves, so a sandboxed run declares nothing here.
+    """
+    if cli_sandboxed:
+        return ()
+    resources: tuple[HostResource, ...] = ()
+    if container_topology:
+        resources = container_runtime_resources(env)
+        if task_name is not None:
+            scratch = task_scratch_dir(task_name)
+            scratch.mkdir(parents=True, exist_ok=True)
+            resources = (
+                *resources,
+                HostResource(scratch, HostResourceAccess.READ_WRITE, "task container scratch"),
+            )
+    if evaluator_package_root is not None:
+        resources = (
+            *resources,
+            HostResource(evaluator_package_root, HostResourceAccess.READ_ONLY, "evaluator package"),
+        )
+    return resources
+
+
 def _operator_allowlist(ctx: HostResourceContext) -> Iterable[HostResource]:
     raw = ctx.env.get(ALLOW_ENV, "")
     paths = (Path(path).expanduser() for path in raw.split(os.pathsep) if path.strip())
