@@ -127,10 +127,18 @@ live. A second visualization command replaces the pane's contents rather than
 stacking another surface on top.
 
 `Ctrl+W` moves focus one column to the right and wraps, through whichever
-columns are actually on screen; the focused one carries the theme's focus
-border and says so in its title. Page Up and Page Down scroll whichever pane
-has focus, and Escape on the right pane closes it and restores the full-width
-view. Chat and transcript state survive the pane closing.
+columns are actually on screen. Every pane reads the same authoritative focus
+state: the focused pane carries the theme's focus border and a `▸` in its title,
+while every other pane uses the neutral border. Page Up and Page Down scroll
+whichever pane has focus, and Escape on the right pane closes it and restores
+the full-width view. Chat and transcript state survive the pane closing.
+
+`F4` toggles zoom for the focused pane. Zoom gives that pane the complete
+content row; pressing `F4` again restores the previous split and focus. It does
+not create a second pane or move its data, so hypothesis and agent selection,
+chat drafts, and pane scroll positions remain in place. The shortcut works for
+the hypothesis list, agent graph, transcript, experiment chat, and performance
+pane. Modal dialogs keep `F4` to themselves until they close.
 
 Pane widths are computed from the terminal, so a wide terminal gives the
 visualization real room while the left pane keeps a readable floor. Below 100

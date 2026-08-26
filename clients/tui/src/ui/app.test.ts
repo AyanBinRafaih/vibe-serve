@@ -36,6 +36,7 @@ import {
   setExperiments,
   setPaneContent,
   setTheme,
+  togglePaneZoom,
 } from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import {resolveTheme, type ThemeName} from './theme.js';
@@ -646,6 +647,85 @@ describe('OpenTUI presentation', () => {
     testRenderer.mockInput.pressKey('TAB');
     await frameAfter(testRenderer);
     expect(controller.state.selectedAgentKind).not.toBe(firstAgent);
+  });
+
+  it('focuses round panes from blank and interactive click targets', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      experimentLog: null,
+      rounds: [{number: 1, status: 'active'}],
+      selectedRound: 1,
+      phases: [
+        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+      ],
+      conversation: [
+        {
+          id: 'e1',
+          kind: 'assistant',
+          label: 'implementer',
+          content: 'edited the kernel',
+          roundNumber: 1,
+        },
+        {
+          id: 'e2',
+          kind: 'assistant',
+          label: 'judge',
+          content: 'checking the diff',
+          roundNumber: 1,
+        },
+      ],
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    let frame = await testRenderer.waitForFrame(value => value.includes('edited the kernel'));
+
+    // The graph heading has no action of its own. Clicking it still focuses
+    // the containing pane rather than requiring a click on an agent.
+    let lines = frame.split('\n');
+    let row = lines.findIndex(line => line.includes('Round 1'));
+    let column = (lines[row]?.indexOf('Round 1') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(frame).toContain('▸ Agents');
+
+    // Entering the pane selects its active agent. Clicking that inner node
+    // keeps Agents focused and clears the filter, preserving node semantics.
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('● judge'));
+    column = (lines[row]?.indexOf('judge') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(controller.state.selectedAgentKind).toBeNull();
+
+    // A turn card has its own selection action. It composes pane focus with
+    // that action, and the next arrow is consequently routed to transcript.
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('edited the kernel'));
+    column = (lines[row]?.indexOf('edited the kernel') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+    expect(controller.state.selectedEntryId).toBe('e1');
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedEntryId).toBe('e2');
+
+    // Agent nodes likewise keep their selection behavior while taking focus.
+    frame = testRenderer.captureCharFrame();
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('✓ implementer'));
+    column = (lines[row]?.indexOf('implementer') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(controller.state.selectedAgentKind).toBe('implementer');
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedAgentKind).toBe('judge');
   });
 
   it('marks the chat input as focused when it is clicked', async () => {
@@ -1837,7 +1917,7 @@ describe('theming', () => {
     const paneTop = lines.find(line => line.includes('╭─ Experiment chat')) ?? '';
     const inputTop = lines.find(line => line.includes('╭─ Chat ')) ?? '';
     expect(inputTop).toContain('╭─ Ask or command');
-    expect(inputTop.indexOf('╭─ Ask or command')).toBe(paneTop.indexOf('╭─ Experiments'));
+    expect(inputTop.indexOf('╭─ Ask or command')).toBe(paneTop.indexOf('╭─ ▸ Experiments'));
   });
 
   it('routes typing to whichever input Ctrl+W points at', async () => {
@@ -2063,15 +2143,131 @@ describe('theming', () => {
     await controller.openPane('perf');
 
     const onRight = await frameAfter(testRenderer);
-    expect(onRight).toContain('· focused');
+    expect(onRight).toContain('▸ Performance');
     const theme = resolveTheme('dark');
-    expect(spanColors(testRenderer, 'Performance · focused')?.fg).toBe(theme.borderFocus);
+    expect(spanColors(testRenderer, '▸ Performance')?.fg).toBe(theme.borderFocus);
 
     testRenderer.mockInput.pressKey('w', {ctrl: true});
     const onLeft = await frameAfter(testRenderer);
 
     expect(controller.state.layout.focus).toBe('left');
-    expect(onLeft).not.toContain('· focused');
+    expect(onLeft).toContain('▸ Transcript');
+  });
+
+  it('marks exactly one focused pane across the hypothesis layout', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 20});
+    const controller = logController();
+    controller.paneContent = 'Performance · tok_s\nbest r7 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await controller.openPane('perf');
+
+    expect(await frameAfter(testRenderer)).toContain('▸ Performance');
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    expect(await frameAfter(testRenderer)).toContain('▸ Experiment chat');
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    expect(await frameAfter(testRenderer)).toContain('▸ Experiments');
+    expect(controller.state.layout.focus).toBe('left');
+  });
+
+  it('focuses hypothesis panes from their inner content and routes the next key', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 22});
+    const controller = logController();
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {claim: 'batch the prefill step'}),
+      logEntry('H-08', 42, 42, {claim: 'increase the cache block'}),
+    ];
+    controller.paneContent = 'Performance · tok_s\nbest r7 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await controller.openPane('perf');
+    let frame = await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('right');
+
+    // A table row both selects its hypothesis and focuses Experiments.
+    let lines = frame.split('\n');
+    let row = lines.findIndex(line => line.includes('H-08'));
+    let column = (lines[row]?.indexOf('H-08') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('left');
+    expect(controller.state.experimentLog?.selectedId).toBe('H-08');
+    expect(frame).toContain('▸ Experiments');
+    testRenderer.mockInput.pressKey('ARROW_UP');
+    await frameAfter(testRenderer);
+    expect(controller.state.experimentLog?.selectedId).toBe('H-07');
+
+    // The chart body is inside a scroll surface. Clicking it focuses the
+    // performance pane, so Escape is routed there and closes it.
+    frame = testRenderer.captureCharFrame();
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('best r7 1135 tok_s'));
+    column = (lines[row]?.indexOf('best r7 1135 tok_s') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('right');
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.layout.right).toBeNull();
+  });
+
+  it('zooms and restores every pane without replacing its model state', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 20});
+    const controller = logController();
+    controller.paneContent = 'Performance · tok_s\nbest r7 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await controller.openPane('perf');
+    const right = controller.state.layout.right;
+
+    testRenderer.mockInput.pressKey('F4');
+    const performance = await frameAfter(testRenderer);
+    expect(performance).toContain('best r7 1135 tok_s');
+    expect(performance).not.toContain('H-07');
+    expect(performance).not.toContain('Experiment chat');
+
+    testRenderer.mockInput.pressKey('F4');
+    const restored = await frameAfter(testRenderer);
+    expect(restored).toContain('H-07');
+    expect(restored).toContain('Experiment chat');
+    expect(controller.state.layout.right).toBe(right);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    testRenderer.mockInput.pressKey('F4');
+    const chat = await frameAfter(testRenderer);
+    expect(chat).toContain('Experiment chat');
+    expect(chat).not.toContain('H-07');
+
+    testRenderer.mockInput.pressKey('F4');
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    testRenderer.mockInput.pressKey('F4');
+    const experiments = await frameAfter(testRenderer);
+    expect(experiments).toContain('H-07');
+    expect(experiments).not.toContain('Experiment chat');
+    expect(experiments).not.toContain('best r7 1135 tok_s');
+  });
+
+  it('zooms the selected agents or transcript pane in a round', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = splitController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    controller.focusRound('agents');
+    testRenderer.mockInput.pressKey('F4');
+    const agents = await frameAfter(testRenderer);
+    expect(agents).toContain('▸ Agents');
+    expect(agents).not.toContain('batched the prefill step');
+
+    testRenderer.mockInput.pressKey('F4');
+    controller.focusRound('transcript');
+    testRenderer.mockInput.pressKey('F4');
+    const transcript = await frameAfter(testRenderer);
+    expect(transcript).toContain('batched the prefill step');
+    expect(transcript).not.toContain('Agents');
   });
 
   it('closes the pane with Escape and restores the full-width transcript', async () => {
@@ -2146,7 +2342,7 @@ describe('theming', () => {
     await controller.openPane('perf');
     await frameAfter(testRenderer);
 
-    expect(spanColors(testRenderer, 'Performance · focused')?.fg).toBe(theme.borderFocus);
+    expect(spanColors(testRenderer, '▸ Performance')?.fg).toBe(theme.borderFocus);
     expect(spanColors(testRenderer, 'best r7 1135 tok_s')?.fg).toBe(theme.textPrimary);
 
     controller.cyclePaneFocus();
@@ -2613,6 +2809,9 @@ class FakeController implements SessionController {
   }
   focusPane(focus: PaneFocus): void {
     this.publish(focusPane(this.state, focus));
+  }
+  togglePaneZoom(): void {
+    this.publish(togglePaneZoom(this.state));
   }
   setChatDockFits(fits: boolean): void {
     this.publish(setChatDockFits(this.state, fits));

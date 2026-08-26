@@ -2,6 +2,7 @@ import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} fr
 import type {SessionController} from '../session-controller.js';
 import {
   experimentLogVisible,
+  focusedPane,
   type SessionState,
   statusText,
   stripRounds,
@@ -31,12 +32,14 @@ export interface OpenTuiApp {
 /** Which of the client's inputs currently holds the cursor. */
 type FocusTarget = 'command' | 'chat' | 'modal';
 
-const KEY_HELP = '[/]: round · ←→: pane · ↑↓/Tab: within it · /todos · /prompt · Ctrl+L: live';
-const SCOPED_KEY_HELP = '[/]: round · ←→: pane · ↑↓/Tab: within it · /todos · /prompt · Esc: back';
+const KEY_HELP =
+  '[/]: round · ←→: pane · ↑↓/Tab: within it · F4: zoom · /todos · /prompt · Ctrl+L: live';
+const SCOPED_KEY_HELP =
+  '[/]: round · ←→: pane · ↑↓/Tab: within it · F4: zoom · /todos · /prompt · Esc: back';
 const LOG_KEY_HELP =
-  '↑↓ or scroll: select · Enter or /open-round: open its rounds · /open-round --N';
+  '↑↓ or scroll: select · Enter or /open-round: open its rounds · F4: zoom · /open-round --N';
 const LOG_CHAT_KEY_HELP =
-  '↑↓: select · Enter: open its rounds · Ctrl+W: chat and back · /open-round --N';
+  '↑↓: select · Enter: open its rounds · Ctrl+W: chat and back · F4: zoom · /open-round --N';
 /**
  * Shown above the docked chat's own input. Short enough to leave a gap before
  * the key hints beside it even in the narrowest column that docks, and it says
@@ -47,7 +50,7 @@ const CHAT_INPUT_HINT = 'Ask about this run';
 const CHAT_INPUT_PENDING_HINT = 'Awaiting the agent';
 const CHAT_INPUT_BLURRED_HINT = 'Ctrl+W to type here';
 const SPLIT_KEY_HELP =
-  'Ctrl+W: switch pane · PgUp/PgDn: scroll focused pane · Esc on the pane: close it';
+  'Ctrl+W: switch pane · F4: zoom focused pane · PgUp/PgDn: scroll · Esc: close pane';
 
 /**
  * A round the run has not reached has no turns and never will until it runs.
@@ -77,6 +80,10 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     fg: theme.accent,
     content: 'VibeSys · connecting',
   });
+  const focusTranscript = (): void => {
+    controller.focusPane('left');
+    controller.focusRound('transcript');
+  };
   const transcriptFrame = new BoxRenderable(renderer, {
     id: 'viewport',
     width: 'auto',
@@ -87,6 +94,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     border: true,
     borderStyle: 'rounded',
     borderColor: theme.border,
+    onMouseUp: focusTranscript,
   });
   const viewport = new ScrollBoxRenderable(renderer, {
     id: 'transcript-scroll',
@@ -96,6 +104,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     stickyStart: 'bottom',
     viewportCulling: true,
     verticalScrollbarOptions: {showArrows: true},
+    onMouseUp: focusTranscript,
   });
   const main = new BoxRenderable(renderer, {
     id: 'main',
@@ -118,10 +127,11 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   const conversationActivityBar = new ActivityBarView(renderer, theme, 'conversation-activity-bar');
   const overlay = new OverlayView(renderer, theme);
   const experimentLog = new ExperimentLogView(renderer, controller, theme);
-  const rightPane = new RightPaneView(renderer, theme);
+  const rightPane = new RightPaneView(renderer, theme, () => controller.focusPane('right'));
   const themePicker = new ThemePickerView(renderer, theme);
   const conversation = new ConversationView(renderer, controller, markdownStyle, theme, {
     showsSelection: true,
+    onFocusRequest: focusTranscript,
   });
   const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme);
   const chatPane = new ChatPaneView(renderer, controller, markdownStyle, theme);
@@ -246,15 +256,23 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     const releasePreviousStyle =
       state.themeName === themeName ? undefined : applyTheme(state.themeName);
     const showLog = experimentLogVisible(state);
+    const paneFocus = focusedPane(state);
+    const zoomedPane = state.layout.zoomedPane;
     // A split only happens when the terminal can carry both panes. Narrower
     // than that, a visualization keeps the modal it had before the split
     // existed rather than squeezing two unreadable columns onto the screen.
     const splitOpen = state.layout.right !== null;
-    const showSplit = splitOpen && splitFits(renderer.terminalWidth);
-    const paneFallback = splitOpen && !showSplit ? state.layout.right : null;
+    const showSplit = zoomedPane === null && splitOpen && splitFits(renderer.terminalWidth);
+    const showRightPane = zoomedPane === 'performance' || (zoomedPane === null && showSplit);
+    const paneFallback = zoomedPane === null && splitOpen && !showSplit ? state.layout.right : null;
     // Whatever holds the left side, log or transcript, shares the row with the
     // pane rather than being replaced by it.
-    const rightWidth = showSplit ? rightPaneWidth(renderer.terminalWidth) : 0;
+    const rightWidth =
+      zoomedPane === 'performance'
+        ? renderer.terminalWidth
+        : showSplit
+          ? rightPaneWidth(renderer.terminalWidth)
+          : 0;
     const leftWidth = renderer.terminalWidth - rightWidth;
     // Measured here because this is the only place that knows the width, and
     // reported to the controller so a question goes where the operator can see
@@ -262,8 +280,14 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     // for the state to come back, so a resize never draws a stale row.
     const dockFits = chatDockFits(renderer.terminalWidth, rightWidth);
     if (state.chatDockFits !== dockFits) controller.setChatDockFits(dockFits);
-    const showChatPane = showLog && dockFits && !state.chatOpen;
-    const chatWidth = showChatPane ? chatPaneWidth(renderer.terminalWidth, rightWidth) : 0;
+    const chatAvailable = showLog && dockFits && !state.chatOpen;
+    const showChatPane = chatAvailable && (zoomedPane === null || zoomedPane === 'chat');
+    const chatWidth = showChatPane
+      ? zoomedPane === 'chat'
+        ? renderer.terminalWidth
+        : chatPaneWidth(renderer.terminalWidth, rightWidth)
+      : 0;
+    const showExperimentLog = showLog && (zoomedPane === null || zoomedPane === 'experiments');
     const dialogOpen = state.chatOpen || state.overlay !== null || state.themePicker !== null;
     const returnHint = dialogOpen ? ' · Esc: close dialog' : '';
     const selection = state.selectedAgentKind ? ` · selected ${state.selectedAgentKind}` : '';
@@ -285,13 +309,15 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
           : SCOPED_KEY_HELP;
     // The round strip and agent map are per-round detail. They belong to a
     // hypothesis trajectory, not to the list of claims.
-    agentMap.output.visible = !showLog;
-    transcriptFrame.visible = !showLog;
-    roundStrip.output.visible = !showLog;
-    todoStrip.output.visible = !showLog;
+    const showAgents = !showLog && (zoomedPane === null ? !showSplit : zoomedPane === 'agents');
+    const showTranscript = !showLog && (zoomedPane === null || zoomedPane === 'transcript');
+    agentMap.output.visible = showAgents;
+    transcriptFrame.visible = showTranscript;
+    roundStrip.output.visible = !showLog && zoomedPane === null;
+    todoStrip.output.visible = !showLog && zoomedPane === null;
     if (!showLog) {
       roundStrip.render(state);
-      agentMap.render(state);
+      agentMap.render(state, zoomedPane === 'agents' ? renderer.terminalWidth : undefined);
       // The todo box sits under the agent pane and stops where it stops: the
       // todos belong to an agent, so running them under the transcript would
       // attach them to the wrong thing.
@@ -305,13 +331,12 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     }
     // The agent map is the first thing to give up room: it is a summary the
     // visualization largely supersedes while the split is open.
-    agentMap.output.visible = !showLog && !showSplit;
+    agentMap.output.visible = showAgents;
     // Inside a round the transcript is one of two navigable panes, so it carries
     // the focus border whenever the round view's keys are on it.
-    const transcriptFocused = showLog
-      ? showSplit && state.layout.focus === 'left'
-      : state.roundFocus === 'transcript';
+    const transcriptFocused = !showLog && paneFocus === 'transcript';
     transcriptFrame.borderColor = transcriptFocused ? theme.borderFocus : theme.border;
+    transcriptFrame.title = transcriptFocused ? ' ▸ Transcript ' : ' Transcript ';
     // Match the chat to the left pane's rectangle so it sits beside the
     // visualization instead of over it. Bounds come from the siblings that
     // actually occupy those rows, so a taller todo strip still fits.
@@ -340,12 +365,15 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
         ? CHAT_INPUT_HINT
         : CHAT_INPUT_BLURRED_HINT;
     chatInput.setFocused(chatInputFocused);
+    commandColumn.visible = zoomedPane !== 'chat';
+    input.setFocused(paneFocus === 'experiments' || paneFocus === 'transcript');
     // The command list completes the box it belongs to, and on this view that
     // box cannot open a chat that is already beside it.
     input.setCommandContext({chatDocked: showChatPane});
     experimentLog.setAvailableWidth(showSplit || showChatPane ? leftWidth - chatWidth : null);
     experimentLog.render(state);
-    rightPane.render(state, showSplit);
+    experimentLog.output.visible = showExperimentLog;
+    rightPane.render(state, showRightPane, rightWidth);
     overlay.render(
       paneFallback === null
         ? state

@@ -1,5 +1,5 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
-import type {SessionState} from '../session-model.js';
+import type {RightPane, SessionState} from '../session-model.js';
 import type {Theme} from './theme.js';
 
 /**
@@ -38,12 +38,12 @@ export class RightPaneView {
   readonly output: BoxRenderable;
   readonly #scroll: ScrollBoxRenderable;
   #theme: Theme;
-  #renderedState: SessionState | null = null;
-  #renderedWidth = 0;
+  #renderedPane: RightPane | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
     theme: Theme,
+    onFocusRequest: () => void,
   ) {
     this.#theme = theme;
     this.output = new BoxRenderable(renderer, {
@@ -58,6 +58,7 @@ export class RightPaneView {
       borderColor: theme.border,
       title: ' Pane ',
       visible: false,
+      onMouseUp: onFocusRequest,
     });
     this.#scroll = new ScrollBoxRenderable(renderer, {
       id: 'right-pane-scroll',
@@ -66,13 +67,14 @@ export class RightPaneView {
       stickyScroll: false,
       viewportCulling: true,
       verticalScrollbarOptions: {showArrows: false},
+      onMouseUp: onFocusRequest,
     });
     this.output.add(this.#scroll);
   }
 
   applyTheme(theme: Theme): void {
     this.#theme = theme;
-    this.#renderedState = null;
+    this.#renderedPane = null;
   }
 
   /** Scrolled by Page Up/Page Down while this pane holds focus. */
@@ -80,24 +82,25 @@ export class RightPaneView {
     this.#scroll.scrollBy(delta, 'viewport');
   }
 
-  render(state: SessionState, visible: boolean): void {
+  render(
+    state: SessionState,
+    visible: boolean,
+    width = rightPaneWidth(this.renderer.terminalWidth),
+  ): void {
     const right = visible ? state.layout.right : null;
     if (right === null) {
       this.output.visible = false;
-      this.#renderedState = null;
       return;
     }
     this.output.visible = true;
-    const width = rightPaneWidth(this.renderer.terminalWidth);
     this.output.width = width;
     // The focused pane is the one that takes keys, so it carries the focus
     // border colour and says so in its title.
     const focused = state.layout.focus === 'right';
     this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
-    this.output.title = focused ? ` ${right.title} · focused ` : ` ${right.title} `;
-    if (state === this.#renderedState && width === this.#renderedWidth) return;
-    this.#renderedState = state;
-    this.#renderedWidth = width;
+    this.output.title = focused ? ` ▸ ${right.title} ` : ` ${right.title} `;
+    if (right === this.#renderedPane) return;
+    this.#renderedPane = right;
     this.#clear();
 
     if (right.error !== null) {

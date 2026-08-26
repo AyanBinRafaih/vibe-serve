@@ -201,7 +201,12 @@ export interface LayoutState {
   /** null means no visualization pane: the left side has the rest of the row. */
   right: RightPane | null;
   focus: PaneFocus;
+  /** The pane temporarily occupying the full content row, or null for the split layout. */
+  zoomedPane: PaneId | null;
 }
+
+/** Semantic pane identities, independent of their current screen position. */
+export type PaneId = 'agents' | 'chat' | 'experiments' | 'performance' | 'transcript';
 
 export interface ThemePicker {
   selected: ThemeName;
@@ -276,7 +281,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     // list of claims before it reads as a long list of rounds.
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
     hypothesisScope: null,
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
     // Docked until the renderer measures otherwise, so the landing view carries
     // the chat from the first frame rather than after a resize.
     chatDockFits: true,
@@ -457,7 +462,7 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
     // A visualization opened from the log belongs to the log. Carrying it into
     // the round view would leave the operator reading one view's answer beside
     // another view's transcript.
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
     hypothesisScope: {
       id: entry.hypothesis_id,
       label: hypothesisLabel(entry),
@@ -498,7 +503,7 @@ export function enterExperimentRound(
     ...state,
     overlay: null,
     chatOpen: false,
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
     hypothesisScope: {
       id: entry.hypothesis_id,
       label: hypothesisLabel(entry),
@@ -530,7 +535,7 @@ export function enterUnownedExperimentRound(
     ...state,
     overlay: null,
     chatOpen: false,
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
     hypothesisScope: {
       id: `round-${roundNumber}`,
       label: `Round ${roundNumber}`,
@@ -731,6 +736,7 @@ export function openPane(state: SessionState, view: PaneView): SessionState {
         error: null,
       },
       focus: 'right',
+      zoomedPane: state.layout.zoomedPane,
     },
   };
 }
@@ -754,7 +760,7 @@ export function failPane(state: SessionState, view: PaneView, error: string): Se
 
 export function closePane(state: SessionState): SessionState {
   if (state.layout.right === null) return state;
-  return {...state, layout: {right: null, focus: 'left'}};
+  return {...state, layout: {right: null, focus: 'left', zoomedPane: null}};
 }
 
 /**
@@ -763,6 +769,7 @@ export function closePane(state: SessionState): SessionState {
  * cannot see.
  */
 export function cyclePaneFocus(state: SessionState): SessionState {
+  if (state.layout.zoomedPane !== null) return state;
   const order = visiblePaneOrder(state);
   if (order.length < 2) return state;
   const next = order[(order.indexOf(state.layout.focus) + 1) % order.length] ?? 'left';
@@ -777,8 +784,14 @@ export function cyclePaneFocus(state: SessionState): SessionState {
  */
 export function normalizeFocus(state: SessionState): SessionState {
   const order = visiblePaneOrder(state);
-  if (order.includes(state.layout.focus)) return state;
-  return {...state, layout: {...state.layout, focus: 'left'}};
+  const focus = order.includes(state.layout.focus) ? state.layout.focus : 'left';
+  const zoomedPane =
+    state.layout.zoomedPane === null ||
+    visiblePaneIds({...state, layout: {...state.layout, focus}}).includes(state.layout.zoomedPane)
+      ? state.layout.zoomedPane
+      : null;
+  if (focus === state.layout.focus && zoomedPane === state.layout.zoomedPane) return state;
+  return {...state, layout: {...state.layout, focus, zoomedPane}};
 }
 
 /** Escape from a round view: close whatever is layered over it, all of it. */
@@ -788,7 +801,7 @@ export function closeOverlays(state: SessionState): SessionState {
     ...state,
     overlay: null,
     chatOpen: false,
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
   };
 }
 
@@ -796,6 +809,49 @@ export function focusPane(state: SessionState, focus: PaneFocus): SessionState {
   if (state.layout.focus === focus) return state;
   if (!visiblePaneOrder(state).includes(focus)) return state;
   return {...state, layout: {...state.layout, focus}};
+}
+
+/** The semantic pane currently receiving pane navigation keys. */
+export function focusedPane(state: SessionState): PaneId {
+  if (experimentLogVisible(state)) {
+    if (state.layout.focus === 'chat' && chatPaneVisible(state)) return 'chat';
+    if (state.layout.focus === 'right' && state.layout.right !== null) return 'performance';
+    return 'experiments';
+  }
+  // Opening a visualization replaces the agent summary in the left column
+  // with the transcript. Keep roundFocus intact so closing the visualization
+  // can restore it, but never report the hidden Agents pane as focused.
+  if (state.layout.right !== null) {
+    return state.layout.focus === 'right' ? 'performance' : 'transcript';
+  }
+  return state.roundFocus;
+}
+
+/**
+ * Gives the focused pane the content row, or restores the existing split.
+ * Pane content and selection stay in their owning models; zoom only changes
+ * presentation, so toggling cannot replace or reconstruct pane state.
+ */
+export function togglePaneZoom(state: SessionState): SessionState {
+  return {
+    ...state,
+    layout: {
+      ...state.layout,
+      zoomedPane: state.layout.zoomedPane === null ? focusedPane(state) : null,
+    },
+  };
+}
+
+/** Every pane currently available to focus or zoom in the active view. */
+export function visiblePaneIds(state: SessionState): PaneId[] {
+  if (experimentLogVisible(state)) {
+    return [
+      ...(chatPaneVisible(state) ? (['chat'] as const) : []),
+      'experiments',
+      ...(state.layout.right !== null ? (['performance'] as const) : []),
+    ];
+  }
+  return state.layout.right === null ? ['agents', 'transcript'] : ['transcript', 'performance'];
 }
 
 function visiblePaneOrder(state: SessionState): PaneFocus[] {

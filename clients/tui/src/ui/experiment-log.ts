@@ -5,6 +5,7 @@ import {
   entryKey,
   experimentIndexItems,
   experimentLogVisible,
+  focusedPane,
   type HypothesisPlanningActivity,
   hypothesisPlanningActivity,
   type SessionState,
@@ -77,10 +78,11 @@ export class ExperimentLogView {
       paddingRight: 1,
       border: true,
       borderStyle: 'rounded',
-      borderColor: theme.accent,
+      borderColor: theme.border,
       backgroundColor: theme.elevatedSurface,
       visible: false,
       title: ' Experiments ',
+      onMouseUp: () => this.controller.focusPane('left'),
     });
     this.#header = new TextRenderable(renderer, {
       content: '',
@@ -103,6 +105,7 @@ export class ExperimentLogView {
       stickyScroll: false,
       viewportCulling: true,
       verticalScrollbarOptions: {showArrows: false},
+      onMouseUp: () => this.controller.focusPane('left'),
     });
     this.#footerLine = new TextRenderable(renderer, {
       content: '',
@@ -129,7 +132,7 @@ export class ExperimentLogView {
 
   applyTheme(theme: Theme): void {
     this.#theme = theme;
-    this.output.borderColor = theme.accent;
+    this.output.borderColor = theme.border;
     this.output.backgroundColor = theme.elevatedSurface;
     this.#header.fg = theme.textSubtle;
     this.#footerLine.fg = theme.textSubtle;
@@ -148,6 +151,9 @@ export class ExperimentLogView {
       return;
     }
     this.output.visible = true;
+    const focused = focusedPane(state) === 'experiments';
+    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
+    this.output.title = focused ? ' ▸ Experiments ' : ' Experiments ';
     const width = this.#availableWidth ?? this.renderer.terminalWidth;
     if (state === this.#renderedState && width === this.#renderedWidth) return;
     this.#renderedState = state;
@@ -328,6 +334,7 @@ export class ExperimentLogView {
       flexDirection: 'row',
       ...selection,
       onMouseUp: () => {
+        this.controller.focusPane('left');
         this.controller.moveExperimentSelection(
           index + activityOffset - this.#selectedNavigationIndex(),
         );
@@ -349,8 +356,10 @@ export class ExperimentLogView {
       height: 1,
       flexShrink: 0,
       ...(isSelected ? {backgroundColor: this.#theme.selectedSurface} : {}),
-      onMouseUp: () =>
-        this.controller.moveExperimentSelection(index - this.#selectedNavigationIndex()),
+      onMouseUp: () => {
+        this.controller.focusPane('left');
+        this.controller.moveExperimentSelection(index - this.#selectedNavigationIndex());
+      },
     });
     row.add(
       this.#cell(
@@ -419,7 +428,10 @@ export class ExperimentLogView {
       height: 1,
       flexShrink: 0,
       ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
-      onMouseUp: () => this.controller.selectExperimentActivity(),
+      onMouseUp: () => {
+        this.controller.focusPane('left');
+        this.controller.selectExperimentActivity();
+      },
     });
     const text = new TextRenderable(this.renderer, {
       content,

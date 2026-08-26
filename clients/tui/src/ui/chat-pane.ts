@@ -5,7 +5,7 @@ import {
   type SyntaxStyle,
 } from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
-import {chatPaneFocused, type SessionState} from '../session-model.js';
+import {type ConversationEntry, chatPaneFocused, type SessionState} from '../session-model.js';
 import {ConversationView} from './conversation.js';
 import {LOG_CLAIM_PANEL_WIDTH, LOG_COMPACT_PANEL_WIDTH} from './experiment-log.js';
 import type {Theme} from './theme.js';
@@ -54,7 +54,7 @@ export class ChatPaneView {
   readonly #scroll: ScrollBoxRenderable;
   readonly #conversation: ConversationView;
   #theme: Theme;
-  #renderedState: SessionState | null = null;
+  #renderedConversation: ConversationEntry[] | null = null;
 
   constructor(
     renderer: CliRenderer,
@@ -72,7 +72,7 @@ export class ChatPaneView {
       paddingRight: 1,
       border: true,
       borderStyle: 'rounded',
-      borderColor: theme.info,
+      borderColor: theme.border,
       title: ' Experiment chat ',
       visible: false,
       // Clicking into the chat gives it the keys, the same thing Ctrl+W does.
@@ -97,6 +97,7 @@ export class ChatPaneView {
       selectConversation: state => state.chatConversation,
       emptyContent: 'Ask about this run: progress, a failure, or what a hypothesis changed.',
       renderMarkdown: false,
+      onFocusRequest: () => controller.focusPane('chat'),
     });
     this.#scroll.add(this.#conversation.output);
     this.output.add(this.#scroll);
@@ -104,9 +105,9 @@ export class ChatPaneView {
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.#theme = theme;
-    this.output.borderColor = theme.info;
+    this.output.borderColor = theme.border;
     this.#conversation.applyTheme(theme, markdownStyle);
-    this.#renderedState = null;
+    this.#renderedConversation = null;
   }
 
   /** Scrolled by Page Up/Page Down while this pane holds focus. */
@@ -117,21 +118,17 @@ export class ChatPaneView {
   render(state: SessionState, visible: boolean, width: number): void {
     this.output.visible = visible;
     if (!visible) {
-      this.#renderedState = null;
       return;
     }
     this.output.width = width;
     const focused = chatPaneFocused(state);
-    // The chat keeps a colour of its own at rest, the way the command input
-    // keeps green: which box a keystroke lands in should be readable without
-    // moving focus around to find out.
-    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.info;
+    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
     // The column can be as narrow as its minimum, where a spelled-out "focused"
     // costs the title itself: a box with no title reads as nothing at all. The
     // marker is the one the table already uses for the row that has the keys.
     this.output.title = focused ? ' ▸ Experiment chat ' : ' Experiment chat ';
-    if (state === this.#renderedState) return;
-    this.#renderedState = state;
+    if (state.chatConversation === this.#renderedConversation) return;
+    this.#renderedConversation = state.chatConversation;
     this.#conversation.render(state);
     this.#scroll.scrollTo(this.#scroll.scrollHeight);
   }

@@ -31,6 +31,19 @@ export function bindKeybindings(
       renderer.destroy();
       return;
     }
+    // F4 is delivered consistently by terminal emulators and has no text-input
+    // meaning. Zoom is a presentation toggle, so it is disabled only while a
+    // modal surface owns the screen.
+    if (
+      key.name === 'f4' &&
+      controller.state.chatOpen === false &&
+      controller.state.overlay === null &&
+      controller.state.themePicker === null
+    ) {
+      controller.togglePaneZoom();
+      key.preventDefault();
+      return;
+    }
     if (
       controller.state.errorBanner !== null &&
       key.ctrl &&

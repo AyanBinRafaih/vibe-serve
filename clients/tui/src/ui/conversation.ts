@@ -18,6 +18,8 @@ export interface ConversationViewOptions {
   renderMarkdown?: boolean;
   /** Whether this view draws the entry cursor. */
   showsSelection?: boolean;
+  /** Gives the containing semantic pane focus when any conversation surface is clicked. */
+  onFocusRequest?: () => void;
 }
 
 export class ConversationView {
@@ -29,6 +31,7 @@ export class ConversationView {
   #emptyContent: string;
   readonly #renderMarkdown: boolean;
   readonly #showsSelection: boolean;
+  readonly #onFocusRequest: (() => void) | undefined;
   #renderedConversation: ConversationEntry[] = [];
   #renderedCards: BoxRenderable[] = [];
   #renderedSelection: string | null = null;
@@ -47,12 +50,14 @@ export class ConversationView {
     this.#emptyContent = options.emptyContent ?? 'Waiting for run events…';
     this.#renderMarkdown = options.renderMarkdown ?? true;
     this.#showsSelection = options.showsSelection ?? false;
+    this.#onFocusRequest = options.onFocusRequest;
     // The bordered surface owns horizontal inset so transcript siblings, such
     // as a fixed footer, share the same content origin as these turn cards.
     this.output = new BoxRenderable(renderer, {
       id: 'output',
       width: '100%',
       flexDirection: 'column',
+      ...(this.#onFocusRequest === undefined ? {} : {onMouseUp: this.#onFocusRequest}),
     });
   }
 
@@ -184,13 +189,19 @@ export class ConversationView {
       backgroundColor: palette.background,
       ...(this.#showsSelection
         ? {
-            onMouseUp: () =>
-              entry.kind === 'prompt'
-                ? this.#togglePrompt(entry.id)
-                : this.controller.selectNextEntry(0, entry.id),
+            onMouseUp: () => {
+              this.#onFocusRequest?.();
+              if (entry.kind === 'prompt') this.#togglePrompt(entry.id);
+              else this.controller.selectNextEntry(0, entry.id);
+            },
           }
         : entry.kind === 'prompt'
-          ? {onMouseUp: () => this.#togglePrompt(entry.id)}
+          ? {
+              onMouseUp: () => {
+                this.#onFocusRequest?.();
+                this.#togglePrompt(entry.id);
+              },
+            }
           : {}),
     });
     const heading = new BoxRenderable(this.renderer, {
