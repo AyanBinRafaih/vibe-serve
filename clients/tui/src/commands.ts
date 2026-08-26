@@ -2,7 +2,9 @@ import type {RequestInput} from './protocol.js';
 import type {PaneView} from './session-model.js';
 import {isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
-export type ParsedInput = {
+type CommandRequest = Exclude<RequestInput, {type: 'query.chat'}>;
+
+export type ParsedCommand = {
   localView?: 'chat' | 'help' | 'theme';
   /**
    * Surfaces that also have a key. macOS reserves the function keys for system
@@ -12,7 +14,7 @@ export type ParsedInput = {
   toggle?: 'todos' | 'prompt';
   chatMessage?: string;
   themeName?: ThemeName;
-  request?: RequestInput;
+  request?: CommandRequest;
   responseView?: 'perf';
   /** Opens a hypothesis trajectory: the selected row, or the given round. */
   openRound?: {round?: number};
@@ -88,7 +90,8 @@ export function slashCommandRange(text: string): {start: number; end: number} | 
   return {start: 0, end: match[0].length};
 }
 
-export function parseInput(text: string): ParsedInput {
+/** Parses the command surface. Ordinary questions belong to Experiment chat. */
+export function parseCommand(text: string): ParsedCommand {
   if (text === '/help') return {localView: 'help'};
   const chat = text.match(/^\/chat(?:\s+(.*))?$/);
   if (chat) {
@@ -130,6 +133,6 @@ export function parseInput(text: string): ParsedInput {
     return {request: {type: 'query.performance'}, responseView: 'perf', paneView: 'perf'};
   }
   if (text.startsWith('/')) return {error: `Unknown command: ${text}. Use /help.`};
-  if (text === '') return {error: 'Enter a question or use /help.'};
-  return {request: {type: 'query.chat', text}};
+  if (text === '') return {error: 'Enter a slash command. Use /help.'};
+  return {error: 'Commands start with /. Use Experiment chat for questions.'};
 }

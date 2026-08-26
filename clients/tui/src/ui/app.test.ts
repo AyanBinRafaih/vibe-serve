@@ -26,6 +26,7 @@ import {
   type PaneFocus,
   type PaneView,
   type RoundFocus,
+  reportError,
   type SessionState,
   selectAgent,
   selectExperimentActivity,
@@ -85,8 +86,8 @@ describe('OpenTUI presentation', () => {
     expect(frame).toContain('Rounds');
     expect(frame).toContain('● optimizer');
     expect(frame).toContain('Result');
-    expect(frame).toContain('Ask or command');
-    expect(frame).toContain('Type a question or /help');
+    expect(frame).toContain('Command');
+    expect(frame).toContain('Type /help for commands');
   });
 
   it('shows and dismisses a fatal error above the empty experiment log', async () => {
@@ -1024,7 +1025,7 @@ describe('OpenTUI presentation', () => {
     expect(controller.submissions).toEqual(['/help']);
   });
 
-  it('submits ordinary text as an operator question', async () => {
+  it('rejects ordinary text from the command input without sending chat', async () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController(initialSessionState());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -1032,8 +1033,10 @@ describe('OpenTUI presentation', () => {
 
     await testRenderer.mockInput.typeText('what is running?');
     testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
-    expect(controller.submissions).toEqual(['what is running?']);
+    const frame = await testRenderer.waitForFrame(value => value.includes('Commands start with /'));
+    expect(frame).toContain('Use Experiment chat for questions.');
+    expect(controller.submissions).toEqual([]);
+    expect(controller.chatSubmissions).toEqual([]);
   });
 
   it('suggests and completes slash commands with Tab', async () => {
@@ -1047,8 +1050,8 @@ describe('OpenTUI presentation', () => {
     expect(suggestions).toContain('/pause');
     expect(suggestions).not.toContain('/help  ');
     expect(suggestions).not.toContain('/perf');
-    expect(suggestions.indexOf('/pause')).toBeLessThan(suggestions.indexOf('Ask or command'));
-    expect(testRenderer.renderer.root.findDescendantById('input-box')?.height).toBe(3);
+    expect(suggestions.indexOf('/pause')).toBeLessThan(suggestions.indexOf('Command'));
+    expect(testRenderer.renderer.root.findDescendantById('command-input-box')?.height).toBe(3);
 
     testRenderer.mockInput.pressKey('TAB');
     testRenderer.mockInput.pressEnter();
@@ -1063,7 +1066,7 @@ describe('OpenTUI presentation', () => {
     registerCleanup(testRenderer.renderer, app);
 
     await testRenderer.mockInput.typeText('/steer inspect the cache');
-    const input = testRenderer.renderer.root.findDescendantById('input');
+    const input = testRenderer.renderer.root.findDescendantById('command-input');
     expect(input).toBeInstanceOf(InputRenderable);
     if (!(input instanceof InputRenderable)) throw new Error('input was not rendered');
     expect(input.getLineHighlights(0)).toMatchObject([{start: 0, end: 6}]);
@@ -1087,7 +1090,7 @@ describe('OpenTUI presentation', () => {
     const clipboard = clipboardReturning('copied');
     const app = createOpenTuiApp(testRenderer.renderer, controller, clipboard);
     registerCleanup(testRenderer.renderer, app);
-    await testRenderer.waitForFrame(value => value.includes('Ask or command'));
+    await testRenderer.waitForFrame(value => value.includes('Command'));
 
     testRenderer.mockInput.pressKey('c', {ctrl: true});
 
@@ -1105,7 +1108,7 @@ describe('OpenTUI presentation', () => {
     const clipboard = clipboardReturning('unsupported');
     const app = createOpenTuiApp(testRenderer.renderer, controller, clipboard);
     registerCleanup(testRenderer.renderer, app);
-    await testRenderer.waitForFrame(value => value.includes('Ask or command'));
+    await testRenderer.waitForFrame(value => value.includes('Command'));
 
     testRenderer.mockInput.pressKey('c', {ctrl: true});
 
@@ -1979,9 +1982,9 @@ describe('theming', () => {
     const lines = landing.split('\n');
     const paneTop = lines.find(line => line.includes('╭─ Experiment chat')) ?? '';
     const messageTop = lines.find(line => line.includes('╭─ Message ')) ?? '';
-    const commandTop = lines.find(line => line.includes('╭─ Ask or command')) ?? '';
+    const commandTop = lines.find(line => line.includes('╭─ Command')) ?? '';
     expect(messageTop).not.toBe('');
-    expect(commandTop.indexOf('╭─ Ask or command')).toBe(paneTop.indexOf('╭─ ▸ Experiments'));
+    expect(commandTop.indexOf('╭─ Command')).toBe(paneTop.indexOf('╭─ ▸ Experiments'));
   });
 
   it('routes typing to whichever input Ctrl+W points at', async () => {
@@ -1991,6 +1994,14 @@ describe('theming', () => {
     registerCleanup(testRenderer.renderer, app);
     await controller.openExperimentLog();
     await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('this belongs in chat');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Commands start with /'));
+    expect(controller.submissions).toEqual([]);
+    expect(controller.chatSubmissions).toEqual([]);
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
 
     testRenderer.mockInput.pressKey('w', {ctrl: true});
     await frameAfter(testRenderer);
@@ -2119,10 +2130,10 @@ describe('theming', () => {
 
     const lines = frame.split('\n');
     const suggestion = lines.find(line => line.includes('/perf')) ?? '';
-    const commandInput = lines.find(line => line.includes('╭─ Ask or command')) ?? '';
+    const commandInput = lines.find(line => line.includes('╭─ Command')) ?? '';
     // The list belongs to the box it completes, so it starts where that box
     // starts rather than running back across the chat column.
-    expect(suggestion.indexOf('/perf')).toBeGreaterThan(commandInput.indexOf('╭─ Ask or command'));
+    expect(suggestion.indexOf('/perf')).toBeGreaterThan(commandInput.indexOf('╭─ Command'));
   });
 
   it('drops /chat from the command surface while the chat is already docked', async () => {
@@ -2159,9 +2170,11 @@ describe('theming', () => {
     registerCleanup(testRenderer.renderer, app);
     await controller.openExperimentLog();
 
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
     await testRenderer.mockInput.typeText('why is r41 slow?');
     testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
     controller.publish({
       ...controller.state,
       chatConversation: [
@@ -2860,7 +2873,15 @@ class FakeController implements SessionController {
   stop(): Promise<void> {
     return Promise.resolve();
   }
-  submit(value: string): Promise<void> {
+  submitCommand(value: string): Promise<void> {
+    if (!value.trim().startsWith('/')) {
+      this.publish(
+        reportError(this.state, 'Commands start with /. Use Experiment chat for questions.', {
+          scope: 'input',
+        }),
+      );
+      return Promise.resolve();
+    }
     this.submissions.push(value);
     if (value.trim() === '/chat') {
       this.state = {...this.state, chatOpen: true, overlay: null};
@@ -2893,7 +2914,7 @@ class FakeController implements SessionController {
   submitChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text.startsWith('/')) return this.sendChat(value);
-    return this.submit(text);
+    return this.submitCommand(text);
   }
 
   sendChat(value: string): Promise<void> {

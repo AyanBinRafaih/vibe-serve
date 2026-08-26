@@ -9,7 +9,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/help');
+    await controller.submitCommand('/help');
 
     expect(controller.state.overlay?.kind).toBe('help');
     expect(controller.state.overlay?.content).toContain('/open-round');
@@ -17,11 +17,18 @@ describe('session controller', () => {
     expect(transport.requests).toEqual([]);
   });
 
-  it('sends ordinary text to the chat docked beside the log', async () => {
+  it('keeps ordinary text out of commands and accepts it from Experiment chat', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('what is happening?');
+    await controller.submitCommand('what is happening?');
+
+    expect(transport.requests).toEqual([]);
+    expect(controller.state.chatConversation).toEqual([]);
+    expect(controller.state.errorBanner?.message).toContain('Commands start with /');
+
+    controller.dismissErrorBanner();
+    await controller.submitChat('what is happening?');
 
     expect(transport.requests).toEqual([{type: 'query.chat', text: 'what is happening?'}]);
     // The pane is part of the landing view, so nothing opens over the table.
@@ -155,7 +162,7 @@ describe('session controller', () => {
     );
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/resume');
+    await controller.submitCommand('/resume');
 
     expect(controller.state.errorBanner).toMatchObject({
       message: diagnostic.summary,
@@ -211,7 +218,7 @@ describe('session controller', () => {
     );
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
 
     expect(transport.requests).toEqual([{type: 'query.performance'}]);
     // The chart lands beside the transcript, not over it.
@@ -251,7 +258,7 @@ describe('session controller', () => {
     );
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/chat');
+    await controller.submitCommand('/chat');
 
     // Already on screen: /chat puts the pane keys on it instead of opening a
     // modal over the log.
@@ -281,7 +288,7 @@ describe('session controller', () => {
     // A terminal too narrow for two columns, reported by the renderer.
     controller.setChatDockFits(false);
 
-    await controller.submit('what is happening?');
+    await controller.submitChat('what is happening?');
 
     expect(controller.state.chatOpen).toBe(true);
     expect(chatPaneVisible(controller.state)).toBe(false);
@@ -314,12 +321,12 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
 
-    await controller.submit('/help');
+    await controller.submitCommand('/help');
     expect(controller.state.overlay?.content).not.toContain('/chat');
 
     // Inside a hypothesis the chat is a dialog again, so the command returns.
     controller.enterExperimentDrilldown();
-    await controller.submit('/help');
+    await controller.submitCommand('/help');
     expect(controller.state.overlay?.content).toContain('/chat');
   });
 
@@ -333,7 +340,7 @@ describe('session controller', () => {
     controller.enterExperimentDrilldown();
 
     // Asked from the trajectory view, where the chat is a pop-up.
-    await controller.submit('/chat why did r1 fail?');
+    await controller.submitCommand('/chat why did r1 fail?');
     expect(controller.state.chatOpen).toBe(true);
 
     controller.live();
@@ -376,7 +383,7 @@ describe('session controller', () => {
     });
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/chat why?');
+    await controller.submitCommand('/chat why?');
 
     expect(controller.state.chatOpen).toBe(false);
     expect(controller.state.layout.focus).toBe('chat');
@@ -450,7 +457,7 @@ describe('session controller', () => {
     const transport = new FakeTransport([], [], undefined, new Error('Codex exited with code 1'));
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/chat');
+    await controller.submitCommand('/chat');
     await controller.sendChat('what happened?');
 
     expect(controller.state.chatPending).toBe(false);
@@ -473,7 +480,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport, 'solarized-dark');
 
-    await controller.submit('/theme');
+    await controller.submitCommand('/theme');
 
     expect(controller.state.themePicker?.selected).toBe('solarized-dark');
     // The list is a selection, not a text overlay.
@@ -486,7 +493,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/theme');
+    await controller.submitCommand('/theme');
     controller.moveThemeSelection(2);
     controller.applySelectedTheme();
 
@@ -498,7 +505,7 @@ describe('session controller', () => {
   it('closes the picker without switching when it is dismissed', async () => {
     const controller = new SocketSessionController(new FakeTransport(), 'light');
 
-    await controller.submit('/theme');
+    await controller.submitCommand('/theme');
     controller.moveThemeSelection(1);
     controller.closeThemePicker();
 
@@ -509,7 +516,7 @@ describe('session controller', () => {
   it('closes the picker when the selection is the theme already in use', async () => {
     const controller = new SocketSessionController(new FakeTransport(), 'light');
 
-    await controller.submit('/theme');
+    await controller.submitCommand('/theme');
     controller.applySelectedTheme();
 
     expect(controller.state.themeName).toBe('light');
@@ -520,8 +527,8 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/theme');
-    await controller.submit('/theme high-contrast-dark');
+    await controller.submitCommand('/theme');
+    await controller.submitCommand('/theme high-contrast-dark');
 
     expect(controller.state.themeName).toBe('high-contrast-dark');
     expect(controller.state.themePicker).toBeNull();
@@ -546,20 +553,20 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/history');
+    await controller.submitCommand('/history');
     expect(controller.state.errorBanner?.scope).toBe('input');
     expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
 
-    await controller.submit('/history rounds');
+    await controller.submitCommand('/history rounds');
     expect(controller.state.errorBanner?.message).toContain('Unknown command: /history rounds');
 
-    await controller.submit('/experiments');
+    await controller.submitCommand('/experiments');
     expect(controller.state.errorBanner?.message).toContain('Unknown command: /experiments');
 
     controller.dismissErrorBanner();
     expect(controller.state.errorBanner).toBeNull();
 
-    await controller.submit('/history');
+    await controller.submitCommand('/history');
     expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
 
     expect(transport.requests).toEqual([]);
@@ -764,7 +771,7 @@ describe('session controller', () => {
     await controller.start();
     controller.moveExperimentSelection(1);
 
-    await controller.submit('/open-round');
+    await controller.submitCommand('/open-round');
 
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
     // Lands on the hypothesis's latest round: the round view is built around
@@ -786,7 +793,7 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
 
-    await controller.submit('/open-round --3');
+    await controller.submitCommand('/open-round --3');
 
     // Lands on the requested round, inside the hypothesis that owns it, and
     // moves the table selection to match.
@@ -808,7 +815,7 @@ describe('session controller', () => {
       event: {...event(1, 'phase_started'), agent_kind: 'orchestrator', round_label: 'round-9-pre'},
     });
 
-    await controller.submit('/open-round --9');
+    await controller.submitCommand('/open-round --9');
 
     expect(controller.state.hypothesisScope).toMatchObject({id: 'round-9', rounds: [9]});
     expect(controller.state.selectedRound).toBe(9);
@@ -832,7 +839,7 @@ describe('session controller', () => {
   it('reports a round that has not been observed', async () => {
     const controller = new SocketSessionController(new FakeTransport());
 
-    await controller.submit('/open-round --9');
+    await controller.submitCommand('/open-round --9');
 
     expect(controller.state.overlay?.content).toContain('Round 9 has not been recorded.');
     expect(controller.state.hypothesisScope).toBeNull();
@@ -845,9 +852,9 @@ describe('session controller', () => {
     ];
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submit('/open-round');
+    await controller.submitCommand('/open-round');
 
-    await controller.submit('/open-round');
+    await controller.submitCommand('/open-round');
 
     expect(controller.state.overlay?.content).toContain('Already inside H-01');
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-01'});
@@ -860,7 +867,7 @@ describe('session controller', () => {
     );
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
     const before = perfRequests(transport);
 
     transport.emit({type: 'event', event: event(9, 'round_finished')});
@@ -875,7 +882,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
     controller.closePane();
     const before = perfRequests(transport);
 
@@ -895,7 +902,7 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
     await controller.sendChat('why?');
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
 
     controller.closePane();
 
@@ -915,7 +922,7 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
 
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
     await controller.sendChat('what changed in r1?');
 
     // Three columns: chat, log, pane. None of them replaced another.
@@ -933,7 +940,7 @@ describe('session controller', () => {
     });
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
     const pane = controller.state.layout.right;
 
     await controller.sendChat('what regressed?');
@@ -956,7 +963,7 @@ describe('session controller', () => {
   it('runs a slash command typed in the chat through the main input path', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
-    await controller.submit('/chat');
+    await controller.submitCommand('/chat');
     const before = transport.requests.length;
 
     // The performance plot, which is the command that answers in the right
@@ -1002,7 +1009,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/theme monokai');
+    await controller.submitCommand('/theme monokai');
 
     expect(controller.state.errorBanner).toMatchObject({scope: 'input'});
     expect(controller.state.errorBanner?.message).toContain('Unknown theme: monokai');
