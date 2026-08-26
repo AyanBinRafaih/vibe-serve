@@ -1317,6 +1317,12 @@ export interface ErrorReport {
   invocationId?: string | null;
 }
 
+/** Acknowledges the visible diagnostic without changing any run or view state. */
+export function dismissErrorBanner(state: SessionState): SessionState {
+  if (state.errorBanner === null) return state;
+  return {...state, errorBanner: null};
+}
+
 /**
  * Records an error independently of any particular view. A terminal event
  * commonly repeats an invocation failure, so equivalent reports promote the

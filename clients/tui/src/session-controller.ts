@@ -15,6 +15,7 @@ import {
   closePane,
   closeThemePicker,
   cyclePaneFocus,
+  dismissErrorBanner,
   enterExperimentDrilldown,
   enterExperimentRound,
   enterUnownedExperimentRound,
@@ -86,6 +87,7 @@ export interface SessionController {
   openPane(view: PaneView): Promise<void>;
   closePane(): void;
   closeOverlays(): void;
+  dismissErrorBanner(): void;
   cyclePaneFocus(): void;
   focusPane(focus: PaneFocus): void;
   togglePaneZoom(): void;
@@ -312,6 +314,10 @@ export class SocketSessionController implements SessionController {
 
   closeOverlays(): void {
     this.#setState(closeOverlays(this.#state));
+  }
+
+  dismissErrorBanner(): void {
+    this.#setState(dismissErrorBanner(this.#state));
   }
 
   cyclePaneFocus(): void {
