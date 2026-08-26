@@ -52,8 +52,7 @@ export function closeActiveAgentTimings<T extends RoundTimingState>(
   state: T,
   timestamp: string,
 ): T {
-  const activeAgentStarts = state.activeAgentStarts ?? {};
-  const activeIntervals = Object.values(activeAgentStarts).map(startedAt => ({
+  const activeIntervals = Object.values(state.activeAgentStarts ?? {}).map(startedAt => ({
     startedAt,
     finishedAt: timestamp,
   }));
@@ -64,7 +63,8 @@ export function closeActiveAgentTimings<T extends RoundTimingState>(
   };
 }
 
-export function activeTimingElapsedMs(state: RoundTimingState, now = new Date()): number {
+/** The caller supplies time so this selector stays deterministic. */
+export function activeTimingElapsedMs(state: RoundTimingState, now: Date): number {
   const finishedAt = now.toISOString();
   const activeIntervals = Object.values(state.activeAgentStarts ?? {}).map(startedAt => ({
     startedAt,

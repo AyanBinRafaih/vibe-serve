@@ -1,7 +1,7 @@
 import {afterEach, describe, expect, it} from 'bun:test';
 import {CliRenderEvents, InputRenderable, rgbToHex, ScrollBoxRenderable} from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
-import type {HypothesisEntry} from '../protocol.js';
+import type {HypothesisEntry} from '@vibesys/backend-client';
 import type {SessionController} from '../session-controller.js';
 import {
   clearAgentSelection,
@@ -55,26 +55,29 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      agentKind: 'optimizer',
-      roundLabel: 'round 2',
-      phases: [
-        {
-          kind: 'optimizer',
-          status: 'active',
-          roundNumber: null,
-          roundLabel: 'round 2',
-        },
-      ],
-      conversation: [
-        {
-          id: '1',
-          kind: 'assistant',
-          label: 'optimizer · round 2',
-          agentKind: 'optimizer',
-          content: '## Result\n\nUse `fast_path()`.',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        agentKind: 'optimizer',
+        roundLabel: 'round 2',
+        phases: [
+          {
+            kind: 'optimizer',
+            status: 'active',
+            roundNumber: null,
+            roundLabel: 'round 2',
+          },
+        ],
+        transcript: [
+          {
+            id: '1',
+            kind: 'assistant',
+            label: 'optimizer · round 2',
+            agentKind: 'optimizer',
+            content: '## Result\n\nUse `fast_path()`.',
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -154,17 +157,20 @@ describe('OpenTUI presentation', () => {
     const activeStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {number: 1, status: 'completed'},
-        {
-          number: 2,
-          status: 'active',
-          startedAt: activeStartedAt,
-          activeAgentStarts: {'judge:judge-1': activeStartedAt},
-        },
-        {number: 3, status: 'failed'},
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {
+            number: 2,
+            status: 'active',
+            startedAt: activeStartedAt,
+            activeAgentStarts: {'judge:judge-1': activeStartedAt},
+          },
+          {number: 3, status: 'failed'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -186,16 +192,19 @@ describe('OpenTUI presentation', () => {
     const activeStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {
-          number: 2,
-          status: 'active',
-          startedAt: activeStartedAt,
-          activeAgentStarts: {'judge:judge-1': activeStartedAt},
-        },
-      ],
-      phases: [{kind: 'judge', status: 'active', roundNumber: 2, roundLabel: 'round-2-judge'}],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {
+            number: 2,
+            status: 'active',
+            startedAt: activeStartedAt,
+            activeAgentStarts: {'judge:judge-1': activeStartedAt},
+          },
+        ],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 2, roundLabel: 'round-2-judge'}],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -209,13 +218,21 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 150, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
-        {kind: 'implementer', status: 'active', roundNumber: 1, roundLabel: 'round-1-implementer'},
-        {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+          {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -237,43 +254,46 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 140, height: 26});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      activeExecutions: {
-        'judge-1': {
-          executionId: 'judge-1',
-          agentKind: 'judge',
-          roundLabel: 'round-1-judge',
-          roundNumber: 1,
-          stage: 'evaluation',
-          attempt: 1,
-          assignment: 'Evaluate the candidate',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'thinking', summary: 'Checking the diff'},
-        },
-      },
       selectedRound: 1,
-      conversation: [
-        {
-          id: 'e1',
-          kind: 'assistant',
-          label: 'implementer · round-1',
-          content: 'edited the kernel',
-          agentKind: 'implementer',
-          roundNumber: 1,
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        activeExecutions: {
+          'judge-1': {
+            executionId: 'judge-1',
+            agentKind: 'judge',
+            roundLabel: 'round-1-judge',
+            roundNumber: 1,
+            stage: 'evaluation',
+            attempt: 1,
+            assignment: 'Evaluate the candidate',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'thinking', summary: 'Checking the diff'},
+          },
         },
-        {
-          id: 'e2',
-          kind: 'assistant',
-          label: 'judge · round-1',
-          content: 'checking the diff',
-          agentKind: 'judge',
-          roundNumber: 1,
-        },
-      ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant',
+            label: 'implementer · round-1',
+            content: 'edited the kernel',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant',
+            label: 'judge · round-1',
+            content: 'checking the diff',
+            agentKind: 'judge',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -306,28 +326,31 @@ describe('OpenTUI presentation', () => {
     const controller = new FakeController({
       ...base,
       selectedRound: 2,
-      activeExecutions: {
-        implementer: {
-          executionId: 'implementer',
-          agentKind: 'implementer',
-          roundLabel: 'round-2-implementer',
-          roundNumber: 2,
-          stage: 'implementation',
-          attempt: 1,
-          assignment: 'Implement the queue',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'tool', summary: 'Running queue tests', tool: 'Bash'},
-        },
-        reviewer: {
-          executionId: 'reviewer',
-          agentKind: 'reviewer',
-          roundLabel: 'round-2-review',
-          roundNumber: 2,
-          stage: 'review',
-          attempt: 1,
-          assignment: 'Review the diff',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'thinking', summary: 'Inspecting the diff'},
+      core: {
+        ...base.core,
+        activeExecutions: {
+          implementer: {
+            executionId: 'implementer',
+            agentKind: 'implementer',
+            roundLabel: 'round-2-implementer',
+            roundNumber: 2,
+            stage: 'implementation',
+            attempt: 1,
+            assignment: 'Implement the queue',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'tool', summary: 'Running queue tests', tool: 'Bash'},
+          },
+          reviewer: {
+            executionId: 'reviewer',
+            agentKind: 'reviewer',
+            roundLabel: 'round-2-review',
+            roundNumber: 2,
+            stage: 'review',
+            attempt: 1,
+            assignment: 'Review the diff',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'thinking', summary: 'Inspecting the diff'},
+          },
         },
       },
     });
@@ -340,7 +363,13 @@ describe('OpenTUI presentation', () => {
     expect(active).not.toContain('Running queue tests');
     expect(active).not.toContain('Inspecting the diff');
 
-    controller.publish({...controller.state, activeExecutions: {}});
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        activeExecutions: {},
+      },
+    });
     const finished = await frameAfter(testRenderer);
     expect(finished).not.toContain('agents active');
     expect(finished).not.toContain('Running queue tests');
@@ -350,26 +379,29 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {
-          kind: 'implementer',
-          status: 'pending',
-          roundNumber: 1,
-          roundLabel: 'round-1-implementer',
-        },
-      ],
       selectedRound: 1,
       selectedAgentKind: 'implementer',
-      conversation: [
-        {
-          id: 'prompt',
-          kind: 'prompt',
-          content: 'Implement the queue',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {
+            kind: 'implementer',
+            status: 'pending',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+        ],
+        transcript: [
+          {
+            id: 'prompt',
+            kind: 'prompt',
+            content: 'Implement the queue',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -378,17 +410,20 @@ describe('OpenTUI presentation', () => {
 
     controller.publish({
       ...controller.state,
-      activeExecutions: {
-        'impl-1': {
-          executionId: 'impl-1',
-          agentKind: 'implementer',
-          roundLabel: 'round-1-implementer',
-          roundNumber: 1,
-          stage: 'implementation',
-          attempt: 1,
-          assignment: 'Implement the queue',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'responding', summary: 'Editing the queue'},
+      core: {
+        ...controller.state.core,
+        activeExecutions: {
+          'impl-1': {
+            executionId: 'impl-1',
+            agentKind: 'implementer',
+            roundLabel: 'round-1-implementer',
+            roundNumber: 1,
+            stage: 'implementation',
+            attempt: 1,
+            assignment: 'Implement the queue',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'responding', summary: 'Editing the queue'},
+          },
         },
       },
     });
@@ -437,21 +472,24 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
       selectedRound: 1,
       selectedAgentKind: 'implementer',
-      conversation,
-      activeExecutions: {
-        'impl-1': {
-          executionId: 'impl-1',
-          agentKind: 'implementer',
-          roundLabel: 'round-1-implementer',
-          roundNumber: 1,
-          stage: 'implementation',
-          attempt: 1,
-          assignment: 'Implement the queue',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'thinking', summary: 'Thinking'},
+      core: {
+        ...initialSessionState().core,
+        transcript: conversation,
+        rounds: [{number: 1, status: 'active'}],
+        activeExecutions: {
+          'impl-1': {
+            executionId: 'impl-1',
+            agentKind: 'implementer',
+            roundLabel: 'round-1-implementer',
+            roundNumber: 1,
+            stage: 'implementation',
+            attempt: 1,
+            assignment: 'Implement the queue',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'thinking', summary: 'Thinking'},
+          },
         },
       },
     });
@@ -466,16 +504,19 @@ describe('OpenTUI presentation', () => {
     testRenderer.renderer.on(CliRenderEvents.FRAME, captureFrame);
     controller.publish({
       ...controller.state,
-      conversation: [
-        ...conversation,
-        {
-          id: 'new-turn',
-          kind: 'assistant',
-          content: 'newly rendered turn',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...controller.state.core,
+        transcript: [
+          ...conversation,
+          {
+            id: 'new-turn',
+            kind: 'assistant',
+            content: 'newly rendered turn',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     await testRenderer.waitForVisualIdle();
     testRenderer.renderer.off(CliRenderEvents.FRAME, captureFrame);
@@ -504,17 +545,20 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      activeExecutions: {
-        'impl-1': {
-          executionId: 'impl-1',
-          agentKind: 'implementer',
-          roundLabel: 'round-1-implementer',
-          roundNumber: 1,
-          stage: 'implementation',
-          attempt: 1,
-          assignment: 'Implement the queue',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'responding', summary: 'Editing the queue'},
+      core: {
+        ...initialSessionState().core,
+        activeExecutions: {
+          'impl-1': {
+            executionId: 'impl-1',
+            agentKind: 'implementer',
+            roundLabel: 'round-1-implementer',
+            roundNumber: 1,
+            stage: 'implementation',
+            attempt: 1,
+            assignment: 'Implement the queue',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'responding', summary: 'Editing the queue'},
+          },
         },
       },
     });
@@ -532,14 +576,16 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      // A run that announced 100 rounds and has reached 12 of them.
-      maxRounds: 100,
-      rounds: Array.from({length: 12}, (_, index) => ({
-        number: index + 1,
-        status: index === 11 ? ('active' as const) : ('completed' as const),
-      })),
-      phases: [{kind: 'judge', status: 'active', roundNumber: 12, roundLabel: 'round-12-judge'}],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+      core: {
+        ...initialSessionState().core,
+        maxRounds: 100,
+        rounds: Array.from({length: 12}, (_, index) => ({
+          number: index + 1,
+          status: index === 11 ? ('active' as const) : ('completed' as const),
+        })),
+        phases: [{kind: 'judge', status: 'active', roundNumber: 12, roundLabel: 'round-12-judge'}],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -565,30 +611,33 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 150, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
       selectedRound: 1,
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [
-        {
-          id: 'e1',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'edited the kernel',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-        {
-          id: 'e2',
-          kind: 'assistant',
-          label: 'judge',
-          content: 'checking the diff',
-          agentKind: 'judge',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'edited the kernel',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant',
+            label: 'judge',
+            content: 'checking the diff',
+            agentKind: 'judge',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -609,38 +658,41 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 150, height: 26});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
       selectedRound: 1,
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [
-        {
-          id: 'e1',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'edited the kernel',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-        {
-          id: 'e2',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'guarded the tail tile',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-        {
-          id: 'e3',
-          kind: 'assistant',
-          label: 'judge',
-          content: 'checking the diff',
-          agentKind: 'judge',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'edited the kernel',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'guarded the tail tile',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e3',
+            kind: 'assistant',
+            label: 'judge',
+            content: 'checking the diff',
+            agentKind: 'judge',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -682,28 +734,31 @@ describe('OpenTUI presentation', () => {
     const controller = new FakeController({
       ...initialSessionState(),
       experimentLog: null,
-      rounds: [{number: 1, status: 'active'}],
       selectedRound: 1,
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [
-        {
-          id: 'e1',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'edited the kernel',
-          roundNumber: 1,
-        },
-        {
-          id: 'e2',
-          kind: 'assistant',
-          label: 'judge',
-          content: 'checking the diff',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'edited the kernel',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant',
+            label: 'judge',
+            content: 'checking the diff',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -821,13 +876,16 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      maxRounds: 20,
-      rounds: [{number: 1, status: 'completed'}],
-      phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
       selectedRound: 9,
-      conversation: [
-        {id: 'e1', kind: 'assistant', label: 'judge', content: 'done', roundNumber: 1},
-      ],
+      core: {
+        ...initialSessionState().core,
+        maxRounds: 20,
+        rounds: [{number: 1, status: 'completed'}],
+        phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [
+          {id: 'e1', kind: 'assistant', label: 'judge', content: 'done', roundNumber: 1},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -842,13 +900,16 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 130, height: 22});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
       hypothesisScope: {id: 'H-01', label: 'H-01 · r1', rounds: [1]},
       selectedRound: 1,
-      conversation: [
-        {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [
+          {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -869,12 +930,15 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 130, height: 22});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
       selectedRound: 1,
-      conversation: [
-        {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [
+          {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -900,9 +964,12 @@ describe('OpenTUI presentation', () => {
         {id: 'q1', kind: 'user', label: 'You', content: 'what changed?'},
         {id: 'a1', kind: 'assistant', label: 'Answer', content: 'the epilogue was fused'},
       ],
-      rounds: [{number: 1, status: 'active'}],
-      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
       chatOpen: true,
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -925,17 +992,20 @@ describe('OpenTUI presentation', () => {
     });
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        phase('orchestrator', 'completed', 0),
-        phase('implementer', 'completed', 1),
-        phase('implementer', 'active', 2),
-        phase('implementer', 'active', 3),
-        phase('judge', 'pending', 4),
-        phase('judge', 'pending', 5),
-        phase('profiler', 'pending', 6),
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          phase('orchestrator', 'completed', 0),
+          phase('implementer', 'completed', 1),
+          phase('implementer', 'active', 2),
+          phase('implementer', 'active', 3),
+          phase('judge', 'pending', 4),
+          phase('judge', 'pending', 5),
+          phase('profiler', 'pending', 6),
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -954,13 +1024,21 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 30});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
-        {kind: 'implementer', status: 'active', roundNumber: 1, roundLabel: 'round-1-implementer'},
-        {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+          {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -975,19 +1053,22 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {
-          number: 1,
-          status: 'completed',
-          // 60s of wall clock with a 15s gap where no agent was running.
-          agentIntervals: [
-            {startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:30Z'},
-            {startedAt: '2026-01-01T00:00:45Z', finishedAt: '2026-01-01T00:01:00Z'},
-          ],
-        },
-      ],
-      phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {
+            number: 1,
+            status: 'completed',
+            // 60s of wall clock with a 15s gap where no agent was running.
+            agentIntervals: [
+              {startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:30Z'},
+              {startedAt: '2026-01-01T00:00:45Z', finishedAt: '2026-01-01T00:01:00Z'},
+            ],
+          },
+        ],
+        phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1001,9 +1082,12 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'completed'}],
-      phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'completed'}],
+        phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1123,7 +1207,10 @@ describe('OpenTUI presentation', () => {
     const controller = new FakeController({
       ...initialSessionState(),
       overlay: {kind: 'help', content: 'Available commands'},
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1144,7 +1231,10 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
-      conversation: [{id: 'assistant', kind: 'assistant', label: 'Agent', content: lines}],
+      core: {
+        ...initialSessionState().core,
+        transcript: [{id: 'assistant', kind: 'assistant', label: 'Agent', content: lines}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1159,16 +1249,20 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
-      conversation: [
-        {
-          id: 'tool',
-          kind: 'tool',
-          label: 'implementer · round 1',
-          content: '→ Bash(command="pytest")\n2 passed',
-          toolCall: '→ Bash(command="pytest")\n',
-          toolResponse: '2 passed',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: '2 passed',
+            toolName: 'Bash',
+            toolArguments: {command: 'pytest'},
+            toolResult: {kind: 'tool_result', tool: 'Bash', content: '2 passed'},
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1183,7 +1277,10 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      conversation: [{id: 'prompt', kind: 'prompt', label: 'Prompt', content}],
+      core: {
+        ...initialSessionState().core,
+        transcript: [{id: 'prompt', kind: 'prompt', label: 'Prompt', content}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1208,23 +1305,26 @@ describe('OpenTUI presentation', () => {
       ...initialSessionState(),
       selectedRound: 1,
       selectedAgentKind: 'implementer',
-      rounds: [{number: 1, status: 'active'}],
-      conversation: [
-        {
-          id: 'implementer-prompt',
-          kind: 'prompt',
-          agentKind: 'implementer',
-          roundNumber: 1,
-          content: visiblePrompt,
-        },
-        {
-          id: 'judge-prompt',
-          kind: 'prompt',
-          agentKind: 'judge',
-          roundNumber: 1,
-          content: hiddenPrompt,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        transcript: [
+          {
+            id: 'implementer-prompt',
+            kind: 'prompt',
+            agentKind: 'implementer',
+            roundNumber: 1,
+            content: visiblePrompt,
+          },
+          {
+            id: 'judge-prompt',
+            kind: 'prompt',
+            agentKind: 'judge',
+            roundNumber: 1,
+            content: hiddenPrompt,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1244,14 +1344,24 @@ describe('OpenTUI presentation', () => {
       content: `event ${index}`,
     }));
     const testRenderer = await createTestRenderer({width: 100, height: 20});
-    const controller = new FakeController({...initialSessionState(), conversation});
+    const initial = initialSessionState();
+    const controller = new FakeController({
+      ...initial,
+      core: {...initial.core, transcript: conversation},
+    });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
     await testRenderer.waitForFrame(value => value.includes('event 999'));
     const firstCard = testRenderer.renderer.root.findDescendantById('event-entry-0');
     const lastCard = testRenderer.renderer.root.findDescendantById('event-entry-999');
 
-    controller.publish({...controller.state, status: 'paused'});
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        status: 'paused',
+      },
+    });
     expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBe(firstCard);
     expect(testRenderer.renderer.root.findDescendantById('event-entry-999')).toBe(lastCard);
 
@@ -1260,7 +1370,10 @@ describe('OpenTUI presentation', () => {
     const updatedLast = {...previousLast, content: 'updated tail'};
     controller.publish({
       ...controller.state,
-      conversation: [...conversation.slice(0, -1), updatedLast],
+      core: {
+        ...controller.state.core,
+        transcript: [...conversation.slice(0, -1), updatedLast],
+      },
     });
     await testRenderer.waitForFrame(value => value.includes('updated tail'));
     expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBe(firstCard);
@@ -1271,29 +1384,32 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1'},
-      ],
-      rounds: [{number: 1, status: 'active'}],
-      conversation: [
-        {
-          id: 'implementer',
-          kind: 'assistant',
-          label: 'implementer · round 1',
-          agentKind: 'implementer',
-          roundNumber: 1,
-          content: 'edited files',
-        },
-        {
-          id: 'judge',
-          kind: 'assistant',
-          label: 'judge · round 1',
-          agentKind: 'judge',
-          roundNumber: 1,
-          content: 'checking behavior',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1'},
+        ],
+        rounds: [{number: 1, status: 'active'}],
+        transcript: [
+          {
+            id: 'implementer',
+            kind: 'assistant',
+            label: 'implementer · round 1',
+            agentKind: 'implementer',
+            roundNumber: 1,
+            content: 'edited files',
+          },
+          {
+            id: 'judge',
+            kind: 'assistant',
+            label: 'judge · round 1',
+            agentKind: 'judge',
+            roundNumber: 1,
+            content: 'checking behavior',
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1311,19 +1427,22 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      agentKind: 'implementer',
-      todoPhases: [
-        {
-          agentKind: 'implementer',
-          roundNumber: null,
-          items: [
-            {content: 'Profile the hot loop', status: 'completed'},
-            {content: 'Vectorize the kernel', status: 'in_progress'},
-            {content: 'Re-run the benchmark', status: 'pending'},
-          ],
-        },
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        agentKind: 'implementer',
+        todos: [
+          {
+            agentKind: 'implementer',
+            roundNumber: null,
+            items: [
+              {content: 'Profile the hot loop', status: 'completed'},
+              {content: 'Vectorize the kernel', status: 'in_progress'},
+              {content: 'Re-run the benchmark', status: 'pending'},
+            ],
+          },
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1344,15 +1463,18 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      agentKind: 'judge',
-      todoPhases: [
-        {
-          agentKind: 'implementer',
-          roundNumber: null,
-          items: [{content: 'Edit files', status: 'completed'}],
-        },
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        agentKind: 'judge',
+        todos: [
+          {
+            agentKind: 'implementer',
+            roundNumber: null,
+            items: [{content: 'Edit files', status: 'completed'}],
+          },
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1366,17 +1488,20 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'failed',
-      terminal: true,
-      conversation: [
-        {
-          id: 'configuration-error',
-          kind: 'result',
-          label: 'Configuration failed',
-          content: 'Invalid --max-rounds value',
-          tone: 'failure',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'failed',
+        terminal: true,
+        transcript: [
+          {
+            id: 'configuration-error',
+            kind: 'result',
+            label: 'Configuration failed',
+            content: 'Invalid --max-rounds value',
+            tone: 'failure',
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1397,17 +1522,20 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'failed',
-      terminal: true,
-      conversation: [
-        {
-          id: 'configuration-error',
-          kind: 'result',
-          label: 'Configuration failed',
-          content: 'agent.toml was not found',
-          tone: 'failure',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'failed',
+        terminal: true,
+        transcript: [
+          {
+            id: 'configuration-error',
+            kind: 'result',
+            label: 'Configuration failed',
+            content: 'agent.toml was not found',
+            tone: 'failure',
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1482,8 +1610,11 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 20});
     const controller = new FakeController({
       ...initialSessionState('light'),
-      status: 'running',
-      conversation: [assistantEntry],
+      core: {
+        ...initialSessionState('light').core,
+        status: 'running',
+        transcript: [assistantEntry],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1500,8 +1631,11 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      conversation: [assistantEntry],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        transcript: [assistantEntry],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1519,8 +1653,11 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      conversation: [assistantEntry],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        transcript: [assistantEntry],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1541,11 +1678,14 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {number: 1, status: 'completed'},
-        {number: 2, status: 'active'},
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'active'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1577,7 +1717,10 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1677,24 +1820,27 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 36});
     const controller = new FakeController({
       ...initialSessionState('high-contrast-light'),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
-        {kind: 'judge', status: 'failed', roundNumber: 1, roundLabel: 'round-1'},
-        {kind: 'profiler', status: 'cancelled', roundNumber: 1, roundLabel: 'round-1'},
-        {kind: 'reviewer', status: 'interrupted', roundNumber: 1, roundLabel: 'round-1'},
-      ],
-      todoPhases: [
-        {
-          agentKind: null,
-          roundNumber: null,
-          items: [
-            {content: 'write the kernel', status: 'completed'},
-            {content: 'benchmark it', status: 'in_progress'},
-          ],
-        },
-      ],
       todosExpanded: true,
+      core: {
+        ...initialSessionState('high-contrast-light').core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
+          {kind: 'judge', status: 'failed', roundNumber: 1, roundLabel: 'round-1'},
+          {kind: 'profiler', status: 'cancelled', roundNumber: 1, roundLabel: 'round-1'},
+          {kind: 'reviewer', status: 'interrupted', roundNumber: 1, roundLabel: 'round-1'},
+        ],
+        todos: [
+          {
+            agentKind: null,
+            roundNumber: null,
+            items: [
+              {content: 'write the kernel', status: 'completed'},
+              {content: 'benchmark it', status: 'in_progress'},
+            ],
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1715,16 +1861,19 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 22});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 41, status: 'completed'}],
-      conversation: [
-        {
-          id: 'a',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'round 41 detail',
-          roundNumber: 41,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 41, status: 'completed'}],
+        transcript: [
+          {
+            id: 'a',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'round 41 detail',
+            roundNumber: 41,
+          },
+        ],
+      },
     });
     // The landing view is what a fresh client starts on.
     controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
@@ -1755,28 +1904,37 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {number: 41, status: 'completed'},
-        {number: 42, status: 'completed'},
-        {number: 43, status: 'completed'},
-      ],
-      conversation: [
-        {
-          id: 'a',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'unrelated round 41',
-          roundNumber: 41,
-        },
-        {
-          id: 'b',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'grew the block',
-          roundNumber: 42,
-        },
-        {id: 'c', kind: 'assistant', label: 'judge', content: 'regression found', roundNumber: 43},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 41, status: 'completed'},
+          {number: 42, status: 'completed'},
+          {number: 43, status: 'completed'},
+        ],
+        transcript: [
+          {
+            id: 'a',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'unrelated round 41',
+            roundNumber: 41,
+          },
+          {
+            id: 'b',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'grew the block',
+            roundNumber: 42,
+          },
+          {
+            id: 'c',
+            kind: 'assistant',
+            label: 'judge',
+            content: 'regression found',
+            roundNumber: 43,
+          },
+        ],
+      },
     });
     controller.experiments = [
       logEntry('H-07', 41, 41, {
@@ -2575,16 +2733,19 @@ describe('theming', () => {
     const planningStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      phases: [
-        {
-          kind: 'orchestrator',
-          status: 'active',
-          roundNumber: 1,
-          roundLabel: 'round-1-pre',
-          startedAt: planningStartedAt,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-pre',
+            startedAt: planningStartedAt,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -2605,13 +2766,18 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      rounds: [{number: 1, status: 'completed'}],
-      phases: [{kind: 'orchestrator', status: 'active', roundNumber: 2, roundLabel: 'round-2-pre'}],
-      conversation: [
-        {id: 'r1', kind: 'assistant', content: 'earlier unassociated turn', roundNumber: 1},
-        {id: 'r2', kind: 'assistant', content: 'planning turn', roundNumber: 2},
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        rounds: [{number: 1, status: 'completed'}],
+        phases: [
+          {kind: 'orchestrator', status: 'active', roundNumber: 2, roundLabel: 'round-2-pre'},
+        ],
+        transcript: [
+          {id: 'r1', kind: 'assistant', content: 'earlier unassociated turn', roundNumber: 1},
+          {id: 'r2', kind: 'assistant', content: 'planning turn', roundNumber: 2},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -2632,11 +2798,14 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 7, status: 'completed'}],
-      conversation: [
-        {id: 'r6', kind: 'assistant', content: 'other round', roundNumber: 6},
-        {id: 'r7', kind: 'assistant', content: 'unindexed turn', roundNumber: 7},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 7, status: 'completed'}],
+        transcript: [
+          {id: 'r6', kind: 'assistant', content: 'other round', roundNumber: 6},
+          {id: 'r7', kind: 'assistant', content: 'unindexed turn', roundNumber: 7},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -2662,10 +2831,13 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      phases: [
-        {kind: 'orchestrator', status: 'active', roundNumber: 42, roundLabel: 'round-42-plan'},
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        phases: [
+          {kind: 'orchestrator', status: 'active', roundNumber: 42, roundLabel: 'round-42-plan'},
+        ],
+      },
     });
     controller.experiments = [logEntry('H-07', 41, 41, {claim: 'batch the prefill step'})];
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -2684,15 +2856,18 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      rounds: [
-        {number: 4, status: 'completed'},
-        {number: 2, status: 'completed'},
-        {number: 5, status: 'active'},
-      ],
-      phases: [
-        {kind: 'orchestrator', status: 'active', roundNumber: 5, roundLabel: 'round-5-plan'},
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        rounds: [
+          {number: 4, status: 'completed'},
+          {number: 2, status: 'completed'},
+          {number: 5, status: 'active'},
+        ],
+        phases: [
+          {kind: 'orchestrator', status: 'active', roundNumber: 5, roundLabel: 'round-5-plan'},
+        ],
+      },
     });
     controller.experiments = [
       logEntry('H-03', 3, 3, {claim: 'third'}),
@@ -2718,10 +2893,13 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      phases: [
-        {kind: 'profiler', status: 'active', roundNumber: 1, roundLabel: 'round-1-profiler'},
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        phases: [
+          {kind: 'profiler', status: 'active', roundNumber: 1, roundLabel: 'round-1-profiler'},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -2753,8 +2931,11 @@ async function frameAfterEscape(testRenderer: TestRendererSetup): Promise<string
 function logController(): FakeController {
   const controller = new FakeController({
     ...initialSessionState(),
-    status: 'running',
-    rounds: [{number: 41, status: 'completed'}],
+    core: {
+      ...initialSessionState().core,
+      status: 'running',
+      rounds: [{number: 41, status: 'completed'}],
+    },
   });
   controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
   controller.experiments = [
@@ -2771,17 +2952,20 @@ function logController(): FakeController {
 function splitController(): FakeController {
   const controller = new FakeController({
     ...initialSessionState(),
-    status: 'running',
-    rounds: [{number: 7, status: 'active'}],
-    conversation: [
-      {
-        id: 'a',
-        kind: 'assistant',
-        label: 'implementer · round 7',
-        content: 'batched the prefill step',
-        roundNumber: 7,
-      },
-    ],
+    core: {
+      ...initialSessionState().core,
+      status: 'running',
+      rounds: [{number: 7, status: 'active'}],
+      transcript: [
+        {
+          id: 'a',
+          kind: 'assistant',
+          label: 'implementer · round 7',
+          content: 'batched the prefill step',
+          roundNumber: 7,
+        },
+      ],
+    },
   });
   controller.paneContent = 'Performance · tok_s\n    1135 ┤   ●\nbest r7 1135 tok_s';
   return controller;
@@ -2958,9 +3142,9 @@ class FakeController implements SessionController {
     const current = this.state.selectedAgentKind;
     const visibleRound =
       this.state.selectedRound ??
-      this.state.rounds.find(round => round.status === 'active')?.number ??
+      this.state.core.rounds.find(round => round.status === 'active')?.number ??
       null;
-    const phases = this.state.phases.filter(phase => phase.roundNumber === visibleRound);
+    const phases = this.state.core.phases.filter(phase => phase.roundNumber === visibleRound);
     const index = current === null ? -1 : phases.findIndex(phase => phase.kind === current);
     const next = phases[(index + 1 + phases.length) % phases.length];
     this.state = {...this.state, selectedAgentKind: next?.kind ?? null, overlay: null};

@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import stat
+from pathlib import PureWindowsPath
 from typing import TYPE_CHECKING, Never, cast
 
 from release_versions import (
@@ -25,6 +26,10 @@ _REQUIRED_FILES = (
     "app/dist/launcher.js",
     "app/dist/self-test.js",
     "app/package.json",
+    "app/node_modules/@vibesys/backend-client/package.json",
+    "app/node_modules/@vibesys/backend-client/dist/index.js",
+    "app/node_modules/@vibesys/core-state/package.json",
+    "app/node_modules/@vibesys/core-state/dist/index.js",
     "app/node_modules/@opentui/core/index.js",
     "licenses/BUN-LICENSE.md",
     "licenses/opentui-core.txt",
@@ -112,6 +117,7 @@ def _validate_payload_version(
         raise error from exc
     if not isinstance(document, dict) or not isinstance(document.get("version"), str):
         _fail("TUI payload app/package.json must declare version as a string")
+    _validate_portable_dependencies(cast("dict[str, object]", document))
     package_version = cast("str", document["version"])
     package_identity = _npm_identity(package_version, source="TUI payload package.json version")
     manifest_identity = _npm_identity(manifest_version, source="TUI payload manifest version")
@@ -134,6 +140,18 @@ def _validate_payload_version(
             f"TUI payload version {manifest_version!r} does not match Python distribution "
             f"version {expected_distribution_version!r}"
         )
+
+
+def _validate_portable_dependencies(document: dict[str, object]) -> None:
+    raw_dependencies = document.get("dependencies", {})
+    if not isinstance(raw_dependencies, dict):
+        _fail("TUI payload app/package.json dependencies must be an object")
+    for name, value in raw_dependencies.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            _fail("TUI payload app/package.json dependencies must contain strings")
+        is_windows_absolute = PureWindowsPath(value).is_absolute()
+        if "file:" in value or value.startswith(("/", "\\", "./", "../")) or is_windows_absolute:
+            _fail(f"TUI payload dependency {name!r} contains a local path")
 
 
 def _npm_identity(raw: str, *, source: str) -> ReleaseIdentity:

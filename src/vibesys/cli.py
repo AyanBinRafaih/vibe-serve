@@ -43,6 +43,12 @@ _MIN_NODE_MAJOR = 20
 #: Files and directories whose changes trigger a source-TUI rebuild, relative to
 #: the repository root. Mirrors the staleness check the old ``./vs`` script used.
 _REBUILD_WATCH_FILES: tuple[str, ...] = (
+    "clients/backend-client/package.json",
+    "clients/backend-client/tsconfig.json",
+    "clients/backend-client/tsconfig.check.json",
+    "clients/core-state/package.json",
+    "clients/core-state/tsconfig.json",
+    "clients/core-state/tsconfig.check.json",
     "clients/tui/package.json",
     "clients/tui/tsconfig.json",
     "clients/tui/tsconfig.check.json",
@@ -51,7 +57,12 @@ _REBUILD_WATCH_FILES: tuple[str, ...] = (
     "pnpm-workspace.yaml",
     "biome.json",
 )
-_REBUILD_WATCH_DIRS: tuple[str, ...] = ("clients/tui/src", "src/vibesys/server")
+_REBUILD_WATCH_DIRS: tuple[str, ...] = (
+    "clients/backend-client/src",
+    "clients/core-state/src",
+    "clients/tui/src",
+    "src/vibesys/server",
+)
 
 
 @dataclass(frozen=True)
@@ -228,8 +239,8 @@ def _ensure_source_tui_built(root: Path) -> bool:
     print("vibesys: building the interactive client...", file=sys.stderr)  # noqa: T201  # tracked: #288
     steps = (
         [*pnpm, "install", "--frozen-lockfile"],
-        [*pnpm, "--dir", "clients/tui", "generate:protocol"],
-        [*pnpm, "--dir", "clients/tui", "build"],
+        [*pnpm, "--dir", "clients/backend-client", "generate:protocol"],
+        [*pnpm, "build:clients"],
     )
     for command in steps:
         result = subprocess.run(  # noqa: S603  # tracked: #288

@@ -70,8 +70,24 @@ def _fake_deployment(destination: Path) -> None:
     (destination / "dist" / "launcher.js.map").write_text("{}\n")
     (destination / "dist" / "self-test.js").write_text("// self-test\n")
     (destination / "package.json").write_text(
-        json.dumps({"name": "@vibesys/tui", "version": "0.1.0"})
+        json.dumps(
+            {
+                "name": "@vibesys/tui",
+                "version": "0.1.0",
+                "dependencies": {
+                    "@vibesys/backend-client": "@vibesys/backend-client@file:///build/backend",
+                    "@vibesys/core-state": "@vibesys/core-state@file:///build/core",
+                },
+            }
+        )
     )
+    for package in ("backend-client", "core-state"):
+        workspace_package = destination / "node_modules" / "@vibesys" / package
+        (workspace_package / "dist").mkdir(parents=True)
+        (workspace_package / "package.json").write_text(
+            json.dumps({"name": f"@vibesys/{package}", "version": "0.1.0"})
+        )
+        (workspace_package / "dist" / "index.js").write_text(f"// {package}\n")
     opentui = destination / "node_modules" / "@opentui"
     (opentui / "core").mkdir(parents=True)
     (opentui / "core" / "index.js").write_text("// core\n")
@@ -106,6 +122,7 @@ def test_build_release_wheel_assembles_payload_without_mutating_node_modules(tmp
             payload_snapshot["files"] = {
                 path.relative_to(payload).as_posix() for path in payload.rglob("*")
             }
+            payload_snapshot["package"] = json.loads((payload / "app" / "package.json").read_text())
             wheel = output / "vibesys-0.1.0-py3-none-manylinux_2_28_x86_64.whl"
             wheel.parent.mkdir(parents=True, exist_ok=True)
             wheel.write_bytes(b"wheel")
@@ -127,7 +144,7 @@ def test_build_release_wheel_assembles_payload_without_mutating_node_modules(tmp
     assert sentinel.read_text() == "untouched\n"
     commands = [call[0] for call in calls]
     assert ["pnpm", "install", "--frozen-lockfile"] in commands
-    assert ["pnpm", "--dir", "clients/tui", "build"] in commands
+    assert ["pnpm", "build:clients"] in commands
     deploy = next(command for command in commands if "deploy" in command)
     assert "--prod" in deploy
     assert "--legacy" not in deploy
@@ -143,6 +160,15 @@ def test_build_release_wheel_assembles_payload_without_mutating_node_modules(tmp
     assert "app/dist/launcher.js.map" not in files
     assert "app/node_modules/@opentui/core-linux-x64" in files
     assert "app/node_modules/@opentui/core-linux-arm64" not in files
+    assert "app/node_modules/@vibesys/backend-client/dist/index.js" in files
+    assert "app/node_modules/@vibesys/core-state/dist/index.js" in files
+    package = payload_snapshot["package"]
+    assert isinstance(package, dict)
+    assert package["dependencies"] == {
+        "@vibesys/backend-client": "0.1.0",
+        "@vibesys/core-state": "0.1.0",
+    }
+    assert "file://" not in json.dumps(package)
 
 
 def test_build_release_wheel_resolves_caller_relative_paths(

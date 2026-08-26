@@ -1,5 +1,5 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
-import type {HypothesisEntry} from '../protocol.js';
+import type {HypothesisEntry} from '@vibesys/backend-client';
 import type {SessionController} from '../session-controller.js';
 import {
   type ExperimentIndexItem,

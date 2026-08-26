@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'bun:test';
-import type {ActiveAgentExecution} from '../session-model.js';
+import type {ActiveAgentExecution} from '@vibesys/core-state';
 import {activitySummary} from './activity-bar.js';
 
 const STARTED_AT = '2026-08-25T12:00:00.000Z';

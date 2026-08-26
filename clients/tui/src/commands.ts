@@ -1,4 +1,4 @@
-import type {RequestInput} from './protocol.js';
+import type {RequestInput} from '@vibesys/backend-client';
 import type {PaneView} from './session-model.js';
 import {isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 

@@ -8,7 +8,7 @@ import {
 import type {SessionController} from '../session-controller.js';
 import type {ConversationEntry, SessionState} from '../session-model.js';
 import {visibleConversation} from '../session-model.js';
-import {promptPreview, toolOutputPreview} from './previews.js';
+import {promptPreview, toolCallPreview, toolOutputPreview} from './previews.js';
 import {entryPalette} from './styles.js';
 import type {Theme} from './theme.js';
 
@@ -224,7 +224,11 @@ export class ConversationView {
       (entry.kind === 'assistant' || entry.kind === 'prompt' || entry.kind === 'user')
     ) {
       this.#renderMarkdownEntry(card, entry);
-    } else if (entry.kind === 'tool' && entry.toolCall) {
+    } else if (
+      entry.kind === 'tool' &&
+      (entry.toolCall !== undefined ||
+        (entry.toolName !== undefined && entry.toolArguments !== undefined))
+    ) {
       this.#renderToolTurn(card, entry);
     } else {
       const prompt =
@@ -263,7 +267,7 @@ export class ConversationView {
         content: preview.content,
         syntaxStyle: this.#markdownStyle,
         conceal: true,
-        streaming: !this.controller.state.terminal,
+        streaming: !this.controller.state.core.terminal,
         width: '100%',
       }),
     );
@@ -281,18 +285,23 @@ export class ConversationView {
   }
 
   #renderToolTurn(card: BoxRenderable, entry: ConversationEntry): void {
+    const toolCall =
+      entry.toolName !== undefined && entry.toolArguments !== undefined
+        ? toolCallPreview(entry.toolName, entry.toolArguments)
+        : (entry.toolCall ?? '');
+    const toolResponse = entry.toolResult?.content ?? entry.toolResponse;
     card.add(
       new TextRenderable(this.renderer, {
-        content: entry.toolCall?.trimEnd() ?? '',
+        content: toolCall.trimEnd(),
         fg: this.#theme.toolCall.foreground,
         bg: this.#theme.toolCall.background,
         width: '100%',
       }),
     );
-    if (entry.toolResponse) {
+    if (toolResponse) {
       card.add(
         new TextRenderable(this.renderer, {
-          content: toolOutputPreview(entry.toolResponse),
+          content: toolOutputPreview(toolResponse),
           fg: this.#theme.toolResult.foreground,
           bg: this.#theme.toolResult.background,
           width: '100%',

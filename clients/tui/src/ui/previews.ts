@@ -1,5 +1,18 @@
 const MAX_TOOL_OUTPUT_LINES = 12;
 const MAX_PROMPT_LINES = 12;
+const MAX_TOOL_ARG_LENGTH = 80;
+
+export function toolCallPreview(tool: string, args: Record<string, unknown>): string {
+  const parts = Object.entries(args).map(([key, value]) => {
+    const stringValue = typeof value === 'string';
+    let rendered = stringValue ? value : (JSON.stringify(value) ?? String(value));
+    if (rendered.length > MAX_TOOL_ARG_LENGTH) {
+      rendered = `${rendered.slice(0, MAX_TOOL_ARG_LENGTH)}...`;
+    }
+    return stringValue ? `${key}="${rendered}"` : `${key}=${rendered}`;
+  });
+  return `→ ${tool}(${parts.join(', ')})\n`;
+}
 
 export function toolOutputPreview(content: string, maxLines = MAX_TOOL_OUTPUT_LINES): string {
   const lines = content.split('\n');

@@ -1,5 +1,5 @@
-import type {ProtocolResponse, RunEvent} from './protocol.js';
-import {roundNumberFromLabel} from './run-map.js';
+import type {ProtocolResponse, RunEvent} from '@vibesys/backend-client';
+import {roundNumberFromLabel} from '@vibesys/core-state';
 
 interface PerfPoint {
   round: number;

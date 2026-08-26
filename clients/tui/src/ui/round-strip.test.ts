@@ -1,5 +1,5 @@
 import {describe, expect, test} from 'bun:test';
-import type {RoundSummary} from '../run-map.js';
+import type {RoundSummary} from '@vibesys/core-state';
 import {stripWindow} from './round-strip.js';
 
 function rounds(count: number): RoundSummary[] {

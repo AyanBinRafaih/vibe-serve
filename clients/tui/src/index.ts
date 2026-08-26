@@ -1,6 +1,6 @@
 import {writeFile} from 'node:fs/promises';
 import {createCliRenderer} from '@opentui/core';
-import {SupervisionClient} from './client.js';
+import {SupervisionClient} from '@vibesys/backend-client';
 import {runTuiSession} from './runtime.js';
 import {SocketSessionController} from './session-controller.js';
 import {createOpenTuiApp} from './ui/app.js';

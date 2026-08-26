@@ -1,7 +1,13 @@
-import {type EventSubscription, SupervisionError} from './client.js';
+import {
+  type EventSubscription,
+  type ProtocolResponse,
+  type RequestInput,
+  type RunEvent,
+  type ServerMessage,
+  SupervisionError,
+} from '@vibesys/backend-client';
 import {helpText, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
-import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
 import {
   applyActiveExecutionCheckpoint,
   applyEvent,
@@ -25,6 +31,7 @@ import {
   focusRound,
   initialSessionState,
   leaveExperimentDrilldown,
+  markEventStreamUnavailable,
   moveExperimentSelection,
   moveThemeSelection,
   normalizeFocus,
@@ -155,15 +162,17 @@ export class SocketSessionController implements SessionController {
           // A terminal event already carries the actual outcome. The socket
           // closing afterward is lifecycle cleanup, not a second failure that
           // should replace the useful diagnostic in the banner.
-          if (!this.#state.terminal && !this.#streamProtocolError) {
+          if (!this.#state.core.terminal && !this.#streamProtocolError) {
             this.#setState(
-              reportCaughtError({...this.#state, activeExecutions: {}}, error, 'transport'),
+              reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
             );
           }
         },
       );
     } catch (error) {
-      this.#setState(reportCaughtError({...this.#state, activeExecutions: {}}, error, 'transport'));
+      this.#setState(
+        reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
+      );
     }
   }
 
@@ -581,7 +590,7 @@ export class SocketSessionController implements SessionController {
     if (message.type === 'protocol_error') {
       this.#streamProtocolError = true;
       this.#setState(
-        reportError({...this.#state, activeExecutions: {}}, message.message, {
+        reportError(markEventStreamUnavailable(this.#state), message.message, {
           scope: 'protocol',
           diagnostic: message.diagnostic ?? null,
         }),

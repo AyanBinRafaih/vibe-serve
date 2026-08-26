@@ -272,6 +272,17 @@ def test_sdist_contains_evaluator_packages_without_local_build_outputs(tmp_path:
 
     assert "resources/evaluators/queue/vibesys.evaluator.toml" in members
     assert "resources/evaluators/microservice/vibesys.evaluator.toml" in members
+    assert "clients/backend-client/src/index.ts" in members
+    assert "clients/core-state/src/index.ts" in members
+    assert "clients/tui/src/index.ts" in members
+    assert "clients/backend-client/package.json" in members
+    assert "clients/core-state/package.json" in members
+    assert "clients/tui/package.json" in members
+    assert "pnpm-lock.yaml" in members
+    assert "tsconfig.architecture.json" in members
+    assert ".dependency-cruiser.cjs" in members
+    assert "scripts/check_ts_architecture.test.mjs" in members
+    assert "scripts/check_ts_package_manifests.mjs" in members
     assert not any(
         member.startswith("resources/evaluators/") and "/target/" in member for member in members
     )

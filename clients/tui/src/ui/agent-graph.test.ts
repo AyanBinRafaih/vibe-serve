@@ -1,5 +1,5 @@
 import {describe, expect, test} from 'bun:test';
-import type {AgentPhase} from '../run-map.js';
+import type {AgentPhase} from '@vibesys/core-state';
 import {graphPaneBounds, layoutAgentGraph, NODE_HEIGHT, stageKinds} from './agent-graph.js';
 
 function phase(kind: string, status: AgentPhase['status'], roundNumber = 1): AgentPhase {

@@ -1,6 +1,12 @@
 import {describe, expect, it} from 'bun:test';
-import {type EventSubscription, SupervisionError} from './client.js';
-import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
+import {
+  type EventSubscription,
+  type ProtocolResponse,
+  type RequestInput,
+  type RunEvent,
+  type ServerMessage,
+  SupervisionError,
+} from '@vibesys/backend-client';
 import {SocketSessionController, type SupervisionTransport} from './session-controller.js';
 import {chatPaneVisible, experimentLogVisible} from './session-model.js';
 
@@ -49,8 +55,10 @@ describe('session controller', () => {
     transport.emit({type: 'event_batch', events: [event(1, 'agent_output_chunk', 'one\n')]});
     transport.emit({type: 'event', event: event(2, 'agent_output_chunk', 'two\n')});
 
-    expect(controller.state.conversation.map(entry => entry.content).join('')).toBe('one\ntwo\n');
-    expect(controller.state.sequence).toBe(2);
+    expect(controller.state.core.transcript.map(entry => entry.content).join('')).toBe(
+      'one\ntwo\n',
+    );
+    expect(controller.state.core.sequence).toBe(2);
     await controller.stop();
     expect(transport.closed).toBe(true);
   });
@@ -90,9 +98,9 @@ describe('session controller', () => {
       active_executions: [],
     });
 
-    expect(controller.state.sequence).toBe(2);
-    expect(controller.state.conversation.at(-1)?.content).toBe('persisted output\n');
-    expect(controller.state.activeExecutions).toEqual({});
+    expect(controller.state.core.sequence).toBe(2);
+    expect(controller.state.core.transcript.at(-1)?.content).toBe('persisted output\n');
+    expect(controller.state.core.activeExecutions).toEqual({});
   });
 
   it('keeps terminal state when the stream closes after completion', async () => {
@@ -102,12 +110,12 @@ describe('session controller', () => {
     transport.emit({type: 'event', event: event(1, 'run_finished')});
     transport.disconnect(new Error('closed'));
 
-    expect(controller.state.status).toBe('completed');
+    expect(controller.state.core.status).toBe('completed');
     expect(controller.state.overlay).toBeNull();
     expect(controller.state.errorBanner).toBeNull();
   });
 
-  it('clears active executions when the event stream disconnects unexpectedly', async () => {
+  it('preserves backend execution state but suppresses live activity after a disconnect', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
@@ -135,11 +143,12 @@ describe('session controller', () => {
         },
       },
     });
-    expect(controller.state.activeExecutions['impl-1']).toBeDefined();
+    expect(controller.state.core.activeExecutions['impl-1']).toBeDefined();
 
     transport.disconnect(new Error('Supervision event stream disconnected'));
 
-    expect(controller.state.activeExecutions).toEqual({});
+    expect(controller.state.core.activeExecutions['impl-1']).toBeDefined();
+    expect(controller.state.eventStreamAvailable).toBe(false);
     expect(controller.state.errorBanner).toMatchObject({scope: 'transport'});
   });
 
