@@ -9,6 +9,7 @@ import {
   closePane,
   closeThemePicker,
   cyclePaneFocus,
+  dismissErrorBanner,
   enterExperimentDrilldown,
   enterExperimentRound,
   enterUnownedExperimentRound,
@@ -25,6 +26,7 @@ import {
   openChat,
   openPane,
   openThemePicker,
+  reportError,
   selectExperimentActivity,
   selectNextAgent,
   selectNextRound,
@@ -597,6 +599,20 @@ describe('session event model', () => {
       severity: 'fatal',
       count: 2,
     });
+  });
+
+  it('dismisses an error without changing session state or suppressing later errors', () => {
+    const state = reportError({...initialSessionState(), selectedRound: 2}, 'The request failed.', {
+      scope: 'request',
+    });
+    const dismissed = dismissErrorBanner(state);
+
+    expect(dismissed.errorBanner).toBeNull();
+    expect(dismissed.selectedRound).toBe(2);
+    expect(dismissErrorBanner(dismissed)).toBe(dismissed);
+    expect(
+      reportError(dismissed, 'A later failure.', {scope: 'transport'}).errorBanner,
+    ).toMatchObject({message: 'A later failure.', scope: 'transport'});
   });
 
   it('prefers structured diagnostics and deduplicates their ids across terminal events', () => {

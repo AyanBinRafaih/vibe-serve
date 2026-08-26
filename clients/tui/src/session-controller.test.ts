@@ -556,6 +556,12 @@ describe('session controller', () => {
     await controller.submit('/experiments');
     expect(controller.state.errorBanner?.message).toContain('Unknown command: /experiments');
 
+    controller.dismissErrorBanner();
+    expect(controller.state.errorBanner).toBeNull();
+
+    await controller.submit('/history');
+    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
+
     expect(transport.requests).toEqual([]);
   });
 

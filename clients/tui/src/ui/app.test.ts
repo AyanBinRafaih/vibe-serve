@@ -10,6 +10,7 @@ import {
   closePane,
   closeThemePicker,
   cyclePaneFocus,
+  dismissErrorBanner,
   enterExperimentDrilldown,
   enterExperimentRound,
   enterUnownedExperimentRound,
@@ -88,30 +89,32 @@ describe('OpenTUI presentation', () => {
     expect(frame).toContain('Type a question or /help');
   });
 
-  it('keeps a fatal error visible above the empty experiment log', async () => {
+  it('shows and dismisses a fatal error above the empty experiment log', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 24});
     const controller = new FakeController(initialSessionState());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    const fatalBanner: NonNullable<SessionState['errorBanner']> = {
+      title: 'Run failed',
+      message: 'RuntimeError: app-server initialization was denied\nOperation not permitted',
+      detail: 'The run server exited before accepting a client.',
+      hint: 'Check the startup log and retry.',
+      diagnosticId: 'diagnostic-1',
+      severity: 'fatal',
+      scope: 'run',
+      agentKind: 'orchestrator',
+      roundLabel: 'round-1-pre',
+      invocationId: null,
+      count: 1,
+    };
     controller.publish({
       ...controller.state,
       experimentLog: {entries: [], selectedId: null, pending: false, error: null},
-      errorBanner: {
-        title: 'Run failed',
-        message: 'RuntimeError: app-server initialization was denied\nOperation not permitted',
-        detail: 'The run server exited before accepting a client.',
-        hint: 'Check the startup log and retry.',
-        diagnosticId: 'diagnostic-1',
-        severity: 'fatal',
-        scope: 'run',
-        agentKind: 'orchestrator',
-        roundLabel: 'round-1-pre',
-        invocationId: null,
-        count: 1,
-      },
+      errorBanner: fatalBanner,
     });
 
-    const frame = await testRenderer.waitForFrame(value =>
+    let frame = await testRenderer.waitForFrame(value =>
       value.includes('app-server initialization was denied'),
     );
     expect(frame).toContain('Run failed · orchestrator · round-1-pre');
@@ -120,7 +123,29 @@ describe('OpenTUI presentation', () => {
     expect(frame).toContain('Hint: Check the startup log and retry.');
     expect(frame).toContain('Experiments');
 
-    expect(frame).toContain('Ctrl+PgUp/PgDn: scroll');
+    expect(frame).toContain('[× Dismiss] · Esc: dismiss · Ctrl+PgUp/PgDn: scroll');
+
+    const lines = frame.split('\n');
+    const row = lines.findIndex(line => line.includes('[× Dismiss]'));
+    const column = (lines[row]?.indexOf('[× Dismiss]') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.errorBanner).toBeNull();
+    expect(frame).not.toContain('app-server initialization was denied');
+    expect(frame).toContain('Experiments');
+
+    controller.publish({
+      ...controller.state,
+      errorBanner: {...fatalBanner, title: 'Request failed', message: 'A later failure.'},
+    });
+    frame = await testRenderer.waitForFrame(value => value.includes('A later failure.'));
+    expect(frame).toContain('Esc: dismiss');
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    frame = await frameAfterEscape(testRenderer);
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(frame).not.toContain('A later failure.');
   });
 
   it('renders quiet round labels without status text or symbols', async () => {
@@ -2988,6 +3013,9 @@ class FakeController implements SessionController {
   }
   closeOverlays(): void {
     this.publish(closeOverlays(this.state));
+  }
+  dismissErrorBanner(): void {
+    this.publish(dismissErrorBanner(this.state));
   }
   cyclePaneFocus(): void {
     this.publish(cyclePaneFocus(this.state));

@@ -134,7 +134,7 @@ export function createOpenTuiApp(
   let markdownStyle = createMarkdownStyle(theme);
   const roundStrip = new RoundStripView(renderer, controller, theme);
   const todoStrip = new TodoStripView(renderer, controller, theme);
-  const errorBanner = new ErrorBannerView(renderer, theme);
+  const errorBanner = new ErrorBannerView(renderer, theme, () => controller.dismissErrorBanner());
   const agentMap = new AgentMapView(renderer, controller, theme);
   const conversationActivityBar = new ActivityBarView(renderer, theme, 'conversation-activity-bar');
   const overlay = new OverlayView(renderer, theme);

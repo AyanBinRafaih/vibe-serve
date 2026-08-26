@@ -60,6 +60,13 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
+    // The fixed error surface is the topmost global layer. Escape acknowledges
+    // it first; a second Escape can then act on the pane or dialog underneath.
+    if (controller.state.errorBanner !== null && key.name === 'escape') {
+      controller.dismissErrorBanner();
+      key.preventDefault();
+      return;
+    }
     // Pane switching works from anywhere a second column is on screen, which
     // on the landing view includes the docked chat, so the operator never has
     // to leave the table to scroll back through an answer.
