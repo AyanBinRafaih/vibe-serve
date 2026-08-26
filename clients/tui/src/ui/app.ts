@@ -237,7 +237,7 @@ export function createOpenTuiApp(
     lastState = state;
     const previewName = state.themePicker?.selected ?? state.themeName;
     const releasePreviousStyle =
-      state.themeName === themeName ? undefined : applyTheme(state.themeName);
+      previewName === themeName ? undefined : applyTheme(previewName);
     const showLog = experimentLogVisible(state);
     const paneFocus = focusedPane(state);
     const zoomedPane = state.layout.zoomedPane;
@@ -369,7 +369,7 @@ export function createOpenTuiApp(
   };
   const unbindKeys = bindKeybindings(renderer, controller, viewport, clipboard, {
     completeInput: () => commandInput.completeSuggestion(),
-    navigateSuggestions: (direction) => commandInput.navigateSuggestions(direction),
+    navigateSuggestions: direction => commandInput.navigateSuggestions(direction),
     // Enter belongs to a pane only when nothing is typed anywhere. Asking which
     // box has the cursor is not enough: a question waiting in the other box is
     // still a question, and Enter must never discard it to open a hypothesis.
