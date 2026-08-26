@@ -19,6 +19,15 @@ def test_tee_logger_owns_and_restores_stderr(tmp_path):  # noqa: ANN001, ANN201 
     assert "diagnostic" in logger.path.read_text()
 
 
+def test_tee_logger_preserves_real_stderr_file_descriptor(tmp_path):  # noqa: ANN001, ANN201
+    original = sys.stderr
+    logger = RunLogger(tmp_path)
+    try:
+        assert sys.stderr.fileno() == original.fileno()
+    finally:
+        logger.close()
+
+
 def test_no_tee_logger_leaves_stderr_untouched(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     original = sys.stderr
     logger = RunLogger(tmp_path, tee_stderr=False)

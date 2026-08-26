@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from vibesys import backends
 from vibesys.agents import AgentClient, build_agent_client
+from vibesys.agents.factory import agent_driver_supports_mcp_servers, resolve_agent_driver
 from vibesys.agents.progress import AgentProgress
 from vibesys.backends.base import ComputeBackendImpl, ContentionMonitor
 from vibesys.config import Config, as_config
@@ -410,6 +411,25 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         environment_default_profiler_kind=environment.default_profiler_kind,
         environment_supported_profiler_kinds=environment.supported_profiler_kinds,
     )
+    driver_supports_mcp = agent_driver_supports_mcp_servers(
+        config,
+        agent_backend=agent_backend,
+    )
+    if resolved_profiler_kind in ACTIVE_PROFILER_KINDS and driver_supports_mcp is False:
+        driver_name = resolve_agent_driver(config)
+        definition = profiler_definition(resolved_profiler_kind)
+        raise ConfigurationError(
+            ConfigurationDiagnostic(
+                code="agent_profiler_incompatible",
+                stage="agent_capability_validation",
+                message=(
+                    f"Profiler {resolved_profiler_kind.value!r} requires session MCP server "
+                    f"{definition.mcp_name!r}, but agent driver {driver_name!r} does not "
+                    "support session MCP servers. Select agent.driver='agentshim' or "
+                    "disable profiling with --profiler none."
+                ),
+            )
+        )
     profiler_preflight = preflight_profiler_kind(resolved_profiler_kind)
     if not profiler_preflight.usable:
         raise ConfigurationError(

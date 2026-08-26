@@ -575,6 +575,38 @@ def test_direct_run_rejects_unmaterialized_workspace_source(tmp_path):  # noqa: 
         )
 
 
+def test_omnigent_accepts_active_profiler_configuration(tmp_path):  # noqa: ANN001, ANN201
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    configuration = _configuration().model_copy(
+        update={
+            "agent_backend": "cli",
+            "agent_driver": "omnigent",
+            "cli_provider": "codex",
+            "profiler": "macos_cpu",
+        }
+    )
+
+    with create_run_context(
+        config={  # pyright: ignore[reportArgumentType]
+            "model": {"name": "gpt-test"},
+            "agent": {"backend": "cli", "driver": "omnigent", "cli_provider": "codex"},
+        },
+        exp_name="queue",
+        runs_dir=None,
+        input_path=str(project),
+        accuracy_command="python _evaluator/checker/check.py",
+        benchmark_command="python _evaluator/checker/check.py",
+        evaluator_path=evaluator,
+        project_configuration=configuration,
+        profiler_kind=ProfilerKind.MACOS_CPU,
+        profiler_domain=DomainName.GENERIC,
+        run_environment=RunEnvironmentSpec("local"),
+        active_state_model_type=ActiveHypothesis,
+    ) as context:
+        assert context.profiler_kind is ProfilerKind.MACOS_CPU
+
+
 def test_portable_state_snapshot_replaces_namespace_exactly(tmp_path):  # noqa: ANN001, ANN201
     project = tmp_path / "queue"
     evaluator = _write_project(project)

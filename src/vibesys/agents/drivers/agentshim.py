@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import weakref
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from vibesys._agent_cli.base import CodingAgent
@@ -29,6 +30,15 @@ from vibesys.agents.contracts import (
 from vibesys.agents.docker_executor import DockerCommandExecutor
 from vibesys.agents.host_resource_declarations import declare_agent_host_resources
 from vs_sandbox import build_host_sandbox
+
+AGENTSHIM_CAPABILITIES = AgentCapabilities(
+    mcp_servers=True,
+    nested_read_only_paths=True,
+    hidden_paths=True,
+    timeouts=True,
+    session_reuse=True,
+)
+"""Capabilities invariant across AgentShim host and container execution."""
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -391,14 +401,10 @@ class AgentShimDriver:
     @property
     def capabilities(self) -> AgentCapabilities:
         """Describe the policy and lifecycle features this driver enforces."""
-        return AgentCapabilities(
-            mcp_servers=True,
-            nested_read_only_paths=True,
-            hidden_paths=True,
+        return replace(
+            AGENTSHIM_CAPABILITIES,
             host_path_grants=self._docker_sandboxes is None,
             container_execution=self._docker_sandboxes is not None,
-            timeouts=True,
-            session_reuse=True,
         )
 
     def create_session(self, spec: AgentSessionSpec) -> AgentSession:
