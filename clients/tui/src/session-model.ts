@@ -143,6 +143,8 @@ export interface ExperimentLogState {
   selectedId: string | null;
   /** The transient planning activity is selected instead of a recorded claim. */
   selectedActivity?: boolean;
+  /** Round anchor retained while selected planning becomes a persisted hypothesis. */
+  selectedActivityRound?: number | null;
   /** A recorded round that has no hypothesis entry is selected. */
   selectedUnownedRound?: number | null;
   pending: boolean;
@@ -292,9 +294,9 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
 }
 
 /**
- * Rows are keyed by hypothesis id, which the server orders by first round and
- * never reshuffles. Selection therefore survives a refresh even when a new
- * hypothesis lands above the current one.
+ * Rows are keyed by hypothesis identity rather than response position, so
+ * selection survives refreshes even when the backend returns a different
+ * order. The canonical index sorts the rows before presenting them.
  */
 export function entryKey(entry: HypothesisEntry, index: number): string {
   return entry.identified === false
@@ -371,30 +373,43 @@ export function openExperimentLog(state: SessionState): SessionState {
 export function setExperiments(state: SessionState, entries: HypothesisEntry[]): SessionState {
   const log = state.experimentLog;
   if (log === null) return state;
-  const keys = entries.map(entryKey);
+  const activity = hypothesisPlanningActivity(state);
+  const selectedActivityRound =
+    log.selectedActivity === true
+      ? (log.selectedActivityRound ?? activity?.roundNumber ?? null)
+      : null;
+  const orderedEntries = [...entries].sort(compareHypothesisEntries);
+  const keys = orderedEntries.map(entryKey);
+  const materializedActivity =
+    selectedActivityRound === null
+      ? undefined
+      : orderedEntries.find(entry => scopeRounds(entry).includes(selectedActivityRound));
   // Keep the operator's row when it still exists; otherwise fall back to the
   // active hypothesis, then to the first row.
   const selectedId =
-    log.selectedId !== null && keys.includes(log.selectedId)
-      ? log.selectedId
-      : (keys[entries.findIndex(entry => entry.active === true)] ?? keys[0] ?? null);
-  const unownedRounds = unownedExperimentRounds(state, entries);
+    materializedActivity !== undefined
+      ? entryKeyFor(orderedEntries, materializedActivity)
+      : log.selectedId !== null && keys.includes(log.selectedId)
+        ? log.selectedId
+        : (keys[orderedEntries.findIndex(entry => entry.active === true)] ?? keys[0] ?? null);
+  const unownedRounds = unownedExperimentRounds(state, orderedEntries);
   const currentUnownedRound = log.selectedUnownedRound;
   const selectedUnownedRound =
     currentUnownedRound !== undefined &&
     currentUnownedRound !== null &&
     unownedRounds.includes(currentUnownedRound)
       ? currentUnownedRound
-      : entries.length === 0
+      : orderedEntries.length === 0
         ? (unownedRounds[0] ?? null)
         : null;
   return {
     ...state,
     experimentLog: {
       ...log,
-      entries,
+      entries: orderedEntries,
       selectedId,
-      selectedActivity: hypothesisPlanningActivity(state) !== null && log.selectedActivity === true,
+      selectedActivity: materializedActivity === undefined && log.selectedActivity === true,
+      selectedActivityRound: materializedActivity === undefined ? selectedActivityRound : null,
       selectedUnownedRound,
       pending: false,
       error: null,
@@ -429,7 +444,16 @@ export function selectExperimentActivity(state: SessionState): SessionState {
   ) {
     return state;
   }
-  return {...state, experimentLog: {...log, selectedActivity: true, selectedUnownedRound: null}};
+  const activity = hypothesisPlanningActivity(state);
+  return {
+    ...state,
+    experimentLog: {
+      ...log,
+      selectedActivity: true,
+      selectedActivityRound: activity?.roundNumber ?? null,
+      selectedUnownedRound: null,
+    },
+  };
 }
 
 /**
@@ -596,28 +620,49 @@ export function unownedExperimentRounds(
       round =>
         !owned.has(round.number) && round.number !== planningRound && round.status !== 'planned',
     )
-    .map(round => round.number);
+    .map(round => round.number)
+    .sort((left, right) => left - right);
 }
 
-/** The visual index: live planning, hypotheses, then observed unowned rounds. */
+/**
+ * The canonical visual index. Historical work is chronological regardless of
+ * server response order, and transient planning is always the newest item.
+ */
 export function experimentIndexItems(state: SessionState): ExperimentIndexItem[] {
-  const items: ExperimentIndexItem[] = [];
-  const activity = hypothesisPlanningActivity(state);
-  if (activity !== null) items.push({kind: 'activity', key: 'activity', activity});
+  const history: ExperimentIndexItem[] = [];
   for (const [index, entry] of (state.experimentLog?.entries ?? []).entries()) {
-    items.push({kind: 'hypothesis', key: entryKey(entry, index), entry});
+    history.push({kind: 'hypothesis', key: entryKey(entry, index), entry});
   }
   for (const roundNumber of unownedExperimentRounds(state)) {
-    items.push({kind: 'round', key: `round-${roundNumber}`, roundNumber});
+    history.push({kind: 'round', key: `round-${roundNumber}`, roundNumber});
   }
-  return items;
+  history.sort((left, right) => experimentItemRound(left) - experimentItemRound(right));
+  const activity = hypothesisPlanningActivity(state);
+  return activity === null ? history : [...history, {kind: 'activity', key: 'activity', activity}];
+}
+
+function experimentItemRound(item: ExperimentIndexItem): number {
+  if (item.kind === 'hypothesis') return item.entry.first_round;
+  if (item.kind === 'round') return item.roundNumber;
+  return item.activity.roundNumber;
+}
+
+function compareHypothesisEntries(left: HypothesisEntry, right: HypothesisEntry): number {
+  return (
+    left.first_round - right.first_round ||
+    left.last_round - right.last_round ||
+    left.hypothesis_id.localeCompare(right.hypothesis_id)
+  );
 }
 
 export function selectedExperimentIndexItem(state: SessionState): ExperimentIndexItem | null {
   const log = state.experimentLog;
   if (log === null) return null;
   const items = experimentIndexItems(state);
-  if (log.selectedActivity === true) return items.find(item => item.kind === 'activity') ?? null;
+  if (log.selectedActivity === true) {
+    const activity = items.find(item => item.kind === 'activity');
+    if (activity !== undefined) return activity;
+  }
   if (log.selectedUnownedRound !== undefined && log.selectedUnownedRound !== null) {
     return (
       items.find(item => item.kind === 'round' && item.roundNumber === log.selectedUnownedRound) ??
@@ -636,11 +681,24 @@ function selectExperimentIndexItem(
   const log = state.experimentLog;
   if (log === null || item === undefined) return state;
   if (item.kind === 'activity')
-    return {...state, experimentLog: {...log, selectedActivity: true, selectedUnownedRound: null}};
+    return {
+      ...state,
+      experimentLog: {
+        ...log,
+        selectedActivity: true,
+        selectedActivityRound: item.activity.roundNumber,
+        selectedUnownedRound: null,
+      },
+    };
   if (item.kind === 'round') {
     return {
       ...state,
-      experimentLog: {...log, selectedActivity: false, selectedUnownedRound: item.roundNumber},
+      experimentLog: {
+        ...log,
+        selectedActivity: false,
+        selectedActivityRound: null,
+        selectedUnownedRound: item.roundNumber,
+      },
     };
   }
   return {
@@ -649,6 +707,7 @@ function selectExperimentIndexItem(
       ...log,
       selectedId: item.key,
       selectedActivity: false,
+      selectedActivityRound: null,
       selectedUnownedRound: null,
     },
   };

@@ -5,9 +5,7 @@ import type {Theme} from './theme.js';
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPINNER_INTERVAL_MS = 120;
-export type ActivityBarScope = 'global' | 'conversation';
-
-/** Stable, selection-aware status line for backend-authoritative execution activity. */
+/** Status for executions visible in the selected agent conversation. */
 export class ActivityBarView {
   readonly output: TextRenderable;
   #executions: ActiveAgentExecution[] = [];
@@ -27,17 +25,15 @@ export class ActivityBarView {
     });
   }
 
-  render(state: SessionState, scope: ActivityBarScope, visible = true): void {
+  render(state: SessionState, visible = true): void {
     const all = Object.values(state.activeExecutions);
     const roundNumber = visibleRoundNumber(state);
     this.#executions = visible
-      ? scope === 'global'
-        ? all
-        : all.filter(
-            execution =>
-              (roundNumber === null || execution.roundNumber === roundNumber) &&
-              (state.selectedAgentKind === null || execution.agentKind === state.selectedAgentKind),
-          )
+      ? all.filter(
+          execution =>
+            (roundNumber === null || execution.roundNumber === roundNumber) &&
+            (state.selectedAgentKind === null || execution.agentKind === state.selectedAgentKind),
+        )
       : [];
     this.output.visible = this.#executions.length > 0;
     this.#refresh();

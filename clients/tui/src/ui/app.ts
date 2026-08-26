@@ -123,7 +123,6 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   const todoStrip = new TodoStripView(renderer, controller, theme);
   const errorBanner = new ErrorBannerView(renderer, theme);
   const agentMap = new AgentMapView(renderer, controller, theme);
-  const globalActivityBar = new ActivityBarView(renderer, theme, 'global-activity-bar');
   const conversationActivityBar = new ActivityBarView(renderer, theme, 'conversation-activity-bar');
   const overlay = new OverlayView(renderer, theme);
   const experimentLog = new ExperimentLogView(renderer, controller, theme);
@@ -213,7 +212,6 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   root.add(roundStrip.output);
   root.add(main);
   root.add(todoStrip.output);
-  root.add(globalActivityBar.output);
   root.add(bottom);
   root.add(overlay.output);
   root.add(themePicker.output);
@@ -234,7 +232,6 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     todoStrip.applyTheme(theme);
     errorBanner.applyTheme(theme);
     agentMap.applyTheme(theme);
-    globalActivityBar.applyTheme(theme);
     conversationActivityBar.applyTheme(theme);
     overlay.applyTheme(theme);
     experimentLog.applyTheme(theme);
@@ -381,8 +378,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     );
     themePicker.render(state);
     chat.render(state);
-    globalActivityBar.render(state, 'global', showLog);
-    conversationActivityBar.render(state, 'conversation', !showLog);
+    conversationActivityBar.render(state, !showLog);
     // One cursor, three places it can be. The modal owns it while it is open;
     // otherwise it belongs to whichever input the pane focus points at.
     const target: FocusTarget = state.chatOpen ? 'modal' : chatInputFocused ? 'chat' : 'command';
@@ -429,7 +425,6 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
       input.destroy();
       chatInput.destroy();
       chat.destroy();
-      globalActivityBar.destroy();
       conversationActivityBar.destroy();
       roundStrip.destroy();
       agentMap.destroy();

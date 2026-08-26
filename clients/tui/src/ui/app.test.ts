@@ -473,7 +473,7 @@ describe('OpenTUI presentation', () => {
     expect(firstTurn?.x).toBe(activity.x);
   });
 
-  it('keeps the global working indicator on the hypothesis log', async () => {
+  it('keeps working indicators scoped to agent conversations', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
@@ -495,8 +495,9 @@ describe('OpenTUI presentation', () => {
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
 
-    const frame = await testRenderer.waitForFrame(value => value.includes('Implementer · Working'));
+    const frame = await frameAfter(testRenderer);
     expect(frame).toContain('Experiments');
+    expect(frame).not.toContain('Implementer · Working');
     expect(frame).not.toContain('Editing the queue');
   });
 
@@ -2447,8 +2448,8 @@ describe('theming', () => {
     await controller.openExperimentLog();
 
     const kickoff = await frameAfter(testRenderer);
-    expect(kickoff).toContain('Planning Hypothesis 1 · Round 2');
-    expect(kickoff).toContain('UNASSOCIATED ROUNDS');
+    expect(kickoff).toContain('Planning Hypothesis 1');
+    expect(kickoff).toContain('Round 2');
     expect(kickoff).toContain('Round 1 · recorded agent turns · no hypothesis');
 
     testRenderer.mockInput.pressEnter();
@@ -2482,10 +2483,12 @@ describe('theming', () => {
     expect(detail).not.toContain('other round');
 
     testRenderer.mockInput.pressKey('ESCAPE');
-    expect(await frameAfterEscape(testRenderer)).toContain('UNASSOCIATED ROUNDS');
+    expect(await frameAfterEscape(testRenderer)).toContain(
+      'Round 7 · recorded agent turns · no hypothesis',
+    );
   });
 
-  it('pins later hypothesis planning above the existing history', async () => {
+  it('keeps later hypothesis planning below the existing history', async () => {
     const testRenderer = await createTestRenderer({width: 120, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
@@ -2503,7 +2506,42 @@ describe('theming', () => {
     expect(frame).toContain('CURRENT ACTIVITY');
     expect(frame).toContain('Planning Hypothesis 2 · forming it · Round 42');
     expect(frame).toContain('H-07');
+    expect(frame.indexOf('H-07')).toBeLessThan(frame.indexOf('Planning Hypothesis 2'));
     expect(frame).not.toContain('UNASSOCIATED ROUNDS');
+  });
+
+  it('renders shuffled hypotheses and unassociated rounds in one ascending index', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      status: 'running',
+      rounds: [
+        {number: 4, status: 'completed'},
+        {number: 2, status: 'completed'},
+        {number: 5, status: 'active'},
+      ],
+      phases: [
+        {kind: 'orchestrator', status: 'active', roundNumber: 5, roundLabel: 'round-5-plan'},
+      ],
+    });
+    controller.experiments = [
+      logEntry('H-03', 3, 3, {claim: 'third'}),
+      logEntry('H-01', 1, 1, {claim: 'first'}),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const frame = await frameAfter(testRenderer);
+    const positions = [
+      frame.indexOf('H-01'),
+      frame.indexOf('Round 2 · recorded'),
+      frame.indexOf('H-03'),
+      frame.indexOf('Round 4 · recorded'),
+      frame.indexOf('Planning Hypothesis 3'),
+    ];
+    expect(positions.every(position => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((left, right) => left - right));
   });
 
   it('labels an explicit profiler phase without claiming it will happen earlier', async () => {
