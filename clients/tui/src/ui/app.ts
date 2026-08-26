@@ -235,6 +235,7 @@ export function createOpenTuiApp(
   let lastState: SessionState = controller.state;
   const render = (state: SessionState): void => {
     lastState = state;
+    const previewName = state.themePicker?.selected ?? state.themeName;
     const releasePreviousStyle =
       state.themeName === themeName ? undefined : applyTheme(state.themeName);
     const showLog = experimentLogVisible(state);
