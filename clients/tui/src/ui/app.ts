@@ -10,12 +10,13 @@ import {
 } from '../session-model.js';
 import {ActivityBarView} from './activity-bar.js';
 import {AgentMapView} from './agent-map.js';
+import {createChatDraft} from './chat-composer.js';
 import {ChatOverlayView} from './chat-overlay.js';
 import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
 import {ConversationView} from './conversation.js';
 import {ErrorBannerView} from './error-banner.js';
 import {ExperimentLogView} from './experiment-log.js';
-import {createChatInputPanel, createInputPanel} from './input.js';
+import {createInputPanel} from './input.js';
 import {bindKeybindings} from './keybindings.js';
 import {OverlayView} from './overlay.js';
 import {RightPaneView, rightPaneWidth, splitFits} from './right-pane.js';
@@ -29,7 +30,7 @@ export interface OpenTuiApp {
   destroy(): void;
 }
 
-/** Which of the client's inputs currently holds the cursor. */
+/** Which of the client's editors currently holds the cursor. */
 type FocusTarget = 'command' | 'chat' | 'modal';
 
 const KEY_HELP =
@@ -40,15 +41,6 @@ const LOG_KEY_HELP =
   '↑↓ or scroll: select · Enter or /open-round: open its rounds · F4: zoom · /open-round --N';
 const LOG_CHAT_KEY_HELP =
   '↑↓: select · Enter: open its rounds · Ctrl+W: chat and back · F4: zoom · /open-round --N';
-/**
- * Shown above the docked chat's own input. Short enough to leave a gap before
- * the key hints beside it even in the narrowest column that docks, and it says
- * how to reach the box while the cursor is in the command input, because two
- * boxes on screen must never leave that a guess.
- */
-const CHAT_INPUT_HINT = 'Ask about this run';
-const CHAT_INPUT_PENDING_HINT = 'Awaiting the agent';
-const CHAT_INPUT_BLURRED_HINT = 'Ctrl+W to type here';
 const SPLIT_KEY_HELP =
   'Ctrl+W: switch pane · F4: zoom focused pane · PgUp/PgDn: scroll · Esc: close pane';
 
@@ -112,6 +104,20 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     flexGrow: 1,
     flexDirection: 'row',
   });
+  // The chat is a sibling of the entire workspace column, not just its
+  // transcript row. Its composer therefore remains inside the chat border and
+  // the pane spans the same height as the table plus command surface.
+  const body = new BoxRenderable(renderer, {
+    id: 'body',
+    width: '100%',
+    flexGrow: 1,
+    flexDirection: 'row',
+  });
+  const workspace = new BoxRenderable(renderer, {
+    id: 'workspace',
+    flexGrow: 1,
+    flexDirection: 'column',
+  });
   const help = new TextRenderable(renderer, {
     id: 'key-help',
     height: 1,
@@ -132,8 +138,9 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     showsSelection: true,
     onFocusRequest: focusTranscript,
   });
-  const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme);
-  const chatPane = new ChatPaneView(renderer, controller, markdownStyle, theme);
+  const chatDraft = createChatDraft();
+  const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme, chatDraft);
+  const chatPane = new ChatPaneView(renderer, controller, markdownStyle, theme, chatDraft);
   // Clicking either box moves the pane focus to it, so the border, the hint,
   // and the cursor never disagree about which surface is taking keystrokes.
   const input = createInputPanel(
@@ -142,36 +149,12 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     theme,
     () => controller.focusPane('left'),
   );
-  const chatInput = createChatInputPanel(
-    renderer,
-    value => void controller.submitChat(value),
-    theme,
-    () => controller.focusPane('chat'),
-  );
-  // The two inputs share a row and split it on the same boundary as the panes
-  // above them, so each box sits under the surface it writes to.
   const bottom = new BoxRenderable(renderer, {
     id: 'bottom',
     width: '100%',
     flexShrink: 0,
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-  });
-  const chatInputColumn = new BoxRenderable(renderer, {
-    id: 'chat-input-column',
     flexDirection: 'column',
-    flexShrink: 0,
-    flexGrow: 0,
-    visible: false,
-  });
-  const chatInputHint = new TextRenderable(renderer, {
-    id: 'chat-input-hint',
-    height: 1,
-    width: '100%',
-    wrapMode: 'none',
-    truncate: true,
-    fg: theme.textSubtle,
-    content: CHAT_INPUT_HINT,
+    alignItems: 'stretch',
   });
   const commandColumn = new BoxRenderable(renderer, {
     id: 'command-column',
@@ -190,29 +173,26 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
   // turn can change scroll height without moving the line.
   transcriptFrame.add(conversationActivityBar.output);
   main.add(agentMap.output);
-  // The chat is the leftmost column of the landing view, so it is added before
-  // the surfaces it sits beside.
-  main.add(chatPane.output);
   main.add(transcriptFrame);
   // The log lives in the main pane rather than floating over it: it is the
   // landing view, not a dialog.
   main.add(experimentLog.output);
   main.add(rightPane.output);
-  chatInputColumn.add(chatInputHint);
-  chatInputColumn.add(chatInput.box);
   commandColumn.add(help);
   // Absolute inside the command column rather than the root, so the list rises
   // out of the input it belongs to instead of across the chat beside it.
   commandColumn.add(input.suggestions);
   commandColumn.add(input.box);
-  bottom.add(chatInputColumn);
   bottom.add(commandColumn);
   root.add(header);
   root.add(errorBanner.output);
   root.add(roundStrip.output);
-  root.add(main);
-  root.add(todoStrip.output);
-  root.add(bottom);
+  body.add(chatPane.output);
+  workspace.add(main);
+  workspace.add(todoStrip.output);
+  workspace.add(bottom);
+  body.add(workspace);
+  root.add(body);
   root.add(overlay.output);
   root.add(themePicker.output);
   root.add(chat.output);
@@ -240,8 +220,6 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     conversation.applyTheme(theme, markdownStyle);
     chat.applyTheme(theme, markdownStyle);
     chatPane.applyTheme(theme, markdownStyle);
-    chatInput.applyTheme(theme);
-    chatInputHint.fg = theme.textSubtle;
     input.applyTheme(theme);
     return () => previousMarkdownStyle.destroy();
   };
@@ -351,17 +329,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
       chat.setPaneBounds(null);
     }
     chatPane.render(state, showChatPane, chatWidth);
-    // The chat's input tracks the pane above it, so the boundary between the
-    // two boxes is the boundary between the two surfaces they write to.
-    chatInputColumn.visible = showChatPane;
-    chatInputColumn.width = chatWidth;
     const chatInputFocused = showChatPane && state.layout.focus === 'chat';
-    chatInputHint.content = state.chatPending
-      ? CHAT_INPUT_PENDING_HINT
-      : chatInputFocused
-        ? CHAT_INPUT_HINT
-        : CHAT_INPUT_BLURRED_HINT;
-    chatInput.setFocused(chatInputFocused);
     commandColumn.visible = zoomedPane !== 'chat';
     input.setFocused(paneFocus === 'experiments' || paneFocus === 'transcript');
     // The command list completes the box it belongs to, and on this view that
@@ -385,7 +353,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     if (target !== focusTarget) {
       focusTarget = target;
       if (target === 'modal') chat.focus();
-      else if (target === 'chat') chatInput.focus();
+      else if (target === 'chat') chatPane.focusComposer();
       else input.focus();
     }
     releasePreviousStyle?.();
@@ -395,7 +363,7 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
     // Enter belongs to a pane only when nothing is typed anywhere. Asking which
     // box has the cursor is not enough: a question waiting in the other box is
     // still a question, and Enter must never discard it to open a hypothesis.
-    inputIsEmpty: () => input.isEmpty() && chatInput.isEmpty(),
+    inputIsEmpty: () => input.isEmpty() && chatPane.isComposerEmpty() && chat.isComposerEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
     revealSelectedEntry: () => {
@@ -423,8 +391,6 @@ export function createOpenTuiApp(renderer: CliRenderer, controller: SessionContr
       unsubscribe();
       unbindKeys();
       input.destroy();
-      chatInput.destroy();
-      chat.destroy();
       conversationActivityBar.destroy();
       roundStrip.destroy();
       agentMap.destroy();
