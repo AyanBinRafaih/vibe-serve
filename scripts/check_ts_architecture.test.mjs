@@ -61,16 +61,19 @@ test('dependency-cruiser rejects forbidden package and runtime edges', async () 
     result.output.summary.violations.map(violation => violation.rule.name),
   );
 
-  assert.deepEqual(violatedRules, new Set([
-    'backend-client-is-lowest-layer',
-    'core-state-does-not-depend-on-tui',
-    'workspace-packages-use-public-exports',
-    'core-state-has-no-node-runtime',
-    'core-state-has-no-ui-runtime',
-    'production-dependencies-are-declared',
-    'no-circular-dependencies',
-    'no-unresolvable-imports',
-  ]));
+  assert.deepEqual(
+    violatedRules,
+    new Set([
+      'backend-client-is-lowest-layer',
+      'core-state-does-not-depend-on-tui',
+      'workspace-packages-use-public-exports',
+      'core-state-has-no-node-runtime',
+      'core-state-has-no-ui-runtime',
+      'production-dependencies-are-declared',
+      'no-circular-dependencies',
+      'no-unresolvable-imports',
+    ]),
+  );
 });
 
 test('manifest policy rejects declared reverse dependencies', async () => {
