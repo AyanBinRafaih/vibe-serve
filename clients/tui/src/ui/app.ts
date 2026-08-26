@@ -236,8 +236,7 @@ export function createOpenTuiApp(
   const render = (state: SessionState): void => {
     lastState = state;
     const previewName = state.themePicker?.selected ?? state.themeName;
-    const releasePreviousStyle =
-      previewName === themeName ? undefined : applyTheme(previewName);
+    const releasePreviousStyle = previewName === themeName ? undefined : applyTheme(previewName);
     const showLog = experimentLogVisible(state);
     const paneFocus = focusedPane(state);
     const zoomedPane = state.layout.zoomedPane;
