@@ -85,7 +85,6 @@ from vs_project import (
 
 if TYPE_CHECKING:
     from vibesys.server.supervisor import RunSupervisor
-    from vs_loop_state import RoundRecord
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -257,7 +256,7 @@ def create_run_context(  # noqa: PLR0913  # tracked: #288
     environment_hooks: EnvironmentHooks | None = None,
     remote_repo: str | None = None,
     repo_visibility: RepositoryVisibility = RepositoryVisibility.PRIVATE,
-    active_state_model_type: type[BaseModel] | None = None,
+    agent_state_model_type: type[BaseModel] | None = None,
 ) -> "_RunContext":
     """Build a fully wired :class:`_RunContext`.
 
@@ -298,7 +297,7 @@ def create_run_context(  # noqa: PLR0913  # tracked: #288
             environment_hooks=environment_hooks,
             remote_repo=remote_repo,
             repo_visibility=repo_visibility,
-            active_state_model_type=active_state_model_type,
+            agent_state_model_type=agent_state_model_type,
         )
     except BaseException as construction_error:
         _close_after_construction_failure(teardown_stack, construction_error)
@@ -348,7 +347,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     environment_hooks: EnvironmentHooks | None,
     remote_repo: str | None,
     repo_visibility: RepositoryVisibility,
-    active_state_model_type: type[BaseModel] | None,
+    agent_state_model_type: type[BaseModel] | None,
 ) -> "_RunContext":
     config = as_config(config)
     for source in workspace_sources:
@@ -675,13 +674,13 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         )
 
     if project_configuration.outer_loop == "agent":
-        if active_state_model_type is None:
-            raise ValueError("agent runs require an active state model type")  # noqa: TRY003  # tracked: #288
+        if agent_state_model_type is None:
+            raise ValueError("agent runs require an agent state model type")  # noqa: TRY003  # tracked: #288
         round_transaction_coordinator = RoundTransactionCoordinator(
             project,
             git,
             run_id,
-            active_state_model_type=active_state_model_type,
+            agent_state_model_type=agent_state_model_type,
         )
         if existing:
             recovery = round_transaction_coordinator.recover()
@@ -1543,9 +1542,9 @@ class _RunContext:
 
     def begin_completed_round(
         self,
-        record: "RoundRecord",
+        round_number: int,
         *,
-        active_transition: StateTransition,
+        state_transition: StateTransition,
     ) -> None:
         """Journal a completed project round before mutating local state."""
         if self._round_transaction_coordinator is None:
@@ -1553,8 +1552,8 @@ class _RunContext:
         if self._pending_round_transaction is not None:
             raise RuntimeError("a completed-round transaction is already active")  # noqa: TRY003  # tracked: #288
         self._pending_round_transaction = self._round_transaction_coordinator.begin(
-            record,
-            active_transition=active_transition,
+            round_number,
+            state_transition=state_transition,
         )
 
     def persist_completed_round(self) -> None:

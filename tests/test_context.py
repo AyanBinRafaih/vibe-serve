@@ -17,7 +17,7 @@ from vibesys.domains.environment import EnvironmentPatch, NoopEnvironmentHooks
 from vibesys.domains.llm_serving.hooks import LLMServingEnvironmentHooks
 from vibesys.errors import ConfigurationError
 from vibesys.input_manifest import WorkspaceSource
-from vibesys.loops.agent.model import ActiveHypothesis
+from vibesys.loops.agent.model import AgentRunState
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.run import RunLogger, RunPaths, RunStateNamespace
 from vibesys.sandbox.run_environment import RunEnvironmentSpec
@@ -178,7 +178,7 @@ def _create_context(  # noqa: PLR0913
         agent_backend="stub",
         environment_hooks=hooks or NoopEnvironmentHooks(),
         remote_repo=remote_repo,
-        active_state_model_type=ActiveHypothesis,
+        agent_state_model_type=AgentRunState,
     )
 
 
@@ -650,7 +650,7 @@ def test_omnigent_accepts_active_profiler_configuration(tmp_path):  # noqa: ANN0
         profiler_kind=ProfilerKind.MACOS_CPU,
         profiler_domain=DomainName.GENERIC,
         run_environment=RunEnvironmentSpec("local"),
-        active_state_model_type=ActiveHypothesis,
+        agent_state_model_type=AgentRunState,
     ) as context:
         assert context.profiler_kind is ProfilerKind.MACOS_CPU
 

@@ -1,6 +1,7 @@
 """Tests for vibesys.loops.agent — orchestrator-driven build loop."""
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
@@ -11,10 +12,8 @@ from vibesys.agents import AgentClient
 from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationError
 from vibesys.loops.agent import issue_board
-from vibesys.loops.agent.hypotheses import reconcile_hypothesis_ledger
 from vibesys.loops.agent.loop import (
     FrameworkBenchmarkOutcome,
-    _ActiveHypothesis,
     _backfill_revert_commit,
     _candidate_evidence_is_fresh,
     _invoke_read_only_role,
@@ -24,14 +23,13 @@ from vibesys.loops.agent.loop import (
     _pareto_archive_summary,
     _pareto_frontier_records,
     _provisional_candidates_since_official,
-    _require_active_checkpoint_consistency,
     _review_due,
     _run_framework_validation_gate,
     _terminal_workspace_notice,
     run_agent_loop,
 )
-from vibesys.loops.agent.model import HypothesisLedger
-from vibesys.loops.agent.state import AgentStateStore, HypothesisLedgerStore
+from vibesys.loops.agent.model import Hypothesis
+from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.evolve.population import Objective
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.prompts import PROMPTS_DIR
@@ -69,13 +67,16 @@ def test_missing_implementer_response_fails_closed():  # noqa: ANN201  # tracked
 
 
 def test_legacy_active_hypothesis_backfills_framework_revert_commit():  # noqa: ANN201  # tracked: #288
-    state = _ActiveHypothesis(
-        plan=OrchestratorPlan(
-            task="restore parent",
-            pass_criteria="review",  # noqa: S106  # tracked: #288
-            revert_to_round=28,
-            reasoning="resume an older run",
-        ),
+    plan = OrchestratorPlan(
+        hypothesis_id="restore-parent",
+        task="restore parent",
+        pass_criteria="review",  # noqa: S106  # tracked: #288
+        revert_to_round=28,
+        reasoning="resume an older run",
+    )
+    state = Hypothesis(
+        hypothesis_id=plan.hypothesis_id,
+        plan=plan,
         started_round=34,
         parent_round=28,
         revert_applied=True,
@@ -93,56 +94,6 @@ def test_legacy_active_hypothesis_backfills_framework_revert_commit():  # noqa: 
     assert _backfill_revert_commit(state, records) is True
     assert state.revert_commit == "a" * 40
     assert _backfill_revert_commit(state, records) is False
-
-
-def test_portable_active_hypothesis_requires_local_continuation_checkpoint():  # noqa: ANN201  # tracked: #288
-    ledger = HypothesisLedger.model_validate(
-        {
-            "hypotheses": [
-                {
-                    "hypothesis_id": "interrupted-work",
-                    "strategy": "active",
-                    "started_round": 3,
-                }
-            ]
-        }
-    )
-
-    with pytest.raises(ValueError, match="local continuation checkpoint is missing"):
-        _require_active_checkpoint_consistency(ledger, None)
-
-
-def test_newer_terminal_round_repairs_stale_portable_active_checkpoint():  # noqa: ANN201  # tracked: #288
-    saved_active = HypothesisLedger.model_validate(
-        {
-            "hypotheses": [
-                {
-                    "hypothesis_id": "completed-before-ledger-write",
-                    "strategy": "active",
-                    "started_round": 3,
-                }
-            ]
-        }
-    )
-    completed = RoundRecord(
-        round_number=3,
-        commit="a" * 40,
-        perf_metric=None,
-        perf_unit=None,
-        passed=True,
-        reviewed=True,
-        hypothesis_id="completed-before-ledger-write",
-        hypothesis_declared_outcome="supported",
-        judge_verdict="pass",
-        hypothesis_outcome="proven",
-    )
-
-    reconciled = reconcile_hypothesis_ledger(saved_active, [completed], None)
-
-    _require_active_checkpoint_consistency(reconciled, None)
-    repaired = reconciled.by_id("completed-before-ledger-write")
-    assert repaired is not None
-    assert repaired.strategy.value == "completed"
 
 
 # RoundRecord's persistence and rollback resolution (RoundHistory) now live
@@ -349,15 +300,20 @@ def _run_id(project: Path) -> str:
 
 def _round_payloads(tmp_path: Path) -> list[dict[str, object]]:
     project = _created_project(tmp_path)
-    records = Project.open(project).state.load_rounds(_run_id(project))
+    state = Project.open(project).state
+    records = AgentRunStateStore(state.portable_namespace(_run_id(project), "agent")).load().rounds
     assert records
     return [json.loads(serialize_round(record)) for record in records]
 
 
-def _active_hypothesis(tmp_path: Path) -> _ActiveHypothesis | None:
+def _active_hypothesis(tmp_path: Path) -> Hypothesis | None:
     project = _created_project(tmp_path)
     store = Project.open(project).state
-    return AgentStateStore(store.local_namespace(_run_id(project), "agent")).load_active()
+    return (
+        AgentRunStateStore(store.portable_namespace(_run_id(project), "agent"))
+        .load()
+        .active_hypothesis
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2053,7 +2009,7 @@ def test_loop_round_one_no_profile_runs_one_round(tmp_path, ref_file):  # noqa: 
     assert runner.counters["judge"] == 1
 
 
-def test_continuing_hypothesis_uses_canonical_local_state(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+def test_continuing_hypothesis_uses_unified_run_state(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
     runner = _make_orchestrate_runner(
         plans=[
             OrchestratorPlan(
@@ -2072,6 +2028,139 @@ def test_continuing_hypothesis_uses_canonical_local_state(tmp_path, ref_file):  
     assert active is not None
     assert active.plan.hypothesis_id == "continue-canonical"
     assert [round_data["round"] for round_data in _round_payloads(tmp_path)] == [1]
+
+
+def test_resume_migrates_legacy_hypothesis_state_without_losing_continuation(
+    tmp_path: Path,
+    ref_file: str,
+) -> None:
+    first_runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="legacy-continuation",
+                task="finish the interrupted change",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise migration at the loop boundary",
+            )
+        ],
+        implementer_outcomes=[HypothesisOutcome.CONTINUE],
+    )
+    assert _invoke_orchestrate(tmp_path, ref_file, first_runner, max_rounds=1) is True
+
+    project_path = _created_project(tmp_path)
+    project = Project.open(project_path)
+    run_id = _run_id(project_path)
+    portable = project.state.portable_namespace(run_id, "agent")
+    local = project.state.local_namespace(run_id, "agent")
+    unified = AgentRunStateStore(portable).load()
+    hypothesis = unified.active_hypothesis
+    assert hypothesis is not None
+    assert len(hypothesis.rounds) == 1
+
+    portable_root = portable.external_directory()
+    local_root = local.external_directory()
+    portable.apply(portable.transition("state.json", None))
+    (portable_root / "rounds").mkdir(parents=True, exist_ok=True)
+    (portable_root / "rounds" / "0001.json").write_bytes(serialize_round(hypothesis.rounds[0]))
+    (portable_root / "hypotheses.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hypotheses": [
+                    {
+                        "hypothesis_id": hypothesis.hypothesis_id,
+                        "claim": hypothesis.plan.hypothesis,
+                        "task": hypothesis.plan.task,
+                        "started_round": hypothesis.started_round,
+                        "rounds": [1],
+                        "parent_round": hypothesis.parent_round,
+                        "parent_commit": hypothesis.parent_commit,
+                        "declared_outcome": hypothesis.declared_outcome,
+                        "review": hypothesis.review,
+                        "resolution": hypothesis.resolution,
+                        "measurement": hypothesis.measurement.model_dump(mode="json")
+                        if hypothesis.measurement is not None
+                        else None,
+                        "candidate_retained": hypothesis.candidate_retained,
+                        "strategy": "active",
+                        "strategy_reason": None,
+                    }
+                ],
+            },
+            default=str,
+        )
+    )
+    local_root.mkdir(parents=True, exist_ok=True)
+    active_payload = hypothesis.model_dump(
+        mode="json",
+        include={
+            "plan",
+            "started_round",
+            "parent_round",
+            "parent_commit",
+            "feedback",
+            "next_step",
+            "continuation_rounds",
+            "revert_applied",
+            "revert_commit",
+            "gate_revalidation_pending",
+            "gate_approved_perf_metric",
+            "gate_approved_perf_unit",
+            "gate_approved_metrics",
+            "gate_approved_evaluation_artifact",
+            "gate_approved_candidate_disposition",
+            "gate_approved_candidate_metrics",
+            "gate_approved_candidate_evaluation_artifact",
+            "gate_approved_candidate_operating_point",
+            "gate_approved_candidate_retention_reason",
+            "gate_candidate_commit",
+            "gate_accuracy_passed",
+        },
+    )
+    active_payload["schema_version"] = 1
+    (local_root / "active.json").write_text(json.dumps(active_payload))
+    subprocess.run(
+        ["git", "add", "-A", "--", ".vibesys"],  # noqa: S607  # test fixture
+        cwd=project_path,
+        check=True,
+    )
+    subprocess.run(
+        [  # noqa: S607  # test fixture
+            "git",
+            "commit",
+            "-m",
+            "test: restore legacy hypothesis state",
+        ],
+        cwd=project_path,
+        check=True,
+        capture_output=True,
+    )
+
+    resumed_runner = _make_orchestrate_runner(
+        plans=[],
+        implementer_outcomes=[HypothesisOutcome.NOMINATED],
+    )
+    assert (
+        _invoke_orchestrate(
+            tmp_path,
+            str(project_path / "resume-input"),
+            resumed_runner,
+            exp_name=run_id,
+            existing=True,
+            start_round=2,
+            max_rounds=2,
+        )
+        is True
+    )
+
+    migrated = AgentRunStateStore(portable).load()
+    migrated_hypothesis = migrated.by_id("legacy-continuation")
+    assert migrated_hypothesis is not None
+    assert [record.round_number for record in migrated_hypothesis.rounds] == [1, 2]
+    assert resumed_runner.counters["orch_plan"] == 0
+    assert not (portable_root / "hypotheses.json").exists()
+    assert not (portable_root / "rounds").exists()
+    assert not (local_root / "active.json").exists()
 
 
 def test_agent_roles_reference_framework_owned_effective_objective(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
@@ -3056,11 +3145,8 @@ def test_hypothesis_revert_is_applied_once_across_continuation_rounds(tmp_path, 
     )
     project = _created_project(tmp_path)
     store = Project.open(project).state
-    ledger = HypothesisLedgerStore(
-        store.portable_namespace(_run_id(project), "agent")
-    ).load_optional()
-    assert ledger is not None
-    seed = ledger.by_id("seed")
+    agent_run_state = AgentRunStateStore(store.portable_namespace(_run_id(project), "agent")).load()
+    seed = agent_run_state.by_id("seed")
     assert seed is not None
     assert seed.strategy.value == "abandoned"
     assert seed.strategy_reason == "The later evidence invalidated this direction."
@@ -3249,12 +3335,10 @@ def test_official_regression_disproves_and_drops_queue_candidate(tmp_path, ref_f
 
     project = _created_project(tmp_path)
     store = Project.open(project).state
-    ledger = HypothesisLedgerStore(
-        store.portable_namespace(_run_id(project), "agent")
-    ).load_optional()
-    assert ledger is not None
-    m3 = ledger.by_id("m3-pow2-mask-addressing")
+    agent_run_state = AgentRunStateStore(store.portable_namespace(_run_id(project), "agent")).load()
+    m3 = agent_run_state.by_id("m3-pow2-mask-addressing")
     assert m3 is not None
+    assert m3.resolution is not None
     assert m3.resolution.value == "disproven"
     assert m3.candidate_retained is False
 

@@ -1,23 +1,25 @@
-"""Hypothesis lifecycle projection and evidence-resolution regressions."""
+"""Tests for the unified hypothesis aggregate and its pure transitions."""
 
 from typing import Literal
 
 import pytest
+from pydantic import ValidationError
 
 from vibesys.loops.agent.hypotheses import (
     ResolutionEvidence,
+    append_round,
     apply_strategy_updates,
     metric_baseline,
-    reconcile_hypothesis_ledger,
     resolve_hypothesis_outcome,
     scalar_candidate_retained,
+    start_hypothesis,
+    update_active_hypothesis,
 )
 from vibesys.loops.agent.model import (
-    ActiveHypothesis,
-    HypothesisLedger,
-    HypothesisRecord,
+    AgentRunState,
+    Hypothesis,
     HypothesisResolution,
-    HypothesisStrategyState,
+    HypothesisStrategy,
 )
 from vibesys.schemas import (
     HypothesisOutcome,
@@ -27,72 +29,197 @@ from vibesys.schemas import (
 from vs_loop_state import RoundRecord
 
 
-def _official_round(  # noqa: PLR0913  # test fixture makes evidence explicit
+def _plan(identifier: str, *, updates: list[HypothesisStrategyUpdate] | None = None):  # noqa: ANN202
+    return OrchestratorPlan(
+        hypothesis_id=identifier,
+        hypothesis=f"claim {identifier}",
+        hypothesis_updates=updates or [],
+        task=f"implement {identifier}",
+        pass_criteria="tests pass",  # noqa: S106
+        reasoning="test the claim",
+    )
+
+
+def _round(  # noqa: PLR0913
     number: int,
-    metric: float,
+    metric: float | None,
     *,
     hypothesis_id: str,
     parent_round: int | None = None,
     parent_commit: str | None = None,
     outcome: str = "proven",
-    declared: str | None = None,
+    declared: str | None = "nominated",
     direction: Literal["max", "min"] = "max",
-    candidate_retained: bool | None = True,
+    retained: bool | None = True,
 ) -> RoundRecord:
     return RoundRecord(
         round_number=number,
         commit=f"{number:040x}",
         perf_metric=metric,
-        perf_unit="total_ops_per_sec",
+        perf_unit="total_ops_per_sec" if metric is not None else None,
         passed=True,
         hypothesis_id=hypothesis_id,
         hypothesis_declared_outcome=declared,
         judge_verdict="pass",
         hypothesis_outcome=outcome,
+        hypothesis_claim=f"claim {hypothesis_id}",
+        hypothesis_task=f"implement {hypothesis_id}",
         hypothesis_parent_round=parent_round,
         hypothesis_parent_commit=parent_commit,
-        metrics={"total_ops_per_sec": metric},
-        official_evaluation=True,
-        perf_direction=direction,
-        candidate_retained=candidate_retained,
+        metrics={"total_ops_per_sec": metric} if metric is not None else {},
+        official_evaluation=metric is not None,
+        perf_direction=direction if metric is not None else None,
+        candidate_retained=retained,
     )
 
 
+def test_hypothesis_owns_all_of_its_rounds_and_active_is_only_a_pointer() -> None:
+    initial = AgentRunState()
+    started = start_hypothesis(initial, _plan("H-1"), started_round=1)
+    continued = append_round(
+        started,
+        _round(1, None, hypothesis_id="H-1", outcome="continue", declared="continue"),
+        keep_active=True,
+    )
+    completed = append_round(
+        continued,
+        _round(2, 100.0, hypothesis_id="H-1"),
+        keep_active=False,
+    )
+
+    hypothesis = completed.by_id("H-1")
+    assert hypothesis is not None
+    assert [record.round_number for record in hypothesis.rounds] == [1, 2]
+    assert completed.rounds == hypothesis.rounds
+    assert completed.active_hypothesis_id is None
+    assert initial.hypotheses == []
+    started_hypothesis = started.by_id("H-1")
+    assert started_hypothesis is not None
+    assert started_hypothesis.rounds == []
+
+
+def test_operational_restart_fields_live_on_the_same_hypothesis() -> None:
+    state = start_hypothesis(AgentRunState(), _plan("H-1"), started_round=1)
+    active = state.active_hypothesis
+    assert active is not None
+    active = active.clone()
+    active.feedback = "measure the producer path"
+    active.next_step = "add the producer-local cache"
+    active.continuation_rounds = 1
+    active.gate_revalidation_pending = True
+
+    updated = update_active_hypothesis(state, active)
+
+    assert updated.active_hypothesis is not None
+    assert updated.active_hypothesis.feedback == "measure the producer path"
+    assert updated.active_hypothesis.next_step == "add the producer-local cache"
+    assert updated.active_hypothesis.continuation_rounds == 1
+    assert state.active_hypothesis is not None
+    assert state.active_hypothesis.feedback is None
+
+
+def test_plan_strategy_updates_and_start_are_one_pure_transition() -> None:
+    first = start_hypothesis(AgentRunState(), _plan("old"), started_round=1)
+    completed = append_round(
+        first,
+        _round(1, 100.0, hypothesis_id="old"),
+        keep_active=False,
+    )
+    update = HypothesisStrategyUpdate(
+        hypothesis_id="old",
+        disposition="abandoned",
+        reason="A better direction supersedes it.",
+    )
+
+    started = start_hypothesis(
+        completed,
+        _plan("new", updates=[update]),
+        started_round=2,
+        parent_round=1,
+        parent_commit="a" * 40,
+    )
+
+    old = started.by_id("old")
+    assert old is not None
+    assert old.strategy is HypothesisStrategy.ABANDONED
+    assert started.active_hypothesis_id == "new"
+    unchanged_old = completed.by_id("old")
+    assert unchanged_old is not None
+    assert unchanged_old.strategy is HypothesisStrategy.AVAILABLE
+
+
+def test_strategy_updates_reject_unknown_active_and_incomplete_hypotheses() -> None:
+    active = start_hypothesis(AgentRunState(), _plan("active"), started_round=1)
+    abandon_active = HypothesisStrategyUpdate(
+        hypothesis_id="active",
+        disposition="abandoned",
+        reason="stop",
+    )
+    with pytest.raises(ValueError, match="cannot abandoned active"):
+        apply_strategy_updates(active, [abandon_active])
+
+    incomplete = active.clone()
+    incomplete.active_hypothesis_id = None
+    with pytest.raises(ValueError, match="incomplete hypothesis"):
+        apply_strategy_updates(incomplete, [abandon_active])
+
+    unknown = HypothesisStrategyUpdate(
+        hypothesis_id="missing",
+        disposition="parked",
+        reason="no evidence",
+    )
+    with pytest.raises(ValueError, match="unknown hypothesis"):
+        apply_strategy_updates(AgentRunState(), [unknown])
+
+
+def test_aggregate_rejects_duplicate_ids_rounds_and_dangling_active_pointer() -> None:
+    first = Hypothesis(hypothesis_id="H-1", plan=_plan("H-1"), started_round=1)
+    with pytest.raises(ValidationError, match="hypothesis IDs must be unique"):
+        AgentRunState(hypotheses=[first, first.clone()])
+
+    with pytest.raises(ValidationError, match="active_hypothesis_id"):
+        AgentRunState(active_hypothesis_id="missing")
+
+    one = first.clone()
+    one.rounds = [_round(1, None, hypothesis_id="H-1")]
+    two = Hypothesis(
+        hypothesis_id="H-2",
+        plan=_plan("H-2"),
+        started_round=1,
+        rounds=[_round(1, None, hypothesis_id="H-2")],
+    )
+    with pytest.raises(ValidationError, match="globally unique"):
+        AgentRunState(hypotheses=[one, two])
+
+
 def test_queue_rs_regression_is_disproven_and_not_retained() -> None:
-    """Configured legacy M3 is repaired from evidence, not its old pass mapping."""
-    rounds = [
-        RoundRecord(
-            round_number=2,
-            commit=f"{2:040x}",
-            perf_metric=104_257_741.0,
-            perf_unit="total_ops_per_sec",
-            passed=True,
-            reviewed=True,
-            hypothesis_id="m2-preallocated-spsc-ring",
-            hypothesis_outcome="proven",
-            official_evaluation=True,
+    parent = start_hypothesis(AgentRunState(), _plan("m2"), started_round=2)
+    parent = append_round(
+        parent,
+        _round(2, 104_257_741.0, hypothesis_id="m2"),
+        keep_active=False,
+    )
+    child = start_hypothesis(
+        parent,
+        _plan("m3"),
+        started_round=3,
+        parent_round=2,
+        parent_commit=f"{2:040x}",
+    )
+    child = append_round(
+        child,
+        _round(
+            3,
+            97_028_091.721612,
+            hypothesis_id="m3",
+            parent_round=2,
+            parent_commit=f"{2:040x}",
+            retained=False,
         ),
-        RoundRecord(
-            round_number=3,
-            commit=f"{3:040x}",
-            perf_metric=97_028_091.721612,
-            perf_unit="total_ops_per_sec",
-            passed=True,
-            reviewed=True,
-            hypothesis_id="m3-pow2-mask-addressing",
-            hypothesis_outcome="proven",
-            hypothesis_parent_round=2,
-            official_evaluation=True,
-        ),
-    ]
+        keep_active=False,
+    )
 
-    m3 = reconcile_hypothesis_ledger(
-        None,
-        rounds,
-        None,
-        legacy_directions={"total_ops_per_sec": "max"},
-    ).by_id("m3-pow2-mask-addressing")
-
+    m3 = child.by_id("m3")
     assert m3 is not None
     assert m3.resolution is HypothesisResolution.DISPROVEN
     assert m3.candidate_retained is False
@@ -102,141 +229,31 @@ def test_queue_rs_regression_is_disproven_and_not_retained() -> None:
     assert m3.measurement.delta_pct < 0
 
 
-def test_configured_legacy_minimize_run_uses_min_direction() -> None:
-    rounds = [
-        RoundRecord(
-            1,
-            "a" * 40,
-            100.0,
-            "latency_ms",
-            True,  # noqa: FBT003  # legacy positional codec shape
-            hypothesis_id="parent",
-        ),
-        RoundRecord(
-            2,
-            "b" * 40,
-            90.0,
-            "latency_ms",
-            True,  # noqa: FBT003  # tracked: #288
-            hypothesis_id="child",
-            hypothesis_outcome="proven",
-            hypothesis_parent_round=1,
-            official_evaluation=True,
-        ),
-    ]
-    rounds[0].official_evaluation = True
+def test_metric_baseline_prefers_exact_parent_commit_and_fails_closed() -> None:
+    parent = _round(1, 100.0, hypothesis_id="parent")
+    later = _round(2, 120.0, hypothesis_id="later")
 
-    child = reconcile_hypothesis_ledger(
-        None,
-        rounds,
-        None,
-        legacy_directions={"latency_ms": "min"},
-    ).by_id("child")
-
-    assert child is not None
-    assert child.resolution is HypothesisResolution.PROVEN
-    assert child.candidate_retained is True
-    assert child.measurement is not None
-    assert child.measurement.direction == "min"
-
-
-def test_configured_legacy_metric_without_causal_baseline_is_inconclusive() -> None:
-    legacy = RoundRecord(
-        round_number=1,
-        commit="a" * 40,
-        perf_metric=100.0,
-        perf_unit="ops",
-        passed=True,
-        reviewed=True,
-        hypothesis_id="H-1",
-        hypothesis_outcome="proven",
-        official_evaluation=True,
-    )
-
-    hypothesis = reconcile_hypothesis_ledger(
-        None,
-        [legacy],
-        None,
-        legacy_directions={"ops": "max"},
-    ).by_id("H-1")
-
-    assert hypothesis is not None
-    assert hypothesis.resolution is HypothesisResolution.INCONCLUSIVE
-
-
-def test_projection_uses_hypothesis_parent_not_previous_round() -> None:
-    rounds = [
-        _official_round(2, 100.0, hypothesis_id="parent"),
-        _official_round(3, 70.0, hypothesis_id="unrelated"),
-        _official_round(
-            4,
-            90.0,
-            hypothesis_id="child",
+    assert (
+        metric_baseline(
             parent_round=2,
-            candidate_retained=None,
-        ),
-    ]
-
-    child = reconcile_hypothesis_ledger(None, rounds, None).by_id("child")
-
-    assert child is not None
-    assert child.resolution is HypothesisResolution.DISPROVEN
-    assert child.measurement is not None
-    assert child.measurement.baseline_round == 2
-    assert child.measurement.delta_pct == -10.0
-
-
-def test_projection_preserves_latest_official_measurement_across_provisional_rounds() -> None:
-    measured = _official_round(1, 100.0, hypothesis_id="H-1")
-    provisional = RoundRecord(
-        round_number=2,
-        commit="c2",
-        perf_metric=None,
-        perf_unit=None,
-        passed=False,
-        reviewed=False,
-        hypothesis_id="H-1",
-        hypothesis_declared_outcome="continue",
-        hypothesis_outcome="continue",
+            parent_commit=parent.commit,
+            metric="total_ops_per_sec",
+            rounds=[parent, later],
+        )
+        is parent
+    )
+    assert (
+        metric_baseline(
+            parent_round=2,
+            parent_commit="missing",
+            metric="total_ops_per_sec",
+            rounds=[parent, later],
+        )
+        is None
     )
 
-    hypothesis = reconcile_hypothesis_ledger(None, [measured, provisional], None).by_id("H-1")
 
-    assert hypothesis is not None
-    assert hypothesis.measurement is not None
-    assert hypothesis.measurement.value == 100.0
-    assert hypothesis.candidate_retained is True
-
-
-def test_metric_baseline_prefers_exact_parent_commit_over_round_number() -> None:
-    parent = _official_round(1, 100.0, hypothesis_id="parent")
-    later = _official_round(2, 120.0, hypothesis_id="later")
-
-    baseline = metric_baseline(
-        parent_round=2,
-        parent_commit=parent.commit,
-        metric="total_ops_per_sec",
-        rounds=[parent, later],
-    )
-
-    assert baseline is parent
-
-
-def test_metric_baseline_fails_closed_when_exact_parent_commit_is_missing() -> None:
-    parent = _official_round(1, 100.0, hypothesis_id="parent")
-    later = _official_round(2, 120.0, hypothesis_id="later")
-
-    baseline = metric_baseline(
-        parent_round=2,
-        parent_commit="missing-parent-commit",
-        metric="total_ops_per_sec",
-        rounds=[parent, later],
-    )
-
-    assert baseline is None
-
-
-def test_framework_resolves_max_and_min_objectives_directionally() -> None:
+def test_resolution_and_retention_respect_objective_direction_and_noise() -> None:
     maximize = resolve_hypothesis_outcome(
         ResolutionEvidence(
             declared=HypothesisOutcome.NOMINATED,
@@ -262,320 +279,10 @@ def test_framework_resolves_max_and_min_objectives_directionally() -> None:
 
     assert maximize is HypothesisResolution.DISPROVEN
     assert minimize is HypothesisResolution.PROVEN
-
-
-def test_official_regression_overrides_implementer_support() -> None:
-    resolution = resolve_hypothesis_outcome(
-        ResolutionEvidence(
-            declared=HypothesisOutcome.SUPPORTED,
-            passed=True,
-            reviewed=True,
-            official_metric=90.0,
-            baseline_metric=100.0,
-            direction="max",
-            benchmark_expected=True,
-        )
-    )
-
-    assert resolution is HypothesisResolution.DISPROVEN
-
-
-@pytest.mark.parametrize(
-    "declared",
-    [HypothesisOutcome.SUPPORTED, HypothesisOutcome.NOMINATED],
-)
-def test_non_benchmark_claim_ignores_incidental_official_metric(
-    declared: HypothesisOutcome,
-) -> None:
-    resolution = resolve_hypothesis_outcome(
-        ResolutionEvidence(
-            declared=declared,
-            passed=True,
-            reviewed=True,
-            official_metric=90.0,
-            baseline_metric=100.0,
-            direction="max",
-            benchmark_expected=False,
-        )
-    )
-
-    assert resolution is HypothesisResolution.PROVEN
-
-
-def test_noise_band_and_missing_parent_are_inconclusive() -> None:
-    within_noise = resolve_hypothesis_outcome(
-        ResolutionEvidence(
-            declared=HypothesisOutcome.NOMINATED,
-            passed=True,
-            reviewed=True,
-            official_metric=100.5,
-            baseline_metric=100.0,
-            direction="max",
-            noise_fraction=0.01,
-            benchmark_expected=True,
-        )
-    )
-    missing_parent = resolve_hypothesis_outcome(
-        ResolutionEvidence(
-            declared=HypothesisOutcome.NOMINATED,
-            passed=True,
-            reviewed=True,
-            official_metric=110.0,
-            baseline_metric=None,
-            direction="max",
-            benchmark_expected=True,
-        )
-    )
-
-    assert within_noise is HypothesisResolution.INCONCLUSIVE
-    assert missing_parent is HypothesisResolution.INCONCLUSIVE
-
-
-def test_scalar_retention_requires_a_directional_new_best() -> None:
     assert (
         scalar_candidate_retained(
-            metric=101.0,
-            direction="max",
-            prior=[100.0],
-            noise_fraction=0.005,
-        )
-        is True
-    )
-    assert (
-        scalar_candidate_retained(
-            metric=100.2,
-            direction="max",
-            prior=[100.0],
-            noise_fraction=0.005,
+            metric=100.2, direction="max", prior=[100.0], noise_fraction=0.005
         )
         is False
     )
-    assert (
-        scalar_candidate_retained(
-            metric=90.0,
-            direction="min",
-            prior=[100.0],
-        )
-        is True
-    )
-
-
-def test_orchestrator_strategy_update_is_separate_from_resolution() -> None:
-    ledger = reconcile_hypothesis_ledger(
-        None,
-        [_official_round(1, 100.0, hypothesis_id="H-1")],
-        None,
-    )
-
-    updated = apply_strategy_updates(
-        ledger,
-        [
-            HypothesisStrategyUpdate(
-                hypothesis_id="H-1",
-                disposition="abandoned",
-                reason="Official measurement regressed against its parent.",
-            )
-        ],
-    )
-    hypothesis = updated.by_id("H-1")
-
-    assert hypothesis is not None
-    assert hypothesis.resolution is HypothesisResolution.PROVEN
-    assert hypothesis.strategy is HypothesisStrategyState.ABANDONED
-
-
-def test_reconciliation_completes_active_projection_when_round_evidence_exists() -> None:
-    round_record = _official_round(1, 100.0, hypothesis_id="H-1")
-    stale = HypothesisLedger(hypotheses=[HypothesisRecord(hypothesis_id="H-1", started_round=1)])
-
-    hypothesis = reconcile_hypothesis_ledger(stale, [round_record], None).by_id("H-1")
-
-    assert hypothesis is not None
-    assert hypothesis.strategy is HypothesisStrategyState.COMPLETED
-
-
-def test_reconciliation_recovers_portable_active_without_local_checkpoint() -> None:
-    saved_active = HypothesisLedger(
-        hypotheses=[HypothesisRecord(hypothesis_id="H-1", started_round=1)]
-    )
-
-    hypothesis = reconcile_hypothesis_ledger(saved_active, [], None).by_id("H-1")
-
-    assert hypothesis is not None
-    assert hypothesis.strategy is HypothesisStrategyState.ACTIVE
-
-
-def test_reconciliation_preserves_portable_active_after_observed_continuation() -> None:
-    continued = RoundRecord(
-        round_number=1,
-        commit="a" * 40,
-        perf_metric=None,
-        perf_unit=None,
-        passed=True,
-        reviewed=True,
-        hypothesis_id="H-1",
-        hypothesis_declared_outcome="continue",
-        hypothesis_outcome="continue",
-    )
-    saved_active = HypothesisLedger(
-        hypotheses=[HypothesisRecord(hypothesis_id="H-1", started_round=1, rounds=[1])]
-    )
-
-    hypothesis = reconcile_hypothesis_ledger(saved_active, [continued], None).by_id("H-1")
-
-    assert hypothesis is not None
-    assert hypothesis.strategy is HypothesisStrategyState.ACTIVE
-
-
-def test_reconciliation_replays_active_plan_strategy_updates() -> None:
-    completed = RoundRecord(
-        round_number=1,
-        commit="a" * 40,
-        perf_metric=None,
-        perf_unit=None,
-        passed=True,
-        reviewed=True,
-        hypothesis_id="old-direction",
-        hypothesis_outcome="proven",
-    )
-    saved_before_start = HypothesisLedger(
-        hypotheses=[
-            HypothesisRecord(
-                hypothesis_id="old-direction",
-                started_round=1,
-                strategy=HypothesisStrategyState.COMPLETED,
-            )
-        ]
-    )
-    active = ActiveHypothesis(
-        plan=OrchestratorPlan(
-            hypothesis_id="new-direction",
-            hypothesis_updates=[
-                HypothesisStrategyUpdate(
-                    hypothesis_id="old-direction",
-                    disposition="abandoned",
-                    reason="The active plan superseded it.",
-                )
-            ],
-            task="try the new direction",
-            pass_criteria="review",  # noqa: S106  # tracked: #288
-            reasoning="start a recoverable transition",
-        ),
-        started_round=2,
-        parent_round=1,
-        parent_commit="a" * 40,
-    )
-
-    ledger = reconcile_hypothesis_ledger(saved_before_start, [completed], active)
-
-    old = ledger.by_id("old-direction")
-    new = ledger.by_id("new-direction")
-    assert old is not None
-    assert old.strategy is HypothesisStrategyState.ABANDONED
-    assert new is not None
-    assert new.strategy is HypothesisStrategyState.ACTIVE
-
-
-def test_legacy_round_with_unknown_direction_keeps_semantics_unknown() -> None:
-    legacy = RoundRecord(
-        round_number=1,
-        commit="a" * 40,
-        perf_metric=90.0,
-        perf_unit="total_ops_per_sec",
-        passed=True,
-        reviewed=True,
-        hypothesis_id="H-1",
-        hypothesis_outcome="proven",
-        official_evaluation=True,
-    )
-
-    hypothesis = reconcile_hypothesis_ledger(None, [legacy], None).by_id("H-1")
-
-    assert hypothesis is not None
-    assert hypothesis.resolution is HypothesisResolution.INCONCLUSIVE
-    assert hypothesis.measurement is None
-    assert hypothesis.candidate_retained is None
-
-
-def test_legacy_prerequisite_disposition_is_retained() -> None:
-    legacy = RoundRecord(
-        round_number=1,
-        commit="a" * 40,
-        perf_metric=None,
-        perf_unit=None,
-        passed=True,
-        hypothesis_id="H-1",
-        candidate_disposition="prerequisite",
-    )
-
-    hypothesis = reconcile_hypothesis_ledger(None, [legacy], None).by_id("H-1")
-
-    assert hypothesis is not None
-    assert hypothesis.candidate_retained is True
-
-
-def test_typed_unknown_retention_does_not_reuse_raw_disposition() -> None:
-    typed = RoundRecord(
-        round_number=1,
-        commit="a" * 40,
-        perf_metric=None,
-        perf_unit=None,
-        passed=True,
-        reviewed=True,
-        hypothesis_id="H-1",
-        hypothesis_declared_outcome="supported",
-        judge_verdict="pass",
-        hypothesis_outcome="proven",
-        candidate_disposition="pareto_frontier",
-        candidate_retained=None,
-    )
-
-    hypothesis = reconcile_hypothesis_ledger(None, [typed], None).by_id("H-1")
-
-    assert hypothesis is not None
-    assert hypothesis.candidate_retained is None
-
-
-def test_strategy_updates_reject_unknown_and_active_hypotheses() -> None:
-    ledger = HypothesisLedger(
-        hypotheses=[
-            HypothesisRecord(
-                hypothesis_id="completed",
-                started_round=1,
-                strategy=HypothesisStrategyState.COMPLETED,
-            ),
-            HypothesisRecord(hypothesis_id="active", started_round=2),
-        ]
-    )
-    unknown = HypothesisStrategyUpdate(
-        hypothesis_id="missing",
-        disposition="parked",
-        reason="No evidence.",
-    )
-    active = HypothesisStrategyUpdate(
-        hypothesis_id="active",
-        disposition="abandoned",
-        reason="No evidence.",
-    )
-
-    with pytest.raises(ValueError, match="unknown hypothesis"):
-        apply_strategy_updates(ledger, [unknown])
-    with pytest.raises(ValueError, match="cannot abandoned active"):
-        apply_strategy_updates(ledger, [active])
-
-
-def test_ledger_rejects_duplicate_ids_and_multiple_active_hypotheses() -> None:
-    with pytest.raises(ValueError, match="hypothesis IDs must be unique"):
-        HypothesisLedger(
-            hypotheses=[
-                HypothesisRecord(hypothesis_id="H-1", started_round=1),
-                HypothesisRecord(hypothesis_id="H-1", started_round=2),
-            ]
-        )
-    with pytest.raises(ValueError, match="at most one hypothesis may be active"):
-        HypothesisLedger(
-            hypotheses=[
-                HypothesisRecord(hypothesis_id="H-1", started_round=1),
-                HypothesisRecord(hypothesis_id="H-2", started_round=2),
-            ]
-        )
+    assert scalar_candidate_retained(metric=90.0, direction="min", prior=[100.0]) is True

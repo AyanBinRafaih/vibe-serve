@@ -1,69 +1,375 @@
-"""Typed persistence adapter for agent-loop state."""
+"""Persistence boundary for the unified agent-loop state aggregate."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from enum import StrEnum
+from typing import TYPE_CHECKING, Annotated, Literal
 
-from vibesys.loops.agent.model import ActiveHypothesis, HypothesisLedger
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
+
+from vibesys.loops.agent.hypotheses import project_round_evidence
+from vibesys.loops.agent.model import (
+    AgentRunState,
+    Hypothesis,
+    HypothesisMeasurement,
+    HypothesisResolution,
+    HypothesisReview,
+    HypothesisStrategy,
+)
+from vibesys.schemas import (
+    CandidateDisposition,
+    HypothesisOutcome,
+    OrchestratorPlan,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from vs_loop_state import RoundRecord
     from vs_project import StateNamespace, StateSlot, StateTransition
 
 
-class AgentStateStore:
-    """Persist typed agent-loop local state in one namespace."""
+class AgentRunStateStore:
+    """Persist the single authoritative agent-loop state file."""
 
-    _ACTIVE_FILE = "active.json"
+    _STATE_FILE = "state.json"
+    _LEGACY_LEDGER_FILE = "hypotheses.json"
+    _LEGACY_ACTIVE_FILE = "active.json"
 
     def __init__(self, namespace: StateNamespace) -> None:
-        """Bind the adapter to one machine-local agent namespace."""
-        self._slot: StateSlot[ActiveHypothesis] = namespace.slot(
-            self._ACTIVE_FILE,
-            ActiveHypothesis,
+        """Bind the store to one run's portable agent namespace."""
+        self._namespace = namespace
+        self._slot: StateSlot[AgentRunState] = namespace.slot(
+            self._STATE_FILE,
+            AgentRunState,
         )
 
-    def load_active(self) -> ActiveHypothesis | None:
-        """Load active state, returning ``None`` only when absent."""
+    def load_optional(self) -> AgentRunState | None:
+        """Load unified state, returning ``None`` only when absent."""
         return self._slot.load_optional()
 
-    def save_active(self, state: ActiveHypothesis | None) -> None:
-        """Atomically save or clear active state."""
+    def load(self) -> AgentRunState:
+        """Load unified state or return a new empty aggregate."""
+        return self.load_optional() or AgentRunState()
+
+    def save(self, state: AgentRunState) -> None:
+        """Atomically replace the unified state."""
         self._slot.save(state)
 
-    def prepare_active_transition(
-        self,
-        state: ActiveHypothesis | None,
-    ) -> StateTransition:
-        """Build the exact typed active-state transition without applying it."""
+    def transition(self, state: AgentRunState) -> StateTransition:
+        """Prepare an exact replacement without applying it."""
         return self._slot.transition(state)
 
-    def apply_active_transition(self, transition: StateTransition) -> None:
-        """Atomically apply a previously prepared active-state transition."""
+    def apply_transition(self, transition: StateTransition) -> None:
+        """Validate and apply a previously prepared state transition."""
         self._slot.apply(transition)
 
-
-class HypothesisLedgerStore:
-    """Persist authoritative hypothesis state in the portable agent namespace."""
-
-    _LEDGER_FILE = "hypotheses.json"
-
-    def __init__(self, namespace: StateNamespace) -> None:
-        """Bind the ledger to one run's portable agent namespace."""
-        self._namespace = namespace
-        self._slot: StateSlot[HypothesisLedger] = namespace.slot(
-            self._LEDGER_FILE,
-            HypothesisLedger,
+    def migrate_legacy(
+        self,
+        *,
+        rounds: Sequence[RoundRecord],
+        local_namespace: StateNamespace,
+        legacy_directions: Mapping[str, Literal["max", "min"]] | None = None,
+    ) -> AgentRunState:
+        """Build unified state from legacy files without modifying either format."""
+        existing = self.load_optional()
+        if existing is not None:
+            return existing
+        ledger = self._namespace.load_optional(
+            self._LEGACY_LEDGER_FILE,
+            _LegacyHypothesisLedger,
+        )
+        active = local_namespace.load_optional(
+            self._LEGACY_ACTIVE_FILE,
+            _LegacyActiveHypothesis,
+        )
+        return _migrate_legacy_state(
+            rounds=rounds,
+            ledger=ledger,
+            active=active,
+            legacy_directions=legacy_directions,
         )
 
-    def load_optional(self) -> HypothesisLedger | None:
-        """Load the ledger, returning ``None`` only for legacy runs."""
-        return self._slot.load_optional()
+    def cleanup_legacy(
+        self,
+        *,
+        round_numbers: Sequence[int],
+        local_namespace: StateNamespace,
+    ) -> None:
+        """Delete old files after the caller has committed ``state.json``."""
+        self.cleanup_legacy_portable(round_numbers)
+        self.cleanup_legacy_local(local_namespace)
 
-    def save(self, ledger: HypothesisLedger) -> None:
-        """Atomically replace the validated ledger."""
-        self._slot.save(ledger)
+    def cleanup_legacy_portable(self, round_numbers: Sequence[int]) -> None:
+        """Remove legacy portable documents before an exact namespace commit."""
+        unique_rounds = sorted(set(round_numbers))
+        if any(number <= 0 for number in unique_rounds):
+            raise ValueError("legacy round numbers must be positive")  # noqa: TRY003
+        self._namespace.apply(self._namespace.transition(self._LEGACY_LEDGER_FILE, None))
+        for number in unique_rounds:
+            self._namespace.apply(self._namespace.transition(f"rounds/{number:04d}.json", None))
+
+    def cleanup_legacy_local(self, local_namespace: StateNamespace) -> None:
+        """Remove the obsolete machine-local active checkpoint."""
+        local_namespace.apply(local_namespace.transition(self._LEGACY_ACTIVE_FILE, None))
 
     @property
     def namespace(self) -> StateNamespace:
         """Return the namespace used for durable Git snapshots."""
         return self._namespace
+
+
+class _LegacyHypothesisStrategy(StrEnum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    PARKED = "parked"
+    ABANDONED = "abandoned"
+
+
+class _LegacyHypothesisRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hypothesis_id: str = Field(min_length=1)
+    claim: str | None = None
+    task: str | None = None
+    started_round: Annotated[int, Field(gt=0)]
+    rounds: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
+    parent_round: Annotated[int, Field(gt=0)] | None = None
+    parent_commit: str | None = None
+    declared_outcome: HypothesisOutcome | None = None
+    review: HypothesisReview = HypothesisReview.PENDING
+    resolution: HypothesisResolution | None = None
+    measurement: HypothesisMeasurement | None = None
+    candidate_retained: bool | None = None
+    strategy: _LegacyHypothesisStrategy = _LegacyHypothesisStrategy.ACTIVE
+    strategy_reason: str | None = None
+
+
+class _LegacyHypothesisLedger(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    hypotheses: list[_LegacyHypothesisRecord] = Field(default_factory=list)
+
+
+class _LegacyActiveHypothesis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    plan: OrchestratorPlan
+    started_round: Annotated[int, Field(gt=0)]
+    parent_round: Annotated[int, Field(gt=0)] | None = None
+    parent_commit: str | None = None
+    feedback: str | None = None
+    next_step: str | None = None
+    continuation_rounds: Annotated[int, Field(ge=0)] = 0
+    revert_applied: bool = False
+    revert_commit: str | None = None
+    gate_revalidation_pending: bool = False
+    gate_approved_perf_metric: FiniteFloat | None = None
+    gate_approved_perf_unit: str | None = None
+    gate_approved_metrics: dict[str, FiniteFloat] = Field(default_factory=dict)
+    gate_approved_evaluation_artifact: str | None = None
+    gate_approved_candidate_disposition: str = CandidateDisposition.UNASSESSED.value
+    gate_approved_candidate_metrics: dict[str, FiniteFloat] = Field(default_factory=dict)
+    gate_approved_candidate_evaluation_artifact: str | None = None
+    gate_approved_candidate_operating_point: str = ""
+    gate_approved_candidate_retention_reason: str = ""
+    gate_candidate_commit: str | None = None
+    gate_accuracy_passed: bool = False
+
+
+def _migrate_legacy_state(
+    *,
+    rounds: Sequence[RoundRecord],
+    ledger: _LegacyHypothesisLedger | None,
+    active: _LegacyActiveHypothesis | None,
+    legacy_directions: Mapping[str, Literal["max", "min"]] | None,
+) -> AgentRunState:
+    ordered_rounds = sorted(rounds, key=lambda record: record.round_number)
+    records_by_id = {
+        record.hypothesis_id: record for record in (ledger.hypotheses if ledger is not None else ())
+    }
+    identifiers: list[str] = []
+    for record in ordered_rounds:
+        identifier = record.hypothesis_id or _legacy_unassigned_id(record.round_number)
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+    for record in ledger.hypotheses if ledger is not None else ():
+        if record.hypothesis_id not in identifiers:
+            identifiers.append(record.hypothesis_id)
+    if active is not None and active.plan.hypothesis_id not in identifiers:
+        identifiers.append(active.plan.hypothesis_id)
+
+    hypotheses = [
+        _legacy_hypothesis(
+            identifier,
+            rounds=ordered_rounds,
+            record=records_by_id.get(identifier),
+            active=active,
+        )
+        for identifier in identifiers
+    ]
+    state = AgentRunState(hypotheses=hypotheses)
+    prior_rounds: list[RoundRecord] = []
+    for round_record in ordered_rounds:
+        identifier = round_record.hypothesis_id or _legacy_unassigned_id(round_record.round_number)
+        hypothesis = state.by_id(identifier)
+        assert hypothesis is not None  # noqa: S101  # created above
+        projected = project_round_evidence(
+            hypothesis,
+            round_record,
+            prior_rounds=prior_rounds,
+            legacy_directions=legacy_directions,
+        )
+        index = next(
+            index for index, item in enumerate(state.hypotheses) if item.hypothesis_id == identifier
+        )
+        state.hypotheses[index] = projected
+        prior_rounds.append(round_record)
+
+    active_identifier = _legacy_active_id(ledger, active)
+    if active_identifier is not None and state.by_id(active_identifier) is not None:
+        active_hypothesis = state.by_id(active_identifier)
+        assert active_hypothesis is not None  # noqa: S101  # guarded above
+        active_hypothesis.strategy = HypothesisStrategy.AVAILABLE
+        active_hypothesis.strategy_reason = None
+        state.active_hypothesis_id = active_identifier
+    return AgentRunState.model_validate(state.model_dump())
+
+
+def _legacy_hypothesis(
+    identifier: str,
+    *,
+    rounds: Sequence[RoundRecord],
+    record: _LegacyHypothesisRecord | None,
+    active: _LegacyActiveHypothesis | None,
+) -> Hypothesis:
+    matching = [
+        item
+        for item in rounds
+        if (item.hypothesis_id or _legacy_unassigned_id(item.round_number)) == identifier
+    ]
+    active_match = (
+        active if active is not None and active.plan.hypothesis_id == identifier else None
+    )
+    first = matching[0] if matching else None
+    started_round = (
+        active_match.started_round
+        if active_match is not None
+        else record.started_round
+        if record is not None
+        else first.round_number
+        if first is not None
+        else 1
+    )
+    plan = (
+        active_match.plan.model_copy(deep=True)
+        if active_match is not None
+        else _legacy_plan(identifier, record=record, first=first)
+    )
+    hypothesis = Hypothesis(
+        hypothesis_id=identifier,
+        plan=plan,
+        started_round=started_round,
+        parent_round=(
+            active_match.parent_round
+            if active_match is not None
+            else record.parent_round
+            if record is not None
+            else first.hypothesis_parent_round
+            if first is not None
+            else None
+        ),
+        parent_commit=(
+            active_match.parent_commit
+            if active_match is not None
+            else record.parent_commit
+            if record is not None
+            else first.hypothesis_parent_commit
+            if first is not None
+            else None
+        ),
+        strategy=_legacy_strategy(record),
+        strategy_reason=record.strategy_reason if record is not None else None,
+    )
+    if record is not None:
+        hypothesis.declared_outcome = record.declared_outcome
+        hypothesis.review = record.review
+        hypothesis.resolution = record.resolution
+        hypothesis.measurement = record.measurement
+        hypothesis.candidate_retained = record.candidate_retained
+    if active_match is not None:
+        for field in _LEGACY_OPERATIONAL_FIELDS:
+            setattr(hypothesis, field, getattr(active_match, field))
+    return hypothesis
+
+
+_LEGACY_OPERATIONAL_FIELDS = (
+    "feedback",
+    "next_step",
+    "continuation_rounds",
+    "revert_applied",
+    "revert_commit",
+    "gate_revalidation_pending",
+    "gate_approved_perf_metric",
+    "gate_approved_perf_unit",
+    "gate_approved_metrics",
+    "gate_approved_evaluation_artifact",
+    "gate_approved_candidate_disposition",
+    "gate_approved_candidate_metrics",
+    "gate_approved_candidate_evaluation_artifact",
+    "gate_approved_candidate_operating_point",
+    "gate_approved_candidate_retention_reason",
+    "gate_candidate_commit",
+    "gate_accuracy_passed",
+)
+
+
+def _legacy_plan(
+    identifier: str,
+    *,
+    record: _LegacyHypothesisRecord | None,
+    first: RoundRecord | None,
+) -> OrchestratorPlan:
+    claim = record.claim if record is not None else first.hypothesis_claim if first else None
+    task = record.task if record is not None else first.hypothesis_task if first else None
+    return OrchestratorPlan(
+        hypothesis_id=identifier,
+        hypothesis=claim or "",
+        task=task or "",
+        pass_criteria="",
+        reasoning="",
+    )
+
+
+def _legacy_strategy(record: _LegacyHypothesisRecord | None) -> HypothesisStrategy:
+    if record is None:
+        return HypothesisStrategy.AVAILABLE
+    if record.strategy is _LegacyHypothesisStrategy.PARKED:
+        return HypothesisStrategy.PARKED
+    if record.strategy is _LegacyHypothesisStrategy.ABANDONED:
+        return HypothesisStrategy.ABANDONED
+    return HypothesisStrategy.AVAILABLE
+
+
+def _legacy_active_id(
+    ledger: _LegacyHypothesisLedger | None,
+    active: _LegacyActiveHypothesis | None,
+) -> str | None:
+    if active is not None:
+        return active.plan.hypothesis_id
+    if ledger is None:
+        return None
+    return next(
+        (
+            record.hypothesis_id
+            for record in ledger.hypotheses
+            if record.strategy is _LegacyHypothesisStrategy.ACTIVE
+        ),
+        None,
+    )
+
+
+def _legacy_unassigned_id(round_number: int) -> str:
+    return f"legacy-round-{round_number}"

@@ -657,6 +657,27 @@ class StateSlot[ModelT: BaseModel]:
             subject="state transition",
         )
 
+    def snapshot_transition(self, transition: StateTransition) -> StateSnapshot:
+        """Return the exact portable snapshot produced by one replacement.
+
+        A ``StateSnapshot`` represents files that must exist, so deletion
+        transitions cannot be expressed through this API. Callers that need
+        namespace replacement semantics must use ``StateNamespace.snapshot``
+        after applying the deletion instead.
+        """
+        validated = self.validate_transition(transition)
+        if validated._next_document is None:
+            raise ProjectStateError("Cannot create a state snapshot from a deletion transition")
+        return StateSnapshot._create(
+            namespace_root=self._namespace._namespace_root,
+            files=(
+                StateFile(
+                    relative_path=self._relative_path,
+                    contents=validated._next_document._contents,
+                ),
+            ),
+        )
+
     def deserialize_transition(self, payload: bytes) -> StateTransition:
         """Parse and schema-validate a transition for exactly this slot."""
         if not isinstance(payload, bytes):  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -675,7 +696,10 @@ class StateSlot[ModelT: BaseModel]:
         if not isinstance(document, dict):
             raise ProjectStateError("Serialized state transition document must be an object")
         try:
-            model = self._model_type.model_validate(document, strict=True)
+            model = self._model_type.model_validate_json(
+                json.dumps(document),
+                strict=True,
+            )
         except ValidationError as exc:
             raise ProjectStateError(
                 f"Serialized state transition does not match the slot schema: {exc}"

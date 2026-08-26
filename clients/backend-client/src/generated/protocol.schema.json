@@ -928,8 +928,7 @@
           "anyOf": [
             {
               "enum": [
-                "active",
-                "completed",
+                "available",
                 "parked",
                 "abandoned"
               ],

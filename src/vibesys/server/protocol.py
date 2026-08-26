@@ -161,20 +161,19 @@ class HypothesisEntry(ProtocolModel):
     last_round: int
     rounds: list[HypothesisRound] = Field(default_factory=list)
     resolved_outcome: str | None = None
-    # ``pass``/``fail`` from the closing round, or None when independent review
-    # was deferred by sparse-review policy and the round is still provisional.
+    # Independent review from the authoritative hypothesis state.
     judge_verdict: Literal["pass", "fail"] | None = None
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
-    # Change against the last measured round preceding this hypothesis. None
-    # when either side is unmeasured or the baseline is zero.
+    # Causal delta paired with ``perf_metric`` by the hypothesis state. None
+    # means no official comparison is available.
     perf_delta_pct: FiniteFloat | None = None
     # Integration, not truth: the framework's explicit retention decision.
     # None means legacy or not yet assessed, never "official evaluation ran".
     kept: bool | None = None
     # Orchestrator strategy is separate from empirical resolution and
     # candidate retention. It is structured backend state, not roadmap prose.
-    strategy_disposition: Literal["active", "completed", "parked", "abandoned"] | None = None
+    strategy_disposition: Literal["available", "parked", "abandoned"] | None = None
     strategy_reason: str | None = None
     active: bool = False
 

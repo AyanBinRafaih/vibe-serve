@@ -1,4 +1,4 @@
-"""Pure hypothesis-ledger projection and transition functions."""
+"""Pure transitions for the authoritative agent-run hypothesis state."""
 
 from __future__ import annotations
 
@@ -6,15 +6,18 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from vibesys.loops.agent.model import (
-    ActiveHypothesis,
-    HypothesisLedger,
+    AgentRunState,
+    Hypothesis,
     HypothesisMeasurement,
-    HypothesisRecord,
     HypothesisResolution,
     HypothesisReview,
-    HypothesisStrategyState,
+    HypothesisStrategy,
 )
-from vibesys.schemas import HypothesisOutcome, HypothesisStrategyUpdate
+from vibesys.schemas import (
+    HypothesisOutcome,
+    HypothesisStrategyUpdate,
+    OrchestratorPlan,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -49,7 +52,7 @@ def resolve_hypothesis_outcome(
     else:
         resolution = {
             HypothesisOutcome.DISPROVEN: HypothesisResolution.DISPROVEN,
-            HypothesisOutcome.IMPLEMENTATION_FAILED: (HypothesisResolution.IMPLEMENTATION_FAILED),
+            HypothesisOutcome.IMPLEMENTATION_FAILED: HypothesisResolution.IMPLEMENTATION_FAILED,
             HypothesisOutcome.INCONCLUSIVE: HypothesisResolution.INCONCLUSIVE,
             HypothesisOutcome.BLOCKED: HypothesisResolution.BLOCKED,
         }.get(evidence.declared)
@@ -57,8 +60,6 @@ def resolve_hypothesis_outcome(
             resolution = None
         elif resolution is None:
             if not evidence.benchmark_expected:
-                # Without a benchmark contract, incidental metrics have no
-                # lifecycle meaning. Independent review resolves the claim.
                 resolution = HypothesisResolution.PROVEN
             elif evidence.official_metric is not None:
                 resolution = _resolve_metric_evidence(evidence)
@@ -70,7 +71,6 @@ def resolve_hypothesis_outcome(
 
 
 def _resolve_metric_evidence(evidence: ResolutionEvidence) -> HypothesisResolution:
-    """Classify a reviewed nomination from its official parent comparison."""
     if (
         evidence.official_metric is None
         or evidence.baseline_metric in {None, 0}
@@ -102,8 +102,9 @@ def scalar_candidate_retained(
     if not prior:
         return True
     best = max(prior) if direction == "max" else min(prior)
-    tolerance = abs(best) * noise_fraction
-    return metric > best + tolerance if direction == "max" else metric < best - tolerance
+    scale = abs(best) if best != 0 else 1.0
+    improvement = metric - best if direction == "max" else best - metric
+    return improvement > scale * noise_fraction
 
 
 def metric_baseline(
@@ -113,23 +114,17 @@ def metric_baseline(
     metric: str | None,
     rounds: Sequence[RoundRecord],
 ) -> RoundRecord | None:
-    """Resolve the measured causal parent, preferring exact commit provenance."""
+    """Find the exact causal baseline for one metric when provenance permits."""
     comparable = [
         item
         for item in rounds
         if item.official_evaluation and item.perf_metric is not None and item.perf_unit == metric
     ]
     if parent_commit is not None:
-        match = next(
+        return next(
             (item for item in reversed(comparable) if item.commit == parent_commit),
             None,
         )
-        if match is not None:
-            return match
-        # A commit pin is stronger provenance than the legacy round number.  A
-        # missing pin means the causal baseline is unknown, not that another
-        # same-numbered measurement is interchangeable.
-        return None
     if parent_round is not None:
         return next(
             (item for item in reversed(comparable) if item.round_number == parent_round),
@@ -138,71 +133,105 @@ def metric_baseline(
     return comparable[-1] if comparable else None
 
 
-def reconcile_hypothesis_ledger(
-    existing: HypothesisLedger | None,
-    rounds: Sequence[RoundRecord],
-    active: ActiveHypothesis | None,
+def start_hypothesis(
+    state: AgentRunState,
+    plan: OrchestratorPlan,
     *,
-    legacy_directions: Mapping[str, Literal["max", "min"]] | None = None,
-) -> HypothesisLedger:
-    """Project evidence, using configured direction only for legacy records."""
-    strategy = {
-        item.hypothesis_id: (item.strategy, item.strategy_reason)
-        for item in (existing.hypotheses if existing is not None else ())
-        if item.strategy
-        in {
-            HypothesisStrategyState.PARKED,
-            HypothesisStrategyState.ABANDONED,
-        }
-    }
-    saved_active = (
-        next(
-            (
-                item.model_copy(deep=True)
-                for item in existing.hypotheses
-                if item.strategy is HypothesisStrategyState.ACTIVE
-            ),
-            None,
+    started_round: int,
+    parent_round: int | None = None,
+    parent_commit: str | None = None,
+) -> AgentRunState:
+    """Start a new hypothesis after applying its strategic updates."""
+    if state.active_hypothesis_id is not None:
+        raise ValueError("cannot start a hypothesis while another is active")  # noqa: TRY003
+    identifier = plan.hypothesis_id.strip()
+    if not identifier:
+        raise ValueError("hypothesis ID must not be blank")  # noqa: TRY003
+    if state.by_id(identifier) is not None:
+        raise ValueError(f"hypothesis ID {identifier!r} already exists")  # noqa: TRY003
+    updated = apply_strategy_updates(state, plan.hypothesis_updates)
+    updated.hypotheses.append(
+        Hypothesis(
+            hypothesis_id=identifier,
+            plan=plan.model_copy(update={"hypothesis_id": identifier}, deep=True),
+            started_round=started_round,
+            parent_round=parent_round,
+            parent_commit=parent_commit,
         )
-        if existing is not None and active is None
-        else None
     )
-    ledger = HypothesisLedger()
-    prior_rounds: list[RoundRecord] = []
-    for round_record in rounds:
-        _apply_round(ledger, round_record, prior_rounds, legacy_directions)
-        prior_rounds.append(round_record)
-    for item in ledger.hypotheses:
-        saved = strategy.get(item.hypothesis_id)
-        if saved is not None and item.strategy is not HypothesisStrategyState.ACTIVE:
-            item.strategy, item.strategy_reason = saved
-    if active is not None:
-        # The active plan is already the durable handoff if interruption lands
-        # between the local checkpoint and portable-ledger writes. Replay its
-        # validated strategy updates to make that start transition recoverable.
-        ledger = apply_strategy_updates(ledger, active.plan.hypothesis_updates)
-        _ensure_active(ledger, active)
-    elif saved_active is not None:
-        # Preserve a portable ACTIVE decision only when that ledger had already
-        # observed every reconstructed round. Newer immutable round evidence
-        # supersedes a stale active snapshot after a terminal transition.
-        reconstructed = ledger.by_id(saved_active.hypothesis_id)
-        if reconstructed is None:
-            ledger.hypotheses.append(saved_active)
-        elif set(reconstructed.rounds).issubset(saved_active.rounds):
-            # The portable record was written after every reconstructed round,
-            # so its ACTIVE transition is newer than the evidence projection.
-            reconstructed.strategy = HypothesisStrategyState.ACTIVE
-            reconstructed.strategy_reason = None
-    return _validated_ledger(ledger)
+    updated.active_hypothesis_id = identifier
+    return _validated_state(updated)
+
+
+def update_active_hypothesis(
+    state: AgentRunState,
+    hypothesis: Hypothesis,
+) -> AgentRunState:
+    """Replace the active hypothesis with an updated restart checkpoint."""
+    identifier = state.active_hypothesis_id
+    if identifier is None:
+        raise ValueError("cannot update an active hypothesis when none is active")  # noqa: TRY003
+    if hypothesis.hypothesis_id != identifier:
+        raise ValueError("updated hypothesis must preserve the active hypothesis ID")  # noqa: TRY003
+    updated = state.clone()
+    index = next(
+        index for index, item in enumerate(updated.hypotheses) if item.hypothesis_id == identifier
+    )
+    updated.hypotheses[index] = hypothesis.model_copy(deep=True)
+    return _validated_state(updated)
+
+
+def append_round(
+    state: AgentRunState,
+    record: RoundRecord,
+    *,
+    keep_active: bool,
+    legacy_directions: Mapping[str, Literal["max", "min"]] | None = None,
+) -> AgentRunState:
+    """Append one completed round to the active hypothesis."""
+    active = state.active_hypothesis
+    if active is None:
+        raise ValueError("cannot append a round when no hypothesis is active")  # noqa: TRY003
+    if record.hypothesis_id != active.hypothesis_id:
+        raise ValueError("round hypothesis_id must match the active hypothesis")  # noqa: TRY003
+    if any(item.round_number == record.round_number for item in state.rounds):
+        raise ValueError(f"round {record.round_number} already exists")  # noqa: TRY003
+
+    updated = state.clone()
+    updated_active = updated.active_hypothesis
+    assert updated_active is not None  # noqa: S101  # preserved by the clone
+    projected = project_round_evidence(
+        updated_active,
+        record,
+        prior_rounds=state.rounds,
+        legacy_directions=legacy_directions,
+    )
+    index = next(
+        index
+        for index, item in enumerate(updated.hypotheses)
+        if item.hypothesis_id == projected.hypothesis_id
+    )
+    updated.hypotheses[index] = projected
+    if not keep_active:
+        updated.active_hypothesis_id = None
+    return _validated_state(updated)
+
+
+def finish_hypothesis(state: AgentRunState) -> AgentRunState:
+    """Clear the active pointer without changing the hypothesis itself."""
+    if state.active_hypothesis_id is None:
+        return state.clone()
+    updated = state.clone()
+    updated.active_hypothesis_id = None
+    return _validated_state(updated)
 
 
 def apply_strategy_updates(
-    ledger: HypothesisLedger,
+    state: AgentRunState,
     updates: Sequence[HypothesisStrategyUpdate],
-) -> HypothesisLedger:
-    """Apply validated orchestrator-owned parked/abandoned transitions."""
-    updated = ledger.model_copy(deep=True)
+) -> AgentRunState:
+    """Apply orchestrator-owned parked/abandoned decisions."""
+    updated = state.clone()
     seen: set[str] = set()
     for change in updates:
         if change.hypothesis_id in seen:
@@ -215,127 +244,93 @@ def apply_strategy_updates(
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"strategy update names unknown hypothesis {change.hypothesis_id!r}"
             )
-        if item.strategy is HypothesisStrategyState.ACTIVE:
+        if updated.active_hypothesis_id == change.hypothesis_id:
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"cannot {change.disposition} active hypothesis {change.hypothesis_id!r}"
             )
-        item.strategy = HypothesisStrategyState(change.disposition)
-        item.strategy_reason = change.reason.strip()
-    return _validated_ledger(updated)
-
-
-def start_hypothesis(
-    ledger: HypothesisLedger,
-    active: ActiveHypothesis,
-) -> HypothesisLedger:
-    """Add the framework-created active hypothesis if it is not present."""
-    updated = ledger.model_copy(deep=True)
-    existing = updated.by_id(active.plan.hypothesis_id)
-    if existing is not None:
-        if existing.strategy is not HypothesisStrategyState.ACTIVE:
+        if not item.rounds:
             raise ValueError(  # noqa: TRY003  # tracked: #288
-                f"hypothesis ID {active.plan.hypothesis_id!r} was already completed"
+                f"cannot update incomplete hypothesis {change.hypothesis_id!r}"
             )
-        return _validated_ledger(updated)
-    updated.hypotheses.append(_active_record(active))
-    return _validated_ledger(updated)
+        item.strategy = HypothesisStrategy(change.disposition)
+        item.strategy_reason = change.reason.strip()
+    return _validated_state(updated)
 
 
-def _validated_ledger(ledger: HypothesisLedger) -> HypothesisLedger:
-    return HypothesisLedger.model_validate(ledger.model_dump())
-
-
-def _ensure_active(ledger: HypothesisLedger, active: ActiveHypothesis) -> None:
-    item = ledger.by_id(active.plan.hypothesis_id)
-    if item is None:
-        ledger.hypotheses.append(_active_record(active))
-        return
-    item.strategy = HypothesisStrategyState.ACTIVE
-    item.strategy_reason = None
-
-
-def _active_record(active: ActiveHypothesis) -> HypothesisRecord:
-    return HypothesisRecord(
-        hypothesis_id=active.plan.hypothesis_id,
-        claim=active.plan.hypothesis or None,
-        task=active.plan.task or None,
-        started_round=active.started_round,
-        parent_round=active.parent_round,
-        parent_commit=active.parent_commit,
-    )
-
-
-def _apply_round(
-    ledger: HypothesisLedger,
+def project_round_evidence(
+    hypothesis: Hypothesis,
     record: RoundRecord,
+    *,
     prior_rounds: Sequence[RoundRecord],
-    legacy_directions: Mapping[str, Literal["max", "min"]] | None,
-) -> None:
-    identifier = record.hypothesis_id
-    if not identifier:
-        return
-    item = ledger.by_id(identifier)
-    if item is None:
-        item = HypothesisRecord(
-            hypothesis_id=identifier,
-            claim=record.hypothesis_claim,
-            task=record.hypothesis_task,
-            started_round=record.round_number,
-            parent_round=record.hypothesis_parent_round,
-            parent_commit=record.hypothesis_parent_commit,
-        )
-        ledger.hypotheses.append(item)
-    if record.round_number not in item.rounds:
-        item.rounds.append(record.round_number)
-    item.claim = record.hypothesis_claim or item.claim
-    item.task = record.hypothesis_task or item.task
-    item.parent_round = record.hypothesis_parent_round
-    item.parent_commit = record.hypothesis_parent_commit
-    item.declared_outcome = _declared_outcome(record.hypothesis_declared_outcome)
-    item.review = _review(record)
-    item.resolution = (
-        _resolution(record.hypothesis_outcome)
-        if item.review not in {HypothesisReview.PENDING, HypothesisReview.DEFERRED}
-        else None
-    )
+    legacy_directions: Mapping[str, Literal["max", "min"]] | None = None,
+) -> Hypothesis:
+    """Return a hypothesis updated with one completed round's evidence."""
+    if record.hypothesis_id != hypothesis.hypothesis_id:
+        raise ValueError("round hypothesis_id must match its owning hypothesis")  # noqa: TRY003
+    if any(item.round_number == record.round_number for item in hypothesis.rounds):
+        raise ValueError(f"round {record.round_number} already belongs to hypothesis")  # noqa: TRY003
+    updated = hypothesis.clone()
+    updated.rounds.append(record)
+    updated.declared_outcome = _declared_outcome(record.hypothesis_declared_outcome)
+    updated.review = _review(record)
     measurement = _measurement(record, prior_rounds, legacy_directions)
+    if record.judge_verdict is not None:
+        updated.resolution = resolve_hypothesis_outcome(
+            ResolutionEvidence(
+                declared=updated.declared_outcome,
+                passed=record.passed,
+                reviewed=updated.review
+                not in {HypothesisReview.PENDING, HypothesisReview.DEFERRED},
+                official_metric=record.perf_metric if record.official_evaluation else None,
+                baseline_metric=(measurement.baseline_value if measurement is not None else None),
+                direction=(
+                    measurement.direction if measurement is not None else record.perf_direction
+                ),
+                benchmark_expected=record.official_evaluation,
+            )
+        )
+    else:
+        updated.resolution = (
+            _resolution(record.hypothesis_outcome)
+            if updated.review not in {HypothesisReview.PENDING, HypothesisReview.DEFERRED}
+            else None
+        )
     if measurement is not None:
-        item.measurement = measurement
+        updated.measurement = measurement
     retained = _retained(record, prior_rounds, legacy_directions)
     if retained is not None:
-        item.candidate_retained = retained
-    item.strategy = HypothesisStrategyState.COMPLETED
-    _correct_legacy_resolution(item, record, measurement)
+        updated.candidate_retained = retained
+    if record.judge_verdict is None:
+        _correct_legacy_resolution(updated, record, measurement)
+    return Hypothesis.model_validate(updated.model_dump())
+
+
+def _validated_state(state: AgentRunState) -> AgentRunState:
+    return AgentRunState.model_validate(state.model_dump())
 
 
 def _correct_legacy_resolution(
-    item: HypothesisRecord,
+    hypothesis: Hypothesis,
     record: RoundRecord,
     measurement: HypothesisMeasurement | None,
 ) -> None:
-    """Repair old pass-derived resolutions only when direction is known."""
+    if record.judge_verdict is not None or hypothesis.resolution is not HypothesisResolution.PROVEN:
+        return
     if (
-        record.hypothesis_declared_outcome is None
-        and record.candidate_retained is None
-        and item.resolution is HypothesisResolution.PROVEN
+        record.official_evaluation
+        and record.perf_metric is not None
+        and (measurement is None or measurement.delta_pct is None)
     ):
-        if (
-            record.official_evaluation
-            and record.perf_metric is not None
-            and (measurement is None or measurement.delta_pct is None)
-        ):
-            # A legacy "proven" performance claim needs both configured
-            # direction and a causal baseline before it has lifecycle meaning.
-            item.resolution = HypothesisResolution.INCONCLUSIVE
-        elif measurement is not None:
-            assert measurement.delta_pct is not None  # noqa: S101  # branch above
-            benefit = measurement.delta_pct
-            if measurement.direction == "min":
-                benefit = -benefit
-            if benefit < 0:
-                item.resolution = HypothesisResolution.DISPROVEN
-            elif benefit == 0:
-                item.resolution = HypothesisResolution.INCONCLUSIVE
+        hypothesis.resolution = HypothesisResolution.INCONCLUSIVE
+    elif measurement is not None:
+        assert measurement.delta_pct is not None  # noqa: S101  # guarded above
+        benefit = measurement.delta_pct
+        if measurement.direction == "min":
+            benefit = -benefit
+        if benefit < 0:
+            hypothesis.resolution = HypothesisResolution.DISPROVEN
+        elif benefit == 0:
+            hypothesis.resolution = HypothesisResolution.INCONCLUSIVE
 
 
 def _declared_outcome(value: str | None) -> HypothesisOutcome | None:
@@ -375,8 +370,6 @@ def _measurement(
         return None
     direction = record.perf_direction or _configured_legacy_direction(record, legacy_directions)
     if direction not in {"max", "min"}:
-        # Keep a legacy raw measurement in the round journal when the run's
-        # configuration does not establish its objective direction.
         return None
     baseline = _baseline(record, prior_rounds)
     baseline_value = record.perf_baseline_metric
@@ -384,9 +377,8 @@ def _measurement(
         baseline_value = baseline.perf_metric
     delta = record.perf_delta_pct
     if delta is None and baseline_value not in {None, 0}:
-        baseline_metric = baseline_value
-        assert baseline_metric is not None  # noqa: S101  # narrowed by the guard above
-        delta = (record.perf_metric - baseline_metric) / abs(baseline_metric) * 100
+        assert baseline_value is not None  # noqa: S101  # narrowed above
+        delta = (record.perf_metric - baseline_value) / abs(baseline_value) * 100
     return HypothesisMeasurement(
         round=record.round_number,
         metric=record.perf_unit,
@@ -406,39 +398,13 @@ def _measurement(
     )
 
 
-def _baseline(
-    record: RoundRecord,
-    prior_rounds: Sequence[RoundRecord],
-) -> RoundRecord | None:
-    comparable = [
-        prior
-        for prior in prior_rounds
-        if prior.official_evaluation
-        and prior.perf_metric is not None
-        and prior.perf_unit == record.perf_unit
-    ]
-    if record.hypothesis_parent_commit is not None:
-        match = next(
-            (
-                prior
-                for prior in reversed(comparable)
-                if prior.commit == record.hypothesis_parent_commit
-            ),
-            None,
-        )
-        if match is not None:
-            return match
-        return None
-    if record.hypothesis_parent_round is not None:
-        return next(
-            (
-                prior
-                for prior in reversed(comparable)
-                if prior.round_number == record.hypothesis_parent_round
-            ),
-            None,
-        )
-    return comparable[-1] if comparable else None
+def _baseline(record: RoundRecord, prior_rounds: Sequence[RoundRecord]) -> RoundRecord | None:
+    return metric_baseline(
+        parent_round=record.hypothesis_parent_round,
+        parent_commit=record.hypothesis_parent_commit,
+        metric=record.perf_unit,
+        rounds=prior_rounds,
+    )
 
 
 def _retained(
@@ -449,8 +415,6 @@ def _retained(
     if record.candidate_retained is not None:
         retained = record.candidate_retained
     elif record.judge_verdict is not None:
-        # Typed records deliberately distinguish unknown from false. Raw
-        # implementer dispositions are evidence, not a retention decision.
         retained = None
     elif record.candidate_disposition in {"pareto_frontier", "prerequisite"}:
         retained = True
@@ -459,9 +423,10 @@ def _retained(
     elif not record.official_evaluation or record.perf_metric is None:
         retained = None
     else:
-        direction = record.perf_direction or _configured_legacy_direction(record, legacy_directions)
-        if direction not in {"max", "min"}:
-            return None
+        direction = record.perf_direction or _configured_legacy_direction(
+            record,
+            legacy_directions,
+        )
         comparable = [
             prior.perf_metric
             for prior in prior_rounds
@@ -470,12 +435,11 @@ def _retained(
             and prior.perf_metric is not None
             and prior.perf_unit == record.perf_unit
         ]
-        if not comparable:
-            retained = True
-        elif direction == "min":
-            retained = record.perf_metric < min(comparable)
-        else:
-            retained = record.perf_metric > max(comparable)
+        retained = scalar_candidate_retained(
+            metric=record.perf_metric,
+            direction=direction,
+            prior=comparable,
+        )
     return retained
 
 

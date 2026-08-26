@@ -29,20 +29,20 @@ from vibesys.input_manifest import BenchmarkResult, WorkspaceSource  # noqa: TC0
 from vibesys.loops.agent import issue_board
 from vibesys.loops.agent.hypotheses import (
     ResolutionEvidence,
+    append_round,
     apply_strategy_updates,
     metric_baseline,
-    reconcile_hypothesis_ledger,
     resolve_hypothesis_outcome,
     scalar_candidate_retained,
     start_hypothesis,
+    update_active_hypothesis,
 )
-from vibesys.loops.agent.model import ActiveHypothesis as _ActiveHypothesis
 from vibesys.loops.agent.model import (
-    HypothesisLedger,
+    AgentRunState,
+    Hypothesis,
     HypothesisResolution,
-    HypothesisStrategyState,
 )
-from vibesys.loops.agent.state import AgentStateStore, HypothesisLedgerStore
+from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.evolve.population import Objective  # noqa: TC001  # tracked: #288
 from vibesys.loops.gates import run_accuracy_gate
 from vibesys.loops.profiler import mcp_spec as profiler_mcp_spec
@@ -108,7 +108,7 @@ _TEMPLATE_DIR = PROMPTS_DIR / "loops" / "agent"
 
 
 def _backfill_revert_commit(
-    state: _ActiveHypothesis | None,
+    state: Hypothesis | None,
     records: list[RoundRecord],
 ) -> bool:
     """Recover rollback provenance for state written before it was persisted.
@@ -137,27 +137,6 @@ def _backfill_revert_commit(
     return True
 
 
-def _require_active_checkpoint_consistency(
-    ledger: HypothesisLedger | None,
-    active: _ActiveHypothesis | None,
-) -> None:
-    """Fail closed when portable state cannot be resumed operationally."""
-    if active is not None or ledger is None:
-        return
-    portable_active = next(
-        (item for item in ledger.hypotheses if item.strategy is HypothesisStrategyState.ACTIVE),
-        None,
-    )
-    if portable_active is None:
-        return
-    raise ValueError(  # noqa: TRY003  # tracked: #288
-        "Portable hypothesis state marks "
-        f"{portable_active.hypothesis_id!r} active, but its local continuation "
-        "checkpoint is missing. Restore the run's local state before resuming; "
-        "VibeSys will not replace the active hypothesis automatically."
-    )
-
-
 # `CONTINUE`/`SUPPORTED`/`NOMINATED` name an active or successful hypothesis;
 # every other `HypothesisOutcome` member represents a failed one. Derive the
 # failure set by subtraction so a new enum member defaults to "failed" rather
@@ -175,16 +154,30 @@ _FAILED_HYPOTHESIS_OUTCOMES = (
 _MAX_CONTINUATION_ROUNDS_WITHOUT_DESIGN_REVIEW = 2
 
 
-def _persist_hypothesis_ledger(
+def _persist_agent_run_state(
     ctx: LoopContext,
-    store: HypothesisLedgerStore,
-    ledger: HypothesisLedger,
+    store: AgentRunStateStore,
+    state: AgentRunState,
     *,
     label: str,
 ) -> None:
-    """Persist and snapshot authoritative hypothesis state."""
-    store.save(ledger)
+    """Persist only authoritative agent state without staging candidate edits."""
+    store.save(state)
     ctx.state.commit(label, store.namespace)
+
+
+def _persist_active_hypothesis(
+    ctx: LoopContext,
+    store: AgentRunStateStore,
+    state: AgentRunState,
+    hypothesis: Hypothesis,
+    *,
+    label: str,
+) -> AgentRunState:
+    """Replace and persist the active hypothesis inside its owning aggregate."""
+    updated = update_active_hypothesis(state, hypothesis)
+    _persist_agent_run_state(ctx, store, updated, label=label)
+    return updated
 
 
 def _implementation_requests_continuation(
@@ -1021,7 +1014,7 @@ def _domain_render_context(
 def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
     ctx: LoopContext,
     *,
-    hypothesis_ledger: HypothesisLedger,
+    agent_run_state: AgentRunState,
     round_number: int,
     objective: str,
     profiler_summary: ProfilerSummary | None,
@@ -1086,7 +1079,7 @@ def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
         reuse_session=False,
     )
     plan.hypothesis_id = plan.hypothesis_id.strip() or f"hypothesis-{round_number:04d}"
-    _validate_orchestrator_plan_state(plan, hypothesis_ledger)
+    _validate_orchestrator_plan_state(plan, agent_run_state)
     plan.recommended_skills, _ = _validate_skill_selections(ctx, plan.recommended_skills)
     issue_board.write_plan_artifact(progress_path, round_number, plan)
     issue_board.append_orchestrator_plan(progress_path, round_number, plan)
@@ -1095,7 +1088,7 @@ def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
 
 def _validate_orchestrator_plan_state(
     plan: OrchestratorPlan,
-    ledger: HypothesisLedger,
+    state: AgentRunState,
 ) -> None:
     """Validate structured lifecycle decisions against framework-owned state."""
     if len({update.hypothesis_id for update in plan.hypothesis_updates}) != len(
@@ -1108,13 +1101,13 @@ def _validate_orchestrator_plan_state(
         raise ValueError(  # noqa: TRY003  # tracked: #288
             "Orchestrator hypothesis_updates must refer to prior hypotheses"
         )
-    if ledger.by_id(plan.hypothesis_id) is not None:
+    if state.by_id(plan.hypothesis_id) is not None:
         raise ValueError(  # noqa: TRY003  # tracked: #288
             f"hypothesis ID {plan.hypothesis_id!r} was already used"
         )
     # Apply to a copy before any plan artifact is written. The real transition
     # is persisted after the operational active checkpoint is assembled.
-    apply_strategy_updates(ledger, plan.hypothesis_updates)
+    apply_strategy_updates(state, plan.hypothesis_updates)
 
 
 def _missing_implementer_response() -> ImplementerResponse:
@@ -2457,7 +2450,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         environment_hooks=domain_definition.environment_hooks,
         remote_repo=remote_repo,
         repo_visibility=repo_visibility,
-        active_state_model_type=_ActiveHypothesis,
+        agent_state_model_type=AgentRunState,
     )
     ctx.lprint(f"[log] orchestrate run: {ctx.run_log_path}")
     ctx.lprint(f"[log] project root: {ctx.project_root}")
@@ -2472,28 +2465,27 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     pareto_archive_path = issue_board.pareto_archive_path(progress_path)
     pareto_archive_location = issue_board.display_path(pareto_archive_path, ctx.workspace)
 
-    round_history = RoundHistory(records=ctx.state.completed_rounds())
-    records = round_history.records
-    agent_state = AgentStateStore(ctx.state.local(RunStateNamespace.AGENT))
-    active_hypothesis = agent_state.load_active()
-    if _backfill_revert_commit(active_hypothesis, records):
-        agent_state.save_active(active_hypothesis)
-    ledger_store = HypothesisLedgerStore(ctx.state.portable(RunStateNamespace.AGENT))
-    saved_ledger = ledger_store.load_optional()
-    hypothesis_ledger = reconcile_hypothesis_ledger(
-        saved_ledger,
-        records,
-        active_hypothesis,
+    portable_agent_state = ctx.state.portable(RunStateNamespace.AGENT)
+    local_agent_state = ctx.state.local(RunStateNamespace.AGENT)
+    state_store = AgentRunStateStore(portable_agent_state)
+    legacy_records = ctx.state.completed_rounds()
+    agent_run_state = state_store.migrate_legacy(
+        rounds=legacy_records,
+        local_namespace=local_agent_state,
         legacy_directions=legacy_metric_directions,
     )
-    _require_active_checkpoint_consistency(hypothesis_ledger, active_hypothesis)
-    if saved_ledger != hypothesis_ledger:
-        _persist_hypothesis_ledger(
-            ctx,
-            ledger_store,
-            hypothesis_ledger,
-            label="agent: reconcile hypothesis state",
-        )
+    active_hypothesis = agent_run_state.active_hypothesis
+    _backfill_revert_commit(active_hypothesis, agent_run_state.rounds)
+
+    # Replace the legacy portable namespace exactly, then remove the local
+    # restart checkpoint only after its unified replacement is committed.
+    state_store.save(agent_run_state)
+    state_store.cleanup_legacy_portable([record.round_number for record in legacy_records])
+    ctx.state.commit("agent: migrate unified hypothesis state", state_store.namespace)
+    state_store.cleanup_legacy_local(local_agent_state)
+
+    round_history = RoundHistory(records=agent_run_state.rounds)
+    records = round_history.records
 
     carry = _CarryOver(regression_info=_terminal_workspace_notice(records))
     round_number = start_round if start_round is not None else len(records) + 1
@@ -2569,7 +2561,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     provisional_candidates = _provisional_candidates_since_official(records)
                     plan = _run_orchestrator_plan(
                         ctx,
-                        hypothesis_ledger=hypothesis_ledger,
+                        agent_run_state=agent_run_state,
                         round_number=round_number,
                         objective=objective,
                         profiler_summary=profiler_summary,
@@ -2604,8 +2596,9 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         ),
                         None,
                     )
-                    active_hypothesis = _ActiveHypothesis(
-                        plan=plan,
+                    agent_run_state = start_hypothesis(
+                        agent_run_state,
+                        plan,
                         started_round=round_number,
                         parent_round=parent_round,
                         parent_commit=(
@@ -2614,22 +2607,15 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             else ctx.git.current_sha()
                         ),
                     )
-                    next_ledger = apply_strategy_updates(
-                        hypothesis_ledger,
-                        plan.hypothesis_updates,
-                    )
-                    next_ledger = start_hypothesis(
-                        next_ledger,
-                        active_hypothesis,
-                    )
-                    agent_state.save_active(active_hypothesis)
-                    _persist_hypothesis_ledger(
+                    active_hypothesis = agent_run_state.active_hypothesis
+                    assert active_hypothesis is not None  # noqa: S101  # started above
+                    plan = active_hypothesis.plan
+                    _persist_agent_run_state(
                         ctx,
-                        ledger_store,
-                        next_ledger,
+                        state_store,
+                        agent_run_state,
                         label=f"agent: start hypothesis {plan.hypothesis_id}",
                     )
-                    hypothesis_ledger = next_ledger
                     if ctx.supervisor is not None:
                         ctx.supervisor.record(
                             EventType.EXPERIMENTS_CHANGED,
@@ -2700,17 +2686,11 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             active_hypothesis.revert_applied = True
                             active_hypothesis.revert_commit = rollback_commit
                             active_hypothesis.parent_commit = rollback_commit
-                            agent_state.save_active(active_hypothesis)
-                            hypothesis_ledger = reconcile_hypothesis_ledger(
-                                hypothesis_ledger,
-                                records,
-                                active_hypothesis,
-                                legacy_directions=legacy_metric_directions,
-                            )
-                            _persist_hypothesis_ledger(
+                            agent_run_state = _persist_active_hypothesis(
                                 ctx,
-                                ledger_store,
-                                hypothesis_ledger,
+                                state_store,
+                                agent_run_state,
+                                active_hypothesis,
                                 label=(f"agent: set hypothesis {plan.hypothesis_id} parent"),
                             )
                         else:
@@ -2912,7 +2892,13 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             if validation_feedback is not None:
                                 feedback = validation_feedback
                                 active_hypothesis.feedback = feedback
-                                agent_state.save_active(active_hypothesis)
+                                agent_run_state = _persist_active_hypothesis(
+                                    ctx,
+                                    state_store,
+                                    agent_run_state,
+                                    active_hypothesis,
+                                    label=f"agent: checkpoint hypothesis {plan.hypothesis_id}",
+                                )
                                 continue
                             if (
                                 implementation.candidate_disposition
@@ -2933,7 +2919,13 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                                 active_hypothesis.gate_approved_candidate_retention_reason = (
                                     implementation.candidate_retention_reason
                                 )
-                                agent_state.save_active(active_hypothesis)
+                                agent_run_state = _persist_active_hypothesis(
+                                    ctx,
+                                    state_store,
+                                    agent_run_state,
+                                    active_hypothesis,
+                                    label=f"agent: checkpoint hypothesis {plan.hypothesis_id}",
+                                )
                             candidate_ready = implementation.hypothesis_outcome in {
                                 HypothesisOutcome.SUPPORTED,
                                 HypothesisOutcome.NOMINATED,
@@ -2979,7 +2971,13 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                                 active_hypothesis.gate_approved_evaluation_artifact = (
                                     implementation.evaluation_artifact
                                 )
-                                agent_state.save_active(active_hypothesis)
+                                agent_run_state = _persist_active_hypothesis(
+                                    ctx,
+                                    state_store,
+                                    agent_run_state,
+                                    active_hypothesis,
+                                    label=f"agent: checkpoint hypothesis {plan.hypothesis_id}",
+                                )
                             issue_board.append_official_evaluation_decision(
                                 progress_path,
                                 round_number,
@@ -3026,11 +3024,23 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             active_hypothesis.gate_candidate_commit = candidate_commit
                             active_hypothesis.gate_accuracy_passed = accuracy_passed
                             active_hypothesis.feedback = feedback
-                            agent_state.save_active(active_hypothesis)
+                            agent_run_state = _persist_active_hypothesis(
+                                ctx,
+                                state_store,
+                                agent_run_state,
+                                active_hypothesis,
+                                label=f"agent: checkpoint hypothesis {plan.hypothesis_id}",
+                            )
                             continue
                         feedback = verdict.feedback
                         active_hypothesis.feedback = feedback
-                        agent_state.save_active(active_hypothesis)
+                        agent_run_state = _persist_active_hypothesis(
+                            ctx,
+                            state_store,
+                            agent_run_state,
+                            active_hypothesis,
+                            label=f"agent: checkpoint hypothesis {plan.hypothesis_id}",
+                        )
                     else:
                         ctx.reselect_gpu()
                         single_agent_response = _run_single_agent_round(
@@ -3126,11 +3136,23 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             active_hypothesis.gate_candidate_commit = candidate_commit
                             active_hypothesis.gate_accuracy_passed = accuracy_passed
                             active_hypothesis.feedback = feedback
-                            agent_state.save_active(active_hypothesis)
+                            agent_run_state = _persist_active_hypothesis(
+                                ctx,
+                                state_store,
+                                agent_run_state,
+                                active_hypothesis,
+                                label=f"agent: checkpoint hypothesis {plan.hypothesis_id}",
+                            )
                             continue
                         feedback = single_agent_response.feedback
                         active_hypothesis.feedback = feedback
-                        agent_state.save_active(active_hypothesis)
+                        agent_run_state = _persist_active_hypothesis(
+                            ctx,
+                            state_store,
+                            agent_run_state,
+                            active_hypothesis,
+                            label=f"agent: checkpoint hypothesis {plan.hypothesis_id}",
+                        )
 
                 # --- Record round result & update carry-over ---
                 commit = ctx.git.current_sha()
@@ -3419,11 +3441,9 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     perf_baseline_metric=baseline_metric,
                     perf_delta_pct=perf_delta_pct,
                 )
-                records.append(completed_record)
-
                 # Compute the completed lifecycle transition in memory so its
                 # exact representation can enter the write-ahead journal before
-                # round records, progress notes, or active state are mutated.
+                # progress notes or durable state are mutated.
                 next_active_hypothesis = active_hypothesis.clone()
                 if inner_loop == "multi-agent" and _implementation_keeps_hypothesis_active(
                     implementation,
@@ -3465,8 +3485,23 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     next_active_hypothesis.next_step = (
                         implementation.next_step if implementation is not None else None
                     )
-                active_transition = agent_state.prepare_active_transition(next_active_hypothesis)
-                ctx.begin_completed_round(completed_record, active_transition=active_transition)
+                state_before_round = (
+                    update_active_hypothesis(agent_run_state, next_active_hypothesis)
+                    if next_active_hypothesis is not None
+                    else agent_run_state
+                )
+                next_agent_run_state = append_round(
+                    state_before_round,
+                    completed_record,
+                    keep_active=next_active_hypothesis is not None,
+                    legacy_directions=legacy_metric_directions,
+                )
+                state_transition = state_store.transition(next_agent_run_state)
+                ctx.begin_completed_round(
+                    round_number,
+                    state_transition=state_transition,
+                )
+                records.append(completed_record)
 
                 if not passed and records[-1].reviewed:
                     issue_board.append_exhaustion_note(
@@ -3524,21 +3559,9 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 # unreviewed terminal result hands control back to the designer;
                 # a rejected review keeps the same claim plus reviewer feedback
                 # so the implementer can address it on the next round.
-                active_hypothesis = next_active_hypothesis
-                agent_state.apply_active_transition(active_transition)
                 ctx.persist_completed_round()
-                hypothesis_ledger = reconcile_hypothesis_ledger(
-                    hypothesis_ledger,
-                    records,
-                    active_hypothesis,
-                    legacy_directions=legacy_metric_directions,
-                )
-                _persist_hypothesis_ledger(
-                    ctx,
-                    ledger_store,
-                    hypothesis_ledger,
-                    label=f"agent: resolve hypothesis {plan.hypothesis_id}",
-                )
+                agent_run_state = next_agent_run_state
+                active_hypothesis = agent_run_state.active_hypothesis
                 if ctx.supervisor is not None:
                     ctx.supervisor.record(
                         EventType.EXPERIMENTS_CHANGED,
