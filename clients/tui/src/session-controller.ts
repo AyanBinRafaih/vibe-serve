@@ -1,5 +1,5 @@
 import {type EventSubscription, SupervisionError} from './client.js';
-import {helpText, parseInput} from './commands.js';
+import {helpText, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
 import {
@@ -61,7 +61,7 @@ export interface SessionController {
   readonly state: SessionState;
   start(): Promise<void>;
   stop(): Promise<void>;
-  submit(value: string): Promise<void>;
+  submitCommand(value: string): Promise<void>;
   closeChat(): void;
   sendChat(value: string): Promise<void>;
   submitChat(value: string): Promise<void>;
@@ -429,7 +429,7 @@ export class SocketSessionController implements SessionController {
   submitChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text.startsWith('/')) return this.sendChat(value);
-    return this.submit(text);
+    return this.submitCommand(text);
   }
 
   sendChat(value: string): Promise<void> {
@@ -511,8 +511,8 @@ export class SocketSessionController implements SessionController {
     }
   }
 
-  async submit(value: string): Promise<void> {
-    const parsed = parseInput(value.trim());
+  async submitCommand(value: string): Promise<void> {
+    const parsed = parseCommand(value.trim());
     if (parsed.error)
       return this.#setState(reportError(this.#state, parsed.error, {scope: 'input'}));
     if (parsed.localView === 'help') {
@@ -542,10 +542,6 @@ export class SocketSessionController implements SessionController {
       return this.setTheme(parsed.themeName);
     }
     if (!parsed.request) return;
-    if (parsed.request.type === 'query.chat') {
-      await this.sendChat(parsed.request.text);
-      return;
-    }
     if (parsed.paneView !== undefined) {
       await this.openPane(parsed.paneView);
       return;

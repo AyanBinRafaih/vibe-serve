@@ -18,8 +18,8 @@ the Python `vibesys` package in the Python environment you want to use, or set
 
 ## Operator interface
 
-Enter ordinary text to ask the supervision backend about the current run. The
-available slash commands are:
+Use Experiment chat for ordinary questions about the current run. The command
+input accepts these slash commands:
 
 | Command | Behavior |
 | --- | --- |
@@ -90,13 +90,11 @@ list rises out of the command input rather than across the chat.
 The cursor starts in the command input, and `Ctrl+W` moves both it and the pane
 keys to the chat and back; the chat's instruction line says so (`Ctrl+W to type
 here`) until it holds them, and the focused input carries the focus border, so
-where a keystroke lands is never a guess. A question typed into either box
-reaches the same agent and is answered in the same column. Page Up and Page Down scroll the focused pane, and
+where a keystroke lands is never a guess. Only the chat composer accepts
+ordinary questions; the command input accepts slash commands. Page Up and Page Down scroll the focused pane, and
 Escape hands the keys back to the table. Arrows, Enter, and the rest of the
 table's keys are unaffected by the dock. A slash command typed into the chat
-input runs through the same path as anywhere else, and ordinary text typed into
-the command input is still a question for the agent: the two boxes are a
-division of attention, not of capability.
+input runs through the same command path as the command box.
 
 `/chat` leaves the command surface on this view, since the chat is already
 beside the table: it is absent from `/help` and from the completions, though it

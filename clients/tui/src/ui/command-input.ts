@@ -14,7 +14,7 @@ import {
 } from '../commands.js';
 import type {Theme} from './theme.js';
 
-export interface InputPanel {
+export interface CommandInputPanel {
   box: BoxRenderable;
   suggestions: BoxRenderable;
   /** Narrows the completions to the commands the current view offers. */
@@ -32,21 +32,21 @@ function commandSyntaxStyle(theme: Theme): SyntaxStyle {
   return SyntaxStyle.fromStyles({'slash-command': {fg: theme.accent, bold: true}});
 }
 
-export function createInputPanel(
+export function createCommandInputPanel(
   renderer: CliRenderer,
   onSubmit: (value: string) => void,
   theme: Theme,
   /** Called when the box is clicked, so the pane focus follows the cursor. */
   onFocusRequest: () => void = () => {},
-): InputPanel {
+): CommandInputPanel {
   const box = new BoxRenderable(renderer, {
-    id: 'input-box',
+    id: 'command-input-box',
     height: 3,
     width: '100%',
     border: true,
     borderStyle: 'rounded',
     borderColor: theme.borderFocus,
-    title: ' Ask or command ',
+    title: ' Command ',
     paddingLeft: 1,
     paddingRight: 1,
     onMouseUp: onFocusRequest,
@@ -54,16 +54,16 @@ export function createInputPanel(
   let syntaxStyle = commandSyntaxStyle(theme);
   let commandStyleId = syntaxStyle.getStyleId('slash-command');
   const input = new InputRenderable(renderer, {
-    id: 'input',
+    id: 'command-input',
     width: '100%',
-    placeholder: 'Type a question or /help',
+    placeholder: 'Type /help for commands',
     textColor: theme.textStrong,
     focusedTextColor: theme.textStrong,
     syntaxStyle,
     onMouseUp: onFocusRequest,
   });
   const suggestions = new BoxRenderable(renderer, {
-    id: 'input-suggestions',
+    id: 'command-input-suggestions',
     position: 'absolute',
     bottom: 3,
     left: 0,
@@ -79,7 +79,7 @@ export function createInputPanel(
     paddingRight: 1,
   });
   const suggestionList = new TextRenderable(renderer, {
-    id: 'input-suggestion-list',
+    id: 'command-input-suggestion-list',
     width: '100%',
     height: 1,
     fg: theme.textMuted,

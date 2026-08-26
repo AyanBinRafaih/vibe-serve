@@ -14,10 +14,10 @@ import {createChatDraft} from './chat-composer.js';
 import {ChatOverlayView} from './chat-overlay.js';
 import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
 import {RendererSelectionClipboard, type SelectionClipboard} from './clipboard.js';
+import {createCommandInputPanel} from './command-input.js';
 import {ConversationView} from './conversation.js';
 import {ErrorBannerView} from './error-banner.js';
 import {ExperimentLogView} from './experiment-log.js';
-import {createInputPanel} from './input.js';
 import {bindKeybindings} from './keybindings.js';
 import {OverlayView} from './overlay.js';
 import {RightPaneView, rightPaneWidth, splitFits} from './right-pane.js';
@@ -150,9 +150,9 @@ export function createOpenTuiApp(
   const chatPane = new ChatPaneView(renderer, controller, markdownStyle, theme, chatDraft);
   // Clicking either box moves the pane focus to it, so the border, the hint,
   // and the cursor never disagree about which surface is taking keystrokes.
-  const input = createInputPanel(
+  const commandInput = createCommandInputPanel(
     renderer,
-    value => void controller.submit(value),
+    value => void controller.submitCommand(value),
     theme,
     () => controller.focusPane('left'),
   );
@@ -188,8 +188,8 @@ export function createOpenTuiApp(
   commandColumn.add(help);
   // Absolute inside the command column rather than the root, so the list rises
   // out of the input it belongs to instead of across the chat beside it.
-  commandColumn.add(input.suggestions);
-  commandColumn.add(input.box);
+  commandColumn.add(commandInput.suggestions);
+  commandColumn.add(commandInput.box);
   bottom.add(commandColumn);
   root.add(header);
   root.add(errorBanner.output);
@@ -204,7 +204,7 @@ export function createOpenTuiApp(
   root.add(themePicker.output);
   root.add(chat.output);
   renderer.root.add(root);
-  input.focus();
+  commandInput.focus();
 
   const applyTheme = (next: ThemeName): (() => void) => {
     themeName = next;
@@ -227,7 +227,7 @@ export function createOpenTuiApp(
     conversation.applyTheme(theme, markdownStyle);
     chat.applyTheme(theme, markdownStyle);
     chatPane.applyTheme(theme, markdownStyle);
-    input.applyTheme(theme);
+    commandInput.applyTheme(theme);
     return () => previousMarkdownStyle.destroy();
   };
 
@@ -326,7 +326,7 @@ export function createOpenTuiApp(
     if (showSplit) {
       const errorHeight = state.errorBanner === null ? 0 : errorBanner.output.height;
       const top = header.height + errorHeight + (showLog ? 0 : roundStrip.output.height);
-      const below = todoStrip.output.height + help.height + input.box.height;
+      const below = todoStrip.output.height + help.height + commandInput.box.height;
       chat.setPaneBounds({
         left: 1,
         width: leftWidth - 2,
@@ -339,10 +339,10 @@ export function createOpenTuiApp(
     chatPane.render(state, showChatPane, chatWidth);
     const chatInputFocused = showChatPane && state.layout.focus === 'chat';
     commandColumn.visible = zoomedPane !== 'chat';
-    input.setFocused(paneFocus === 'experiments' || paneFocus === 'transcript');
+    commandInput.setFocused(paneFocus === 'experiments' || paneFocus === 'transcript');
     // The command list completes the box it belongs to, and on this view that
     // box cannot open a chat that is already beside it.
-    input.setCommandContext({chatDocked: showChatPane});
+    commandInput.setCommandContext({chatDocked: showChatPane});
     experimentLog.setAvailableWidth(showSplit || showChatPane ? leftWidth - chatWidth : null);
     experimentLog.render(state);
     experimentLog.output.visible = showExperimentLog;
@@ -362,16 +362,17 @@ export function createOpenTuiApp(
       focusTarget = target;
       if (target === 'modal') chat.focus();
       else if (target === 'chat') chatPane.focusComposer();
-      else input.focus();
+      else commandInput.focus();
     }
     releasePreviousStyle?.();
   };
   const unbindKeys = bindKeybindings(renderer, controller, viewport, clipboard, {
-    completeInput: () => input.completeSuggestion(),
+    completeInput: () => commandInput.completeSuggestion(),
     // Enter belongs to a pane only when nothing is typed anywhere. Asking which
     // box has the cursor is not enough: a question waiting in the other box is
     // still a question, and Enter must never discard it to open a hypothesis.
-    inputIsEmpty: () => input.isEmpty() && chatPane.isComposerEmpty() && chat.isComposerEmpty(),
+    inputIsEmpty: () =>
+      commandInput.isEmpty() && chatPane.isComposerEmpty() && chat.isComposerEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
     revealSelectedEntry: () => {
@@ -410,7 +411,7 @@ export function createOpenTuiApp(
       renderer.off('resize', onResize);
       unsubscribe();
       unbindKeys();
-      input.destroy();
+      commandInput.destroy();
       conversationActivityBar.destroy();
       roundStrip.destroy();
       agentMap.destroy();

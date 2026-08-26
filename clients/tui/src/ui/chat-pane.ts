@@ -46,9 +46,8 @@ export function chatPaneWidth(terminalWidth: number, rightPaneWidth = 0): number
 
 /**
  * The experiment chat as a column of the landing view rather than a dialog over
- * it. It has no input of its own: the client already has one, and plain text
- * typed there is a question for the agent, so a second box would only split the
- * operator's attention.
+ * it. Its composer is the only surface where ordinary text becomes a question;
+ * slash-prefixed text delegates to the shared command path.
  */
 export class ChatPaneView {
   readonly output: BoxRenderable;
