@@ -277,7 +277,7 @@ def materialize_skills(  # noqa: C901  # tracked: #288
 
 def build_schema_hint(response_cls: type[BaseModel]) -> str:
     """Render a short instruction telling the CLI tool what JSON to emit."""
-    schema = json.dumps(response_cls.model_json_schema(), indent=2)
+    schema = json.dumps(response_cls.model_json_schema(), separators=(",", ":"))
     return (
         "\n\n--\n"
         "Return EXACTLY one JSON object that conforms to the schema below. "

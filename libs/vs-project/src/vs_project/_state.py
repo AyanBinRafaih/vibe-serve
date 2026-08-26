@@ -796,6 +796,7 @@ class AgentRunConfiguration(_BaseRunConfiguration):
     official_eval_every: Annotated[int, Field(gt=0)]
     memory_layout: PortableText
     operator_constraints: tuple[str, ...] = ()
+    objectives: tuple[PortableText, ...] = ()
 
 
 class PlainRunConfiguration(_BaseRunConfiguration):

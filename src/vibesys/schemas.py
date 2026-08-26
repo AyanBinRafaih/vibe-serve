@@ -73,6 +73,26 @@ class CandidateDisposition(StrEnum):
     PARETO_FRONTIER = "pareto_frontier"
 
 
+HypothesisStrategyDisposition = Literal["parked", "abandoned"]
+
+
+class HypothesisStrategyUpdate(BaseModel):
+    """One structured update to a previously completed hypothesis."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hypothesis_id: str = Field(min_length=1)
+    disposition: HypothesisStrategyDisposition
+    reason: str = Field(min_length=1)
+
+    @field_validator("hypothesis_id", "reason")
+    @classmethod
+    def _strip_non_empty(cls, value: str) -> str:
+        if not (stripped := value.strip()):
+            raise ValueError("must not be blank")  # noqa: TRY003  # tracked: #288
+        return stripped
+
+
 class PerfTrend(StrEnum):  # noqa: D101  # tracked: #288
     IMPROVED = "improved"
     REGRESSED = "regressed"
@@ -558,6 +578,13 @@ class OrchestratorPlan(BaseModel):
         description=(
             "Stable short identifier for the hypothesis. Reuse it across rounds while "
             "the same implementer investigation remains active."
+        ),
+    )
+    hypothesis_updates: list[HypothesisStrategyUpdate] = Field(
+        default_factory=list,
+        description=(
+            "Strategic parked/abandoned updates for previously completed hypotheses. "
+            "These are persisted by the framework; roadmap prose is not authoritative."
         ),
     )
     hypothesis: str = Field(

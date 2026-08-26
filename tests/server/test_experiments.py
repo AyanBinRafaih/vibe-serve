@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from vibesys.loops.agent.model import ActiveHypothesis
-from vibesys.loops.agent.state import AgentStateStore
+from vibesys.loops.agent.model import (
+    ActiveHypothesis,
+    HypothesisLedger,
+    HypothesisMeasurement,
+    HypothesisRecord,
+    HypothesisResolution,
+    HypothesisReview,
+    HypothesisStrategyState,
+)
+from vibesys.loops.agent.state import AgentStateStore, HypothesisLedgerStore
 from vibesys.run.state import RunStateNamespace
 from vibesys.schemas import OrchestratorPlan
 from vibesys.server import EventType, RunSupervisor
@@ -147,12 +155,20 @@ def test_entries_are_ordered_by_first_round_and_do_not_reshuffle() -> None:
 def test_kept_is_independent_of_the_judge_verdict() -> None:
     """A judged-good hypothesis need not be integrated, and vice versa."""
     rounds = [
-        _round(1, hypothesis_id="H-A", hypothesis_outcome="proven", passed=True),
+        _round(
+            1,
+            hypothesis_id="H-A",
+            hypothesis_outcome="proven",
+            passed=True,
+            candidate_disposition="pareto_frontier",
+            candidate_retained=False,
+        ),
         _round(
             2,
             hypothesis_id="H-B",
             hypothesis_outcome="rejected",
             candidate_disposition="pareto_frontier",
+            candidate_retained=True,
         ),
         _round(
             3,
@@ -160,6 +176,7 @@ def test_kept_is_independent_of_the_judge_verdict() -> None:
             hypothesis_outcome="proven",
             passed=True,
             official_evaluation=True,
+            candidate_retained=True,
         ),
     ]
 
@@ -171,6 +188,91 @@ def test_kept_is_independent_of_the_judge_verdict() -> None:
     # Rejected claim whose candidate still earned a place on the frontier.
     assert by_id["H-B"].kept is True
     assert by_id["H-C"].kept is True
+
+
+def test_ledger_is_authoritative_for_the_experiment_projection() -> None:
+    """A display projection must not recreate lifecycle decisions from rounds."""
+    rounds = [
+        _round(
+            4,
+            hypothesis_id="H-04",
+            hypothesis_claim="stale claim",
+            hypothesis_task="stale task",
+            hypothesis_outcome="proven",
+            passed=False,
+            reviewed=False,
+            perf_metric=90.0,
+            perf_unit="ops_s",
+        )
+    ]
+    ledger = HypothesisLedger(
+        hypotheses=[
+            HypothesisRecord(
+                hypothesis_id="H-04",
+                claim="use bounded batches",
+                task="cap the batch size",
+                started_round=4,
+                rounds=[4],
+                review=HypothesisReview.PASS,
+                resolution=HypothesisResolution.DISPROVEN,
+                measurement=HypothesisMeasurement(
+                    round=4,
+                    metric="throughput",
+                    value=90.0,
+                    unit="ops_s",
+                    direction="max",
+                    baseline_round=2,
+                    baseline_commit="c2",
+                    baseline_value=100.0,
+                    delta_pct=-10.0,
+                ),
+                candidate_retained=False,
+                strategy=HypothesisStrategyState.ABANDONED,
+                strategy_reason="Official throughput regressed.",
+            )
+        ]
+    )
+
+    (entry,) = build_experiment_log(rounds, ledger=ledger)
+
+    assert entry.claim == "use bounded batches"
+    assert entry.action == "cap the batch size"
+    assert entry.resolved_outcome == "disproven"
+    assert entry.judge_verdict == "pass"
+    assert entry.kept is False
+    assert entry.perf_delta_pct == -10.0
+    assert entry.strategy_disposition == "abandoned"
+    assert entry.strategy_reason == "Official throughput regressed."
+
+
+def test_ledger_does_not_fall_back_to_a_round_level_outcome() -> None:
+    """Pending ledger state remains pending despite stale round declarations."""
+    rounds = [
+        _round(
+            4,
+            hypothesis_id="H-04",
+            hypothesis_outcome="proven",
+            passed=True,
+            reviewed=True,
+        )
+    ]
+    ledger = HypothesisLedger(
+        hypotheses=[
+            HypothesisRecord(
+                hypothesis_id="H-04",
+                started_round=4,
+                rounds=[4],
+                review=HypothesisReview.DEFERRED,
+                resolution=None,
+                strategy=HypothesisStrategyState.COMPLETED,
+            )
+        ]
+    )
+
+    (entry,) = build_experiment_log(rounds, ledger=ledger)
+
+    assert entry.resolved_outcome is None
+    assert entry.judge_verdict is None
 
 
 def test_measured_delta_uses_the_last_measurement_before_the_hypothesis() -> None:
@@ -185,6 +287,36 @@ def test_measured_delta_uses_the_last_measurement_before_the_hypothesis() -> Non
     assert entries[0].perf_delta_pct is None
     assert entries[1].perf_metric == 112.0
     assert entries[1].perf_delta_pct == 12.0
+
+
+def test_ledger_measurement_does_not_use_a_chronological_fallback_baseline() -> None:
+    rounds = [
+        _round(1, hypothesis_id="H-A", perf_metric=100.0, perf_unit="tok_s"),
+        _round(2, hypothesis_id="H-B", perf_metric=112.0, perf_unit="tok_s"),
+    ]
+    ledger = HypothesisLedger(
+        hypotheses=[
+            HypothesisRecord(
+                hypothesis_id="H-B",
+                started_round=2,
+                rounds=[2],
+                measurement=HypothesisMeasurement(
+                    round=2,
+                    metric="throughput",
+                    value=112.0,
+                    unit="tok_s",
+                    direction="max",
+                ),
+                strategy=HypothesisStrategyState.COMPLETED,
+            )
+        ]
+    )
+
+    entries = build_experiment_log(rounds, ledger=ledger)
+    apply_baselines(entries, rounds, ledger)
+
+    by_id = {entry.hypothesis_id: entry for entry in entries}
+    assert by_id["H-B"].perf_delta_pct is None
 
 
 def _agent_configuration() -> AgentRunConfiguration:
@@ -261,6 +393,98 @@ def test_service_reads_rounds_and_the_active_plan_through_the_store(tmp_path: Pa
     assert response.experiments_ready is True
     recorded = [event.type for event in supervisor.read_events()]
     assert EventType.STATUS_QUERY.value in recorded
+
+
+def test_service_loads_portable_hypothesis_ledger(tmp_path: Path) -> None:
+    """Portable strategy is retained when the service reconciles round evidence."""
+    project, run_id = _project_run(tmp_path / "project")
+    project.state.save_round(
+        run_id,
+        _round(
+            1,
+            hypothesis_id="H-01",
+            hypothesis_outcome="disproven",
+            reviewed=True,
+            official_evaluation=True,
+            perf_metric=97.0,
+            perf_unit="ops_s",
+            candidate_retained=False,
+        ),
+    )
+    portable = project.state.portable_namespace(run_id, "agent")
+    HypothesisLedgerStore(portable).save(
+        HypothesisLedger(
+            hypotheses=[
+                HypothesisRecord(
+                    hypothesis_id="H-01",
+                    claim="portable hypothesis",
+                    task="measure it",
+                    started_round=1,
+                    rounds=[1],
+                    review=HypothesisReview.PASS,
+                    resolution=HypothesisResolution.DISPROVEN,
+                    candidate_retained=False,
+                    strategy=HypothesisStrategyState.PARKED,
+                    strategy_reason="Try a different prerequisite first.",
+                )
+            ]
+        )
+    )
+    supervisor = RunSupervisor()
+    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
+
+    (entry,) = SupervisionService(supervisor).execute(ExperimentQuery()).experiments
+
+    assert entry.resolved_outcome == "disproven"
+    assert entry.kept is False
+    assert entry.strategy_disposition == "parked"
+    assert entry.strategy_reason == "Try a different prerequisite first."
+
+
+def test_service_migrates_legacy_regression_with_persisted_objective_direction(
+    tmp_path: Path,
+) -> None:
+    configuration = _agent_configuration().model_copy(
+        update={"objectives": ("total_ops_per_sec:max",)}
+    )
+    project, run_id = _project_run(tmp_path / "project", configuration=configuration)
+    project.state.save_round(
+        run_id,
+        _round(
+            1,
+            commit="a" * 40,
+            hypothesis_id="queue-parent",
+            hypothesis_outcome="proven",
+            passed=True,
+            reviewed=True,
+            official_evaluation=True,
+            perf_metric=104_257_741.0,
+            perf_unit="total_ops_per_sec",
+        ),
+    )
+    project.state.save_round(
+        run_id,
+        _round(
+            2,
+            commit="b" * 40,
+            hypothesis_id="queue-mask-addressing",
+            hypothesis_outcome="proven",
+            hypothesis_parent_round=1,
+            passed=True,
+            reviewed=True,
+            official_evaluation=True,
+            perf_metric=97_028_091.0,
+            perf_unit="total_ops_per_sec",
+        ),
+    )
+    supervisor = RunSupervisor()
+    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
+
+    entries = SupervisionService(supervisor).execute(ExperimentQuery()).experiments
+
+    by_id = {entry.hypothesis_id: entry for entry in entries}
+    assert by_id["queue-mask-addressing"].resolved_outcome == "disproven"
+    assert by_id["queue-mask-addressing"].kept is False
 
 
 def test_service_returns_nothing_before_a_run_is_attached(tmp_path: Path) -> None:

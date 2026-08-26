@@ -146,10 +146,8 @@ class HypothesisRound(ProtocolModel):
 class HypothesisEntry(ProtocolModel):
     """One unit of investigation: a hypothesis and every round it spans.
 
-    ``resolved_outcome`` is the terminal value the agent loop itself recorded
-    for the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``
-    member). It is copied, never recomputed, so the client cannot drift from
-    the framework's resolution semantics.
+    ``resolved_outcome`` is copied from the backend's typed hypothesis state,
+    never recomputed by the server or client.
     """
 
     hypothesis_id: str
@@ -171,10 +169,13 @@ class HypothesisEntry(ProtocolModel):
     # Change against the last measured round preceding this hypothesis. None
     # when either side is unmeasured or the baseline is zero.
     perf_delta_pct: FiniteFloat | None = None
-    # Integration, not truth: whether a framework-owned gate accepted the
-    # candidate or it was retained on the Pareto frontier. Deliberately
-    # independent of ``resolved_outcome``.
-    kept: bool = False
+    # Integration, not truth: the framework's explicit retention decision.
+    # None means legacy or not yet assessed, never "official evaluation ran".
+    kept: bool | None = None
+    # Orchestrator strategy is separate from empirical resolution and
+    # candidate retention. It is structured backend state, not roadmap prose.
+    strategy_disposition: Literal["active", "completed", "parked", "abandoned"] | None = None
+    strategy_reason: str | None = None
     active: bool = False
 
 

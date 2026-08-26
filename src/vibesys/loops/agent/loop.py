@@ -12,9 +12,9 @@ import json
 import math
 import shlex
 from collections.abc import Mapping, Sequence  # noqa: TC003  # tracked: #288
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from vibesys.agents.base import ResponseFallback
 from vibesys.agents.factory import resolve_agent_driver
@@ -27,8 +27,22 @@ from vibesys.domains.registry import resolve_domain
 from vibesys.domains.rendering import render_domain_section
 from vibesys.input_manifest import BenchmarkResult, WorkspaceSource  # noqa: TC001  # tracked: #288
 from vibesys.loops.agent import issue_board
+from vibesys.loops.agent.hypotheses import (
+    ResolutionEvidence,
+    apply_strategy_updates,
+    metric_baseline,
+    reconcile_hypothesis_ledger,
+    resolve_hypothesis_outcome,
+    scalar_candidate_retained,
+    start_hypothesis,
+)
 from vibesys.loops.agent.model import ActiveHypothesis as _ActiveHypothesis
-from vibesys.loops.agent.state import AgentStateStore
+from vibesys.loops.agent.model import (
+    HypothesisLedger,
+    HypothesisResolution,
+    HypothesisStrategyState,
+)
+from vibesys.loops.agent.state import AgentStateStore, HypothesisLedgerStore
 from vibesys.loops.evolve.population import Objective  # noqa: TC001  # tracked: #288
 from vibesys.loops.gates import run_accuracy_gate
 from vibesys.loops.profiler import mcp_spec as profiler_mcp_spec
@@ -123,6 +137,27 @@ def _backfill_revert_commit(
     return True
 
 
+def _require_active_checkpoint_consistency(
+    ledger: HypothesisLedger | None,
+    active: _ActiveHypothesis | None,
+) -> None:
+    """Fail closed when portable state cannot be resumed operationally."""
+    if active is not None or ledger is None:
+        return
+    portable_active = next(
+        (item for item in ledger.hypotheses if item.strategy is HypothesisStrategyState.ACTIVE),
+        None,
+    )
+    if portable_active is None:
+        return
+    raise ValueError(  # noqa: TRY003  # tracked: #288
+        "Portable hypothesis state marks "
+        f"{portable_active.hypothesis_id!r} active, but its local continuation "
+        "checkpoint is missing. Restore the run's local state before resuming; "
+        "VibeSys will not replace the active hypothesis automatically."
+    )
+
+
 # `CONTINUE`/`SUPPORTED`/`NOMINATED` name an active or successful hypothesis;
 # every other `HypothesisOutcome` member represents a failed one. Derive the
 # failure set by subtraction so a new enum member defaults to "failed" rather
@@ -138,6 +173,18 @@ _FAILED_HYPOTHESIS_OUTCOMES = (
     }
 ) | {"rejected"}
 _MAX_CONTINUATION_ROUNDS_WITHOUT_DESIGN_REVIEW = 2
+
+
+def _persist_hypothesis_ledger(
+    ctx: LoopContext,
+    store: HypothesisLedgerStore,
+    ledger: HypothesisLedger,
+    *,
+    label: str,
+) -> None:
+    """Persist and snapshot authoritative hypothesis state."""
+    store.save(ledger)
+    ctx.state.commit(label, store.namespace)
 
 
 def _implementation_requests_continuation(
@@ -178,19 +225,15 @@ def _implementation_keeps_hypothesis_active(
     )
 
 
-def _best_round(records: list[RoundRecord]) -> RoundRecord | None:
-    best: RoundRecord | None = None
-    best_metric = float("-inf")
-    for r in records:
-        if not r.official_evaluation:
-            continue
-        metric = r.perf_metric
-        if metric is None or not r.passed:
-            continue
-        if best is None or metric > best_metric:
-            best = r
-            best_metric = metric
-    return best
+def _metric_value(record: RoundRecord, metric_name: str | None) -> float | None:
+    """Read one official metric without guessing across objective names."""
+    if metric_name is not None and metric_name in record.metrics:
+        return record.metrics[metric_name]
+    if record.perf_metric is not None and (
+        metric_name is None or record.perf_unit == metric_name or not record.metrics
+    ):
+        return record.perf_metric
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -211,9 +254,43 @@ def _record_candidate_metrics(record: RoundRecord) -> dict[str, float]:
     """
     if record.official_evaluation and record.metrics:
         return record.metrics
-    if record.candidate_disposition == CandidateDisposition.PARETO_FRONTIER.value:
+    if _record_candidate_retained(record) is True:
         return record.candidate_metrics
     return {}
+
+
+def _record_candidate_retained(record: RoundRecord) -> bool | None:
+    """Read framework retention, with one isolated legacy-record adapter."""
+    if record.candidate_retained is not None:
+        return record.candidate_retained
+    if record.judge_verdict is not None:
+        # New records always carry the framework's typed verdict marker. For
+        # them, explicit unknown retention must remain unknown.
+        return None
+    if record.candidate_disposition in {
+        CandidateDisposition.PARETO_FRONTIER.value,
+        CandidateDisposition.PREREQUISITE.value,
+    }:
+        return True
+    if record.candidate_disposition == CandidateDisposition.DISCARD.value:
+        return False
+    if record.hypothesis_outcome == HypothesisResolution.PROVEN.value:
+        return True
+    return None
+
+
+def _provisional_candidate_retained(
+    disposition: CandidateDisposition,
+) -> bool | None:
+    """Translate an implementer disposition into provisional branch retention."""
+    if disposition is CandidateDisposition.DISCARD:
+        return False
+    if disposition in {
+        CandidateDisposition.PREREQUISITE,
+        CandidateDisposition.PARETO_FRONTIER,
+    }:
+        return True
+    return None
 
 
 def _noise_aware_dominates(
@@ -263,10 +340,7 @@ def _trusted_candidate_records(
             continue
         if not record.commit or not record.passed or not record.reviewed:
             continue
-        if not (
-            record.official_evaluation
-            or record.candidate_disposition == CandidateDisposition.PARETO_FRONTIER.value
-        ):
+        if _record_candidate_retained(record) is not True:
             continue
         trusted.append(record)
     return trusted
@@ -373,7 +447,7 @@ def _pareto_archive_summary(
         for record in records
         if record.round_number not in trusted_rounds
         and record.commit
-        and record.candidate_disposition == CandidateDisposition.PARETO_FRONTIER.value
+        and _record_candidate_retained(record) is True
         and all(objective.name in record.candidate_metrics for objective in objectives)
     ]
     if pending:
@@ -551,8 +625,8 @@ def _provisional_candidates_since_official(records: list[RoundRecord]) -> int:
             record.passed
             and record.reviewed
             and (
-                record.hypothesis_outcome == "proven"
-                or record.candidate_disposition == CandidateDisposition.PARETO_FRONTIER.value
+                _record_candidate_retained(record) is True
+                or record.hypothesis_outcome == HypothesisResolution.PROVEN.value
             )
         ):
             count += 1
@@ -601,7 +675,7 @@ def _terminal_workspace_notice(records: list[RoundRecord]) -> str | None:
     if latest.hypothesis_outcome not in terminal_outcomes:
         return None
 
-    if latest.candidate_disposition == CandidateDisposition.PARETO_FRONTIER.value:
+    if _record_candidate_retained(latest) is True:
         review_status = (
             "independently reviewed"
             if latest.passed and latest.reviewed
@@ -947,6 +1021,7 @@ def _domain_render_context(
 def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
     ctx: LoopContext,
     *,
+    hypothesis_ledger: HypothesisLedger,
     round_number: int,
     objective: str,
     profiler_summary: ProfilerSummary | None,
@@ -1010,12 +1085,36 @@ def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
         round_label=f"round-{round_number}-plan",
         reuse_session=False,
     )
-    if not plan.hypothesis_id.strip():
-        plan.hypothesis_id = f"hypothesis-{round_number:04d}"
+    plan.hypothesis_id = plan.hypothesis_id.strip() or f"hypothesis-{round_number:04d}"
+    _validate_orchestrator_plan_state(plan, hypothesis_ledger)
     plan.recommended_skills, _ = _validate_skill_selections(ctx, plan.recommended_skills)
     issue_board.write_plan_artifact(progress_path, round_number, plan)
     issue_board.append_orchestrator_plan(progress_path, round_number, plan)
     return plan
+
+
+def _validate_orchestrator_plan_state(
+    plan: OrchestratorPlan,
+    ledger: HypothesisLedger,
+) -> None:
+    """Validate structured lifecycle decisions against framework-owned state."""
+    if len({update.hypothesis_id for update in plan.hypothesis_updates}) != len(
+        plan.hypothesis_updates
+    ):
+        raise ValueError(  # noqa: TRY003  # tracked: #288
+            "Orchestrator hypothesis_updates must name each hypothesis once"
+        )
+    if any(update.hypothesis_id == plan.hypothesis_id for update in plan.hypothesis_updates):
+        raise ValueError(  # noqa: TRY003  # tracked: #288
+            "Orchestrator hypothesis_updates must refer to prior hypotheses"
+        )
+    if ledger.by_id(plan.hypothesis_id) is not None:
+        raise ValueError(  # noqa: TRY003  # tracked: #288
+            f"hypothesis ID {plan.hypothesis_id!r} was already used"
+        )
+    # Apply to a copy before any plan artifact is written. The real transition
+    # is persisted after the operational active checkpoint is assembled.
+    apply_strategy_updates(ledger, plan.hypothesis_updates)
 
 
 def _missing_implementer_response() -> ImplementerResponse:
@@ -1815,6 +1914,7 @@ class FrameworkBenchmarkOutcome:
     feedback: str | None = None
     metric_name: str | None = None
     metric_value: float | None = None
+    metric_direction: Literal["max", "min"] | None = None
     row: Mapping[str, float] | None = None
 
 
@@ -1842,7 +1942,25 @@ def _read_protocol_benchmark(
         return FrameworkBenchmarkOutcome(
             feedback=f"benchmark evaluator reported a failure: {measurement.failure}"
         )
-    return _select_headline_metric(measurement.values, objectives)
+    outcome = _select_headline_metric(measurement.values, objectives)
+    if outcome.metric_name is not None:
+        configured = next(
+            (item.direction for item in objectives if item.name == outcome.metric_name),
+            None,
+        )
+        declared = (
+            hello.metrics[outcome.metric_name].direction
+            if hello is not None and outcome.metric_name in hello.metrics
+            else None
+        )
+        outcome = replace(
+            outcome,
+            metric_direction=cast(
+                "Literal['max', 'min'] | None",
+                configured or declared,
+            ),
+        )
+    return outcome
 
 
 def _protocol_feedback(error: ProtocolError, hello: Hello | None) -> str:
@@ -2038,7 +2156,16 @@ def _run_framework_benchmark(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracke
                 ),
             )
         return FrameworkBenchmarkOutcome(
-            metric_name=metric_name, metric_value=metric_value, row=row
+            metric_name=metric_name,
+            metric_value=metric_value,
+            metric_direction=(
+                next(
+                    (item.direction for item in objectives if item.name == metric_name),
+                    None,
+                )
+                or ("max" if result_spec is not None else None)
+            ),
+            row=row,
         )
 
     feedback = f"Framework benchmark failed.\n{output[-4000:]}"
@@ -2246,6 +2373,13 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     framework_benchmark_configured = benchmark_result is not None or (
         benchmark_result_protocol is not None
     )
+    legacy_metric_directions: dict[str, Literal["max", "min"]] = {
+        objective.name: objective.direction for objective in objectives
+    }
+    if benchmark_result is not None:
+        # The legacy scalar result contract predates explicit directions and
+        # has always defined its reported metric as a maximization objective.
+        legacy_metric_directions.setdefault(benchmark_result.metric, "max")
     if modality is None and domain_definition.name is DomainName.LLM_SERVING:
         modality = "text_generation"
     run_environment = run_environment or make_run_environment_spec()
@@ -2285,6 +2419,9 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         inner_model=normalized_config.agent.inner.model,
         inner_reasoning_effort=normalized_config.agent.inner.reasoning_effort,
         operator_constraints=operator_constraints,
+        objectives=tuple(
+            f"{name}:{direction}" for name, direction in legacy_metric_directions.items()
+        ),
     )
     ctx = create_run_context(
         config=normalized_config,
@@ -2341,6 +2478,22 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     active_hypothesis = agent_state.load_active()
     if _backfill_revert_commit(active_hypothesis, records):
         agent_state.save_active(active_hypothesis)
+    ledger_store = HypothesisLedgerStore(ctx.state.portable(RunStateNamespace.AGENT))
+    saved_ledger = ledger_store.load_optional()
+    hypothesis_ledger = reconcile_hypothesis_ledger(
+        saved_ledger,
+        records,
+        active_hypothesis,
+        legacy_directions=legacy_metric_directions,
+    )
+    _require_active_checkpoint_consistency(hypothesis_ledger, active_hypothesis)
+    if saved_ledger != hypothesis_ledger:
+        _persist_hypothesis_ledger(
+            ctx,
+            ledger_store,
+            hypothesis_ledger,
+            label="agent: reconcile hypothesis state",
+        )
 
     carry = _CarryOver(regression_info=_terminal_workspace_notice(records))
     round_number = start_round if start_round is not None else len(records) + 1
@@ -2416,6 +2569,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     provisional_candidates = _provisional_candidates_since_official(records)
                     plan = _run_orchestrator_plan(
                         ctx,
+                        hypothesis_ledger=hypothesis_ledger,
                         round_number=round_number,
                         objective=objective,
                         profiler_summary=profiler_summary,
@@ -2435,19 +2589,47 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             provisional_candidates + 1 >= official_eval_every
                         ),
                     )
+                    parent_round = (
+                        plan.revert_to_round
+                        if plan.revert_to_round is not None
+                        else round_number - 1
+                        if round_number > 1
+                        else None
+                    )
+                    parent_record = next(
+                        (
+                            record
+                            for record in reversed(records)
+                            if record.round_number == parent_round
+                        ),
+                        None,
+                    )
                     active_hypothesis = _ActiveHypothesis(
                         plan=plan,
                         started_round=round_number,
-                        parent_round=(
-                            plan.revert_to_round
-                            if plan.revert_to_round is not None
-                            else round_number - 1
-                            if round_number > 1
-                            else None
+                        parent_round=parent_round,
+                        parent_commit=(
+                            parent_record.commit
+                            if parent_record is not None and parent_record.commit is not None
+                            else ctx.git.current_sha()
                         ),
-                        parent_commit=ctx.git.current_sha(),
+                    )
+                    next_ledger = apply_strategy_updates(
+                        hypothesis_ledger,
+                        plan.hypothesis_updates,
+                    )
+                    next_ledger = start_hypothesis(
+                        next_ledger,
+                        active_hypothesis,
                     )
                     agent_state.save_active(active_hypothesis)
+                    _persist_hypothesis_ledger(
+                        ctx,
+                        ledger_store,
+                        next_ledger,
+                        label=f"agent: start hypothesis {plan.hypothesis_id}",
+                    )
+                    hypothesis_ledger = next_ledger
                     if ctx.supervisor is not None:
                         ctx.supervisor.record(
                             EventType.EXPERIMENTS_CHANGED,
@@ -2519,6 +2701,18 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             active_hypothesis.revert_commit = rollback_commit
                             active_hypothesis.parent_commit = rollback_commit
                             agent_state.save_active(active_hypothesis)
+                            hypothesis_ledger = reconcile_hypothesis_ledger(
+                                hypothesis_ledger,
+                                records,
+                                active_hypothesis,
+                                legacy_directions=legacy_metric_directions,
+                            )
+                            _persist_hypothesis_ledger(
+                                ctx,
+                                ledger_store,
+                                hypothesis_ledger,
+                                label=(f"agent: set hypothesis {plan.hypothesis_id} parent"),
+                            )
                         else:
                             ctx.lprint(
                                 "[warn] rollback was not applied; will retry round "
@@ -2536,6 +2730,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 passed = False
                 review_started = False
                 final_attempt_reviewed = False
+                judge_verdict: Literal["pass", "fail", "deferred"] | None = None
                 framework_revalidation_required = active_hypothesis.gate_revalidation_pending
                 implementation: ImplementerResponse | None = None
                 single_agent_response: SingleAgentRoundResponse | None = None
@@ -2705,6 +2900,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             official_evaluation_reason=planned_official_reason,
                             pareto_archive_conflict=candidate_archive_conflict,
                         )
+                        judge_verdict = verdict.verdict.value
                         if verdict.verdict == Verdict.PASS:
                             validation_feedback = _run_framework_validation_gate(
                                 ctx,
@@ -2857,6 +3053,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             pareto_records=records,
                             objectives=objectives,
                         )
+                        judge_verdict = single_agent_response.verdict.value
                         if single_agent_response.verdict == Verdict.PASS:
                             official_reason = _official_evaluation_reason(
                                 records=records,
@@ -3032,22 +3229,6 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 # round; otherwise an unreviewed ``disproven`` retry is
                 # mislabeled rejected and the dead hypothesis stays active.
                 reviewed = final_attempt_reviewed if inner_loop == "multi-agent" else True
-                if passed and inner_loop == "multi-agent" and implementation is not None:
-                    hypothesis_outcome = (
-                        "proven"
-                        if implementation.hypothesis_outcome
-                        in {HypothesisOutcome.SUPPORTED, HypothesisOutcome.NOMINATED}
-                        else implementation.hypothesis_outcome.value
-                    )
-                elif passed:
-                    hypothesis_outcome = "proven"
-                elif reviewed:
-                    hypothesis_outcome = "rejected"
-                elif implementation is not None:
-                    hypothesis_outcome = implementation.hypothesis_outcome.value
-                else:
-                    hypothesis_outcome = None
-
                 if implementation is not None:
                     candidate_disposition = implementation.candidate_disposition.value
                     candidate_metrics = dict(implementation.candidate_metrics)
@@ -3103,6 +3284,90 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 # a protocol row is present: the row above is already complete.
                 if not accepted_metrics and perf_metric is not None and perf_unit is not None:
                     accepted_metrics = {perf_unit: perf_metric}
+                official_evaluation = (
+                    passed
+                    and completed_official_evaluation_reason is not None
+                    and ctx.agent_client.backend_name != "stub"
+                    and (bool(ctx.judge_accuracy_command) or framework_benchmark_configured)
+                )
+                declared_outcome = (
+                    implementation.hypothesis_outcome
+                    if implementation is not None
+                    else HypothesisOutcome.NOMINATED
+                    if single_agent_response is not None
+                    else None
+                )
+                primary_objective = objectives[0] if objectives else None
+                metric_name = (
+                    framework_benchmark.metric_name
+                    or (primary_objective.name if primary_objective is not None else None)
+                    or perf_unit
+                )
+                metric_direction = framework_benchmark.metric_direction or (
+                    primary_objective.direction if primary_objective is not None else None
+                )
+                official_metric = (
+                    accepted_metrics.get(metric_name) if metric_name is not None else perf_metric
+                )
+                if official_metric is None and not accepted_metrics:
+                    official_metric = perf_metric
+                parent_record = metric_baseline(
+                    parent_round=active_hypothesis.parent_round,
+                    parent_commit=active_hypothesis.parent_commit,
+                    metric=metric_name,
+                    rounds=records,
+                )
+                baseline_metric = (
+                    _metric_value(parent_record, metric_name) if parent_record is not None else None
+                )
+                hypothesis_resolution = resolve_hypothesis_outcome(
+                    ResolutionEvidence(
+                        declared=declared_outcome,
+                        passed=passed,
+                        reviewed=reviewed,
+                        official_metric=(official_metric if official_evaluation else None),
+                        baseline_metric=baseline_metric,
+                        direction=metric_direction,
+                        noise_fraction=pareto_relative_noise,
+                        benchmark_expected=framework_benchmark_configured,
+                    )
+                )
+                disposition = CandidateDisposition(candidate_disposition)
+                if not reviewed:
+                    candidate_retained = _provisional_candidate_retained(disposition)
+                elif not passed:
+                    candidate_retained = False
+                elif official_evaluation and objectives and accepted_metrics:
+                    candidate_retained = not _pareto_archive_dominators(
+                        accepted_metrics,
+                        records,
+                        objectives,
+                        relative_noise=pareto_relative_noise,
+                    )
+                elif official_evaluation:
+                    prior_values = [
+                        value
+                        for record in records
+                        if record.official_evaluation
+                        and (value := _metric_value(record, metric_name)) is not None
+                    ]
+                    candidate_retained = scalar_candidate_retained(
+                        metric=official_metric,
+                        direction=metric_direction,
+                        prior=prior_values,
+                        noise_fraction=pareto_relative_noise,
+                    )
+                else:
+                    candidate_retained = _provisional_candidate_retained(disposition)
+                perf_delta_pct = None
+                if (
+                    official_metric is not None
+                    and baseline_metric is not None
+                    and baseline_metric != 0
+                ):
+                    perf_delta_pct = (
+                        (official_metric - baseline_metric) / abs(baseline_metric) * 100
+                    )
                 completed_record = RoundRecord(
                     round_number=round_number,
                     commit=commit,
@@ -3112,19 +3377,24 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     profile_skipped=profile_skipped,
                     reviewed=reviewed,
                     hypothesis_id=plan.hypothesis_id,
-                    hypothesis_outcome=hypothesis_outcome,
+                    hypothesis_declared_outcome=(
+                        declared_outcome.value if declared_outcome is not None else None
+                    ),
+                    judge_verdict=(judge_verdict if judge_verdict is not None else "deferred"),
+                    hypothesis_outcome=(
+                        hypothesis_resolution.value
+                        if hypothesis_resolution is not None
+                        else declared_outcome.value
+                        if declared_outcome is not None
+                        else None
+                    ),
                     hypothesis_claim=plan.hypothesis or None,
                     hypothesis_task=plan.task or None,
                     hypothesis_parent_round=active_hypothesis.parent_round,
                     hypothesis_parent_commit=active_hypothesis.parent_commit,
                     metrics=accepted_metrics,
                     evaluation_artifact=accepted_evaluation_artifact,
-                    official_evaluation=(
-                        passed
-                        and completed_official_evaluation_reason is not None
-                        and ctx.agent_client.backend_name != "stub"
-                        and (bool(ctx.judge_accuracy_command) or framework_benchmark_configured)
-                    ),
+                    official_evaluation=official_evaluation,
                     official_evaluation_reason=(
                         completed_official_evaluation_reason
                         if (
@@ -3138,6 +3408,16 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     candidate_evaluation_artifact=candidate_evaluation_artifact,
                     candidate_operating_point=candidate_operating_point,
                     candidate_retention_reason=candidate_retention_reason,
+                    candidate_retained=candidate_retained,
+                    perf_direction=metric_direction,
+                    perf_baseline_round=(
+                        parent_record.round_number if parent_record is not None else None
+                    ),
+                    perf_baseline_commit=(
+                        parent_record.commit if parent_record is not None else None
+                    ),
+                    perf_baseline_metric=baseline_metric,
+                    perf_delta_pct=perf_delta_pct,
                 )
                 records.append(completed_record)
 
@@ -3217,23 +3497,13 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         # Give the next designer the same explicit parent-state
                         # decision as an unreviewed terminal result.
                         carry.regression_info = _terminal_workspace_notice(records)
-                    elif perf_metric is not None:
-                        best = _best_round(records[:-1])
-                        # _best_round only returns rounds with a metric.
-                        if (
-                            best is None
-                            or best.perf_metric is None
-                            or perf_metric > best.perf_metric
-                        ):
-                            carry.regression_info = None
-                        else:
-                            carry.regression_info = (
-                                f"Round {round_number} perf_metric="
-                                f"{perf_metric}{(' ' + perf_unit) if perf_unit else ''} "
-                                f"did not beat best={best.perf_metric}"
-                                f"{(' ' + (best.perf_unit or '')) if best.perf_unit else ''} "
-                                f"at round {best.round_number}."
-                            )
+                    elif official_evaluation and candidate_retained is False:
+                        carry.regression_info = (
+                            f"Round {round_number}'s official candidate was not retained: "
+                            f"{perf_metric}{(' ' + perf_unit) if perf_unit else ''}. "
+                            "Use its recorded parent and objective directions when choosing "
+                            "the next checkpoint."
+                        )
                     else:
                         carry.regression_info = None
                 else:
@@ -3257,6 +3527,18 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 active_hypothesis = next_active_hypothesis
                 agent_state.apply_active_transition(active_transition)
                 ctx.persist_completed_round()
+                hypothesis_ledger = reconcile_hypothesis_ledger(
+                    hypothesis_ledger,
+                    records,
+                    active_hypothesis,
+                    legacy_directions=legacy_metric_directions,
+                )
+                _persist_hypothesis_ledger(
+                    ctx,
+                    ledger_store,
+                    hypothesis_ledger,
+                    label=f"agent: resolve hypothesis {plan.hypothesis_id}",
+                )
                 if ctx.supervisor is not None:
                     ctx.supervisor.record(
                         EventType.EXPERIMENTS_CHANGED,

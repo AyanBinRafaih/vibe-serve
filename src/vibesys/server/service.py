@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
+from vibesys.loops.agent.hypotheses import reconcile_hypothesis_ledger
 from vibesys.loops.agent.model import ActiveHypothesis  # noqa: TC001  # tracked: #288
-from vibesys.loops.agent.state import AgentStateStore
+from vibesys.loops.agent.state import AgentStateStore, HypothesisLedgerStore
 from vibesys.server.events import EventType, RunEvent
-from vibesys.server.experiments import apply_baselines, build_experiment_log
+from vibesys.server.experiments import build_experiment_log
 from vibesys.server.inspector import RunInspector
 from vibesys.server.protocol import (
     ActiveAgentExecution,
@@ -141,9 +144,16 @@ class SupervisionService:
         if manifest.configuration.outer_loop != "agent":
             return []
         rounds = project_run.project.state.load_rounds(project_run.run_id)
-        entries = build_experiment_log(rounds, self._active_hypothesis(project_run))
-        apply_baselines(entries, rounds)
-        return entries
+        active = self._active_hypothesis(project_run)
+        portable = project_run.project.state.portable_namespace(project_run.run_id, "agent")
+        saved_ledger = HypothesisLedgerStore(portable).load_optional()
+        ledger = reconcile_hypothesis_ledger(
+            saved_ledger,
+            rounds,
+            active,
+            legacy_directions=_metric_directions(manifest.configuration.objectives),
+        )
+        return build_experiment_log(rounds, active, ledger)
 
     @staticmethod
     def _active_hypothesis(project_run: ProjectRunState) -> ActiveHypothesis | None:
@@ -164,3 +174,18 @@ class SupervisionService:
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.wait_for_events(after_sequence, timeout)
+
+
+def _metric_directions(
+    encoded: tuple[str, ...],
+) -> dict[str, Literal["max", "min"]]:
+    """Decode objective directions stored with an agent run."""
+    directions: dict[str, Literal["max", "min"]] = {}
+    for value in encoded:
+        name, separator, direction = value.rpartition(":")
+        if separator and name:
+            if direction == "max":
+                directions[name] = "max"
+            elif direction == "min":
+                directions[name] = "min"
+    return directions

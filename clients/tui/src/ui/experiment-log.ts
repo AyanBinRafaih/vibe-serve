@@ -511,7 +511,10 @@ export function entryCells(entry: HypothesisEntry, columns: Columns): EntryCells
       OUTCOME_WIDTH,
     )}`,
     trailing: columns.kept
-      ? `${COLUMN_GAP}${fitColumn(entry.kept === true ? 'Yes' : 'No', KEPT_WIDTH)}`
+      ? `${COLUMN_GAP}${fitColumn(
+          entry.kept === true ? 'Yes' : entry.kept === false ? 'No' : '—',
+          KEPT_WIDTH,
+        )}`
       : '',
   };
 }

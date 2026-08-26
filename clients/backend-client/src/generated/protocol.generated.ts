@@ -278,7 +278,9 @@ export type JudgeVerdict1 = ("pass" | "fail") | null;
 export type PerfMetric3 = number | null;
 export type PerfUnit3 = string | null;
 export type PerfDeltaPct = number | null;
-export type Kept = boolean;
+export type Kept = boolean | null;
+export type StrategyDisposition = ("active" | "completed" | "parked" | "abandoned") | null;
+export type StrategyReason = string | null;
 export type Active = boolean;
 export type Experiments = HypothesisEntry[];
 export type ExperimentsReady = boolean | null;
@@ -650,10 +652,8 @@ export interface PerformanceRound {
 /**
  * One unit of investigation: a hypothesis and every round it spans.
  *
- * ``resolved_outcome`` is the terminal value the agent loop itself recorded
- * for the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``
- * member). It is copied, never recomputed, so the client cannot drift from
- * the framework's resolution semantics.
+ * ``resolved_outcome`` is copied from the backend's typed hypothesis state,
+ * never recomputed by the server or client.
  */
 export interface HypothesisEntry {
   hypothesis_id: HypothesisId;
@@ -669,6 +669,8 @@ export interface HypothesisEntry {
   perf_unit?: PerfUnit3;
   perf_delta_pct?: PerfDeltaPct;
   kept?: Kept;
+  strategy_disposition?: StrategyDisposition;
+  strategy_reason?: StrategyReason;
   active?: Active;
 }
 /**

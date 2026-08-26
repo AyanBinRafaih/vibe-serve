@@ -11,6 +11,7 @@ from vibesys.agents import AgentClient
 from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationError
 from vibesys.loops.agent import issue_board
+from vibesys.loops.agent.hypotheses import reconcile_hypothesis_ledger
 from vibesys.loops.agent.loop import (
     FrameworkBenchmarkOutcome,
     _ActiveHypothesis,
@@ -23,12 +24,14 @@ from vibesys.loops.agent.loop import (
     _pareto_archive_summary,
     _pareto_frontier_records,
     _provisional_candidates_since_official,
+    _require_active_checkpoint_consistency,
     _review_due,
     _run_framework_validation_gate,
     _terminal_workspace_notice,
     run_agent_loop,
 )
-from vibesys.loops.agent.state import AgentStateStore
+from vibesys.loops.agent.model import HypothesisLedger
+from vibesys.loops.agent.state import AgentStateStore, HypothesisLedgerStore
 from vibesys.loops.evolve.population import Objective
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.prompts import PROMPTS_DIR
@@ -37,6 +40,7 @@ from vibesys.sandbox.run_environment import make_run_environment_spec
 from vibesys.schemas import (
     CandidateDisposition,
     HypothesisOutcome,
+    HypothesisStrategyUpdate,
     ImplementerResponse,
     JudgeResponse,
     OrchestratorPlan,
@@ -89,6 +93,56 @@ def test_legacy_active_hypothesis_backfills_framework_revert_commit():  # noqa: 
     assert _backfill_revert_commit(state, records) is True
     assert state.revert_commit == "a" * 40
     assert _backfill_revert_commit(state, records) is False
+
+
+def test_portable_active_hypothesis_requires_local_continuation_checkpoint():  # noqa: ANN201  # tracked: #288
+    ledger = HypothesisLedger.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "hypothesis_id": "interrupted-work",
+                    "strategy": "active",
+                    "started_round": 3,
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="local continuation checkpoint is missing"):
+        _require_active_checkpoint_consistency(ledger, None)
+
+
+def test_newer_terminal_round_repairs_stale_portable_active_checkpoint():  # noqa: ANN201  # tracked: #288
+    saved_active = HypothesisLedger.model_validate(
+        {
+            "hypotheses": [
+                {
+                    "hypothesis_id": "completed-before-ledger-write",
+                    "strategy": "active",
+                    "started_round": 3,
+                }
+            ]
+        }
+    )
+    completed = RoundRecord(
+        round_number=3,
+        commit="a" * 40,
+        perf_metric=None,
+        perf_unit=None,
+        passed=True,
+        reviewed=True,
+        hypothesis_id="completed-before-ledger-write",
+        hypothesis_declared_outcome="supported",
+        judge_verdict="pass",
+        hypothesis_outcome="proven",
+    )
+
+    reconciled = reconcile_hypothesis_ledger(saved_active, [completed], None)
+
+    _require_active_checkpoint_consistency(reconciled, None)
+    repaired = reconciled.by_id("completed-before-ledger-write")
+    assert repaired is not None
+    assert repaired.strategy.value == "completed"
 
 
 # RoundRecord's persistence and rollback resolution (RoundHistory) now live
@@ -378,6 +432,7 @@ def test_project_configuration_captures_effective_agent_behavior(tmp_path: Path)
         "inner_model": "gpt-inner",
         "inner_reasoning_effort": "medium",
         "operator_constraints": ("Preserve ordering",),
+        "objectives": (),
         "run_environment": {
             "name": "modal",
             "image": None,
@@ -700,6 +755,32 @@ def test_official_evaluation_cadence_counts_reviewed_frontier_tradeoff():  # noq
     ]
 
     assert _provisional_candidates_since_official(records) == 1
+
+
+def test_typed_unknown_retention_is_not_trusted_as_pareto_state():  # noqa: ANN201  # tracked: #288
+    record = RoundRecord(
+        round_number=2,
+        commit="b" * 40,
+        perf_metric=None,
+        perf_unit=None,
+        passed=True,
+        reviewed=True,
+        hypothesis_id="qualitative-result",
+        hypothesis_declared_outcome="supported",
+        judge_verdict="pass",
+        hypothesis_outcome="proven",
+        candidate_disposition=CandidateDisposition.PARETO_FRONTIER.value,
+        candidate_metrics={"throughput": 120.0, "latency": 90.0},
+        candidate_retained=None,
+    )
+
+    assert (
+        _pareto_frontier_records(
+            [record],
+            [Objective("throughput", "max"), Objective("latency", "min")],
+        )
+        == []
+    )
 
 
 def test_noise_aware_dominance_preserves_sub_noise_alternatives():  # noqa: ANN201  # tracked: #288
@@ -1048,6 +1129,63 @@ def test_progress_writes_orchestrator_plan(tmp_path):  # noqa: ANN001, ANN201  #
     assert "/health returns 200" in text
     assert "Forecast 1.3x to 1.6x throughput" in text
     assert "Retain at >=1.15x with no latency regression" in text
+
+
+def test_invalid_hypothesis_update_is_not_written_to_progress(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="new-hypothesis",
+                hypothesis_updates=[
+                    HypothesisStrategyUpdate(
+                        hypothesis_id="unknown-hypothesis",
+                        disposition="abandoned",
+                        reason="This identifier was never created.",
+                    )
+                ],
+                task="attempt an invalid transition",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise fail-closed validation",
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unknown hypothesis"):
+        _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=1)
+
+    project = _created_project(tmp_path)
+    assert not list(project.rglob("plans/round-0001.json"))
+    assert all(
+        "attempt an invalid transition" not in path.read_text() for path in project.rglob("*.md")
+    )
+
+
+def test_reused_hypothesis_id_is_not_written_to_progress(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="already-used",
+                task="complete the first investigation",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="create the identifier",
+            ),
+            OrchestratorPlan(
+                hypothesis_id="already-used",
+                task="incorrectly reuse the identifier",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise unique identity validation",
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="already used"):
+        _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=2)
+
+    project = _created_project(tmp_path)
+    assert not list(project.rglob("plans/round-0002.json"))
+    assert all(
+        "incorrectly reuse the identifier" not in path.read_text() for path in project.rglob("*.md")
+    )
 
 
 @pytest.mark.parametrize(
@@ -2835,6 +2973,13 @@ def test_hypothesis_revert_is_applied_once_across_continuation_rounds(tmp_path, 
             ),
             OrchestratorPlan(
                 hypothesis_id="continued-repair",
+                hypothesis_updates=[
+                    HypothesisStrategyUpdate(
+                        hypothesis_id="seed",
+                        disposition="abandoned",
+                        reason="The later evidence invalidated this direction.",
+                    )
+                ],
                 task="start from parent and continue",
                 pass_criteria="review",  # noqa: S106  # tracked: #288
                 revert_to_round=1,
@@ -2909,6 +3054,16 @@ def test_hypothesis_revert_is_applied_once_across_continuation_rounds(tmp_path, 
         in call.kwargs["system_prompt"].replace("\n", " ")
         for call in judge_calls
     )
+    project = _created_project(tmp_path)
+    store = Project.open(project).state
+    ledger = HypothesisLedgerStore(
+        store.portable_namespace(_run_id(project), "agent")
+    ).load_optional()
+    assert ledger is not None
+    seed = ledger.by_id("seed")
+    assert seed is not None
+    assert seed.strategy.value == "abandoned"
+    assert seed.strategy_reason == "The later evidence invalidated this direction."
 
 
 def test_failed_hypothesis_revert_is_retried_and_not_claimed_as_applied(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
@@ -3032,6 +3187,76 @@ def test_official_framework_benchmark_scalar_populates_round_metrics(tmp_path, r
     # The trusted framework scalar is promoted into the objective row even
     # though the implementer reported no accepted_metrics.
     assert rounds[0]["metrics"] == {"tok/s": 512.0}
+
+
+def test_official_regression_disproves_and_drops_queue_candidate(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="m2-preallocated-spsc-ring",
+                hypothesis="preallocation improves queue throughput",
+                task="establish the measured parent",
+                pass_criteria="queue remains correct",  # noqa: S106  # tracked: #288
+                reasoning="establish the parent",
+            ),
+            OrchestratorPlan(
+                hypothesis_id="m3-pow2-mask-addressing",
+                hypothesis="mask addressing improves queue throughput",
+                task="replace modulo with mask addressing",
+                pass_criteria="queue remains correct",  # noqa: S106  # tracked: #288
+                reasoning="test the next mechanism",
+            ),
+        ]
+    )
+    benchmark_results = [
+        FrameworkBenchmarkOutcome(
+            metric_name="total_ops_per_sec",
+            metric_value=104_257_741.0,
+            metric_direction="max",
+        ),
+        FrameworkBenchmarkOutcome(
+            metric_name="total_ops_per_sec",
+            metric_value=97_028_091.721612,
+            metric_direction="max",
+        ),
+    ]
+
+    with patch(
+        "vibesys.loops.agent.loop._run_framework_benchmark",
+        side_effect=benchmark_results,
+    ):
+        _invoke_orchestrate(
+            tmp_path,
+            ref_file,
+            runner,
+            max_rounds=2,
+            official_eval_every=1,
+            benchmark_result=BenchmarkResult(
+                json_argument="--output-json",
+                metric="total_ops_per_sec",
+            ),
+        )
+
+    rounds = _round_payloads(tmp_path)
+    assert rounds[1]["judge_verdict"] == "pass"
+    assert rounds[1]["hypothesis_declared_outcome"] == "nominated"
+    assert rounds[1]["hypothesis_outcome"] == "disproven"
+    assert rounds[1]["candidate_retained"] is False
+    assert rounds[1]["perf_baseline_round"] == 1
+    assert rounds[1]["perf_baseline_metric"] == 104_257_741.0
+
+    project = _created_project(tmp_path)
+    store = Project.open(project).state
+    ledger = HypothesisLedgerStore(
+        store.portable_namespace(_run_id(project), "agent")
+    ).load_optional()
+    assert ledger is not None
+    m3 = ledger.by_id("m3-pow2-mask-addressing")
+    assert m3 is not None
+    assert m3.resolution.value == "disproven"
+    assert m3.candidate_retained is False
 
 
 def test_loop_retries_when_framework_accuracy_gate_fails(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288

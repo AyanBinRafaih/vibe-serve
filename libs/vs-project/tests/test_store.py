@@ -719,6 +719,7 @@ def test_run_manifest_persists_complete_agent_loop_behavior(tmp_path: Path) -> N
         "modality": "text_generation",
         "model": "gpt-5",
         "official_eval_every": 3,
+        "objectives": [],
         "operator_constraints": ["Do not change the ABI"],
         "outer_loop": "agent",
         "outer_model": "gpt-5.6-sol",
