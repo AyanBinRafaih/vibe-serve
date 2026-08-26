@@ -9,6 +9,7 @@ import {
   setExperiments,
 } from '../session-model.js';
 import {
+  entryCells,
   entryRow,
   formatMeasured,
   formatRounds,
@@ -119,11 +120,29 @@ describe('experiment log rows', () => {
     expect(row).toContain('(unidentified)');
     expect(row).toContain('—');
   });
+
+  it('keeps an explicit gutter after a hypothesis id that fills its column', () => {
+    const columns = resolveColumns(WIDE);
+    const header = headerRow(columns);
+    const row = entryRow(entry({hypothesis_id: 'm1-preallocated-spsc-ring'}), columns);
+    const roundsStart = header.indexOf('Rounds');
+
+    expect(row).toContain('m1-preallocat…  41');
+    expect(row[roundsStart - 1]).toBe(' ');
+    expect(row.slice(roundsStart).startsWith('41')).toBe(true);
+  });
+
+  it('keeps gutters across the separately colored outcome segments', () => {
+    const cells = entryCells(entry(), resolveColumns(WIDE));
+
+    expect(cells.outcome.startsWith('  ')).toBe(true);
+    expect(cells.trailing.startsWith('  ')).toBe(true);
+  });
 });
 
 describe('experiment log layout', () => {
   it('fits the panel exactly at every width it degrades through', () => {
-    for (const width of [120, 104, 90, 72, 62, 54, 40]) {
+    for (const width of [120, 104, 103, 90, 89, 72, 62, 61, 54, 40]) {
       const columns = resolveColumns(width);
       const header = headerRow(columns);
       const row = entryRow(entry(), columns);
