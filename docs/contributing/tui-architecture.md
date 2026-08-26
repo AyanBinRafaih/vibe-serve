@@ -10,6 +10,13 @@ The TypeScript frontend has three packages with one allowed dependency direction
 `@vibesys/tui` may depend on both packages. Reverse imports and cross-package relative imports are
 forbidden and checked by `pnpm check:ts-architecture`.
 
+Dependency-cruiser parses and resolves the TypeScript graph for dependency direction, cycles,
+unresolvable or undeclared imports, public package entry points, and the runtime-independence rules
+for `core-state`. `tsconfig.architecture.json` maps workspace package names to their public source
+entry points, so the check does not depend on prior builds. A small manifest check covers forbidden
+workspace dependencies that are declared but unused, because they do not appear in a source
+dependency graph. Rule regressions run as part of `pnpm test:clients`.
+
 ## Ownership
 
 | State or behavior | Owner |

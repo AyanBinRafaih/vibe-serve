@@ -7,8 +7,10 @@
   },
   "files": {
     "includes": [
+      ".dependency-cruiser.cjs",
       "clients/**/*.ts",
       "clients/**/*.tsx",
+      "scripts/**/*.mjs",
       "!clients/**/dist",
       "!clients/backend-client/src/generated"
     ]
