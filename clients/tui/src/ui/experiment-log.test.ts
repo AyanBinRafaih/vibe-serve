@@ -56,7 +56,6 @@ describe('experiment log rows', () => {
       'Rounds',
       'Implementation Details',
       'Measured',
-      'Verdict',
       'Outcome',
       'Kept',
     ]) {
@@ -66,9 +65,27 @@ describe('experiment log rows', () => {
     expect(row).toContain('41');
     expect(row).toContain('Batch the prefill step');
     expect(row).toContain('+12%');
-    expect(row).toContain('Pass');
     expect(row).toContain('Proven');
+    expect(row).not.toContain('Pass');
     expect(row.trimEnd().endsWith('Yes')).toBe(true);
+  });
+
+  it('shows hypothesis resolution without rendering the judge verdict', () => {
+    const columns = resolveColumns(WIDE);
+
+    const accepted = entryRow(
+      entry({judge_verdict: 'pass', resolved_outcome: 'disproven'}),
+      columns,
+    );
+    const rejected = entryRow(
+      entry({judge_verdict: 'fail', resolved_outcome: 'rejected'}),
+      columns,
+    );
+
+    expect(accepted).toContain('Disproven');
+    expect(accepted).not.toContain('Pass');
+    expect(rejected).toContain('Rejected');
+    expect(rejected).not.toContain('Fail');
   });
 
   it('keeps hypothesis, rounds, and outcome when the terminal is narrow', () => {
@@ -119,6 +136,7 @@ describe('experiment log rows', () => {
 
     expect(row).toContain('(unidentified)');
     expect(row).toContain('—');
+    expect(row).not.toContain('Active');
   });
 
   it('keeps an explicit gutter after a hypothesis id that fills its column', () => {
@@ -166,6 +184,7 @@ describe('experiment log outcome color', () => {
 
     expect(outcomeColor(theme, entry({resolved_outcome: 'continue'}))).toBe(theme.textPrimary);
     expect(outcomeColor(theme, entry({resolved_outcome: 'inconclusive'}))).toBe(theme.textPrimary);
+    expect(outcomeColor(theme, entry({resolved_outcome: null}))).toBe(theme.textPrimary);
   });
 
   it('uses the active accent while a hypothesis is still open', () => {

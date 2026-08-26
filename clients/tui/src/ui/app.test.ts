@@ -1892,7 +1892,11 @@ describe('theming', () => {
     const landing = await frameAfter(testRenderer);
     expect(landing).toContain('Experiments');
     expect(landing).toContain('Implementation Details');
+    expect(landing).toContain('Outcome');
     expect(landing).toContain('H-07');
+    expect(landing).toContain('Proven');
+    expect(landing).not.toContain('Verdict');
+    expect(landing).not.toContain('Pass');
     // Per-round detail is what the operator opts into, not what greets them.
     expect(landing).not.toContain('round 41 detail');
     // The rounds strip and agent map are per-round chrome; neither is drawn.
