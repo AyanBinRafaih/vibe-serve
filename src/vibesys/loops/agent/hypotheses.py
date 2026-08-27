@@ -313,6 +313,51 @@ def project_round_evidence(
     return Hypothesis.model_validate(updated.model_dump())
 
 
+def reproject_run_evidence(
+    state: AgentRunState,
+    *,
+    legacy_directions: Mapping[str, Literal["max", "min"]] | None = None,
+) -> AgentRunState:
+    """Rebuild hypothesis summaries from their authoritative round evidence."""
+    updated = state.clone()
+    updated.hypotheses = [
+        hypothesis.model_copy(
+            update={
+                "rounds": [],
+                "declared_outcome": None,
+                "review": HypothesisReview.PENDING,
+                "resolution": None,
+                "measurement": None,
+                "candidate_retained": None,
+            },
+            deep=True,
+        )
+        for hypothesis in updated.hypotheses
+    ]
+    prior_rounds: list[RoundRecord] = []
+    for record in state.rounds:
+        index = next(
+            (
+                index
+                for index, hypothesis in enumerate(updated.hypotheses)
+                if hypothesis.hypothesis_id == record.hypothesis_id
+            ),
+            None,
+        )
+        if index is None:
+            raise ValueError(  # noqa: TRY003  # tracked: #288
+                f"round {record.round_number} names unknown hypothesis {record.hypothesis_id!r}"
+            )
+        updated.hypotheses[index] = project_round_evidence(
+            updated.hypotheses[index],
+            record,
+            prior_rounds=prior_rounds,
+            legacy_directions=legacy_directions,
+        )
+        prior_rounds.append(record)
+    return _validated_state(updated)
+
+
 def _validated_state(state: AgentRunState) -> AgentRunState:
     return AgentRunState.model_validate(state.model_dump())
 
@@ -327,18 +372,20 @@ def _correct_legacy_resolution(
     if (
         record.official_evaluation
         and record.perf_metric is not None
-        and (measurement is None or measurement.delta_pct is None)
+        and (measurement is None or measurement.direction is None or measurement.delta_pct is None)
     ):
         hypothesis.resolution = HypothesisResolution.INCONCLUSIVE
-    elif measurement is not None:
-        assert measurement.delta_pct is not None  # noqa: S101  # guarded above
-        benefit = measurement.delta_pct
-        if measurement.direction == "min":
-            benefit = -benefit
-        if benefit < 0:
-            hypothesis.resolution = HypothesisResolution.DISPROVEN
-        elif benefit == 0:
-            hypothesis.resolution = HypothesisResolution.INCONCLUSIVE
+        return
+    if measurement is None:
+        return
+    assert measurement.delta_pct is not None  # noqa: S101  # guarded above
+    benefit = measurement.delta_pct
+    if measurement.direction == "min":
+        benefit = -benefit
+    if benefit < 0:
+        hypothesis.resolution = HypothesisResolution.DISPROVEN
+    elif benefit == 0:
+        hypothesis.resolution = HypothesisResolution.INCONCLUSIVE
 
 
 def _declared_outcome(value: str | None) -> HypothesisOutcome | None:
@@ -377,8 +424,6 @@ def _measurement(
     if not record.official_evaluation or record.perf_metric is None or record.perf_unit is None:
         return None
     direction = record.perf_direction or _configured_legacy_direction(record, legacy_directions)
-    if direction not in {"max", "min"}:
-        return None
     baseline = _baseline(record, prior_rounds)
     baseline_value = record.perf_baseline_metric
     if baseline_value is None and baseline is not None:

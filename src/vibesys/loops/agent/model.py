@@ -52,7 +52,7 @@ class HypothesisMeasurement(BaseModel):
     metric: str = Field(min_length=1)
     value: FiniteFloat
     unit: str | None = None
-    direction: Literal["max", "min"]
+    direction: Literal["max", "min"] | None = None
     baseline_round: Annotated[int, Field(gt=0)] | None = None
     baseline_commit: str | None = None
     baseline_value: FiniteFloat | None = None

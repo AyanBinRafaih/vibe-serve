@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
-from vibesys.loops.agent.hypotheses import apply_strategy_updates, project_round_evidence
+from vibesys.loops.agent.hypotheses import (
+    apply_strategy_updates,
+    project_round_evidence,
+    reproject_run_evidence,
+)
 from vibesys.loops.agent.model import (
     AgentRunState,
     Hypothesis,
@@ -75,7 +79,10 @@ class AgentRunStateStore:
         """Build unified state from legacy files without modifying either format."""
         existing = self.load_optional()
         if existing is not None:
-            return existing
+            return reproject_run_evidence(
+                existing,
+                legacy_directions=legacy_directions,
+            )
         ledger = self._namespace.load_optional(
             self._LEGACY_LEDGER_FILE,
             _LegacyHypothesisLedger,
@@ -236,7 +243,7 @@ def _migrate_legacy_state(
 
     if active is not None:
         state = apply_strategy_updates(state, active.plan.hypothesis_updates)
-    active_identifier = _legacy_active_id(ledger, active)
+    active_identifier = _legacy_active_id(active)
     if active_identifier is not None and state.by_id(active_identifier) is not None:
         active_index = next(
             index
@@ -365,22 +372,9 @@ def _legacy_strategy(record: _LegacyHypothesisRecord | None) -> HypothesisStrate
     return HypothesisStrategy.AVAILABLE
 
 
-def _legacy_active_id(
-    ledger: _LegacyHypothesisLedger | None,
-    active: _LegacyActiveHypothesis | None,
-) -> str | None:
-    if active is not None:
-        return active.plan.hypothesis_id
-    if ledger is None:
-        return None
-    return next(
-        (
-            record.hypothesis_id
-            for record in ledger.hypotheses
-            if record.strategy is _LegacyHypothesisStrategy.ACTIVE
-        ),
-        None,
-    )
+def _legacy_active_id(active: _LegacyActiveHypothesis | None) -> str | None:
+    """Trust only the restart checkpoint to identify legacy active work."""
+    return active.plan.hypothesis_id if active is not None else None
 
 
 def _legacy_unassigned_id(round_number: int) -> str:

@@ -138,7 +138,10 @@ def _configuration() -> AgentRunConfiguration:
     )
 
 
-def _project_run(project: Path) -> tuple[Project, str]:
+def _project_run(
+    project: Path,
+    configuration: AgentRunConfiguration | None = None,
+) -> tuple[Project, str]:
     project.mkdir()
     (project / "OBJECTIVE.md").write_text("Make the queue fast.\n", encoding="utf-8")
     vibesys_project = Project.open(project)
@@ -148,7 +151,7 @@ def _project_run(project: Path) -> tuple[Project, str]:
         run_id="queue-run",
         branch="vibesys/queue-run",
         vibesys_version="0.2.0-test",
-        configuration=_configuration(),
+        configuration=configuration or _configuration(),
         trusted_input_baseline="0" * 40,
     )
     vibesys_project.state.create_run(manifest)
@@ -228,6 +231,56 @@ def test_service_adapts_legacy_state_read_only(tmp_path: Path) -> None:
     assert entry.hypothesis_id == "H-01"
     assert entry.claim == "legacy claim"
     assert store.load_optional() is None
+
+
+def test_service_rebuilds_legacy_measurement_and_resolution_from_round_evidence(
+    tmp_path: Path,
+) -> None:
+    """Legacy summaries may omit measurements, but nested evidence is complete."""
+    configuration = _configuration().model_copy(update={"objectives": ("ops_s:max",)})
+    project, run_id = _project_run(tmp_path / "project", configuration)
+    project.state.save_round(
+        run_id,
+        _round(
+            1,
+            commit="a" * 40,
+            hypothesis_id="H-parent",
+            hypothesis_outcome="proven",
+            passed=True,
+            reviewed=True,
+            official_evaluation=True,
+            perf_metric=100.0,
+            perf_unit="ops_s",
+        ),
+    )
+    project.state.save_round(
+        run_id,
+        _round(
+            2,
+            commit="b" * 40,
+            hypothesis_id="H-regression",
+            hypothesis_parent_round=1,
+            hypothesis_parent_commit="a" * 40,
+            hypothesis_outcome="proven",
+            passed=True,
+            reviewed=True,
+            official_evaluation=True,
+            perf_metric=90.0,
+            perf_unit="ops_s",
+        ),
+    )
+    supervisor = RunSupervisor()
+    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
+
+    entries = SupervisionService(supervisor).execute(ExperimentQuery()).experiments
+
+    regression = next(entry for entry in entries if entry.hypothesis_id == "H-regression")
+    assert regression.resolved_outcome == "disproven"
+    assert (regression.perf_metric, regression.perf_unit, regression.perf_delta_pct) == (
+        90.0,
+        "ops_s",
+        -10.0,
+    )
 
 
 def test_service_returns_authoritative_empty_log_after_attach(tmp_path: Path) -> None:

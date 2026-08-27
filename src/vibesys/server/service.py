@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+from vibesys.loops.agent.hypotheses import reproject_run_evidence
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.server.events import EventType, RunEvent
 from vibesys.server.experiments import build_experiment_log
@@ -152,12 +153,14 @@ class SupervisionService:
             local = project_run.project.state.local_namespace(
                 project_run.run_id, RunStateNamespace.AGENT
             )
-            state = store.migrate_legacy(
+            return store.migrate_legacy(
                 rounds=project_run.project.state.load_rounds(project_run.run_id),
                 local_namespace=local,
                 legacy_directions=_metric_directions(manifest.configuration.objectives),
             )
-        return state
+        return reproject_run_evidence(
+            state, legacy_directions=_metric_directions(manifest.configuration.objectives)
+        )
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.wait_for_events(after_sequence, timeout)

@@ -10,6 +10,8 @@ from vibesys.loops.agent.hypotheses import (
     append_round,
     apply_strategy_updates,
     metric_baseline,
+    project_round_evidence,
+    reproject_run_evidence,
     resolve_hypothesis_outcome,
     scalar_candidate_retained,
     start_hypothesis,
@@ -70,6 +72,29 @@ def _round(  # noqa: PLR0913
         official_evaluation=metric is not None,
         perf_direction=direction if metric is not None else None,
         candidate_retained=retained,
+    )
+
+
+def _legacy_evidence_round(
+    number: int,
+    metric: float,
+    *,
+    parent_round: int | None = None,
+) -> RoundRecord:
+    return RoundRecord(
+        round_number=number,
+        commit=f"{number:040x}",
+        perf_metric=metric,
+        perf_unit="ops",
+        passed=True,
+        reviewed=True,
+        hypothesis_id="H-1",
+        hypothesis_declared_outcome="nominated",
+        hypothesis_outcome="proven",
+        hypothesis_claim="claim H-1",
+        hypothesis_task="implement H-1",
+        hypothesis_parent_round=parent_round,
+        official_evaluation=True,
     )
 
 
@@ -240,6 +265,63 @@ def test_queue_rs_regression_is_disproven_and_not_retained() -> None:
     assert m3.measurement.baseline_round == 2
     assert m3.measurement.delta_pct is not None
     assert m3.measurement.delta_pct < 0
+
+
+def test_legacy_performance_remains_visible_without_objective_direction() -> None:
+    record = _legacy_evidence_round(1, 100.0)
+    projected = project_round_evidence(
+        Hypothesis(hypothesis_id="H-1", plan=_plan("H-1"), started_round=1),
+        record,
+        prior_rounds=[],
+    )
+
+    assert projected.measurement is not None
+    assert projected.measurement.value == 100.0
+    assert projected.measurement.metric == "ops"
+    assert projected.measurement.direction is None
+
+
+def test_legacy_resolution_fails_closed_without_objective_direction() -> None:
+    record = _legacy_evidence_round(1, 100.0)
+    projected = project_round_evidence(
+        Hypothesis(hypothesis_id="H-1", plan=_plan("H-1"), started_round=1),
+        record,
+        prior_rounds=[],
+    )
+
+    assert projected.resolution is HypothesisResolution.INCONCLUSIVE
+
+
+@pytest.mark.parametrize(
+    "direction",
+    ["max", "min"],
+)
+def test_reprojection_uses_legacy_direction_for_resolution_and_retention(
+    direction: Literal["max", "min"],
+) -> None:
+    baseline = _legacy_evidence_round(1, 100.0)
+    regression = _legacy_evidence_round(2, 90.0, parent_round=1)
+    state = AgentRunState(
+        hypotheses=[
+            Hypothesis(
+                hypothesis_id="H-1",
+                plan=_plan("H-1"),
+                started_round=1,
+                rounds=[baseline, regression],
+            )
+        ]
+    )
+
+    reprojected = reproject_run_evidence(state, legacy_directions={"ops": direction})
+
+    hypothesis = reprojected.by_id("H-1")
+    assert hypothesis is not None
+    assert hypothesis.resolution is (
+        HypothesisResolution.DISPROVEN if direction == "max" else HypothesisResolution.PROVEN
+    )
+    assert hypothesis.candidate_retained is (direction == "min")
+    assert hypothesis.measurement is not None
+    assert hypothesis.measurement.direction == direction
 
 
 def test_metric_baseline_prefers_exact_parent_commit_and_fails_closed() -> None:

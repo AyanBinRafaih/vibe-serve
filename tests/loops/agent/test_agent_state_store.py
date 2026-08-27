@@ -4,7 +4,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from vibesys.loops.agent.model import AgentRunState, Hypothesis, HypothesisStrategy
+from vibesys.loops.agent.hypotheses import reproject_run_evidence
+from vibesys.loops.agent.model import (
+    AgentRunState,
+    Hypothesis,
+    HypothesisResolution,
+    HypothesisStrategy,
+)
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.schemas import HypothesisStrategyUpdate, OrchestratorPlan
 from vs_loop_state import RoundRecord
@@ -217,6 +223,99 @@ def test_existing_unified_state_wins_over_legacy_inputs(tmp_path) -> None:  # no
     store.save(unified)
 
     assert store.migrate_legacy(rounds=[], local_namespace=local) == unified
+
+
+def test_existing_unified_state_is_reprojected_when_directions_become_available(tmp_path) -> None:  # noqa: ANN001
+    project = _project(tmp_path)
+    portable = project.state.portable_namespace("run-1", "agent")
+    local = project.state.local_namespace("run-1", "agent")
+    store = AgentRunStateStore(portable)
+    baseline = RoundRecord(
+        round_number=1,
+        commit="a" * 40,
+        perf_metric=100.0,
+        perf_unit="ops",
+        passed=True,
+        reviewed=True,
+        hypothesis_id="H-1",
+        hypothesis_outcome="proven",
+        official_evaluation=True,
+    )
+    regression = RoundRecord(
+        round_number=2,
+        commit="b" * 40,
+        perf_metric=90.0,
+        perf_unit="ops",
+        passed=True,
+        reviewed=True,
+        hypothesis_id="H-1",
+        hypothesis_outcome="proven",
+        hypothesis_parent_round=1,
+        official_evaluation=True,
+    )
+    without_direction = reproject_run_evidence(
+        AgentRunState(
+            hypotheses=[
+                Hypothesis(
+                    hypothesis_id="H-1",
+                    plan=_plan("H-1"),
+                    started_round=1,
+                    rounds=[baseline, regression],
+                )
+            ]
+        )
+    )
+    store.save(without_direction)
+
+    reprojected = store.migrate_legacy(
+        rounds=[],
+        local_namespace=local,
+        legacy_directions={"ops": "max"},
+    )
+
+    hypothesis = reprojected.by_id("H-1")
+    assert hypothesis is not None
+    assert hypothesis.resolution is HypothesisResolution.DISPROVEN
+    assert hypothesis.candidate_retained is False
+    assert hypothesis.measurement is not None
+    assert hypothesis.measurement.direction == "max"
+
+
+def test_stale_legacy_ledger_active_without_checkpoint_is_not_resurrected(tmp_path) -> None:  # noqa: ANN001
+    project = _project(tmp_path)
+    portable = project.state.portable_namespace("run-1", "agent")
+    local = project.state.local_namespace("run-1", "agent")
+    portable.save(
+        "hypotheses.json",
+        _LegacyLedger(
+            hypotheses=[
+                _LegacyHypothesis(
+                    hypothesis_id="H-1",
+                    started_round=1,
+                    rounds=[1],
+                    strategy="active",
+                )
+            ]
+        ),
+    )
+    completed = RoundRecord(
+        round_number=1,
+        commit="a" * 40,
+        perf_metric=None,
+        perf_unit=None,
+        passed=True,
+        reviewed=True,
+        hypothesis_id="H-1",
+        hypothesis_outcome="proven",
+    )
+
+    migrated = AgentRunStateStore(portable).migrate_legacy(
+        rounds=[completed],
+        local_namespace=local,
+    )
+
+    assert migrated.active_hypothesis_id is None
+    assert migrated.active_hypothesis is None
 
 
 def test_legacy_migration_normalizes_rounds_without_hypothesis_ids(tmp_path) -> None:  # noqa: ANN001
