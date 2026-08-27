@@ -7,6 +7,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vibesys.context import (
+    _EXPERIMENT_CHAT_SYSTEM_PROMPT,
+    _ExperimentChatDependencies,
+    _ExperimentChatService,
+    _resolve_chat_thread_settings,
     _resume_configuration_update,
     _RunContext,
     create_candidate_context,
@@ -315,6 +319,111 @@ def test_nonretained_experiment_chat_closes_when_context_construction_fails(
         chat_client.close.assert_called_once_with()
     finally:
         REGISTRY.deactivate(supervisor)
+
+
+def test_chat_thread_settings_resolve_run_defaults() -> None:
+    resolved = _resolve_chat_thread_settings(
+        agent_backend="cli",
+        default_driver="agentshim",
+        default_provider="codex",
+        default_model="gpt-run",
+        driver=None,
+        provider=None,
+        model=None,
+    )
+    assert resolved == ("agentshim", "codex", "gpt-run")
+
+
+def test_chat_thread_settings_reject_invalid_combinations() -> None:
+    def resolve(agent_backend: str, driver: str | None, provider: str | None) -> tuple[str, ...]:
+        return _resolve_chat_thread_settings(
+            agent_backend=agent_backend,
+            default_driver="agentshim",
+            default_provider="codex",
+            default_model="gpt-run",
+            driver=driver,
+            provider=provider,
+            model=None,
+        )
+
+    with pytest.raises(ValueError, match="does not support provider 'gemini'"):
+        resolve("cli", "omnigent", "gemini")
+    with pytest.raises(ValueError, match="unknown agent driver 'other'"):
+        resolve("cli", "other", None)
+    with pytest.raises(ValueError, match="require the CLI agent backend"):
+        resolve("deepagents", None, None)
+
+
+def _chat_service(
+    tmp_path: Path, thread_id: str | None, answer: str = "the answer"
+) -> tuple[_ExperimentChatService, MagicMock]:
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "logs")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    agent_client = MagicMock()
+    agent_client.invoke_text.return_value = answer
+    project = MagicMock()
+    project.state.portable_run_export.return_value = MagicMock(files=[])
+    service = _ExperimentChatService(
+        _ExperimentChatDependencies(
+            supervisor=supervisor,
+            agent_client=agent_client,
+            workspace=workspace,
+            log_dir=tmp_path / "logs",
+            project=project,
+            run_id="run-1",
+            log=lambda _line: None,
+            flush_logs=lambda: None,
+            environment=dict,
+            progress=lambda: None,
+            thread_id=thread_id,
+        )
+    )
+    return service, agent_client
+
+
+def test_default_chat_thread_keeps_the_legacy_state_layout(tmp_path: Path) -> None:
+    service, agent_client = _chat_service(tmp_path, thread_id=None)
+
+    service.ask("what happened?")
+
+    workspace = tmp_path / "workspace"
+    transcript = workspace / "_vibesys_chat" / "conversation.jsonl"
+    assert json.loads(transcript.read_text()) == {
+        "question": "what happened?",
+        "answer": "the answer",
+    }
+    prompt = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    assert prompt == _EXPERIMENT_CHAT_SYSTEM_PROMPT
+    assert (workspace / "_vibesys_chat" / "instructions.md").read_text() == prompt
+
+
+def test_created_chat_thread_owns_its_state_dir_and_shares_trajectory(tmp_path: Path) -> None:
+    service, agent_client = _chat_service(tmp_path, thread_id="thread-a")
+
+    service.ask("what happened?")
+
+    workspace = tmp_path / "workspace"
+    thread_dir = workspace / "_vibesys_chat" / "threads" / "thread-a"
+    assert json.loads((thread_dir / "conversation.jsonl").read_text()) == {
+        "question": "what happened?",
+        "answer": "the answer",
+    }
+    prompt = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    # The thread reads its own conversation but the shared trajectory.
+    assert "_vibesys_chat/threads/thread-a/conversation.jsonl" in prompt
+    assert "_vibesys_chat/trajectory/state/" in prompt
+    assert (thread_dir / "instructions.md").read_text() == prompt
+    assert (workspace / "_vibesys_chat" / "trajectory").is_dir()
+    assert not (thread_dir / "trajectory").exists()
+    # The legacy transcript is untouched by thread traffic.
+    assert not (workspace / "_vibesys_chat" / "conversation.jsonl").exists()
+
+    # A follow-up turn continues from the thread's own instructions file.
+    service.ask("and then?")
+    continuation = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    assert "_vibesys_chat/threads/thread-a/instructions.md" in continuation
 
 
 def test_repository_task_exposes_its_actual_reference_path(tmp_path: Path) -> None:

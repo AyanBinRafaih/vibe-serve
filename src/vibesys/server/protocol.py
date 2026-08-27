@@ -45,6 +45,23 @@ class SnapshotQuery(Request):  # noqa: D101  # tracked: #288
 class ChatQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.chat"] = "query.chat"
     text: str
+    # None targets the default thread, preserving pre-thread clients.
+    thread_id: str | None = None
+
+
+class ChatThreadCreateQuery(Request):
+    """Create a new experiment-chat thread with its own agent selection.
+
+    Omitted fields resolve to the run's configured driver, provider, and
+    model. The response carries the resolved settings and thread identity.
+    """
+
+    type: Literal["query.chat_thread_create"] = "query.chat_thread_create"
+    driver: Literal["agentshim", "omnigent"] | None = None
+    provider: str | None = None
+    model: str | None = None
+    # Without a title the server derives one from the thread's first message.
+    title: str | None = None
 
 
 class HistoryQuery(Request):  # noqa: D101  # tracked: #288
@@ -78,6 +95,7 @@ ProtocolRequest = Annotated[
     | SteerCommand
     | SnapshotQuery
     | ChatQuery
+    | ChatThreadCreateQuery
     | HistoryQuery
     | PerformanceQuery
     | ExperimentQuery
@@ -119,6 +137,18 @@ class ChatResult(ProtocolModel):  # noqa: D101  # tracked: #288
     question: str
     answer: str
     effect: Literal["none"] = "none"
+    # Echoes the requested thread; None is the default thread.
+    thread_id: str | None = None
+
+
+class ChatThreadInfo(ProtocolModel):
+    """Resolved identity and agent settings of one experiment-chat thread."""
+
+    thread_id: str
+    title: str = ""
+    driver: str
+    provider: str
+    model: str
 
 
 class PerformanceRound(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -187,6 +217,7 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     diagnostic: Diagnostic | None = None
     ack: CommandAck | None = None
     chat: ChatResult | None = None
+    chat_thread: ChatThreadInfo | None = None
     snapshot: RunSnapshot | None = None
     events: list[RunEvent] = Field(default_factory=list)
     performance: list[PerformanceRound] = Field(default_factory=list)

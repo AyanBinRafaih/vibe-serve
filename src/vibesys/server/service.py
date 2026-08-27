@@ -13,6 +13,8 @@ from vibesys.server.protocol import (
     ActiveAgentExecution,
     ChatQuery,
     ChatResult,
+    ChatThreadCreateQuery,
+    ChatThreadInfo,
     CommandAck,
     EventsQuery,
     ExperimentQuery,
@@ -42,32 +44,12 @@ class SupervisionService:
         self.inspector = RunInspector(supervisor)
 
     def execute(self, request: ProtocolRequest) -> Response:  # noqa: D102, PLR0911  # tracked: #288
-        if isinstance(request, PauseCommand):
-            self.supervisor.pause_after_call()
-            return Response(
-                request_id=request.request_id,
-                ack=CommandAck(action="pause", status="pending"),
-            )
-        if isinstance(request, ResumeCommand):
-            self.supervisor.resume()
-            return Response(
-                request_id=request.request_id,
-                ack=CommandAck(action="resume", status="consumed"),
-            )
-        if isinstance(request, SteerCommand):
-            self.supervisor.steer(request.text)
-            return Response(
-                request_id=request.request_id,
-                ack=CommandAck(action="steer", status="pending"),
-            )
+        if isinstance(request, (PauseCommand, ResumeCommand, SteerCommand)):
+            return self._execute_command(request)
         if isinstance(request, ChatQuery):
-            sequence = self.supervisor.snapshot().sequence
-            answer = self.supervisor.chat(request.text)
-            return Response(
-                request_id=request.request_id,
-                chat=ChatResult(question=request.text, answer=answer),
-                events=self.supervisor.read_events(sequence),
-            )
+            return self._execute_chat(request)
+        if isinstance(request, ChatThreadCreateQuery):
+            return self._execute_chat_thread_create(request)
         if isinstance(request, HistoryQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/history")
             return Response(request_id=request.request_id, events=self.history_events())
@@ -94,6 +76,47 @@ class SupervisionService:
             )
             return Response(request_id=request.request_id, events=events)
         raise TypeError(f"Unsupported protocol request: {type(request).__name__}")  # noqa: TRY003  # tracked: #288
+
+    def _execute_command(self, request: PauseCommand | ResumeCommand | SteerCommand) -> Response:
+        if isinstance(request, PauseCommand):
+            self.supervisor.pause_after_call()
+            ack = CommandAck(action="pause", status="pending")
+        elif isinstance(request, ResumeCommand):
+            self.supervisor.resume()
+            ack = CommandAck(action="resume", status="consumed")
+        else:
+            self.supervisor.steer(request.text)
+            ack = CommandAck(action="steer", status="pending")
+        return Response(request_id=request.request_id, ack=ack)
+
+    def _execute_chat(self, request: ChatQuery) -> Response:
+        sequence = self.supervisor.snapshot().sequence
+        answer = self.supervisor.chat(request.text, thread_id=request.thread_id)
+        return Response(
+            request_id=request.request_id,
+            chat=ChatResult(question=request.text, answer=answer, thread_id=request.thread_id),
+            events=self.supervisor.read_events(sequence),
+        )
+
+    def _execute_chat_thread_create(self, request: ChatThreadCreateQuery) -> Response:
+        sequence = self.supervisor.snapshot().sequence
+        spec = self.supervisor.create_chat_thread(
+            driver=request.driver,
+            provider=request.provider,
+            model=request.model,
+            title=request.title,
+        )
+        return Response(
+            request_id=request.request_id,
+            chat_thread=ChatThreadInfo(
+                thread_id=spec.thread_id,
+                title=spec.title,
+                driver=spec.driver,
+                provider=spec.provider,
+                model=spec.model,
+            ),
+            events=self.supervisor.read_events(sequence),
+        )
 
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         return self.supervisor.snapshot()

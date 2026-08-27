@@ -7,7 +7,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Callable, Generator  # noqa: TC003  # tracked: #288
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +29,7 @@ from vibesys.server.events import (
     AgentOutputChannel,
     AgentOutputChunkData,
     ChatData,
+    ChatThreadCreatedData,
     EventData,
     EventStatus,
     EventStore,
@@ -102,6 +103,23 @@ class TerminalChatResource:
     close: Callable[[], None]
 
 
+@dataclass(frozen=True)
+class ChatThreadHandle:
+    """Resolved thread settings and the handler that answers its questions."""
+
+    spec: ChatThreadCreatedData
+    handler: Callable[[str], str]
+
+
+ChatThreadFactory = Callable[[str, str | None, str | None, str | None], ChatThreadHandle]
+"""Builds one thread's chat service: (thread_id, driver, provider, model).
+
+None arguments resolve to the run's configured defaults. The factory raises
+``ValueError`` for an unsupported driver/provider combination; resource
+cleanup for the built service stays with the factory's owner (the run
+context), not the supervisor."""
+
+
 class RunSupervisor:
     """Own pause state, invocation metadata, and the run audit store."""
 
@@ -128,6 +146,12 @@ class RunSupervisor:
         self._current_kind: str | None = None
         self._current_round: str | None = None
         self._chat_handler: Callable[[str], str] | None = None
+        # Per-thread chat routing. Specs replay from CHAT_THREAD_CREATED
+        # events so a resumed run can rebuild handlers on demand through the
+        # context-owned factory.
+        self._chat_thread_factory: ChatThreadFactory | None = None
+        self._chat_thread_handlers: dict[str, Callable[[str], str]] = {}
+        self._chat_thread_specs: dict[str, ChatThreadCreatedData] = {}
         self._active_chat_calls = 0
         self._retain_terminal_chat = False
         self._terminal_chat_resource: TerminalChatResource | None = None
@@ -511,6 +535,21 @@ class RunSupervisor:
 
     def _index_execution_lifecycle(self, events: list[RunEvent]) -> None:
         for event in events:
+            if event.type is EventType.CHAT_THREAD_CREATED and isinstance(
+                event.data, ChatThreadCreatedData
+            ):
+                self._chat_thread_specs.setdefault(event.data.thread_id, event.data)
+            if (
+                event.type is EventType.CHAT
+                and event.chat_thread_id is not None
+                and isinstance(event.data, ChatData)
+                and event.data.thread_title
+            ):
+                spec = self._chat_thread_specs.get(event.chat_thread_id)
+                if spec is not None and not spec.title:
+                    self._chat_thread_specs[event.chat_thread_id] = spec.model_copy(
+                        update={"title": event.data.thread_title}
+                    )
             if event.execution_id is None:
                 continue
             if event.type in {
@@ -530,7 +569,9 @@ class RunSupervisor:
         with self._condition:
             return self._chat_handler is not None
 
-    def chat(self, text: str) -> str:  # noqa: D102  # tracked: #288
+    def chat(self, text: str, thread_id: str | None = None) -> str:  # noqa: D102  # tracked: #288
+        if thread_id is not None:
+            return self._thread_chat(text, thread_id)
         with self._condition:
             handler = self._chat_handler
             if handler is not None:
@@ -562,6 +603,124 @@ class RunSupervisor:
         finally:
             if handler is not None:
                 self._release_chat_call()
+
+    def _thread_chat(self, text: str, thread_id: str) -> str:
+        """Route one question to a created thread's handler and audit it."""
+        handler = self._resolve_thread_handler(thread_id)
+        if isinstance(handler, str):
+            # A routing failure is an answer to this caller, not run history:
+            # no CHAT event is recorded for a thread that cannot answer.
+            return handler
+        with self._condition:
+            self._active_chat_calls += 1
+        try:
+            answer = handler(text)
+            thread_title = self._title_thread_if_needed(thread_id, text)
+            self.record(
+                EventType.CHAT,
+                text,
+                status=EventStatus.ANSWERED,
+                agent_kind="chat",
+                round_label="experiment-chat",
+                chat_thread_id=thread_id,
+                data=ChatData(answer=answer, thread_title=thread_title),
+            )
+            return answer
+        finally:
+            self._release_chat_call()
+
+    def _title_thread_if_needed(self, thread_id: str, question: str) -> str | None:
+        """Derive and store an untitled thread's title from its first message."""
+        with self._condition:
+            spec = self._chat_thread_specs.get(thread_id)
+            if spec is None or spec.title:
+                return None
+            title = _chat_thread_title(question)
+            if not title:
+                return None
+            self._chat_thread_specs[thread_id] = spec.model_copy(update={"title": title})
+            return title
+
+    def _resolve_thread_handler(self, thread_id: str) -> Callable[[str], str] | str:
+        """Return the thread's handler, or the error answer explaining why not."""
+        with self._condition:
+            handler = self._chat_thread_handlers.get(thread_id)
+            spec = self._chat_thread_specs.get(thread_id)
+            factory = self._chat_thread_factory
+        if handler is not None:
+            return handler
+        if spec is None:
+            return (
+                f"Unknown experiment chat thread {thread_id!r}. Create one with "
+                "/new-chat, or omit the thread to use the default experiment chat."
+            )
+        if factory is None:
+            return (
+                f"Experiment chat thread {thread_id!r} cannot answer right now "
+                f"({self._chat_unavailable_reason()})."
+            )
+        try:
+            handle = factory(thread_id, spec.driver, spec.provider, spec.model)
+        except Exception as exc:  # noqa: BLE001  # routing failures become answers
+            return (
+                f"Could not restore experiment chat thread {thread_id!r}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        with self._condition:
+            return self._chat_thread_handlers.setdefault(thread_id, handle.handler)
+
+    def set_chat_thread_factory(self, factory: ChatThreadFactory | None) -> None:
+        """Install the context-owned builder for per-thread chat services."""
+        with self._condition:
+            self._chat_thread_factory = factory
+
+    def create_chat_thread(
+        self,
+        *,
+        driver: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        title: str | None = None,
+    ) -> ChatThreadCreatedData:
+        """Create one chat thread, record its durable event, and register it.
+
+        An untitled thread is titled by the server from its first message.
+        """
+        with self._condition:
+            factory = self._chat_thread_factory
+        if factory is None:
+            raise RuntimeError(  # noqa: TRY003  # surfaced to the requesting client
+                "Experiment chat threads are not available for this run "
+                f"({self._chat_unavailable_reason()})"
+            )
+        thread_id = uuid.uuid4().hex
+        handle = factory(thread_id, driver, provider, model)
+        spec = handle.spec
+        if title is not None and title.strip():
+            spec = spec.model_copy(update={"title": title.strip()})
+        with self._condition:
+            self._chat_thread_specs[spec.thread_id] = spec
+            self._chat_thread_handlers[spec.thread_id] = handle.handler
+        self.record(
+            EventType.CHAT_THREAD_CREATED,
+            agent_kind="chat",
+            round_label="experiment-chat",
+            chat_thread_id=spec.thread_id,
+            data=spec,
+        )
+        return spec
+
+    def chat_threads(self) -> list[ChatThreadCreatedData]:
+        """Return every created thread's replayable spec, oldest first."""
+        with self._condition:
+            return sorted(self._chat_thread_specs.values(), key=lambda spec: spec.created_at)
+
+    def clear_chat_threads_and_drain(self) -> None:
+        """Stop routing thread chat and wait for in-flight calls to release."""
+        with self._condition:
+            self._chat_thread_factory = None
+            self._chat_thread_handlers.clear()
+            self._wait_for_chat_drain_locked(timeout=_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS)
 
     def _release_chat_call(self) -> None:
         """Release one handler lease and close a retired resource when safe."""
@@ -1013,6 +1172,19 @@ class RunSupervisor:
         with self._condition:
             self._error_diagnostics[key] = (error, diagnostic)
         return diagnostic
+
+
+_CHAT_THREAD_TITLE_MAX_CHARS = 40
+
+
+def _chat_thread_title(question: str) -> str:
+    """Title a thread from its first message: first line, cut on a word."""
+    line = next((part.strip() for part in question.strip().splitlines() if part.strip()), "")
+    if len(line) <= _CHAT_THREAD_TITLE_MAX_CHARS:
+        return line
+    cut = line[:_CHAT_THREAD_TITLE_MAX_CHARS]
+    head, separator, _rest = cut.rpartition(" ")
+    return f"{head.rstrip() if separator else cut}…"
 
 
 def _attempt_from_label(round_label: str) -> int | None:

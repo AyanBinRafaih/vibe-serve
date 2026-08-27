@@ -50,6 +50,24 @@ def agent_driver_supports_mcp_servers(
     return AGENTSHIM_CAPABILITIES.mcp_servers
 
 
+def supported_cli_providers(driver_name: str) -> tuple[str, ...]:
+    """Return the provider names one external driver supports.
+
+    Raises ``ValueError`` for an unknown driver so callers validating a
+    requested driver/provider pair reject both halves before building
+    anything.
+    """
+    if driver_name == "omnigent":
+        from vibesys.agents.omnigent.providers import supported_providers  # noqa: PLC0415
+
+        return tuple(supported_providers())
+    if driver_name == "agentshim":
+        from vibesys.agents.drivers.agentshim import supported_providers  # noqa: PLC0415
+
+        return tuple(supported_providers())
+    raise ValueError(f"unknown agent driver {driver_name!r}; expected 'agentshim' or 'omnigent'")  # noqa: TRY003  # tracked: #288
+
+
 def build_agent_client(  # noqa: C901, PLR0912, PLR0913
     config: Config,
     *,
