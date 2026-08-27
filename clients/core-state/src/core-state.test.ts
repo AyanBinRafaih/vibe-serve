@@ -182,6 +182,83 @@ describe('core state projection', () => {
     expect(state.chatTranscript.map(entry => entry.content)).toEqual(['answer']);
   });
 
+  it('partitions chat transcripts by thread, defaulting unstamped events', () => {
+    let state = initialCoreState();
+    state = reduceEvent(state, chatAnswerEvent(1, 'default answer'));
+    state = reduceEvent(state, chatAnswerEvent(2, 'thread answer', 'thread-a'));
+
+    // Neither thread sees the other's answer, and unstamped events land on
+    // the default thread so pre-thread logs replay unchanged.
+    expect(state.chatTranscripts['default']?.map(entry => entry.content)).toEqual([
+      'default answer',
+    ]);
+    expect(state.chatTranscripts['thread-a']?.map(entry => entry.content)).toEqual([
+      'thread answer',
+    ]);
+    // The legacy selector still reads the default thread.
+    expect(state.chatTranscript.map(entry => entry.content)).toEqual(['default answer']);
+    expect(state.transcript).toEqual([]);
+  });
+
+  it('replays the thread list from creation events after the implicit default', () => {
+    let state = initialCoreState();
+    state = reduceEvent(state, threadCreatedEvent(1, 'thread-a', 'claude'));
+    state = reduceEvent(state, threadCreatedEvent(2, 'thread-b', 'codex'));
+
+    expect(state.chatThreads.map(thread => thread.id)).toEqual(['default', 'thread-a', 'thread-b']);
+    // The implicit default carries no backend title; consumers name it.
+    expect(state.chatThreads[0]).toMatchObject({title: '', driver: null, provider: null});
+    expect(state.chatThreads[1]).toMatchObject({
+      title: '',
+      driver: 'agentshim',
+      provider: 'claude',
+      model: 'opus',
+    });
+    // A created thread has a transcript from the start, even before it talks.
+    expect(state.chatTranscripts['thread-b']).toEqual([]);
+  });
+
+  it('adopts the backend-derived title carried on a chat event', () => {
+    let state = initialCoreState();
+    state = reduceEvent(state, threadCreatedEvent(1, 'thread-a', 'claude'));
+    state = reduceEvent(state, {
+      ...chatAnswerEvent(2, 'first answer', 'thread-a'),
+      data: {kind: 'chat', answer: 'first answer', thread_title: 'why did r2 regress'},
+    });
+
+    expect(state.chatThreads.find(thread => thread.id === 'thread-a')?.title).toBe(
+      'why did r2 regress',
+    );
+  });
+
+  it('names a thread from a titled turn even when its creation replayed away', () => {
+    const state = reduceEvent(initialCoreState(), {
+      ...chatAnswerEvent(1, 'answer', 'thread-x'),
+      data: {kind: 'chat', answer: 'answer', thread_title: 'orphan thread'},
+    });
+
+    expect(state.chatThreads.find(thread => thread.id === 'thread-x')?.title).toBe('orphan thread');
+    expect(state.chatTranscripts['thread-x']?.map(entry => entry.content)).toEqual(['answer']);
+  });
+
+  it('drops legacy chat tool chunks per thread once typed events appear', () => {
+    let state = initialCoreState();
+    state = reduceEvent(state, {
+      ...baseEvent(1, 'tool_call'),
+      agent_kind: 'chat',
+      chat_thread_id: 'thread-a',
+      data: {kind: 'tool_call', tool: 'read_file', args: {}},
+    });
+    // The default thread saw no typed events, so its legacy chunks survive.
+    state = reduceEvent(state, {
+      ...outputEvent(2, 'legacy default output'),
+      agent_kind: 'chat',
+    });
+
+    expect(state.chatTypedToolEvents).toEqual({'thread-a': true});
+    expect(state.chatTranscript.map(entry => entry.content)).toEqual(['legacy default output']);
+  });
+
   it('scopes todo snapshots by execution', () => {
     let state = initialCoreState();
     state = reduceEvent(state, todoEvent(1, 'exec-a', 'first'));
@@ -350,6 +427,34 @@ function baseEvent(sequence: number, type: RunEvent['type']): RunEvent {
     type,
     agent_kind: 'implementer',
     round_label: 'round-1-implementer',
+  };
+}
+
+function chatAnswerEvent(sequence: number, answer: string, threadId?: string): RunEvent {
+  return {
+    ...baseEvent(sequence, 'chat'),
+    agent_kind: 'chat',
+    round_label: 'experiment-chat',
+    ...(threadId === undefined ? {} : {chat_thread_id: threadId}),
+    data: {kind: 'chat', answer},
+  };
+}
+
+function threadCreatedEvent(sequence: number, threadId: string, provider: string): RunEvent {
+  return {
+    ...baseEvent(sequence, 'chat_thread_created'),
+    agent_kind: 'chat',
+    round_label: 'experiment-chat',
+    chat_thread_id: threadId,
+    data: {
+      kind: 'chat_thread_created',
+      thread_id: threadId,
+      title: '',
+      driver: 'agentshim',
+      provider,
+      model: 'opus',
+      created_at: `2026-01-01T00:00:0${sequence}Z`,
+    },
   };
 }
 

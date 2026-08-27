@@ -49,6 +49,23 @@ export interface BenchmarkRecord {
 type RunEventData = NonNullable<RunEvent['data']>;
 export type TypedToolResult = Extract<RunEventData, {kind?: 'tool_result'}>;
 
+/** Thread id used for chat events recorded without one. */
+export const DEFAULT_CHAT_THREAD_ID = 'default';
+
+/**
+ * One experiment-chat thread, replayed from `chat_thread_created` events. The
+ * default thread is implicit: it exists from the first frame and carries no
+ * agent selection of its own.
+ */
+export interface ChatThread {
+  id: string;
+  /** Backend-owned title; empty until the server has derived or been given one. */
+  title: string;
+  driver: string | null;
+  provider: string | null;
+  model: string | null;
+}
+
 export interface TranscriptEntry {
   id: string;
   kind:
@@ -105,7 +122,12 @@ export interface CoreState {
   phases: AgentPhase[];
   activeExecutions: Record<string, ActiveAgentExecution>;
   transcript: TranscriptEntry[];
+  /** The default thread's transcript; equals `chatTranscripts[DEFAULT_CHAT_THREAD_ID]`. */
   chatTranscript: TranscriptEntry[];
+  /** Every thread's transcript, keyed by thread id. */
+  chatTranscripts: Record<string, TranscriptEntry[]>;
+  /** The default thread first, then created threads in replay order. */
+  chatThreads: ChatThread[];
   todos: ExecutionTodos[];
   usage: UsageMeter | null;
   benchmarks: BenchmarkRecord[];
@@ -113,7 +135,8 @@ export interface CoreState {
   /** Sequence of the latest semantic experiment invalidation. */
   experimentsRevision: number;
   typedToolEvents: boolean;
-  chatTypedToolEvents: boolean;
+  /** Per thread id: typed tool events seen, so legacy tool chunks are dropped. */
+  chatTypedToolEvents: Record<string, boolean>;
 }
 
 export function initialCoreState(): CoreState {
@@ -130,14 +153,25 @@ export function initialCoreState(): CoreState {
     activeExecutions: {},
     transcript: [],
     chatTranscript: [],
+    chatTranscripts: {[DEFAULT_CHAT_THREAD_ID]: []},
+    // The default thread has no backend record, so it has no backend-owned
+    // title either. Naming it is the consumer's job.
+    chatThreads: [
+      {id: DEFAULT_CHAT_THREAD_ID, title: '', driver: null, provider: null, model: null},
+    ],
     todos: [],
     usage: null,
     benchmarks: [],
     diagnostics: [],
     experimentsRevision: 0,
     typedToolEvents: false,
-    chatTypedToolEvents: false,
+    chatTypedToolEvents: {},
   };
+}
+
+/** The transcript for one chat thread; unknown threads read as empty. */
+export function chatTranscriptFor(state: CoreState, threadId: string): TranscriptEntry[] {
+  return state.chatTranscripts[threadId] ?? [];
 }
 
 export function reduceSnapshot(state: CoreState, snapshot: RunSnapshot): CoreState {
@@ -350,14 +384,82 @@ function updateTodos(previous: ExecutionTodos[], event: RunEvent): ExecutionTodo
 
 function applyChatEvent(state: CoreState, event: RunEvent): CoreState {
   const data = event.data;
+  const threadId = event.chat_thread_id ?? DEFAULT_CHAT_THREAD_ID;
+  if (data?.kind === 'chat_thread_created') {
+    return upsertChatThread(state, {
+      id: data.thread_id,
+      title: data.title ?? '',
+      driver: data.driver,
+      provider: data.provider,
+      model: data.model,
+    });
+  }
+  let next = state;
   const typed = data?.kind === 'tool_call' || data?.kind === 'tool_result';
-  const next = typed ? {...state, chatTypedToolEvents: true} : state;
+  if (typed && next.chatTypedToolEvents[threadId] !== true) {
+    next = {...next, chatTypedToolEvents: {...next.chatTypedToolEvents, [threadId]: true}};
+  }
   const legacyToolChunk =
-    data?.kind === 'agent_output_chunk' && data.channel === 'tool' && next.chatTypedToolEvents;
+    data?.kind === 'agent_output_chunk' &&
+    data.channel === 'tool' &&
+    next.chatTypedToolEvents[threadId] === true;
   if (legacyToolChunk) return next;
+  if (data?.kind === 'chat' && data.thread_title) {
+    next = setChatThreadTitle(next, threadId, data.thread_title);
+  }
   const entry = eventToTranscriptEntry(event);
   if (entry === null || (entry.kind !== 'assistant' && entry.kind !== 'result')) return next;
-  return {...next, chatTranscript: appendTranscript(next.chatTranscript, entry)};
+  return appendChatTranscript(next, threadId, entry);
+}
+
+/** Registers a replayed thread, or refreshes the record it already has. */
+function upsertChatThread(state: CoreState, thread: ChatThread): CoreState {
+  const existing = state.chatThreads.find(candidate => candidate.id === thread.id);
+  const chatThreads =
+    existing === undefined
+      ? [...state.chatThreads, thread]
+      : state.chatThreads.map(candidate =>
+          candidate.id === thread.id
+            ? {...thread, title: thread.title || candidate.title}
+            : candidate,
+        );
+  const chatTranscripts =
+    state.chatTranscripts[thread.id] === undefined
+      ? {...state.chatTranscripts, [thread.id]: []}
+      : state.chatTranscripts;
+  return {...state, chatThreads, chatTranscripts};
+}
+
+function setChatThreadTitle(state: CoreState, threadId: string, title: string): CoreState {
+  if (!state.chatThreads.some(thread => thread.id === threadId)) {
+    // A titled turn for a thread whose creation event is missing from the
+    // replay window still names a thread the operator can select.
+    return setChatThreadTitle(
+      upsertChatThread(state, {id: threadId, title: '', driver: null, provider: null, model: null}),
+      threadId,
+      title,
+    );
+  }
+  return {
+    ...state,
+    chatThreads: state.chatThreads.map(thread =>
+      thread.id === threadId ? {...thread, title} : thread,
+    ),
+  };
+}
+
+function appendChatTranscript(
+  state: CoreState,
+  threadId: string,
+  entry: TranscriptEntry,
+): CoreState {
+  const transcript = appendTranscript(state.chatTranscripts[threadId] ?? [], entry);
+  const chatTranscripts = {...state.chatTranscripts, [threadId]: transcript};
+  return {
+    ...state,
+    chatTranscripts,
+    chatTranscript: threadId === DEFAULT_CHAT_THREAD_ID ? transcript : state.chatTranscript,
+  };
 }
 
 function applyDiagnosticEvent(state: CoreState, event: RunEvent): CoreState {
