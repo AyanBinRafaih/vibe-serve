@@ -1272,7 +1272,58 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('2 passed'));
     expect(frame).toContain('→ Bash(command="pytest")');
+    expect(frame).toContain('← 2 passed');
     expect(frame.match(/╭/g)).toHaveLength(5);
+  });
+
+  it('collapses, prettifies, and expands long JSON tool responses', async () => {
+    const response = JSON.stringify(
+      Object.fromEntries(Array.from({length: 12}, (_, index) => [`field_${index}`, index])),
+    );
+    const testRenderer = await createTestRenderer({width: 100, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedEntryId: 'tool',
+      core: {
+        ...initialSessionState().core,
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: response,
+            toolName: 'Read',
+            toolArguments: {path: 'run-state.json'},
+            toolResult: {kind: 'tool_result', tool: 'Read', content: response},
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const collapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(collapsed).toContain('← {');
+    expect(collapsed).toContain('"field_0": 0');
+    expect(collapsed).not.toContain('"field_11": 11');
+
+    testRenderer.mockInput.pressEnter();
+    const expanded = await testRenderer.waitForFrame(value => value.includes('"field_11": 11'));
+    expect(expanded).toContain('click or Enter to collapse response');
+
+    // Expanding scrolls the card's tail into view, so click the collapse hint,
+    // which the previous assertion proves is on screen.
+    const hint = 'click or Enter to collapse response';
+    const lines = expanded.split('\n');
+    const row = lines.findIndex(line => line.includes(hint));
+    const column = (lines[row]?.indexOf(hint) ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    const recollapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(recollapsed).not.toContain('"field_11": 11');
   });
 
   it('collapses prompts and expands the latest prompt with Ctrl+P', async () => {

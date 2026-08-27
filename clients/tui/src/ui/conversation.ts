@@ -27,6 +27,7 @@ export class ConversationView {
   #theme: Theme;
   #markdownStyle: SyntaxStyle;
   readonly #expandedPrompts = new Set<string>();
+  readonly #expandedTools = new Set<string>();
   readonly #selectConversation: (state: SessionState) => ConversationEntry[];
   #emptyContent: string;
   readonly #renderMarkdown: boolean;
@@ -110,6 +111,15 @@ export class ConversationView {
     if (latestPrompt) this.#togglePrompt(latestPrompt.id);
   }
 
+  toggleSelectedTool(): boolean {
+    if (this.#selectedId === null) return false;
+    const entry = this.#selectConversation(this.controller.state).find(
+      candidate => candidate.id === this.#selectedId,
+    );
+    if (entry?.kind !== 'tool') return false;
+    return this.#toggleTool(entry);
+  }
+
   #clear(): void {
     for (const child of [...this.output.getChildren()]) {
       this.output.remove(child);
@@ -171,6 +181,16 @@ export class ConversationView {
     this.#renderConversation(this.#selectConversation(this.controller.state));
   }
 
+  #toggleTool(entry: ConversationEntry): boolean {
+    const response = entry.toolResult?.content ?? entry.toolResponse;
+    if (response === undefined || !toolOutputPreview(response).collapsible) return false;
+    if (this.#expandedTools.has(entry.id)) this.#expandedTools.delete(entry.id);
+    else this.#expandedTools.add(entry.id);
+    this.#renderedConversation = [];
+    this.#renderConversation(this.#selectConversation(this.controller.state));
+    return true;
+  }
+
   #renderEntry(entry: ConversationEntry): BoxRenderable {
     const palette = entryPalette(entry, this.#theme);
     const selected = this.#selectedId === entry.id;
@@ -192,14 +212,18 @@ export class ConversationView {
             onMouseUp: () => {
               this.#onFocusRequest?.();
               if (entry.kind === 'prompt') this.#togglePrompt(entry.id);
-              else this.controller.selectNextEntry(0, entry.id);
+              else {
+                this.controller.selectNextEntry(0, entry.id);
+                if (entry.kind === 'tool') this.#toggleTool(entry);
+              }
             },
           }
-        : entry.kind === 'prompt'
+        : entry.kind === 'prompt' || entry.kind === 'tool'
           ? {
               onMouseUp: () => {
                 this.#onFocusRequest?.();
-                this.#togglePrompt(entry.id);
+                if (entry.kind === 'prompt') this.#togglePrompt(entry.id);
+                else this.#toggleTool(entry);
               },
             }
           : {}),
@@ -235,12 +259,26 @@ export class ConversationView {
         entry.kind === 'prompt'
           ? promptPreview(entry.content, this.#expandedPrompts.has(entry.id))
           : null;
-      const content = prompt
-        ? prompt.content
-        : entry.kind === 'tool' || entry.kind === 'diagnostic' || entry.kind === 'subprocess'
+      const output =
+        !prompt &&
+        (entry.kind === 'tool' || entry.kind === 'diagnostic' || entry.kind === 'subprocess')
           ? toolOutputPreview(entry.content)
-          : entry.content;
+          : null;
+      const content = prompt ? prompt.content : (output?.content ?? entry.content);
       card.add(new TextRenderable(this.renderer, {content, fg: palette.content, width: '100%'}));
+      if (output && output.collapsible) {
+        const hidden =
+          output.hiddenLines > 0
+            ? `${output.hiddenLines} more line${output.hiddenLines === 1 ? '' : 's'}`
+            : `${output.hiddenCharacters} more characters`;
+        card.add(
+          new TextRenderable(this.renderer, {
+            content: `… ${hidden} hidden`,
+            fg: this.#theme.info,
+            width: '100%',
+          }),
+        );
+      }
       if (prompt && (prompt.hiddenLines > 0 || this.#expandedPrompts.has(entry.id))) {
         card.add(
           new TextRenderable(this.renderer, {
@@ -299,14 +337,31 @@ export class ConversationView {
       }),
     );
     if (toolResponse) {
+      const expanded = this.#expandedTools.has(entry.id);
+      const response = toolOutputPreview(toolResponse, expanded);
       card.add(
         new TextRenderable(this.renderer, {
-          content: toolOutputPreview(toolResponse),
+          content: `← ${response.content}`,
           fg: this.#theme.toolResult.foreground,
           bg: this.#theme.toolResult.background,
           width: '100%',
         }),
       );
+      if (response.collapsible) {
+        const hidden =
+          response.hiddenLines > 0
+            ? `${response.hiddenLines} more line${response.hiddenLines === 1 ? '' : 's'}`
+            : `${response.hiddenCharacters} more characters`;
+        card.add(
+          new TextRenderable(this.renderer, {
+            content: expanded
+              ? '▴ click or Enter to collapse response'
+              : `▾ Show full response · ${hidden} · click or Enter`,
+            fg: this.#theme.info,
+            width: '100%',
+          }),
+        );
+      }
     }
   }
 }

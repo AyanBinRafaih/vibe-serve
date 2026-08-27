@@ -8,6 +8,7 @@ export interface KeybindingActions {
   inputIsEmpty(): boolean;
   closeChat(): void;
   toggleLatestPrompt(): void;
+  toggleSelectedTool(): boolean;
   /** Brings the entry the cursor moved to into view. */
   revealSelectedEntry(): void;
   selectNextAgent(): void;
@@ -231,6 +232,16 @@ export function bindKeybindings(
         controller.selectNextEntry(key.name === 'down' ? 1 : -1);
         actions.revealSelectedEntry();
       }
+      key.preventDefault();
+      return;
+    }
+    if (
+      (key.name === 'return' || key.name === 'enter') &&
+      controller.state.roundFocus === 'transcript' &&
+      actions.inputIsEmpty() &&
+      actions.toggleSelectedTool()
+    ) {
+      actions.revealSelectedEntry();
       key.preventDefault();
       return;
     }

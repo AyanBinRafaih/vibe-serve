@@ -379,6 +379,7 @@ export function createOpenTuiApp(
       commandInput.isEmpty() && chatPane.isComposerEmpty() && chat.isComposerEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
+    toggleSelectedTool: () => conversation.toggleSelectedTool(),
     revealSelectedEntry: () => {
       const card = conversation.selectedCard();
       if (card !== null) viewport.scrollChildIntoView(card.id);

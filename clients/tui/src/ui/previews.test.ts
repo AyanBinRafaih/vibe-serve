@@ -19,10 +19,33 @@ describe('conversation previews', () => {
     const content = Array.from({length: 20}, (_, index) => `line ${index + 1}`).join('\n');
     const preview = toolOutputPreview(content);
 
-    expect(preview).toContain('line 12');
-    expect(preview).not.toContain('line 13');
-    expect(preview).toContain('8 more lines hidden');
+    expect(preview.content).toContain('line 6');
+    expect(preview.content).not.toContain('line 7');
+    expect(preview).toMatchObject({hiddenLines: 14, collapsible: true});
     expect(content).toContain('line 20');
+  });
+
+  it('pretty-prints JSON responses and restores the complete value when expanded', () => {
+    const content = JSON.stringify(
+      Object.fromEntries(Array.from({length: 10}, (_, index) => [`field_${index}`, index])),
+    );
+
+    const collapsed = toolOutputPreview(content);
+    const expanded = toolOutputPreview(content, true);
+
+    expect(collapsed.content).toStartWith('{\n  "field_0": 0,');
+    expect(collapsed.content).not.toContain('"field_9"');
+    expect(collapsed.hiddenLines).toBeGreaterThan(0);
+    expect(expanded.content).toContain('  "field_9": 9\n}');
+    expect(expanded).toMatchObject({hiddenLines: 0, hiddenCharacters: 0, collapsible: true});
+  });
+
+  it('collapses long single-line responses by character count', () => {
+    const content = 'x'.repeat(1_000);
+    const preview = toolOutputPreview(content);
+
+    expect(preview.content).toHaveLength(600);
+    expect(preview).toMatchObject({hiddenLines: 0, hiddenCharacters: 400, collapsible: true});
   });
 
   it('collapses and expands long prompts', () => {
