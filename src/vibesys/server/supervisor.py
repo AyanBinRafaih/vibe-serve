@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path  # noqa: TC003  # tracked: #288
 from typing import TYPE_CHECKING, Any
 
+from vibesys.server.chat_options import ChatRunSettings  # noqa: TC001  # tracked: #288
 from vibesys.server.diagnostics import (
     Diagnostic,
     DiagnosticRetryability,
@@ -152,6 +153,9 @@ class RunSupervisor:
         self._chat_thread_factory: ChatThreadFactory | None = None
         self._chat_thread_handlers: dict[str, Callable[[str], str]] = {}
         self._chat_thread_specs: dict[str, ChatThreadCreatedData] = {}
+        # The run's own agent selection, attached by the run context. Chat
+        # options are derived from it, so a client enumerates nothing.
+        self._chat_run_settings: ChatRunSettings | None = None
         self._active_chat_calls = 0
         self._retain_terminal_chat = False
         self._terminal_chat_resource: TerminalChatResource | None = None
@@ -673,6 +677,17 @@ class RunSupervisor:
         """Install the context-owned builder for per-thread chat services."""
         with self._condition:
             self._chat_thread_factory = factory
+
+    def set_chat_run_settings(self, settings: ChatRunSettings | None) -> None:
+        """Record the run's agent selection, the basis of every chat option."""
+        with self._condition:
+            self._chat_run_settings = settings
+
+    @property
+    def chat_run_settings(self) -> ChatRunSettings | None:
+        """The run's agent selection, or None before a run context attaches."""
+        with self._condition:
+            return self._chat_run_settings
 
     def create_chat_thread(
         self,

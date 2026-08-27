@@ -5,12 +5,17 @@ import {
   TextareaRenderable,
   TextRenderable,
 } from '@opentui/core';
+import {suggestChatSlashCommands} from '../commands.js';
+import type {ChatMenuRow, SessionState} from '../session-model.js';
 import type {Theme} from './theme.js';
 
 const MIN_EDITOR_ROWS = 1;
 const MAX_EDITOR_ROWS = 6;
 const COMPOSER_CHROME = 3;
 const EDITOR_HORIZONTAL_CHROME = 4;
+/** Rows the menu shows at once before it scrolls its selection into view. */
+const MAX_MENU_ROWS = 10;
+const MENU_CHROME = 2;
 
 class ChatTextareaRenderable extends TextareaRenderable {
   override handleKeyPress(key: KeyEvent): boolean {
@@ -42,12 +47,23 @@ export function createChatDraft(): ChatDraft {
  */
 export class ChatComposerView {
   readonly output: BoxRenderable;
+  /**
+   * The composer's inline menu: chat commands as they are typed, and the row
+   * selection `/model` and `/resume` open. It is a sibling of `output` rather
+   * than a screen-level dialog, mounted by whichever chat surface owns this
+   * composer, so the list rises out of the box it belongs to. This mirrors the
+   * command input's suggestion list on the other side of the screen.
+   */
+  readonly menu: BoxRenderable;
   readonly #box: BoxRenderable;
   readonly #editor: ChatTextareaRenderable;
   readonly #hint: TextRenderable;
+  readonly #menuList: TextRenderable;
   #availableWidth = 1;
   #focused = false;
   #theme: Theme;
+  #renderedMenu: string | null = null;
+  #lastState: SessionState | null = null;
 
   constructor(
     renderer: CliRenderer,
@@ -90,6 +106,9 @@ export class ChatComposerView {
       onContentChange: () => {
         this.draft.value = this.#editor.plainText;
         this.#resize();
+        // Typing does not go through the controller, so the command
+        // suggestions have to follow the draft rather than a state change.
+        if (this.#lastState !== null) this.renderMenu(this.#lastState);
       },
       onSubmit: () => this.#submit(),
     });
@@ -102,9 +121,70 @@ export class ChatComposerView {
       fg: theme.textSubtle,
       content: 'Enter: send · Shift+Enter: newline',
     });
+    this.menu = new BoxRenderable(renderer, {
+      id: `${id}-composer-menu`,
+      position: 'absolute',
+      // Anchored directly above the composer, which is the bottom of whichever
+      // chat surface mounts it. Kept in step with the editor's height below.
+      bottom: COMPOSER_CHROME + MIN_EDITOR_ROWS,
+      left: 0,
+      width: '100%',
+      height: 3,
+      visible: false,
+      zIndex: 5,
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: theme.border,
+      backgroundColor: theme.elevatedSurface,
+      paddingLeft: 1,
+      paddingRight: 1,
+    });
+    this.#menuList = new TextRenderable(renderer, {
+      id: `${id}-composer-menu-list`,
+      width: '100%',
+      height: 1,
+      fg: theme.textPrimary,
+      wrapMode: 'none',
+      truncate: true,
+      content: '',
+    });
+    this.menu.add(this.#menuList);
     this.#box.add(this.#editor);
     this.output.add(this.#box);
     this.output.add(this.#hint);
+  }
+
+  /**
+   * Fills the inline menu. The controller-owned menu wins over the typed
+   * command suggestions: once `/model` is submitted, the list is a selection
+   * rather than a completion.
+   */
+  renderMenu(state: SessionState): void {
+    this.#lastState = state;
+    const lines = this.#menuLines(state);
+    const fingerprint = lines === null ? null : lines.join('\n');
+    if (this.#renderedMenu === fingerprint) return;
+    this.#renderedMenu = fingerprint;
+    this.menu.visible = lines !== null;
+    if (lines === null) return;
+    this.#menuList.content = lines.join('\n');
+    this.#menuList.height = Math.max(1, lines.length);
+    this.menu.height = lines.length + MENU_CHROME;
+  }
+
+  /** The menu's rows, or null when nothing should be on screen. */
+  #menuLines(state: SessionState): string[] | null {
+    const menu = state.chatMenu;
+    if (menu !== null) {
+      const rows = visibleRows(menu.rows, menu.selected);
+      return [
+        menu.title,
+        ...rows.map(({row, index}) => menuRowText(row, index === menu.selected, menu.customModels)),
+      ];
+    }
+    const suggestions = suggestChatSlashCommands(this.draft.value.trim());
+    if (suggestions.length === 0) return null;
+    return suggestions.map(command => `  ${command.name.padEnd(10)} ${command.description}`);
   }
 
   /** Makes this editor authoritative when its presentation becomes visible. */
@@ -140,6 +220,9 @@ export class ChatComposerView {
     this.#editor.textColor = theme.textStrong;
     this.#editor.focusedTextColor = theme.textStrong;
     this.#hint.fg = theme.textSubtle;
+    this.menu.borderColor = theme.border;
+    this.menu.backgroundColor = theme.elevatedSurface;
+    this.#menuList.fg = theme.textPrimary;
   }
 
   #resize(): void {
@@ -151,6 +234,8 @@ export class ChatComposerView {
     this.#editor.height = rows;
     this.#box.height = rows + 2;
     this.output.height = rows + COMPOSER_CHROME;
+    // The menu sits on top of the composer, so it moves with it.
+    this.menu.bottom = this.output.height;
   }
 
   #submit(): void {
@@ -161,6 +246,39 @@ export class ChatComposerView {
     this.#resize();
     this.onSubmit(value);
   }
+}
+
+/**
+ * Keeps the highlighted row on screen without scrolling machinery: a window of
+ * at most `MAX_MENU_ROWS` rows that always contains the selection.
+ */
+function visibleRows(
+  rows: readonly ChatMenuRow[],
+  selected: number,
+): {row: ChatMenuRow; index: number}[] {
+  const indexed = rows.map((row, index) => ({row, index}));
+  if (indexed.length <= MAX_MENU_ROWS) return indexed;
+  const start = Math.min(
+    Math.max(0, selected - Math.floor(MAX_MENU_ROWS / 2)),
+    indexed.length - MAX_MENU_ROWS,
+  );
+  return indexed.slice(start, start + MAX_MENU_ROWS);
+}
+
+function menuRowText(
+  row: ChatMenuRow,
+  selected: boolean,
+  customModels: Record<string, string>,
+): string {
+  const marker = selected ? '›' : ' ';
+  if (row.kind === 'header') return `  ${row.label}`;
+  if (row.kind === 'note') return `  ${row.label}`;
+  if (row.kind === 'thread') return `${marker} ${row.label} · ${row.detail}`;
+  if (row.kind === 'model') return `${marker}   ${row.label}`;
+  const typed = customModels[row.provider] ?? '';
+  // A cursor bar marks the free-text entry as somewhere to type, the same
+  // affordance the wizard's model step used.
+  return `${marker}   ${typed === '' ? row.label : typed}${selected ? '▏' : ''}`;
 }
 
 function wrappedRows(value: string, width: number): number {

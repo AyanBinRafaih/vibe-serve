@@ -8,7 +8,7 @@ import type {SessionController} from '../session-controller.js';
 import {
   type ConversationEntry,
   chatPaneFocused,
-  chatThreadLabel,
+  chatThreadHeading,
   type SessionState,
 } from '../session-model.js';
 import {ChatComposerView, type ChatDraft} from './chat-composer.js';
@@ -116,6 +116,9 @@ export class ChatPaneView {
     );
     this.#scroll.add(this.#conversation.output);
     this.output.add(this.#scroll);
+    // Absolute inside the pane rather than over the screen, so the menu rises
+    // out of the composer it belongs to instead of covering the whole view.
+    this.output.add(this.#composer.menu);
     this.output.add(this.#composer.output);
   }
 
@@ -151,10 +154,12 @@ export class ChatPaneView {
     // The column can be as narrow as its minimum, where a spelled-out "focused"
     // costs the title itself: a box with no title reads as nothing at all. The
     // marker is the one the table already uses for the row that has the keys.
-    // The title names the active thread so switching is visible at a glance.
-    const label = chatThreadLabel(state);
+    // The title names the active thread so switching is visible at a glance,
+    // and its runtime so the operator can tell which agent is answering.
+    const label = chatThreadHeading(state);
     this.output.title = focused ? ` ▸ ${label} ` : ` ${label} `;
     this.#composer.activate(Math.max(1, width - 4), focused, state.chatPending);
+    this.#composer.renderMenu(state);
     if (state.chatConversation === this.#renderedConversation) return;
     this.#renderedConversation = state.chatConversation;
     this.#conversation.render(state);

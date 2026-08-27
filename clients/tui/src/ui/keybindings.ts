@@ -46,8 +46,7 @@ export function bindKeybindings(
       controller.state.chatOpen === false &&
       controller.state.overlay === null &&
       controller.state.themePicker === null &&
-      controller.state.chatThreadPicker === null &&
-      controller.state.newChatPicker === null
+      controller.state.chatMenu === null
     ) {
       controller.togglePaneZoom();
       key.preventDefault();
@@ -76,32 +75,26 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // The new-thread wizard owns the keys wherever it was opened from — on its
-    // model step that includes ordinary typing, which must never leak into the
-    // composer or command input underneath.
-    const newChatPicker = controller.state.newChatPicker;
-    if (newChatPicker !== null) {
-      if (key.name === 'up') controller.moveNewChatSelection(-1);
-      else if (key.name === 'down') controller.moveNewChatSelection(1);
-      else if (key.name === 'escape') controller.retreatNewChatPicker();
+    // The composer's inline menu owns the keys while it is open. On a custom
+    // model entry that includes ordinary typing, which must never leak into
+    // the composer underneath; anywhere else typing dismisses the menu and
+    // goes back to writing a question, so the keystroke is left alone.
+    const chatMenu = controller.state.chatMenu;
+    if (chatMenu !== null) {
+      const onCustomEntry = chatMenu.rows[chatMenu.selected]?.kind === 'custom';
+      if (key.name === 'up') controller.moveChatMenuSelection(-1);
+      else if (key.name === 'down') controller.moveChatMenuSelection(1);
+      else if (key.name === 'escape') controller.closeChatMenu();
       else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
-        void controller.confirmNewChatPicker();
-      } else if (newChatPicker.step === 'model' && key.name === 'backspace') {
-        controller.backspaceNewChatModel();
-      } else if (newChatPicker.step === 'model' && isPrintable(key)) {
-        controller.typeNewChatModel(key.sequence);
-      } else return;
-      key.preventDefault();
-      return;
-    }
-    // The thread list is a selection: Enter switches to the highlighted thread.
-    if (controller.state.chatThreadPicker !== null) {
-      if (key.name === 'up') controller.moveChatThreadSelection(-1);
-      else if (key.name === 'down') controller.moveChatThreadSelection(1);
-      else if (key.name === 'escape') controller.closeChatThreadPicker();
-      else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
-        controller.applySelectedChatThread();
-      } else return;
+        void controller.confirmChatMenu();
+      } else if (onCustomEntry && key.name === 'backspace') {
+        controller.backspaceChatMenuCustomModel();
+      } else if (onCustomEntry && isPrintable(key)) {
+        controller.typeChatMenuCustomModel(key.sequence);
+      } else {
+        if (isPrintable(key)) controller.closeChatMenu();
+        return;
+      }
       key.preventDefault();
       return;
     }

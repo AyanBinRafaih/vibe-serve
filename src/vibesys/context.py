@@ -946,8 +946,24 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     experiment_chat: _ExperimentChatService | None = None
     experiment_chat_owner = ExitStack()
     chat_thread_services: list[_ExperimentChatService] = []
+    from vibesys.server.chat_options import ChatRunSettings  # noqa: PLC0415
+
+    # The run's own agent selection. It is both the default for every chat
+    # thread and the basis the server enumerates chat options from, so it is
+    # resolved once here rather than at each call site.
+    run_chat_settings = ChatRunSettings(
+        driver=resolve_agent_driver(config),
+        provider=resolved_cli_provider,
+        model=model_name,
+        role_models=tuple(
+            role.model
+            for role in (config.agent.outer, config.agent.inner)
+            if role.model is not None
+        ),
+    )
     if supervisor is not None:
         chat_supervisor = supervisor
+        supervisor.set_chat_run_settings(run_chat_settings)
 
         def _build_experiment_chat(
             *,
@@ -960,7 +976,9 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
 
             The default thread (``thread_id=None``) reuses the run's agent
             selection; a created thread carries its own resolved driver,
-            provider, and model.
+            provider, and model. Either way the service is told which
+            selection it runs so its executions are labelled like any other
+            agent's rather than as an anonymous "chat".
             """
             resources = ExitStack()
             try:
@@ -1014,6 +1032,17 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                         environment=dict,
                         progress=lambda: None,
                         thread_id=thread_id,
+                        driver=chat_driver if chat_driver is not None else run_chat_settings.driver,
+                        provider=(
+                            chat_provider
+                            if chat_provider is not None
+                            else run_chat_settings.provider
+                        ),
+                        model=(
+                            chat_model_name
+                            if chat_model_name is not None
+                            else run_chat_settings.model
+                        ),
                     ),
                     resources.pop_all(),
                 )
@@ -1033,9 +1062,9 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
 
             resolved_driver, resolved_provider, resolved_model = _resolve_chat_thread_settings(
                 agent_backend=resolved_backend,
-                default_driver=resolve_agent_driver(config),
-                default_provider=resolved_cli_provider,
-                default_model=model_name,
+                default_driver=run_chat_settings.driver,
+                default_provider=run_chat_settings.provider,
+                default_model=run_chat_settings.model,
                 driver=driver,
                 provider=provider,
                 model=model_override,
@@ -1362,6 +1391,13 @@ class _ExperimentChatDependencies:
     flush_logs: Callable[[], None]
     environment: Callable[[], dict[str, str]]
     progress: Callable[[], AgentProgress | None]
+    # The agent selection this service's client was built with. Chat runs
+    # through its own client rather than ExecutionContext.invoke, so the
+    # selection has to travel with the service for its executions to carry the
+    # same runtime identity a round agent's do.
+    driver: str
+    provider: str
+    model: str
     # None is the default thread, which keeps the legacy _vibesys_chat/ layout
     # so existing workspaces resume their conversation unchanged. A created
     # thread owns _vibesys_chat/threads/<thread-id>/ instead.
@@ -1384,6 +1420,9 @@ class _ExperimentChatService:
         self._flush_logs = dependencies.flush_logs
         self._environment = dependencies.environment
         self._progress = dependencies.progress
+        self._driver = dependencies.driver
+        self._provider = dependencies.provider
+        self._model = dependencies.model
         self._thread_id = dependencies.thread_id
         self._resources = resources
         self._lock = threading.Lock()
@@ -1413,6 +1452,9 @@ class _ExperimentChatService:
                 system_prompt,
                 consume_steering=False,
                 participates_in_run_control=False,
+                driver=self._driver,
+                provider=self._provider,
+                model=self._model,
             )
             answer: str | None = None
             error: BaseException | None = None

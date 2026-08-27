@@ -7,6 +7,7 @@ export type Request =
   | SnapshotQuery
   | ChatQuery
   | ChatThreadCreateQuery
+  | ChatOptionsQuery
   | HistoryQuery
   | PerformanceQuery
   | ExperimentQuery
@@ -47,29 +48,33 @@ export type Title = string | null;
 export type ProtocolVersion6 = 1;
 export type RequestId6 = string;
 export type Timestamp6 = string;
-export type Type6 = "query.history";
+export type Type6 = "query.chat_options";
 export type ProtocolVersion7 = 1;
 export type RequestId7 = string;
 export type Timestamp7 = string;
-export type Type7 = "query.performance";
+export type Type7 = "query.history";
 export type ProtocolVersion8 = 1;
 export type RequestId8 = string;
 export type Timestamp8 = string;
-export type Type8 = "query.experiments";
+export type Type8 = "query.performance";
 export type ProtocolVersion9 = 1;
 export type RequestId9 = string;
 export type Timestamp9 = string;
-export type Type9 = "query.events";
-export type AfterSequence = number;
-export type TimeoutMs = number;
+export type Type9 = "query.experiments";
 export type ProtocolVersion10 = 1;
 export type RequestId10 = string;
 export type Timestamp10 = string;
-export type Type10 = "subscribe";
-export type AfterSequence1 = number;
+export type Type10 = "query.events";
+export type AfterSequence = number;
+export type TimeoutMs = number;
 export type ProtocolVersion11 = 1;
 export type RequestId11 = string;
 export type Timestamp11 = string;
+export type Type11 = "subscribe";
+export type AfterSequence1 = number;
+export type ProtocolVersion12 = 1;
+export type RequestId12 = string;
+export type Timestamp12 = string;
 export type Ok = boolean;
 export type Error = string | null;
 export type Id = string;
@@ -102,7 +107,13 @@ export type Title1 = string;
 export type Driver1 = string;
 export type Provider1 = string;
 export type Model1 = string;
-export type ProtocolVersion12 = 1;
+export type Provider2 = string;
+export type Model2 = string;
+export type Source = "run" | "role" | "suggested";
+export type Default = boolean;
+export type Models = ChatModelOption[];
+export type Providers = ChatProviderOptions[];
+export type ProtocolVersion13 = 1;
 export type RunId = string;
 export type Sequence = number;
 export type Status1 = string;
@@ -120,10 +131,10 @@ export type Mode1 = "thinking" | "responding" | "tool" | "waiting";
 export type Summary1 = string;
 export type Tool = string | null;
 export type ActiveExecutions = ActiveAgentExecution[];
-export type ProtocolVersion13 = 1;
+export type ProtocolVersion14 = 1;
 export type Sequence1 = number;
 export type RunId1 = string;
-export type Timestamp12 = string;
+export type Timestamp13 = string;
 export type EventType =
   | "server_started"
   | "server_ready"
@@ -196,8 +207,8 @@ export type Kind2 = "chat_thread_created";
 export type ThreadId3 = string;
 export type Title2 = string;
 export type Driver2 = string;
-export type Provider2 = string;
-export type Model2 = string;
+export type Provider3 = string;
+export type Model3 = string;
 export type CreatedAt = string;
 export type Kind3 = "invocation_started";
 export type SystemPrompt = string;
@@ -210,13 +221,13 @@ export type Attempt1 = number | null;
 export type SystemPrompt1 = string;
 export type UserPrompt1 = string;
 export type Driver3 = string | null;
-export type Provider3 = string | null;
-export type Model3 = string | null;
+export type Provider4 = string | null;
+export type Model4 = string | null;
 export type Kind6 = "agent_execution_finished";
 export type Error2 = string | null;
 export type Kind7 = "output";
 export type Stream = "stdout" | "stderr";
-export type Source = string;
+export type Source1 = string;
 export type Content = string;
 export type Kind8 = "server_ready";
 export type SocketProtocol = "jsonl";
@@ -291,7 +302,7 @@ export type Todos = TodoItemData[];
 export type Kind24 = "usage_update";
 export type InputTokens1 = number;
 export type ContextWindow1 = number | null;
-export type Model4 = string | null;
+export type Model5 = string | null;
 export type Events = RunEvent[];
 export type Round = number;
 export type PerfMetric1 = number;
@@ -328,17 +339,17 @@ export type Active = boolean;
 export type Experiments = HypothesisEntry[];
 export type ExperimentsReady = boolean | null;
 export type ServerMessage = SubscribedMessage | EventMessage | EventBatchMessage | ProtocolErrorMessage;
-export type Type11 = "subscribed";
-export type RequestId12 = string;
+export type Type12 = "subscribed";
+export type RequestId13 = string;
 export type RunId2 = string;
 export type LatestSequence = number;
-export type Type12 = "event";
-export type Type13 = "event_batch";
+export type Type13 = "event";
+export type Type14 = "event_batch";
 export type Events1 = RunEvent[];
 export type ThroughSequence = number;
 export type ActiveExecutions1 = ActiveAgentExecution[];
-export type Type14 = "protocol_error";
-export type RequestId13 = string | null;
+export type Type15 = "protocol_error";
+export type RequestId14 = string | null;
 export type Code2 = string;
 export type Message1 = string;
 
@@ -389,6 +400,9 @@ export interface ChatQuery {
  *
  * Omitted fields resolve to the run's configured driver, provider, and
  * model. The response carries the resolved settings and thread identity.
+ * ``driver`` exists for completeness and stays validated when supplied, but
+ * which driver backs a run is a deployment detail: clients omit it so every
+ * thread inherits the run's.
  */
 export interface ChatThreadCreateQuery {
   protocol_version?: ProtocolVersion5;
@@ -400,52 +414,62 @@ export interface ChatThreadCreateQuery {
   model?: Model;
   title?: Title;
 }
-export interface HistoryQuery {
+/**
+ * Request the agent selections this run's experiment chat offers.
+ */
+export interface ChatOptionsQuery {
   protocol_version?: ProtocolVersion6;
   request_id?: RequestId6;
   timestamp?: Timestamp6;
   type?: Type6;
 }
-export interface PerformanceQuery {
+export interface HistoryQuery {
   protocol_version?: ProtocolVersion7;
   request_id?: RequestId7;
   timestamp?: Timestamp7;
   type?: Type7;
 }
-/**
- * Request the hypothesis-level experiment log for the attached run.
- */
-export interface ExperimentQuery {
+export interface PerformanceQuery {
   protocol_version?: ProtocolVersion8;
   request_id?: RequestId8;
   timestamp?: Timestamp8;
   type?: Type8;
 }
-export interface EventsQuery {
+/**
+ * Request the hypothesis-level experiment log for the attached run.
+ */
+export interface ExperimentQuery {
   protocol_version?: ProtocolVersion9;
   request_id?: RequestId9;
   timestamp?: Timestamp9;
   type?: Type9;
-  after_sequence?: AfterSequence;
-  timeout_ms?: TimeoutMs;
 }
-export interface SubscribeRequest {
+export interface EventsQuery {
   protocol_version?: ProtocolVersion10;
   request_id?: RequestId10;
   timestamp?: Timestamp10;
   type?: Type10;
+  after_sequence?: AfterSequence;
+  timeout_ms?: TimeoutMs;
+}
+export interface SubscribeRequest {
+  protocol_version?: ProtocolVersion11;
+  request_id?: RequestId11;
+  timestamp?: Timestamp11;
+  type?: Type11;
   after_sequence?: AfterSequence1;
 }
 export interface Response {
-  protocol_version?: ProtocolVersion11;
-  request_id: RequestId11;
-  timestamp?: Timestamp11;
+  protocol_version?: ProtocolVersion12;
+  request_id: RequestId12;
+  timestamp?: Timestamp12;
   ok?: Ok;
   error?: Error;
   diagnostic?: Diagnostic | null;
   ack?: CommandAck | null;
   chat?: ChatResult | null;
   chat_thread?: ChatThreadInfo | null;
+  chat_options?: ChatOptions | null;
   snapshot?: RunSnapshot | null;
   events?: Events;
   performance?: Performance;
@@ -487,8 +511,36 @@ export interface ChatThreadInfo {
   provider: Provider1;
   model: Model1;
 }
+/**
+ * Every chat agent selection this run offers, grouped by provider.
+ *
+ * The agent driver is absent by design. Threads inherit the run's driver, so
+ * a client never chooses one and never enumerates them.
+ */
+export interface ChatOptions {
+  providers?: Providers;
+}
+/**
+ * One CLI provider the run's configured driver supports, with models.
+ */
+export interface ChatProviderOptions {
+  provider: Provider2;
+  models?: Models;
+}
+/**
+ * One model a chat thread can be started with, and where it came from.
+ *
+ * ``source`` is provenance, not presentation: ``run`` is the run's own
+ * configured model, ``role`` an ``[agent.outer]``/``[agent.inner]``
+ * override, ``suggested`` an entry from the backend's short curated list.
+ */
+export interface ChatModelOption {
+  model: Model2;
+  source: Source;
+  default?: Default;
+}
 export interface RunSnapshot {
-  protocol_version?: ProtocolVersion12;
+  protocol_version?: ProtocolVersion13;
   run_id: RunId;
   sequence: Sequence;
   status: Status1;
@@ -523,10 +575,10 @@ export interface AgentExecutionActivityData {
  * One reproducible human, control, or invocation event.
  */
 export interface RunEvent {
-  protocol_version?: ProtocolVersion13;
+  protocol_version?: ProtocolVersion14;
   sequence?: Sequence1;
   run_id?: RunId1;
-  timestamp: Timestamp12;
+  timestamp: Timestamp13;
   type: EventType;
   text?: Text2;
   diagnostic?: Diagnostic | null;
@@ -555,8 +607,8 @@ export interface ChatThreadCreatedData {
   thread_id: ThreadId3;
   title?: Title2;
   driver: Driver2;
-  provider: Provider2;
-  model: Model2;
+  provider: Provider3;
+  model: Model3;
   created_at: CreatedAt;
   [k: string]: unknown;
 }
@@ -586,8 +638,8 @@ export interface AgentExecutionStartedData {
   user_prompt?: UserPrompt1;
   activity: AgentExecutionActivityData;
   driver?: Driver3;
-  provider?: Provider3;
-  model?: Model3;
+  provider?: Provider4;
+  model?: Model4;
   [k: string]: unknown;
 }
 /**
@@ -605,7 +657,7 @@ export interface Result1 {
 export interface OutputData {
   kind?: Kind7;
   stream: Stream;
-  source?: Source;
+  source?: Source1;
   content: Content;
   [k: string]: unknown;
 }
@@ -752,7 +804,7 @@ export interface UsageUpdateData {
   kind?: Kind24;
   input_tokens: InputTokens1;
   context_window?: ContextWindow1;
-  model?: Model4;
+  model?: Model5;
   [k: string]: unknown;
 }
 export interface PerformanceRound {
@@ -802,24 +854,24 @@ export interface HypothesisRound {
   candidate_disposition?: CandidateDisposition;
 }
 export interface SubscribedMessage {
-  type?: Type11;
-  request_id: RequestId12;
+  type?: Type12;
+  request_id: RequestId13;
   run_id: RunId2;
   latest_sequence: LatestSequence;
 }
 export interface EventMessage {
-  type?: Type12;
+  type?: Type13;
   event: RunEvent;
 }
 export interface EventBatchMessage {
-  type?: Type13;
+  type?: Type14;
   events: Events1;
   through_sequence?: ThroughSequence;
   active_executions?: ActiveExecutions1;
 }
 export interface ProtocolErrorMessage {
-  type?: Type14;
-  request_id?: RequestId13;
+  type?: Type15;
+  request_id?: RequestId14;
   code: Code2;
   message: Message1;
   diagnostic?: Diagnostic | null;

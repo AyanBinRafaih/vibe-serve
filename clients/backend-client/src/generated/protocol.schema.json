@@ -366,6 +366,102 @@
       "title": "ChatData",
       "type": "object"
     },
+    "ChatModelOption": {
+      "additionalProperties": false,
+      "description": "One model a chat thread can be started with, and where it came from.\n\n``source`` is provenance, not presentation: ``run`` is the run's own\nconfigured model, ``role`` an ``[agent.outer]``/``[agent.inner]``\noverride, ``suggested`` an entry from the backend's short curated list.",
+      "properties": {
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "run",
+            "role",
+            "suggested"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "default": {
+          "type": "boolean",
+          "default": false,
+          "title": "Default"
+        }
+      },
+      "required": [
+        "model",
+        "source"
+      ],
+      "title": "ChatModelOption",
+      "type": "object"
+    },
+    "ChatOptions": {
+      "additionalProperties": false,
+      "description": "Every chat agent selection this run offers, grouped by provider.\n\nThe agent driver is absent by design. Threads inherit the run's driver, so\na client never chooses one and never enumerates them.",
+      "properties": {
+        "providers": {
+          "items": {
+            "$ref": "#/$defs/ChatProviderOptions"
+          },
+          "title": "Providers",
+          "type": "array"
+        }
+      },
+      "title": "ChatOptions",
+      "type": "object"
+    },
+    "ChatOptionsQuery": {
+      "additionalProperties": false,
+      "description": "Request the agent selections this run's experiment chat offers.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.chat_options",
+          "default": "query.chat_options",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "ChatOptionsQuery",
+      "type": "object"
+    },
+    "ChatProviderOptions": {
+      "additionalProperties": false,
+      "description": "One CLI provider the run's configured driver supports, with models.",
+      "properties": {
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "models": {
+          "items": {
+            "$ref": "#/$defs/ChatModelOption"
+          },
+          "title": "Models",
+          "type": "array"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "title": "ChatProviderOptions",
+      "type": "object"
+    },
     "ChatQuery": {
       "additionalProperties": false,
       "properties": {
@@ -452,7 +548,7 @@
     },
     "ChatThreadCreateQuery": {
       "additionalProperties": false,
-      "description": "Create a new experiment-chat thread with its own agent selection.\n\nOmitted fields resolve to the run's configured driver, provider, and\nmodel. The response carries the resolved settings and thread identity.",
+      "description": "Create a new experiment-chat thread with its own agent selection.\n\nOmitted fields resolve to the run's configured driver, provider, and\nmodel. The response carries the resolved settings and thread identity.\n``driver`` exists for completeness and stays validated when supplied, but\nwhich driver backs a run is a deployment detail: clients omit it so every\nthread inherits the run's.",
       "properties": {
         "protocol_version": {
           "const": 1,
@@ -1754,6 +1850,17 @@
           ],
           "default": null
         },
+        "chat_options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatOptions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "snapshot": {
           "anyOf": [
             {
@@ -2628,6 +2735,7 @@
           "command.resume": "#/$defs/ResumeCommand",
           "command.steer": "#/$defs/SteerCommand",
           "query.chat": "#/$defs/ChatQuery",
+          "query.chat_options": "#/$defs/ChatOptionsQuery",
           "query.chat_thread_create": "#/$defs/ChatThreadCreateQuery",
           "query.events": "#/$defs/EventsQuery",
           "query.experiments": "#/$defs/ExperimentQuery",
@@ -2656,6 +2764,9 @@
         },
         {
           "$ref": "#/$defs/ChatThreadCreateQuery"
+        },
+        {
+          "$ref": "#/$defs/ChatOptionsQuery"
         },
         {
           "$ref": "#/$defs/HistoryQuery"

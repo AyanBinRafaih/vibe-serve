@@ -54,6 +54,9 @@ class ChatThreadCreateQuery(Request):
 
     Omitted fields resolve to the run's configured driver, provider, and
     model. The response carries the resolved settings and thread identity.
+    ``driver`` exists for completeness and stays validated when supplied, but
+    which driver backs a run is a deployment detail: clients omit it so every
+    thread inherits the run's.
     """
 
     type: Literal["query.chat_thread_create"] = "query.chat_thread_create"
@@ -62,6 +65,12 @@ class ChatThreadCreateQuery(Request):
     model: str | None = None
     # Without a title the server derives one from the thread's first message.
     title: str | None = None
+
+
+class ChatOptionsQuery(Request):
+    """Request the agent selections this run's experiment chat offers."""
+
+    type: Literal["query.chat_options"] = "query.chat_options"
 
 
 class HistoryQuery(Request):  # noqa: D101  # tracked: #288
@@ -96,6 +105,7 @@ ProtocolRequest = Annotated[
     | SnapshotQuery
     | ChatQuery
     | ChatThreadCreateQuery
+    | ChatOptionsQuery
     | HistoryQuery
     | PerformanceQuery
     | ExperimentQuery
@@ -149,6 +159,37 @@ class ChatThreadInfo(ProtocolModel):
     driver: str
     provider: str
     model: str
+
+
+class ChatModelOption(ProtocolModel):
+    """One model a chat thread can be started with, and where it came from.
+
+    ``source`` is provenance, not presentation: ``run`` is the run's own
+    configured model, ``role`` an ``[agent.outer]``/``[agent.inner]``
+    override, ``suggested`` an entry from the backend's short curated list.
+    """
+
+    model: str
+    source: Literal["run", "role", "suggested"]
+    # True for exactly one option across the whole response: the run's model.
+    default: bool = False
+
+
+class ChatProviderOptions(ProtocolModel):
+    """One CLI provider the run's configured driver supports, with models."""
+
+    provider: str
+    models: list[ChatModelOption] = Field(default_factory=list)
+
+
+class ChatOptions(ProtocolModel):
+    """Every chat agent selection this run offers, grouped by provider.
+
+    The agent driver is absent by design. Threads inherit the run's driver, so
+    a client never chooses one and never enumerates them.
+    """
+
+    providers: list[ChatProviderOptions] = Field(default_factory=list)
 
 
 class PerformanceRound(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -222,6 +263,9 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     ack: CommandAck | None = None
     chat: ChatResult | None = None
     chat_thread: ChatThreadInfo | None = None
+    # None means the run has not attached its agent selection yet, which is
+    # distinct from a run that offers no provider at all.
+    chat_options: ChatOptions | None = None
     snapshot: RunSnapshot | None = None
     events: list[RunEvent] = Field(default_factory=list)
     performance: list[PerformanceRound] = Field(default_factory=list)
