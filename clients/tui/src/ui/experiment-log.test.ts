@@ -157,6 +157,34 @@ describe('experiment log rows', () => {
     expect(cells.outcome.startsWith('  ')).toBe(true);
     expect(cells.trailing.startsWith('  ')).toBe(true);
   });
+
+  it('prefers the backend-supplied title over the claim and action', () => {
+    const cells = entryCells(
+      entry({
+        title: 'Batch decode requests',
+        claim: 'batch the prefill step',
+        action: 'batch prefill',
+      }),
+      resolveColumns(WIDE),
+    );
+
+    expect(cells.leading).toContain('Batch decode requests');
+    expect(cells.leading).not.toContain('batch the prefill step');
+  });
+
+  it('falls back to the claim, then the action, when there is no title', () => {
+    const withClaim = entryCells(
+      entry({title: null, claim: 'batch the prefill step', action: 'batch prefill'}),
+      resolveColumns(WIDE),
+    );
+    expect(withClaim.leading).toContain('Batch the prefill step');
+
+    const withActionOnly = entryCells(
+      entry({title: null, claim: null, action: 'batch prefill'}),
+      resolveColumns(WIDE),
+    );
+    expect(withActionOnly.leading).toContain('Batch prefill');
+  });
 });
 
 describe('experiment log layout', () => {

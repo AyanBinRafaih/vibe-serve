@@ -563,6 +563,53 @@ class PreRoundDecision(BaseModel):
     reasoning: str = Field(description="Short explanation of the decision. One or two sentences.")
 
 
+HYPOTHESIS_TITLE_MAX_LEN = 60
+
+
+def truncate_hypothesis_title(text: str) -> str:
+    """Truncate ``text`` to ``HYPOTHESIS_TITLE_MAX_LEN`` on a word boundary.
+
+    Adds a trailing ellipsis when truncation occurs. ``text`` is assumed to
+    already be stripped and whitespace-collapsed; this only shortens it.
+    """
+    if len(text) <= HYPOTHESIS_TITLE_MAX_LEN:
+        return text
+    truncated = text[: HYPOTHESIS_TITLE_MAX_LEN - 1]
+    boundary = truncated.rfind(" ")
+    if boundary > 0:
+        truncated = truncated[:boundary]
+    return truncated.rstrip() + "…"
+
+
+def normalize_hypothesis_title(title: str) -> str:
+    """Strip, collapse internal whitespace, and truncate an orchestrator title.
+
+    Returns ``""`` when ``title`` carries no text, so callers can tell an
+    absent title apart from one that was merely whitespace.
+    """
+    collapsed = " ".join(title.split())
+    return truncate_hypothesis_title(collapsed)
+
+
+def derive_hypothesis_title(claim: str) -> str | None:
+    """Derive a display title from a hypothesis claim.
+
+    Takes the claim's first line, then its first sentence, strips a trailing
+    period, and truncates to ``HYPOTHESIS_TITLE_MAX_LEN``. Returns ``None``
+    when the claim carries no text, so callers can distinguish "no claim" from
+    a claim that happened to produce an empty title.
+    """
+    stripped = claim.strip()
+    if not stripped:
+        return None
+    first_line = stripped.splitlines()[0]
+    first_sentence = first_line.split(". ", 1)[0].rstrip(". ")
+    collapsed = " ".join(first_sentence.split())
+    if not collapsed:
+        return None
+    return truncate_hypothesis_title(collapsed)
+
+
 class OrchestratorPlan(BaseModel):
     """The per-round plan produced by the orchestrator.
 
@@ -590,6 +637,13 @@ class OrchestratorPlan(BaseModel):
     hypothesis: str = Field(
         default="",
         description="Causal, falsifiable claim explaining why the proposed change should help.",
+    )
+    title: str = Field(
+        default="",
+        description=(
+            f"Short plain-language title (<={HYPOTHESIS_TITLE_MAX_LEN} chars, no "
+            f"trailing period or 'Hypothesis:' prefix)."
+        ),
     )
     activation_evidence: str = Field(
         default="",

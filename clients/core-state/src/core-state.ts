@@ -18,6 +18,9 @@ export interface ActiveAgentExecution {
   assignment: string;
   startedAt: string;
   activity: {mode: AgentExecutionMode; summary: string; tool?: string | null};
+  driver?: string | null;
+  provider?: string | null;
+  model?: string | null;
 }
 
 export interface TodoItem {
@@ -48,6 +51,8 @@ export interface BenchmarkRecord {
 
 type RunEventData = NonNullable<RunEvent['data']>;
 export type TypedToolResult = Extract<RunEventData, {kind?: 'tool_result'}>;
+/** Typed structure a producer preserved alongside the raw tool-result text. */
+export type ToolResultPayload = NonNullable<TypedToolResult['payload']>;
 
 /** Thread id used for chat events recorded without one. */
 export const DEFAULT_CHAT_THREAD_ID = 'default';
@@ -332,6 +337,9 @@ function applyAgentExecutionEvent(state: CoreState, event: RunEvent): CoreState 
             summary: data.activity.summary,
             tool: data.activity.tool ?? null,
           },
+          driver: data.driver ?? null,
+          provider: data.provider ?? null,
+          model: data.model ?? null,
         },
       },
     };

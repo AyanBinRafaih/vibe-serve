@@ -16,6 +16,7 @@ import {
   NODE_HEIGHT,
   stageKinds,
 } from './agent-graph.js';
+import {agentRuntimeLabel} from './agent-runtime-label.js';
 import {elapsedLabel} from './previews.js';
 import type {Theme} from './theme.js';
 
@@ -273,6 +274,15 @@ export class AgentMapView {
         width: '100%',
       }),
     );
+    // Always drawn, even when empty, so every node keeps the same height
+    // (`NODE_HEIGHT`) whether or not it carries a runtime label.
+    box.add(
+      new TextRenderable(this.renderer, {
+        content: truncate(agentRuntimeLabel(phase.provider, phase.model) ?? '', inner),
+        fg: this.#theme.textMuted,
+        width: '100%',
+      }),
+    );
     return box;
   }
 
@@ -331,6 +341,16 @@ export class AgentMapView {
       row.add(
         new TextRenderable(this.renderer, {
           content: phase.roundLabel,
+          fg: this.#theme.textMuted,
+          width: '100%',
+        }),
+      );
+    }
+    const runtimeLabel = agentRuntimeLabel(phase.provider, phase.model);
+    if (runtimeLabel !== null) {
+      row.add(
+        new TextRenderable(this.renderer, {
+          content: runtimeLabel,
           fg: this.#theme.textMuted,
           width: '100%',
         }),

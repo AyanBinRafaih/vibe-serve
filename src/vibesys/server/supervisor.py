@@ -862,6 +862,9 @@ class RunSupervisor:
         *,
         consume_steering: bool = True,
         participates_in_run_control: bool = True,
+        driver: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> AgentExecutionHandle:
         """Start one prompt-to-result execution and return its explicit identity."""
         with self._condition:
@@ -902,6 +905,9 @@ class RunSupervisor:
                     system_prompt=system_prompt,
                     user_prompt=effective_prompt,
                     activity=activity,
+                    driver=driver,
+                    provider=provider,
+                    model=model,
                 ),
             )
             self._active_executions[execution_id] = active

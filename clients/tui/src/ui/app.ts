@@ -40,9 +40,11 @@ const KEY_HELP =
 const SCOPED_KEY_HELP =
   '[/]: round · ←→: pane · ↑↓/Tab: within it · F4: zoom · /todos · /prompt · Esc: back';
 const LOG_KEY_HELP =
-  '↑↓ or scroll: select · Enter or /open-round: open its rounds · F4: zoom · /open-round --N';
+  '↑↓ or scroll: select · Enter/click: open hypothesis · F4: zoom · /open-round --N';
 const LOG_CHAT_KEY_HELP =
-  '↑↓: select · Enter: open its rounds · Ctrl+W: chat and back · F4: zoom · /open-round --N';
+  '↑↓: select · Enter/click: hypothesis · Ctrl+W: chat · F4: zoom · /open-round --N';
+const HYPOTHESIS_KEY_HELP =
+  '↑↓: select round · Enter/click: trajectory · PgUp/PgDn: scroll · Esc: hypotheses';
 const SPLIT_KEY_HELP =
   'Ctrl+W: switch pane · F4: zoom focused pane · PgUp/PgDn: scroll · Esc: close pane';
 
@@ -281,7 +283,7 @@ export function createOpenTuiApp(
     // for the state to come back, so a resize never draws a stale row.
     const dockFits = chatDockFits(renderer.terminalWidth, rightWidth);
     if (state.chatDockFits !== dockFits) controller.setChatDockFits(dockFits);
-    const chatAvailable = showLog && dockFits && !state.chatOpen;
+    const chatAvailable = showLog && state.hypothesisDetail === null && dockFits && !state.chatOpen;
     const showChatPane = chatAvailable && (zoomedPane === null || zoomedPane === 'chat');
     const chatWidth = showChatPane
       ? zoomedPane === 'chat'
@@ -302,9 +304,11 @@ export function createOpenTuiApp(
     renderedKeyHelp = showSplit
       ? SPLIT_KEY_HELP
       : showLog
-        ? showChatPane
-          ? LOG_CHAT_KEY_HELP
-          : LOG_KEY_HELP
+        ? state.hypothesisDetail !== null
+          ? HYPOTHESIS_KEY_HELP
+          : showChatPane
+            ? LOG_CHAT_KEY_HELP
+            : LOG_KEY_HELP
         : state.hypothesisScope === null
           ? KEY_HELP
           : SCOPED_KEY_HELP;
@@ -396,6 +400,7 @@ export function createOpenTuiApp(
       commandInput.isEmpty() && chatPane.isComposerEmpty() && chat.isComposerEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
+    toggleSelectedTool: () => conversation.toggleSelectedTool(),
     revealSelectedEntry: () => {
       const card = conversation.selectedCard();
       if (card !== null) viewport.scrollChildIntoView(card.id);
@@ -407,6 +412,7 @@ export function createOpenTuiApp(
     toggleTodos: () => controller.toggleTodos(),
     scrollRightPane: delta => rightPane.scrollBy(delta),
     scrollChatPane: delta => chatPane.scrollBy(delta),
+    scrollExperimentDetail: delta => experimentLog.scrollBy(delta),
     scrollErrorBanner: delta => errorBanner.scrollBy(delta),
     clearTransientStatus: () => {
       if (transientStatus === null) return;

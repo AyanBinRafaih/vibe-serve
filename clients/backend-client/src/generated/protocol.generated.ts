@@ -209,6 +209,9 @@ export type Stage1 = string;
 export type Attempt1 = number | null;
 export type SystemPrompt1 = string;
 export type UserPrompt1 = string;
+export type Driver3 = string | null;
+export type Provider3 = string | null;
+export type Model3 = string | null;
 export type Kind6 = "agent_execution_finished";
 export type Error2 = string | null;
 export type Kind7 = "output";
@@ -269,14 +272,26 @@ export type Tool2 = string;
 export type CallId1 = string | null;
 export type Content3 = string;
 export type IsError = boolean;
-export type Kind21 = "todo_update";
+export type Payload = (CommandResultPayload | JsonResultPayload) | null;
+export type Kind21 = "command";
+export type Stdout = string;
+export type Stderr = string;
+export type ExitCode1 = number | null;
+export type Duration = number | null;
+export type Kind22 = "json";
+export type Value1 =
+  | {
+      [k: string]: unknown;
+    }
+  | unknown[];
+export type Kind23 = "todo_update";
 export type Content4 = string;
 export type Status2 = string;
 export type Todos = TodoItemData[];
-export type Kind22 = "usage_update";
+export type Kind24 = "usage_update";
 export type InputTokens1 = number;
 export type ContextWindow1 = number | null;
-export type Model3 = string | null;
+export type Model4 = string | null;
 export type Events = RunEvent[];
 export type Round = number;
 export type PerfMetric1 = number;
@@ -286,6 +301,7 @@ export type ProfileSkipped = boolean;
 export type Performance = PerformanceRound[];
 export type HypothesisId = string;
 export type Identified = boolean;
+export type Title3 = string | null;
 export type Claim = string | null;
 export type Action1 = string | null;
 export type FirstRound = number;
@@ -569,6 +585,9 @@ export interface AgentExecutionStartedData {
   system_prompt?: SystemPrompt1;
   user_prompt?: UserPrompt1;
   activity: AgentExecutionActivityData;
+  driver?: Driver3;
+  provider?: Provider3;
+  model?: Model3;
   [k: string]: unknown;
 }
 /**
@@ -697,10 +716,30 @@ export interface ToolResultData {
   call_id?: CallId1;
   content: Content3;
   is_error?: IsError;
+  payload?: Payload;
+  [k: string]: unknown;
+}
+/**
+ * Structured result of a command-style tool execution.
+ */
+export interface CommandResultPayload {
+  kind?: Kind21;
+  stdout: Stdout;
+  stderr: Stderr;
+  exit_code?: ExitCode1;
+  duration?: Duration;
+  [k: string]: unknown;
+}
+/**
+ * A tool result that is a JSON object or array, already parsed.
+ */
+export interface JsonResultPayload {
+  kind?: Kind22;
+  value: Value1;
   [k: string]: unknown;
 }
 export interface TodoUpdateData {
-  kind?: Kind21;
+  kind?: Kind23;
   todos?: Todos;
   [k: string]: unknown;
 }
@@ -710,10 +749,10 @@ export interface TodoItemData {
   [k: string]: unknown;
 }
 export interface UsageUpdateData {
-  kind?: Kind22;
+  kind?: Kind24;
   input_tokens: InputTokens1;
   context_window?: ContextWindow1;
-  model?: Model3;
+  model?: Model4;
   [k: string]: unknown;
 }
 export interface PerformanceRound {
@@ -732,6 +771,7 @@ export interface PerformanceRound {
 export interface HypothesisEntry {
   hypothesis_id: HypothesisId;
   identified?: Identified;
+  title?: Title3;
   claim?: Claim;
   action?: Action1;
   first_round: FirstRound;

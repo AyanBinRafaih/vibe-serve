@@ -122,6 +122,9 @@ class AgentExecutionStartedData(BaseModel):
     system_prompt: str = ""
     user_prompt: str = ""
     activity: AgentExecutionActivityData
+    driver: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
 
 class AgentExecutionFinishedData(BaseModel):
@@ -207,12 +210,40 @@ class ToolCallData(BaseModel):  # noqa: D101  # tracked: #288
     status: AgentStatusData | None = None
 
 
+class CommandResultPayload(BaseModel):
+    """Structured result of a command-style tool execution."""
+
+    kind: Literal["command"] = "command"
+    stdout: str
+    stderr: str
+    exit_code: int | None = None
+    duration: float | None = None
+    """Wall-clock execution time in seconds."""
+
+
+class JsonResultPayload(BaseModel):
+    """A tool result that is a JSON object or array, already parsed."""
+
+    kind: Literal["json"] = "json"
+    value: dict[str, Any] | list[Any]
+
+
+ToolResultPayload = Annotated[
+    CommandResultPayload | JsonResultPayload,
+    Field(discriminator="kind"),
+]
+"""Typed structure a producer preserved alongside the raw result text."""
+
+
 class ToolResultData(BaseModel):  # noqa: D101  # tracked: #288
     kind: Literal["tool_result"] = "tool_result"
     tool: str
     call_id: str | None = None
     content: str
     is_error: bool = False
+    # ``content`` stays the raw, always-present text (fidelity, logs, replay).
+    # Frontends render ``payload`` when present and fall back to ``content``.
+    payload: ToolResultPayload | None = None
 
 
 class TodoItemData(BaseModel):  # noqa: D101  # tracked: #288

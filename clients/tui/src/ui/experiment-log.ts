@@ -1,13 +1,15 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
-import type {HypothesisEntry} from '@vibesys/backend-client';
+import type {HypothesisEntry, HypothesisRound} from '@vibesys/backend-client';
 import type {SessionController} from '../session-controller.js';
 import {
+  detailedHypothesis,
   type ExperimentIndexItem,
   experimentIndexItems,
   experimentLogVisible,
   focusedPane,
   type HypothesisPlanningActivity,
   hypothesisPlanningActivity,
+  hypothesisRoundNumbers,
   type SessionState,
   selectedExperimentIndexItem,
   unownedExperimentRounds,
@@ -155,9 +157,17 @@ export class ExperimentLogView {
     this.output.title = focused ? ' ▸ Experiments ' : ' Experiments ';
     const width = this.#availableWidth ?? this.renderer.terminalWidth;
     if (state === this.#renderedState && width === this.#renderedWidth) return;
+    const previousDetailKey = this.#renderedState?.hypothesisDetail?.entryKey ?? null;
     this.#renderedState = state;
     this.#renderedWidth = width;
     this.#clear();
+
+    const detail = detailedHypothesis(state);
+    if (detail !== null) {
+      this.#renderDetail(detail, state);
+      if (previousDetailKey !== state.hypothesisDetail?.entryKey) this.#rows.scrollTo(0);
+      return;
+    }
 
     if (log.error !== null) {
       this.#header.content = '';
@@ -230,7 +240,7 @@ export class ExperimentLogView {
       const isSelected = item.key === selected?.key;
       if (item.kind === 'hypothesis') {
         const entryIndex = log.entries.indexOf(item.entry);
-        this.#row(item.entry, columns, isSelected, entryIndex, navigationIndex);
+        this.#row(item.entry, item.key, columns, isSelected, entryIndex);
         if (isSelected) selectedRenderIndex = renderedRows;
         renderedRows += 1;
       } else if (item.kind === 'round') {
@@ -257,9 +267,49 @@ export class ExperimentLogView {
     // reads as breakage rather than as a narrow terminal.
     const hint =
       this.#bodyWidth() >= HINT_MIN_WIDTH
-        ? '↑↓ or scroll: select · Enter or /open-round: open its rounds'
+        ? '↑↓ or scroll: select · Enter or click: open hypothesis'
         : '↑↓ · Enter';
     this.#footerLine.content = `${position} · ${hint}`;
+  }
+
+  #renderDetail(entry: HypothesisEntry, state: SessionState): void {
+    const selectedRound = state.hypothesisDetail?.selectedRound ?? null;
+    this.output.title = ` ${focusedTitlePrefix(state)}Hypothesis ${entry.hypothesis_id} `;
+    this.#header.content = hypothesisMetadata(entry);
+    this.#line('HYPOTHESIS', this.#theme.textSubtle);
+    this.#wrappedLine(
+      entry.claim?.trim() || 'No hypothesis text was recorded.',
+      this.#theme.textPrimary,
+    );
+    this.#line('', this.#theme.textPrimary);
+    this.#line('ROUNDS', this.#theme.textSubtle);
+    const rounds = hypothesisRoundNumbers(entry);
+    if (rounds.length === 0) {
+      this.#line('No recorded rounds.', this.#theme.textSubtle);
+    } else {
+      for (const roundNumber of rounds) {
+        const round = entry.rounds?.find(candidate => candidate.round === roundNumber);
+        const selected = roundNumber === selectedRound;
+        const row = new BoxRenderable(this.renderer, {
+          id: `hypothesis-round-${roundNumber}`,
+          width: '100%',
+          height: 1,
+          flexShrink: 0,
+          ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
+          onMouseUp: () => this.controller.openRound(roundNumber),
+        });
+        row.add(
+          this.#cell(
+            `${selected ? '›' : ' '} ${roundMetadata(roundNumber, round)}`,
+            this.#theme.textPrimary,
+            selected,
+          ),
+        );
+        this.#rows.add(row);
+      }
+    }
+    this.#footerLine.content =
+      '↑↓: select round · Enter or click: open trajectory · Esc: hypotheses';
   }
 
   #renderActivity(
@@ -278,10 +328,10 @@ export class ExperimentLogView {
 
   #row(
     entry: HypothesisEntry,
+    entryKey: string,
     columns: Columns,
     isSelected: boolean,
     index: number,
-    navigationIndex: number,
   ): void {
     const cells = entryCells(entry, columns);
     // The active hypothesis is called out on its own, so it stays visible
@@ -297,7 +347,7 @@ export class ExperimentLogView {
       ...selection,
       onMouseUp: () => {
         this.controller.focusPane('left');
-        this.controller.moveExperimentSelection(navigationIndex - this.#selectedNavigationIndex());
+        this.controller.openHypothesisDetail(entryKey);
       },
     });
     // The outcome is its own renderable so the resolution can carry a color of
@@ -408,6 +458,23 @@ export class ExperimentLogView {
     return text;
   }
 
+  #wrappedLine(content: string, fg: string): TextRenderable {
+    const text = new TextRenderable(this.renderer, {
+      content,
+      fg,
+      width: '100%',
+      flexShrink: 0,
+      wrapMode: 'word',
+    });
+    this.#rows.add(text);
+    return text;
+  }
+
+  /** Scroll hypothesis prose without moving the round selection. */
+  scrollBy(delta: number): void {
+    this.#rows.scrollBy(delta, 'viewport');
+  }
+
   #bodyWidth(): number {
     const width = this.#availableWidth ?? this.renderer.terminalWidth;
     return Math.max(MIN_BODY_WIDTH, width - PANEL_CHROME_COLUMNS);
@@ -498,7 +565,12 @@ export function entryCells(entry: HypothesisEntry, columns: Columns): EntryCells
     fitColumn(formatRounds(entry), ROUNDS_WIDTH),
   ];
   if (columns.claim) {
-    leading.push(fitColumn(sentenceCase(entry.claim ?? entry.action ?? '—'), columns.claimWidth));
+    leading.push(
+      fitColumn(
+        sentenceCase(entry.title ?? entry.claim ?? entry.action ?? '—'),
+        columns.claimWidth,
+      ),
+    );
   }
   if (columns.measured) leading.push(fitColumn(formatMeasured(entry), MEASURED_WIDTH));
   return {
@@ -568,6 +640,32 @@ export function formatMeasured(entry: HypothesisEntry): string {
   }
   if (typeof entry.perf_metric === 'number') return trimNumber(entry.perf_metric);
   return '—';
+}
+
+function focusedTitlePrefix(state: SessionState): string {
+  return focusedPane(state) === 'experiments' ? '▸ ' : '';
+}
+
+function hypothesisMetadata(entry: HypothesisEntry): string {
+  const parts = [`Rounds ${formatRounds(entry)}`];
+  if (entry.judge_verdict !== null && entry.judge_verdict !== undefined) {
+    parts.push(`Judge ${sentenceCase(entry.judge_verdict)}`);
+  }
+  parts.push(`Decision ${outcomeLabel(entry)}`);
+  if (entry.kept === true) parts.push('Candidate kept');
+  else if (entry.kept === false) parts.push('Candidate reverted');
+  return parts.join(' · ');
+}
+
+function roundMetadata(roundNumber: number, round: HypothesisRound | undefined): string {
+  const parts = [`Round ${roundNumber}`];
+  if (round !== undefined) {
+    parts.push(round.reviewed ? `Judge ${round.passed ? 'pass' : 'fail'}` : 'Judge pending');
+  }
+  if (typeof round?.perf_metric === 'number') {
+    parts.push(`${trimNumber(round.perf_metric)}${round.perf_unit ? ` ${round.perf_unit}` : ''}`);
+  }
+  return parts.join(' · ');
 }
 
 function planningHypothesisLabel(existingHypotheses: number): string {

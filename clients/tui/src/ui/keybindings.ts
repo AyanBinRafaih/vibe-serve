@@ -8,6 +8,7 @@ export interface KeybindingActions {
   inputIsEmpty(): boolean;
   closeChat(): void;
   toggleLatestPrompt(): void;
+  toggleSelectedTool(): boolean;
   /** Brings the entry the cursor moved to into view. */
   revealSelectedEntry(): void;
   selectNextAgent(): void;
@@ -17,6 +18,7 @@ export interface KeybindingActions {
   toggleTodos(): void;
   scrollRightPane(delta: number): void;
   scrollChatPane(delta: number): void;
+  scrollExperimentDetail(delta: number): void;
   scrollErrorBanner(delta: number): void;
   clearTransientStatus(): void;
   showClipboardStatus(result: Exclude<ClipboardCopyResult, 'no-selection'>): void;
@@ -176,20 +178,25 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // The experiment log owns navigation while the table is on screen: arrows
-    // move the selection instead of the input cursor, and Enter opens the
-    // rounds behind the selected hypothesis. The input keeps priority over the
-    // table, so a typed command runs on its own Enter and its result opens over
-    // the log rather than the log swallowing the keystroke.
+    // The experiment surface owns navigation while it is on screen. The index
+    // opens a hypothesis summary; that summary selects and opens one round.
+    // The input keeps priority over Enter so a typed command is never lost.
     if (experimentLogVisible(controller.state)) {
-      // Escape has nowhere to go from the root view: the log is the root.
-      // Arrows move the table's selection from the moment the log is on screen:
-      // the table is the view, so it should not need to be clicked into first.
-      if (key.name === 'up') controller.moveExperimentSelection(-1);
-      else if (key.name === 'down') controller.moveExperimentSelection(1);
-      else if (key.name === 'pageup') controller.moveExperimentSelection(-10);
-      else if (key.name === 'pagedown') controller.moveExperimentSelection(10);
-      else if (key.name === 'return' || key.name === 'enter') {
+      const detailOpen = controller.state.hypothesisDetail !== null;
+      if (key.name === 'escape' && detailOpen) controller.leaveHypothesisDetail();
+      else if (key.name === 'up') {
+        if (detailOpen) controller.moveHypothesisRoundSelection(-1);
+        else controller.moveExperimentSelection(-1);
+      } else if (key.name === 'down') {
+        if (detailOpen) controller.moveHypothesisRoundSelection(1);
+        else controller.moveExperimentSelection(1);
+      } else if (key.name === 'pageup') {
+        if (detailOpen) actions.scrollExperimentDetail(-1);
+        else controller.moveExperimentSelection(-10);
+      } else if (key.name === 'pagedown') {
+        if (detailOpen) actions.scrollExperimentDetail(1);
+        else controller.moveExperimentSelection(10);
+      } else if (key.name === 'return' || key.name === 'enter') {
         // A typed command belongs to the input; let its own handler run it so
         // one Enter is enough. An overlay is in front of the table, so Enter
         // behind it must not move the operator somewhere they cannot see.
@@ -256,6 +263,16 @@ export function bindKeybindings(
         controller.selectNextEntry(key.name === 'down' ? 1 : -1);
         actions.revealSelectedEntry();
       }
+      key.preventDefault();
+      return;
+    }
+    if (
+      (key.name === 'return' || key.name === 'enter') &&
+      controller.state.roundFocus === 'transcript' &&
+      actions.inputIsEmpty() &&
+      actions.toggleSelectedTool()
+    ) {
+      actions.revealSelectedEntry();
       key.preventDefault();
       return;
     }

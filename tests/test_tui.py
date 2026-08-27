@@ -1436,6 +1436,9 @@ def test_run_context_records_invocation_boundary(tmp_path):  # noqa: ANN001, ANN
     ctx.supervisor = supervisor
     ctx.agent_client = Mock()
     ctx.agent_client.invoke.return_value = {"summary": "measured"}
+    ctx.agent_client.driver_name = "agentshim"
+    ctx.agent_client.provider = "codex"
+    ctx.agent_client.model_for_kind = Mock(return_value="gpt-5.1-codex-max")
     ctx._paths = RunPaths(  # noqa: SLF001  # tracked: #288
         project_root=tmp_path,
         log_dir=tmp_path / "logs",
@@ -1459,6 +1462,12 @@ def test_run_context_records_invocation_boundary(tmp_path):  # noqa: ANN001, ANN
     events = _events(tmp_path / "run-events.jsonl")
     started = next(event for event in events if event["type"] == "invocation_started")
     assert started["data"]["user_prompt"] == "original"
+    execution_started = next(
+        event for event in events if event["type"] == "agent_execution_started"
+    )
+    assert execution_started["data"]["driver"] == "agentshim"
+    assert execution_started["data"]["provider"] == "codex"
+    assert execution_started["data"]["model"] == "gpt-5.1-codex-max"
 
 
 def test_committed_protocol_schema_matches_python_contract():  # noqa: ANN201  # tracked: #288

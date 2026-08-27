@@ -56,6 +56,8 @@ export interface SessionState {
   todosExpanded: boolean;
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
+  /** Hypothesis summary between the experiment index and a round trajectory. */
+  hypothesisDetail: HypothesisDetail | null;
   hypothesisScope: HypothesisScope | null;
   layout: LayoutState;
   /**
@@ -117,6 +119,12 @@ export interface ExperimentLogState {
   selectedUnownedRound?: number | null;
   pending: boolean;
   error: string | null;
+}
+
+/** UI-only navigation state for the selected hypothesis summary. */
+export interface HypothesisDetail {
+  entryKey: string;
+  selectedRound: number | null;
 }
 
 /** A planning phase that has not produced a hypothesis record yet. */
@@ -268,6 +276,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     // The experiment log is the landing view: a run's history reads as a short
     // list of claims before it reads as a long list of rounds.
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
+    hypothesisDetail: null,
     hypothesisScope: null,
     layout: {right: null, focus: 'left', zoomedPane: null},
     // Docked until the renderer measures otherwise, so the landing view carries
@@ -306,7 +315,12 @@ export function experimentLogVisible(state: SessionState): boolean {
  * it was.
  */
 export function chatDocked(state: SessionState): boolean {
-  return state.chatDockFits && state.experimentLog !== null && state.hypothesisScope === null;
+  return (
+    state.chatDockFits &&
+    state.experimentLog !== null &&
+    state.hypothesisDetail === null &&
+    state.hypothesisScope === null
+  );
 }
 
 /** True when the docked chat is the thing on screen rather than the modal. */
@@ -513,6 +527,7 @@ export function openExperimentLog(state: SessionState): SessionState {
     ...state,
     overlay: null,
     chatOpen: false,
+    hypothesisDetail: null,
     hypothesisScope: null,
     selectedRound: null,
     selectedAgentKind: null,
@@ -552,8 +567,26 @@ export function setExperiments(state: SessionState, entries: HypothesisEntry[]):
       : orderedEntries.length === 0
         ? (unownedRounds[0] ?? null)
         : null;
+  const currentDetail = state.hypothesisDetail;
+  const detailEntry =
+    currentDetail === null
+      ? undefined
+      : orderedEntries.find((entry, index) => entryKey(entry, index) === currentDetail.entryKey);
+  const detailRounds = detailEntry === undefined ? [] : scopeRounds(detailEntry);
+  const hypothesisDetail =
+    currentDetail === null || detailEntry === undefined
+      ? null
+      : {
+          entryKey: currentDetail.entryKey,
+          selectedRound:
+            currentDetail.selectedRound !== null &&
+            detailRounds.includes(currentDetail.selectedRound)
+              ? currentDetail.selectedRound
+              : (detailRounds.at(-1) ?? null),
+        };
   return {
     ...state,
+    hypothesisDetail,
     experimentLog: {
       ...log,
       entries: orderedEntries,
@@ -575,7 +608,8 @@ export function failExperiments(state: SessionState, error: string): SessionStat
 
 export function moveExperimentSelection(state: SessionState, delta: number): SessionState {
   const log = state.experimentLog;
-  if (log === null || state.hypothesisScope !== null) return state;
+  if (log === null || state.hypothesisDetail !== null || state.hypothesisScope !== null)
+    return state;
   const items = experimentIndexItems(state);
   if (items.length === 0) return state;
   const selected = selectedExperimentIndexItem(state);
@@ -584,11 +618,63 @@ export function moveExperimentSelection(state: SessionState, delta: number): Ses
   return selectExperimentIndexItem(state, items[index]);
 }
 
+/** Open one hypothesis summary without entering any of its round trajectories. */
+export function openHypothesisDetail(state: SessionState, requestedKey?: string): SessionState {
+  const log = state.experimentLog;
+  if (log === null || state.hypothesisScope !== null) return state;
+  const key = requestedKey ?? log.selectedId;
+  if (key === null) return state;
+  const entry = log.entries.find((candidate, index) => entryKey(candidate, index) === key);
+  if (entry === undefined) return state;
+  const rounds = scopeRounds(entry);
+  return {
+    ...state,
+    overlay: null,
+    chatOpen: false,
+    layout: {right: null, focus: 'left', zoomedPane: null},
+    experimentLog: {
+      ...log,
+      selectedId: key,
+      selectedActivity: false,
+      selectedActivityRound: null,
+      selectedUnownedRound: null,
+    },
+    hypothesisDetail: {entryKey: key, selectedRound: rounds.at(-1) ?? null},
+  };
+}
+
+/** The durable hypothesis selected for the summary view. */
+export function detailedHypothesis(state: SessionState): HypothesisEntry | null {
+  const detail = state.hypothesisDetail;
+  const entries = state.experimentLog?.entries ?? [];
+  if (detail === null) return null;
+  return entries.find((entry, index) => entryKey(entry, index) === detail.entryKey) ?? null;
+}
+
+/** Move the round cursor within the open hypothesis summary. */
+export function moveHypothesisRoundSelection(state: SessionState, delta: number): SessionState {
+  const detail = state.hypothesisDetail;
+  const entry = detailedHypothesis(state);
+  if (detail === null || entry === null || state.hypothesisScope !== null) return state;
+  const rounds = scopeRounds(entry);
+  if (rounds.length === 0) return state;
+  const current = detail.selectedRound === null ? -1 : rounds.indexOf(detail.selectedRound);
+  const index = current === -1 ? 0 : Math.min(rounds.length - 1, Math.max(0, current + delta));
+  return {...state, hypothesisDetail: {...detail, selectedRound: rounds[index] ?? null}};
+}
+
+/** Return from a hypothesis summary to the experiment index. */
+export function leaveHypothesisDetail(state: SessionState): SessionState {
+  if (state.hypothesisDetail === null || state.hypothesisScope !== null) return state;
+  return {...state, hypothesisDetail: null};
+}
+
 /** Selects the current planning work so Enter opens its live agent turns. */
 export function selectExperimentActivity(state: SessionState): SessionState {
   const log = state.experimentLog;
   if (
     log === null ||
+    state.hypothesisDetail !== null ||
     state.hypothesisScope !== null ||
     hypothesisPlanningActivity(state) === null
   ) {
@@ -607,10 +693,14 @@ export function selectExperimentActivity(state: SessionState): SessionState {
 }
 
 /**
- * Opens the rounds behind the selected hypothesis. The log keeps its selection
- * so leaving the trajectory lands the operator back on the same row.
+ * Advances the experiment navigation by one level: index to hypothesis
+ * summary, then hypothesis summary to its selected round trajectory.
  */
 export function enterExperimentDrilldown(state: SessionState): SessionState {
+  if (state.hypothesisDetail !== null) {
+    const roundNumber = state.hypothesisDetail.selectedRound;
+    return roundNumber === null ? state : (enterExperimentRound(state, roundNumber) ?? state);
+  }
   const activity = hypothesisPlanningActivity(state);
   if (
     activity !== null &&
@@ -628,33 +718,10 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
   }
   const entry = selectedExperiment(state);
   if (entry === null || state.hypothesisScope !== null) return state;
-  const rounds = scopeRounds(entry);
-  if (rounds.length === 0) return state;
-  return {
-    ...state,
-    overlay: null,
-    // A visualization opened from the log belongs to the log. Carrying it into
-    // the round view would leave the operator reading one view's answer beside
-    // another view's transcript.
-    layout: {right: null, focus: 'left', zoomedPane: null},
-    hypothesisScope: {
-      id: entry.hypothesis_id,
-      label: hypothesisLabel(entry),
-      rounds,
-      source: 'hypothesis',
-    },
-    // Land on the hypothesis's latest round rather than on "no round". The
-    // round view is built around one round: the strip marks it, the agent graph
-    // draws its phases, the transcript carries its turns. Leaving the round
-    // unset drew an empty strip and an empty graph, and `[` walks back through
-    // the earlier rounds from here anyway.
-    selectedRound: rounds.at(-1) ?? null,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-  };
+  return openHypothesisDetail(state);
 }
 
-/** Leaves the trajectory and returns to the table with the selection intact. */
+/** Leaves a trajectory for its hypothesis summary, preserving the round cursor. */
 export function leaveExperimentDrilldown(state: SessionState): SessionState {
   if (state.hypothesisScope === null) return state;
   return {...state, hypothesisScope: null, selectedRound: null, selectedAgentKind: null};
@@ -669,10 +736,11 @@ export function enterExperimentRound(
   state: SessionState,
   roundNumber: number,
 ): SessionState | null {
-  const entry = (state.experimentLog?.entries ?? []).find(candidate =>
-    scopeRounds(candidate).includes(roundNumber),
-  );
+  const entries = state.experimentLog?.entries ?? [];
+  const entryIndex = entries.findIndex(candidate => scopeRounds(candidate).includes(roundNumber));
+  const entry = entries[entryIndex];
   if (entry === undefined) return null;
+  const entryKeyValue = entryKey(entry, entryIndex);
   const scoped: SessionState = {
     ...state,
     overlay: null,
@@ -687,10 +755,9 @@ export function enterExperimentRound(
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
+    hypothesisDetail: {entryKey: entryKeyValue, selectedRound: roundNumber},
     experimentLog:
-      state.experimentLog === null
-        ? null
-        : {...state.experimentLog, selectedId: entryKeyFor(state.experimentLog.entries, entry)},
+      state.experimentLog === null ? null : {...state.experimentLog, selectedId: entryKeyValue},
   };
   return scoped;
 }
@@ -710,6 +777,7 @@ export function enterUnownedExperimentRound(
     overlay: null,
     chatOpen: false,
     layout: {right: null, focus: 'left', zoomedPane: null},
+    hypothesisDetail: null,
     hypothesisScope: {
       id: `round-${roundNumber}`,
       label: `Round ${roundNumber}`,
@@ -739,12 +807,17 @@ function scopeRounds(entry: HypothesisEntry): number[] {
   );
 }
 
+/** Ordered round identities owned by a hypothesis, including legacy range-only records. */
+export function hypothesisRoundNumbers(entry: HypothesisEntry): number[] {
+  return scopeRounds(entry);
+}
+
 function hypothesisLabel(entry: HypothesisEntry): string {
   const range =
     entry.first_round === entry.last_round
       ? `r${entry.first_round}`
       : `r${entry.first_round}-${entry.last_round}`;
-  return `${entry.hypothesis_id} · ${range}`;
+  return `${entry.title ?? entry.hypothesis_id} · ${range}`;
 }
 
 export function selectedExperiment(state: SessionState): HypothesisEntry | null {
@@ -1496,6 +1569,7 @@ export function showLive(state: SessionState): SessionState {
     ...state,
     overlay: null,
     chatOpen: false,
+    hypothesisDetail: null,
     hypothesisScope: null,
     selectedRound: null,
     selectedAgentKind: null,

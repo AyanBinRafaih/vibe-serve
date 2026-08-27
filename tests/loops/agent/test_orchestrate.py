@@ -2030,6 +2030,48 @@ def test_continuing_hypothesis_uses_unified_run_state(tmp_path, ref_file):  # no
     assert [round_data["round"] for round_data in _round_payloads(tmp_path)] == [1]
 
 
+def test_orchestrator_title_is_normalized_after_the_structured_call(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    raw_title = "  " + ("A" * 50 + " " + "B" * 20) + "  "
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="normalize-title",
+                title=raw_title,
+                task="normalize the title",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise title normalization",
+            )
+        ],
+        implementer_outcomes=[HypothesisOutcome.CONTINUE],
+    )
+
+    assert _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=1) is True
+
+    active = _active_hypothesis(tmp_path)
+    assert active is not None
+    assert active.plan.title == "A" * 50 + "…"
+
+
+def test_orchestrator_title_stays_empty_when_the_model_gives_none(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="no-title",
+                task="proceed without a title",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise the empty-title passthrough",
+            )
+        ],
+        implementer_outcomes=[HypothesisOutcome.CONTINUE],
+    )
+
+    assert _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=1) is True
+
+    active = _active_hypothesis(tmp_path)
+    assert active is not None
+    assert active.plan.title == ""
+
+
 def test_resume_migrates_legacy_hypothesis_state_without_losing_continuation(
     tmp_path: Path,
     ref_file: str,
@@ -2127,6 +2169,10 @@ def test_resume_migrates_legacy_hypothesis_state_without_losing_continuation(
     subprocess.run(
         [  # noqa: S607  # test fixture
             "git",
+            "-c",
+            "user.name=VibeSys Test",
+            "-c",
+            "user.email=test@vibesys.invalid",
             "commit",
             "-m",
             "test: restore legacy hypothesis state",

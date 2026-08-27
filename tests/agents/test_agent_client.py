@@ -24,7 +24,12 @@ from vibesys.agents.contracts import (
     SessionDisposition,
 )
 from vibesys.render.sink import output_sink
-from vibesys.server.events import AgentOutputChunkData, EventType
+from vibesys.server.events import (
+    AgentOutputChunkData,
+    CommandResultPayload,
+    EventType,
+    ToolResultData,
+)
 
 
 class _Response(BaseModel):
@@ -186,6 +191,52 @@ def test_invoke_preserves_streamed_text_deltas_and_paragraphs(tmp_path: Path) ->
     ]
     assert assistant_chunks == [*deltas, "\n"]
     assert "Tokens stay together.\n\nNext paragraph.\n" in log.getvalue()
+
+
+def test_invoke_threads_typed_tool_result_payload_to_sink(tmp_path: Path) -> None:
+    payload = CommandResultPayload(stdout="ok", stderr="warn", exit_code=1, duration=0.4)
+    session = _FakeSession(
+        results=[AgentTurnResult("Done")],
+        events=[
+            AgentEvent(
+                AgentEventKind.TOOL_RESULT,
+                payload={
+                    "tool": "shell",
+                    "stdout": "ok",
+                    "stderr": "warn",
+                    "exit_code": 1,
+                    "duration": 0.4,
+                    "result_payload": payload,
+                },
+            ),
+            AgentEvent(AgentEventKind.TOOL_RESULT, payload={"tool": "shim", "stdout": "plain"}),
+        ],
+    )
+    client = AgentClient(_FakeDriver([session]))
+    seen = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        client.invoke_text(
+            kind="implementer",
+            workspace=tmp_path,
+            system_prompt="system",
+            user_prompt="user",
+            round_label="round-1",
+        )
+    finally:
+        unsubscribe()
+
+    results = [
+        event.data
+        for event in seen
+        if event.type is EventType.TOOL_RESULT and isinstance(event.data, ToolResultData)
+    ]
+    assert [data.tool for data in results] == ["shell", "shim"]
+    assert results[0].payload == payload
+    assert results[0].content == "ok"
+    # A driver event without typed structure falls back to the classifier,
+    # which leaves plain text unclassified.
+    assert results[1].payload is None
 
 
 def test_invoke_closes_text_before_tool_event(tmp_path: Path) -> None:
@@ -404,6 +455,29 @@ def test_invoke_builds_session_and_turn_contracts_and_records_usage(tmp_path: Pa
         "duration_ms": 30,
     }
     assert {key: record[key] for key in expected} == expected
+
+
+def test_runtime_accessors_expose_configured_driver_provider_and_model() -> None:
+    client = AgentClient(
+        _FakeDriver([]),
+        driver_name="agentshim",
+        provider="claude",
+        model_name="claude-base",
+        role_models={"judge": "claude-judge"},
+    )
+
+    assert client.driver_name == "agentshim"
+    assert client.provider == "claude"
+    assert client.model_for_kind("judge") == "claude-judge"
+    assert client.model_for_kind("implementer") == "claude-base"
+
+
+def test_runtime_accessors_default_to_none_or_codex_when_unconfigured() -> None:
+    client = AgentClient(_FakeDriver([]))
+
+    assert client.driver_name is None
+    assert client.provider == "codex"
+    assert client.model_for_kind("implementer") is None
 
 
 def test_invoke_uses_fallback_only_for_unparseable_output(tmp_path: Path) -> None:
