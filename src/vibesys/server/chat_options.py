@@ -12,17 +12,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from vibesys._agent_cli.opencode import OPENCODE_DEFAULT_MODEL
 from vibesys.agents.factory import supported_cli_providers
 from vibesys.server.protocol import ChatModelOption, ChatOptions, ChatProviderOptions
 
 ChatModelSource = Literal["run", "role", "suggested"]
 
 # A short suggestion list, not a registry: the model a thread actually runs is
-# whatever the provider's CLI accepts, and the free-text entry in the client
-# stays the escape hatch. Slugs mirror the release-curated catalogs the CLIs
-# themselves ship (``omnigent.model_fallbacks`` for codex and claude), which is
-# why they are duplicated here rather than imported: ``omnigent`` is an
-# optional extra, and this query must answer without it installed.
+# whatever the provider's CLI accepts, and the client's free-text entry stays
+# the escape hatch for anything not named here.
+#
+# The codex and claude slugs mirror the release-curated alias catalogs those
+# CLIs ship (``omnigent.model_fallbacks``). They are duplicated rather than
+# imported because ``omnigent`` is an optional extra and this query has to
+# answer without it installed. Gemini ships no curated list here, so its group
+# offers the free-text entry alone rather than guessed slugs.
 _SUGGESTED_MODELS: dict[str, tuple[str, ...]] = {
     "codex": ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5"),
     "claude": (
@@ -31,8 +35,8 @@ _SUGGESTED_MODELS: dict[str, tuple[str, ...]] = {
         "claude-sonnet-5",
         "claude-haiku-4-5",
     ),
-    "gemini": ("gemini-3-pro", "gemini-3-flash"),
-    "opencode": (),
+    "gemini": (),
+    "opencode": (OPENCODE_DEFAULT_MODEL,),
 }
 
 
