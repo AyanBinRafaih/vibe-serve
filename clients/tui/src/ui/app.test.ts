@@ -1235,6 +1235,45 @@ describe('OpenTUI presentation', () => {
     expect(controller.submissions).toEqual(['/pause']);
   });
 
+  it('completes the default-highlighted suggestion with Tab on the experiment log landing view', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    // The landing view: the experiment log (hypothesis table) is on screen,
+    // same as the operator sees before opening a round.
+    controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
+
+    await testRenderer.mockInput.typeText('/p');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+
+    testRenderer.mockInput.pressKey('TAB');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    expect(controller.submissions).toEqual(['/pause']);
+  });
+
+  it('completes a navigated suggestion with Tab on the experiment log landing view', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
+
+    // /pause, /perf, /prompt: navigate down twice to land on /prompt.
+    await testRenderer.mockInput.typeText('/p');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    testRenderer.mockInput.pressArrow('down');
+    testRenderer.mockInput.pressArrow('down');
+    const suggestions = await testRenderer.waitForFrame(value => value.includes('› /prompt'));
+    expect(suggestions).toContain('/prompt');
+
+    testRenderer.mockInput.pressKey('TAB');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    expect(controller.submissions).toEqual(['/prompt']);
+  });
+
   it('highlights a leading slash-command token', async () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController(initialSessionState());

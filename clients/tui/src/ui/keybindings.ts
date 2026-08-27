@@ -172,11 +172,14 @@ export function bindKeybindings(
       } else if (key.name === 'pagedown') {
         if (detailOpen) actions.scrollExperimentDetail(1);
         else controller.moveExperimentSelection(10);
+      } else if (key.name === 'tab' && !key.shift) {
+        // The table has no agent strip to cycle through, so Tab belongs to the
+        // suggestion it would otherwise complete, or nothing at all.
+        if (!actions.completeInput()) return;
       } else if (key.name === 'return' || key.name === 'enter') {
         // A typed command belongs to the input; let its own handler run it so
         // one Enter is enough. An overlay is in front of the table, so Enter
         // behind it must not move the operator somewhere they cannot see.
-
         if (!actions.inputIsEmpty()) return;
         if (controller.state.overlay === null) controller.enterExperimentDrilldown();
       } else return;
