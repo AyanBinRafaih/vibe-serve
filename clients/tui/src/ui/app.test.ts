@@ -1276,6 +1276,45 @@ describe('OpenTUI presentation', () => {
     expect(frame.match(/╭/g)).toHaveLength(5);
   });
 
+  it('renders a typed command payload with labeled stderr and exit code', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: '1 failed',
+            toolName: 'Bash',
+            toolArguments: {command: 'pytest'},
+            toolResult: {
+              kind: 'tool_result',
+              tool: 'Bash',
+              content: '1 failed',
+              payload: {
+                kind: 'command',
+                stdout: '1 failed',
+                stderr: 'assertion error',
+                exit_code: 1,
+                duration: 0.4,
+              },
+            },
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('exit code: 1'));
+    expect(frame).toContain('← 1 failed');
+    expect(frame).toContain('stderr:');
+    expect(frame).toContain('assertion error');
+  });
+
   it('collapses, prettifies, and expands long JSON tool responses', async () => {
     const response = JSON.stringify(
       Object.fromEntries(Array.from({length: 12}, (_, index) => [`field_${index}`, index])),

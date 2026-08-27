@@ -1,3 +1,5 @@
+import type {ToolResultPayload} from '@vibesys/core-state';
+
 const MAX_TOOL_OUTPUT_LINES = 6;
 const MAX_TOOL_OUTPUT_CHARACTERS = 600;
 const MAX_PROMPT_LINES = 12;
@@ -28,7 +30,45 @@ export function toolOutputPreview(
   maxLines = MAX_TOOL_OUTPUT_LINES,
   maxCharacters = MAX_TOOL_OUTPUT_CHARACTERS,
 ): CollapsiblePreview {
-  const formatted = formatJsonObject(content);
+  return collapsePreview(formatJsonObject(content), expanded, maxLines, maxCharacters);
+}
+
+/**
+ * Renders a tool result from its typed payload when the backend preserved
+ * one, falling back to the string-sniffing path for older event logs.
+ */
+export function toolResultPreview(
+  content: string,
+  payload: ToolResultPayload | null | undefined,
+  expanded = false,
+): CollapsiblePreview {
+  if (payload == null) return toolOutputPreview(content, expanded);
+  return collapsePreview(
+    formatToolResultPayload(payload, content),
+    expanded,
+    MAX_TOOL_OUTPUT_LINES,
+    MAX_TOOL_OUTPUT_CHARACTERS,
+  );
+}
+
+function formatToolResultPayload(payload: ToolResultPayload, fallback: string): string {
+  if (payload.kind === 'json') return JSON.stringify(payload.value, null, 2);
+  if (payload.kind === 'command') {
+    const sections: string[] = [];
+    if (payload.stdout !== '') sections.push(payload.stdout.replace(/\n+$/, ''));
+    if (payload.stderr !== '') sections.push(`stderr:\n${payload.stderr.replace(/\n+$/, '')}`);
+    if (payload.exit_code != null) sections.push(`exit code: ${payload.exit_code}`);
+    if (sections.length > 0) return sections.join('\n');
+  }
+  return fallback;
+}
+
+function collapsePreview(
+  formatted: string,
+  expanded: boolean,
+  maxLines: number,
+  maxCharacters: number,
+): CollapsiblePreview {
   const lines = formatted.split('\n');
   if (lines.at(-1) === '') lines.pop();
   const full = lines.join('\n');

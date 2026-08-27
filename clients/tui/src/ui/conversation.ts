@@ -8,7 +8,7 @@ import {
 import type {SessionController} from '../session-controller.js';
 import type {ConversationEntry, SessionState} from '../session-model.js';
 import {visibleConversation} from '../session-model.js';
-import {promptPreview, toolCallPreview, toolOutputPreview} from './previews.js';
+import {promptPreview, toolCallPreview, toolResultPreview} from './previews.js';
 import {entryPalette} from './styles.js';
 import type {Theme} from './theme.js';
 
@@ -183,7 +183,11 @@ export class ConversationView {
 
   #toggleTool(entry: ConversationEntry): boolean {
     const response = entry.toolResult?.content ?? entry.toolResponse;
-    if (response === undefined || !toolOutputPreview(response).collapsible) return false;
+    if (
+      response === undefined ||
+      !toolResultPreview(response, entry.toolResult?.payload).collapsible
+    )
+      return false;
     if (this.#expandedTools.has(entry.id)) this.#expandedTools.delete(entry.id);
     else this.#expandedTools.add(entry.id);
     this.#renderedConversation = [];
@@ -262,7 +266,7 @@ export class ConversationView {
       const output =
         !prompt &&
         (entry.kind === 'tool' || entry.kind === 'diagnostic' || entry.kind === 'subprocess')
-          ? toolOutputPreview(entry.content)
+          ? toolResultPreview(entry.content, entry.toolResult?.payload)
           : null;
       const content = prompt ? prompt.content : (output?.content ?? entry.content);
       card.add(new TextRenderable(this.renderer, {content, fg: palette.content, width: '100%'}));
@@ -338,7 +342,7 @@ export class ConversationView {
     );
     if (toolResponse) {
       const expanded = this.#expandedTools.has(entry.id);
-      const response = toolOutputPreview(toolResponse, expanded);
+      const response = toolResultPreview(toolResponse, entry.toolResult?.payload, expanded);
       card.add(
         new TextRenderable(this.renderer, {
           content: `← ${response.content}`,
