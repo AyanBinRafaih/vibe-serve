@@ -145,6 +145,42 @@ describe('core state projection', () => {
     });
   });
 
+  // A round drilldown's activity bar sources a running agent's harness/model
+  // from this checkpoint, not only from the live agent_execution_started
+  // event: the checkpoint replaces the whole activeExecutions record (see
+  // reconcileActiveExecutions), so if it dropped the identity fields, any
+  // event_batch or reconnect would erase a label the live event had just set.
+  it('carries runtime identity through a snapshot checkpoint', () => {
+    const snapshot = {
+      run_id: 'run',
+      status: 'running',
+      sequence: 1,
+      agent_kind: 'judge',
+      round_label: 'round-2-judge',
+      active_executions: [
+        checkpoint('exec-1', {driver: 'agentshim', provider: 'codex', model: 'gpt-5.1-codex-max'}),
+      ],
+    } satisfies RunSnapshot;
+
+    const state = reduceSnapshot(initialCoreState(), snapshot);
+
+    expect(state.activeExecutions['exec-1']).toMatchObject({
+      driver: 'agentshim',
+      provider: 'codex',
+      model: 'gpt-5.1-codex-max',
+    });
+  });
+
+  it('defaults runtime identity to null for a checkpoint that omits it', () => {
+    const state = reconcileActiveExecutions(initialCoreState(), [checkpoint('exec-1')]);
+
+    expect(state.activeExecutions['exec-1']).toMatchObject({
+      driver: null,
+      provider: null,
+      model: null,
+    });
+  });
+
   it('coalesces streamed assistant chunks by invocation', () => {
     let state = initialCoreState();
     state = reduceEvent(state, outputEvent(1, 'hello ', 'turn-1'));
@@ -550,7 +586,10 @@ function startedData(assignment: string): NonNullable<RunEvent['data']> {
   };
 }
 
-function checkpoint(executionId: string): NonNullable<RunSnapshot['active_executions']>[number] {
+function checkpoint(
+  executionId: string,
+  overrides: Partial<NonNullable<RunSnapshot['active_executions']>[number]> = {},
+): NonNullable<RunSnapshot['active_executions']>[number] {
   return {
     execution_id: executionId,
     agent_kind: 'judge',
@@ -565,6 +604,7 @@ function checkpoint(executionId: string): NonNullable<RunSnapshot['active_execut
       summary: 'Reviewing',
       tool: null,
     },
+    ...overrides,
   };
 }
 

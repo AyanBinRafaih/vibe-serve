@@ -309,6 +309,9 @@ function activeExecutionsFromCheckpoint(
           summary: execution.activity.summary,
           tool: execution.activity.tool ?? null,
         },
+        driver: execution.driver ?? null,
+        provider: execution.provider ?? null,
+        model: execution.model ?? null,
       },
     ]),
   );

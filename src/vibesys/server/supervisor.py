@@ -907,6 +907,9 @@ class RunSupervisor:
                 assignment=effective_prompt,
                 started_at=datetime.now(UTC),
                 activity=activity,
+                driver=driver,
+                provider=provider,
+                model=model,
             )
             self.record(
                 EventType.AGENT_EXECUTION_STARTED,

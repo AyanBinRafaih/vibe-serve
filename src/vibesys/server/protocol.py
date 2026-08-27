@@ -126,6 +126,9 @@ class ActiveAgentExecution(ProtocolModel):
     assignment: str
     started_at: datetime
     activity: AgentExecutionActivityData
+    driver: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
 
 class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288

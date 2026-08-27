@@ -130,6 +130,9 @@ export type Kind = "agent_execution_activity_changed";
 export type Mode1 = "thinking" | "responding" | "tool" | "waiting";
 export type Summary1 = string;
 export type Tool = string | null;
+export type Driver2 = string | null;
+export type Provider3 = string | null;
+export type Model3 = string | null;
 export type ActiveExecutions = ActiveAgentExecution[];
 export type ProtocolVersion14 = 1;
 export type Sequence1 = number;
@@ -206,9 +209,9 @@ export type ThreadTitle = string | null;
 export type Kind2 = "chat_thread_created";
 export type ThreadId3 = string;
 export type Title2 = string;
-export type Driver2 = string;
-export type Provider3 = string;
-export type Model3 = string;
+export type Driver3 = string;
+export type Provider4 = string;
+export type Model4 = string;
 export type CreatedAt = string;
 export type Kind3 = "invocation_started";
 export type SystemPrompt = string;
@@ -220,9 +223,9 @@ export type Stage1 = string;
 export type Attempt1 = number | null;
 export type SystemPrompt1 = string;
 export type UserPrompt1 = string;
-export type Driver3 = string | null;
-export type Provider4 = string | null;
-export type Model4 = string | null;
+export type Driver4 = string | null;
+export type Provider5 = string | null;
+export type Model5 = string | null;
 export type Kind6 = "agent_execution_finished";
 export type Error2 = string | null;
 export type Kind7 = "output";
@@ -302,7 +305,7 @@ export type Todos = TodoItemData[];
 export type Kind24 = "usage_update";
 export type InputTokens1 = number;
 export type ContextWindow1 = number | null;
-export type Model5 = string | null;
+export type Model6 = string | null;
 export type Events = RunEvent[];
 export type Round = number;
 export type PerfMetric1 = number;
@@ -560,6 +563,9 @@ export interface ActiveAgentExecution {
   assignment: Assignment;
   started_at: StartedAt;
   activity: AgentExecutionActivityData;
+  driver?: Driver2;
+  provider?: Provider3;
+  model?: Model3;
 }
 /**
  * Complete current activity for an active agent execution.
@@ -606,9 +612,9 @@ export interface ChatThreadCreatedData {
   kind?: Kind2;
   thread_id: ThreadId3;
   title?: Title2;
-  driver: Driver2;
-  provider: Provider3;
-  model: Model3;
+  driver: Driver3;
+  provider: Provider4;
+  model: Model4;
   created_at: CreatedAt;
   [k: string]: unknown;
 }
@@ -637,9 +643,9 @@ export interface AgentExecutionStartedData {
   system_prompt?: SystemPrompt1;
   user_prompt?: UserPrompt1;
   activity: AgentExecutionActivityData;
-  driver?: Driver3;
-  provider?: Provider4;
-  model?: Model4;
+  driver?: Driver4;
+  provider?: Provider5;
+  model?: Model5;
   [k: string]: unknown;
 }
 /**
@@ -804,7 +810,7 @@ export interface UsageUpdateData {
   kind?: Kind24;
   input_tokens: InputTokens1;
   context_window?: ContextWindow1;
-  model?: Model5;
+  model?: Model6;
   [k: string]: unknown;
 }
 export interface PerformanceRound {

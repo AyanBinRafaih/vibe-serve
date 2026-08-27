@@ -109,6 +109,52 @@ def test_start_agent_execution_omits_runtime_identity_by_default(tmp_path):  # n
     assert started.data.model is None
 
 
+def test_active_execution_checkpoint_carries_runtime_identity(tmp_path):  # noqa: ANN001, ANN201
+    """The snapshot/checkpoint record must match the live event's identity.
+
+    A TUI reconnecting mid-round, or reconciling a periodic subscription
+    checkpoint, reads this record instead of the agent_execution_started
+    event: if it dropped driver/provider/model, the harness+model label would
+    disappear from any round whose checkpoint arrived after the round's own
+    start event.
+    """
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.start_agent_execution(
+        "implementer",
+        "round-1",
+        "work",
+        driver="agentshim",
+        provider="codex",
+        model="gpt-5.1-codex-max",
+    )
+
+    active = supervisor.snapshot().active_executions
+    assert len(active) == 1
+    assert active[0].driver == "agentshim"
+    assert active[0].provider == "codex"
+    assert active[0].model == "gpt-5.1-codex-max"
+
+    _, _, checkpointed = supervisor.subscription_checkpoint(0)
+    assert len(checkpointed) == 1
+    assert checkpointed[0].driver == "agentshim"
+    assert checkpointed[0].provider == "codex"
+    assert checkpointed[0].model == "gpt-5.1-codex-max"
+
+
+def test_active_execution_checkpoint_omits_runtime_identity_by_default(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.start_agent_execution("implementer", "round-1", "work")
+
+    active = supervisor.snapshot().active_executions
+    assert active[0].driver is None
+    assert active[0].provider is None
+    assert active[0].model is None
+
+
 def test_activity_tracks_todo_and_parallel_tools(tmp_path):  # noqa: ANN001, ANN201
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)

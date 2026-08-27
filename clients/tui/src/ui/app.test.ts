@@ -2128,6 +2128,58 @@ describe('theming', () => {
     expect(landing).not.toContain('Agents');
   });
 
+  it('shows a round’s agent harness and model inside a hypothesis round drilldown', async () => {
+    // The Agents pane inside a hypothesis round drilldown is the same
+    // AgentMapView the live run uses, driven by the same core.phases replayed
+    // from the full event history, so a completed historical round must
+    // carry its runtime label exactly like a live one does.
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 42, status: 'completed'}],
+        phases: [
+          {
+            kind: 'implementer',
+            status: 'completed',
+            roundNumber: 42,
+            roundLabel: 'round-42-implementer',
+            provider: 'codex',
+            model: 'gpt-5.1-codex-max',
+          },
+        ],
+        transcript: [
+          {
+            id: 'b',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'grew the block',
+            roundNumber: 42,
+          },
+        ],
+      },
+    });
+    controller.experiments = [
+      logEntry('H-08', 42, 42, {
+        claim: 'increase kv cache block',
+        resolved_outcome: 'proven',
+        rounds: [{round: 42, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressEnter(); // hypothesis summary
+    await frameAfter(testRenderer);
+    testRenderer.mockInput.pressEnter(); // round trajectory
+    const trajectory = await frameAfter(testRenderer);
+
+    expect(trajectory).toContain('Codex (GPT');
+  });
+
   it('drills from a full hypothesis summary into a round trajectory and back', async () => {
     const testRenderer = await createTestRenderer({width: 120, height: 24});
     const controller = new FakeController({
