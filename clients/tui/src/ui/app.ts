@@ -13,6 +13,7 @@ import {AgentMapView} from './agent-map.js';
 import {createChatDraft} from './chat-composer.js';
 import {ChatOverlayView} from './chat-overlay.js';
 import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
+import {ChatThreadPickerView, NewChatPickerView} from './chat-pickers.js';
 import {RendererSelectionClipboard, type SelectionClipboard} from './clipboard.js';
 import {createCommandInputPanel} from './command-input.js';
 import {ConversationView} from './conversation.js';
@@ -39,9 +40,11 @@ const KEY_HELP =
 const SCOPED_KEY_HELP =
   '[/]: round · ←→: pane · ↑↓/Tab: within it · F4: zoom · /todos · /prompt · Esc: back';
 const LOG_KEY_HELP =
-  '↑↓ or scroll: select · Enter or /open-round: open its rounds · F4: zoom · /open-round --N';
+  '↑↓ or scroll: select · Enter/click: open hypothesis · F4: zoom · /open-round --N';
 const LOG_CHAT_KEY_HELP =
-  '↑↓: select · Enter: open its rounds · Ctrl+W: chat and back · F4: zoom · /open-round --N';
+  '↑↓: select · Enter/click: hypothesis · Ctrl+W: chat · F4: zoom · /open-round --N';
+const HYPOTHESIS_KEY_HELP =
+  '↑↓: select round · Enter/click: trajectory · PgUp/PgDn: scroll · Esc: hypotheses';
 const SPLIT_KEY_HELP =
   'Ctrl+W: switch pane · F4: zoom focused pane · PgUp/PgDn: scroll · Esc: close pane';
 
@@ -148,6 +151,13 @@ export function createOpenTuiApp(
   const chatDraft = createChatDraft();
   const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme, chatDraft);
   const chatPane = new ChatPaneView(renderer, controller, markdownStyle, theme, chatDraft);
+  const chatThreadPicker = new ChatThreadPickerView(renderer, theme);
+  const newChatPicker = new NewChatPickerView(renderer, theme);
+  // Composer drafts are per-thread. The shared ChatDraft stays the single
+  // authority both chat surfaces read; switching threads swaps its content
+  // and parks the outgoing thread's half-typed question for its return.
+  const parkedDrafts = new Map<string, string>();
+  let draftThreadId = controller.state.activeChatThreadId;
   // Clicking either box moves the pane focus to it, so the border, the hint,
   // and the cursor never disagree about which surface is taking keystrokes.
   const commandInput = createCommandInputPanel(
@@ -202,6 +212,8 @@ export function createOpenTuiApp(
   root.add(body);
   root.add(overlay.output);
   root.add(themePicker.output);
+  root.add(chatThreadPicker.output);
+  root.add(newChatPicker.output);
   root.add(chat.output);
   renderer.root.add(root);
   commandInput.focus();
@@ -224,6 +236,8 @@ export function createOpenTuiApp(
     experimentLog.applyTheme(theme);
     rightPane.applyTheme(theme);
     themePicker.applyTheme(theme);
+    chatThreadPicker.applyTheme(theme);
+    newChatPicker.applyTheme(theme);
     conversation.applyTheme(theme, markdownStyle);
     chat.applyTheme(theme, markdownStyle);
     chatPane.applyTheme(theme, markdownStyle);
@@ -237,6 +251,13 @@ export function createOpenTuiApp(
     lastState = state;
     const previewName = state.themePicker?.selected ?? state.themeName;
     const releasePreviousStyle = previewName === themeName ? undefined : applyTheme(previewName);
+    if (state.activeChatThreadId !== draftThreadId) {
+      // Park the outgoing thread's draft and restore the incoming thread's,
+      // so switching never sends one thread's question to another's agent.
+      parkedDrafts.set(draftThreadId, chatDraft.value);
+      chatDraft.value = parkedDrafts.get(state.activeChatThreadId) ?? '';
+      draftThreadId = state.activeChatThreadId;
+    }
     const showLog = experimentLogVisible(state);
     const paneFocus = focusedPane(state);
     const zoomedPane = state.layout.zoomedPane;
@@ -262,7 +283,7 @@ export function createOpenTuiApp(
     // for the state to come back, so a resize never draws a stale row.
     const dockFits = chatDockFits(renderer.terminalWidth, rightWidth);
     if (state.chatDockFits !== dockFits) controller.setChatDockFits(dockFits);
-    const chatAvailable = showLog && dockFits && !state.chatOpen;
+    const chatAvailable = showLog && state.hypothesisDetail === null && dockFits && !state.chatOpen;
     const showChatPane = chatAvailable && (zoomedPane === null || zoomedPane === 'chat');
     const chatWidth = showChatPane
       ? zoomedPane === 'chat'
@@ -283,9 +304,11 @@ export function createOpenTuiApp(
     renderedKeyHelp = showSplit
       ? SPLIT_KEY_HELP
       : showLog
-        ? showChatPane
-          ? LOG_CHAT_KEY_HELP
-          : LOG_KEY_HELP
+        ? state.hypothesisDetail !== null
+          ? HYPOTHESIS_KEY_HELP
+          : showChatPane
+            ? LOG_CHAT_KEY_HELP
+            : LOG_KEY_HELP
         : state.hypothesisScope === null
           ? KEY_HELP
           : SCOPED_KEY_HELP;
@@ -353,6 +376,8 @@ export function createOpenTuiApp(
         : {...state, overlay: {kind: 'detail' as const, content: paneFallback.content}},
     );
     themePicker.render(state);
+    chatThreadPicker.render(state);
+    newChatPicker.render(state);
     chat.render(state);
     conversationActivityBar.render(state, !showLog);
     // One cursor, three places it can be. The modal owns it while it is open;
@@ -376,6 +401,7 @@ export function createOpenTuiApp(
       commandInput.isEmpty() && chatPane.isComposerEmpty() && chat.isComposerEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
+    toggleSelectedTool: () => conversation.toggleSelectedTool(),
     revealSelectedEntry: () => {
       const card = conversation.selectedCard();
       if (card !== null) viewport.scrollChildIntoView(card.id);
@@ -387,6 +413,7 @@ export function createOpenTuiApp(
     toggleTodos: () => controller.toggleTodos(),
     scrollRightPane: delta => rightPane.scrollBy(delta),
     scrollChatPane: delta => chatPane.scrollBy(delta),
+    scrollExperimentDetail: delta => experimentLog.scrollBy(delta),
     scrollErrorBanner: delta => errorBanner.scrollBy(delta),
     clearTransientStatus: () => {
       if (transientStatus === null) return;

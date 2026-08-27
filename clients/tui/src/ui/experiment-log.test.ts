@@ -9,11 +9,13 @@ import {
   setExperiments,
 } from '../session-model.js';
 import {
+  entryCells,
   entryRow,
   formatMeasured,
   formatRounds,
   headerRow,
   outcomeColor,
+  outcomeLabel,
   resolveColumns,
   sentenceCase,
 } from './experiment-log.js';
@@ -55,7 +57,6 @@ describe('experiment log rows', () => {
       'Rounds',
       'Implementation Details',
       'Measured',
-      'Verdict',
       'Outcome',
       'Kept',
     ]) {
@@ -65,9 +66,27 @@ describe('experiment log rows', () => {
     expect(row).toContain('41');
     expect(row).toContain('Batch the prefill step');
     expect(row).toContain('+12%');
-    expect(row).toContain('Pass');
-    expect(row).toContain('Proven');
+    expect(row).toContain('Accepted');
+    expect(row).not.toContain('Pass');
     expect(row.trimEnd().endsWith('Yes')).toBe(true);
+  });
+
+  it('shows hypothesis resolution without rendering the judge verdict', () => {
+    const columns = resolveColumns(WIDE);
+
+    const disproven = entryRow(
+      entry({judge_verdict: 'pass', resolved_outcome: 'disproven'}),
+      columns,
+    );
+    const rejected = entryRow(
+      entry({judge_verdict: 'fail', resolved_outcome: 'rejected'}),
+      columns,
+    );
+
+    expect(disproven).toContain('Rejected');
+    expect(disproven).not.toContain('Pass');
+    expect(rejected).toContain('Rejected');
+    expect(rejected).not.toContain('Fail');
   });
 
   it('keeps hypothesis, rounds, and outcome when the terminal is narrow', () => {
@@ -78,7 +97,7 @@ describe('experiment log rows', () => {
     const row = entryRow(entry(), columns);
     expect(row).toContain('H-07');
     expect(row).toContain('41');
-    expect(row).toContain('Proven');
+    expect(row).toContain('Accepted');
     expect(row).not.toContain('Batch the prefill step');
   });
 
@@ -118,12 +137,59 @@ describe('experiment log rows', () => {
 
     expect(row).toContain('(unidentified)');
     expect(row).toContain('—');
+    expect(row).not.toContain('Active');
+  });
+
+  it('keeps an explicit gutter after a hypothesis id that fills its column', () => {
+    const columns = resolveColumns(WIDE);
+    const header = headerRow(columns);
+    const row = entryRow(entry({hypothesis_id: 'm1-preallocated-spsc-ring'}), columns);
+    const roundsStart = header.indexOf('Rounds');
+
+    expect(row).toContain('m1-preallocat…  41');
+    expect(row[roundsStart - 1]).toBe(' ');
+    expect(row.slice(roundsStart).startsWith('41')).toBe(true);
+  });
+
+  it('keeps gutters across the separately colored outcome segments', () => {
+    const cells = entryCells(entry(), resolveColumns(WIDE));
+
+    expect(cells.outcome.startsWith('  ')).toBe(true);
+    expect(cells.trailing.startsWith('  ')).toBe(true);
+  });
+
+  it('prefers the backend-supplied title over the claim and action', () => {
+    const cells = entryCells(
+      entry({
+        title: 'Batch decode requests',
+        claim: 'batch the prefill step',
+        action: 'batch prefill',
+      }),
+      resolveColumns(WIDE),
+    );
+
+    expect(cells.leading).toContain('Batch decode requests');
+    expect(cells.leading).not.toContain('batch the prefill step');
+  });
+
+  it('falls back to the claim, then the action, when there is no title', () => {
+    const withClaim = entryCells(
+      entry({title: null, claim: 'batch the prefill step', action: 'batch prefill'}),
+      resolveColumns(WIDE),
+    );
+    expect(withClaim.leading).toContain('Batch the prefill step');
+
+    const withActionOnly = entryCells(
+      entry({title: null, claim: null, action: 'batch prefill'}),
+      resolveColumns(WIDE),
+    );
+    expect(withActionOnly.leading).toContain('Batch prefill');
   });
 });
 
 describe('experiment log layout', () => {
   it('fits the panel exactly at every width it degrades through', () => {
-    for (const width of [120, 104, 90, 72, 62, 54, 40]) {
+    for (const width of [120, 104, 103, 90, 89, 72, 62, 61, 54, 40]) {
       const columns = resolveColumns(width);
       const header = headerRow(columns);
       const row = entryRow(entry(), columns);
@@ -147,6 +213,7 @@ describe('experiment log outcome color', () => {
 
     expect(outcomeColor(theme, entry({resolved_outcome: 'continue'}))).toBe(theme.textPrimary);
     expect(outcomeColor(theme, entry({resolved_outcome: 'inconclusive'}))).toBe(theme.textPrimary);
+    expect(outcomeColor(theme, entry({resolved_outcome: null}))).toBe(theme.textPrimary);
   });
 
   it('uses the active accent while a hypothesis is still open', () => {
@@ -164,11 +231,13 @@ describe('experiment log outcome color', () => {
     }
   });
 
-  it('spells the outcome out so color is never the only signal', () => {
+  it('maps backend resolutions to operator-facing acceptance labels', () => {
     const columns = resolveColumns(WIDE);
 
-    expect(entryRow(entry({resolved_outcome: 'proven'}), columns)).toContain('Proven');
-    expect(entryRow(entry({resolved_outcome: 'disproven'}), columns)).toContain('Disproven');
+    expect(entryRow(entry({resolved_outcome: 'proven'}), columns)).toContain('Accepted');
+    expect(entryRow(entry({resolved_outcome: 'disproven'}), columns)).toContain('Rejected');
+    expect(outcomeLabel(entry({resolved_outcome: 'rejected'}))).toBe('Rejected');
+    expect(outcomeLabel(entry({resolved_outcome: 'inconclusive'}))).toBe('Inconclusive');
   });
 });
 

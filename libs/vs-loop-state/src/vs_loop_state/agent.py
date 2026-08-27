@@ -24,7 +24,7 @@ the on-disk layout.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import ConfigDict, Field, TypeAdapter
 from pydantic.dataclasses import dataclass
@@ -53,6 +53,8 @@ class RoundRecord:
     # framework gates. Such a round is provisional, not a failed attempt.
     reviewed: bool = True
     hypothesis_id: str | None = None
+    hypothesis_declared_outcome: str | None = None
+    judge_verdict: Literal["pass", "fail", "deferred"] | None = None
     hypothesis_outcome: str | None = None
     # Plan text carried alongside the id so a resolved hypothesis stays
     # readable after ``active_hypothesis.json`` has moved on. Only the live
@@ -85,6 +87,15 @@ class RoundRecord:
     candidate_evaluation_artifact: str | None = None
     candidate_operating_point: str = ""
     candidate_retention_reason: str = ""
+    # Framework-derived retention. ``None`` identifies a legacy or
+    # not-yet-assessed record; presentation code must not infer it from
+    # ``official_evaluation``.
+    candidate_retained: bool | None = None
+    perf_direction: Literal["max", "min"] | None = None
+    perf_baseline_round: int | None = None
+    perf_baseline_commit: str | None = None
+    perf_baseline_metric: float | None = None
+    perf_delta_pct: float | None = None
 
 
 _ROUND_RECORD_ADAPTER: TypeAdapter[RoundRecord] = TypeAdapter(RoundRecord)

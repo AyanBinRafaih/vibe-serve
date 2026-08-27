@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -5,13 +6,22 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vibesys.context import _RunContext, create_candidate_context, create_run_context
+from vibesys.context import (
+    _EXPERIMENT_CHAT_SYSTEM_PROMPT,
+    _ExperimentChatDependencies,
+    _ExperimentChatService,
+    _resolve_chat_thread_settings,
+    _resume_configuration_update,
+    _RunContext,
+    create_candidate_context,
+    create_run_context,
+)
 from vibesys.domains.base import DomainName
 from vibesys.domains.environment import EnvironmentPatch, NoopEnvironmentHooks
 from vibesys.domains.llm_serving.hooks import LLMServingEnvironmentHooks
 from vibesys.errors import ConfigurationError
 from vibesys.input_manifest import WorkspaceSource
-from vibesys.loops.agent.model import ActiveHypothesis
+from vibesys.loops.agent.model import AgentRunState
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.run import RunLogger, RunPaths, RunStateNamespace
 from vibesys.sandbox.run_environment import RunEnvironmentSpec
@@ -74,6 +84,15 @@ def _configuration(max_rounds: int = 1) -> AgentRunConfiguration:
         official_eval_every=1,
         memory_layout="files",
     )
+
+
+def test_resume_adopts_objectives_omitted_by_legacy_agent_manifest() -> None:
+    requested = _configuration().model_copy(update={"objectives": ("throughput:max",)})
+    legacy_payload = requested.model_dump(exclude={"objectives"})
+    recorded = AgentRunConfiguration.model_validate(legacy_payload)
+
+    assert "objectives" not in recorded.model_fields_set
+    assert _resume_configuration_update(recorded, requested) == requested
 
 
 def _write_project(root: Path, *, evaluator_name: str = "checker") -> Path:
@@ -163,13 +182,20 @@ def _create_context(  # noqa: PLR0913
         agent_backend="stub",
         environment_hooks=hooks or NoopEnvironmentHooks(),
         remote_repo=remote_repo,
-        active_state_model_type=ActiveHypothesis,
+        agent_state_model_type=AgentRunState,
     )
 
 
 def _git(project: Path, *args: str) -> str:
     return subprocess.run(  # noqa: S603
-        ["git", *args],  # noqa: S607
+        [  # noqa: S607
+            "git",
+            "-c",
+            "user.name=VibeSys Test",
+            "-c",
+            "user.email=test@vibesys.invalid",
+            *args,
+        ],
         cwd=project,
         check=True,
         capture_output=True,
@@ -302,6 +328,111 @@ def test_nonretained_experiment_chat_closes_when_context_construction_fails(
         REGISTRY.deactivate(supervisor)
 
 
+def test_chat_thread_settings_resolve_run_defaults() -> None:
+    resolved = _resolve_chat_thread_settings(
+        agent_backend="cli",
+        default_driver="agentshim",
+        default_provider="codex",
+        default_model="gpt-run",
+        driver=None,
+        provider=None,
+        model=None,
+    )
+    assert resolved == ("agentshim", "codex", "gpt-run")
+
+
+def test_chat_thread_settings_reject_invalid_combinations() -> None:
+    def resolve(agent_backend: str, driver: str | None, provider: str | None) -> tuple[str, ...]:
+        return _resolve_chat_thread_settings(
+            agent_backend=agent_backend,
+            default_driver="agentshim",
+            default_provider="codex",
+            default_model="gpt-run",
+            driver=driver,
+            provider=provider,
+            model=None,
+        )
+
+    with pytest.raises(ValueError, match="does not support provider 'gemini'"):
+        resolve("cli", "omnigent", "gemini")
+    with pytest.raises(ValueError, match="unknown agent driver 'other'"):
+        resolve("cli", "other", None)
+    with pytest.raises(ValueError, match="require the CLI agent backend"):
+        resolve("deepagents", None, None)
+
+
+def _chat_service(
+    tmp_path: Path, thread_id: str | None, answer: str = "the answer"
+) -> tuple[_ExperimentChatService, MagicMock]:
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "logs")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    agent_client = MagicMock()
+    agent_client.invoke_text.return_value = answer
+    project = MagicMock()
+    project.state.portable_run_export.return_value = MagicMock(files=[])
+    service = _ExperimentChatService(
+        _ExperimentChatDependencies(
+            supervisor=supervisor,
+            agent_client=agent_client,
+            workspace=workspace,
+            log_dir=tmp_path / "logs",
+            project=project,
+            run_id="run-1",
+            log=lambda _line: None,
+            flush_logs=lambda: None,
+            environment=dict,
+            progress=lambda: None,
+            thread_id=thread_id,
+        )
+    )
+    return service, agent_client
+
+
+def test_default_chat_thread_keeps_the_legacy_state_layout(tmp_path: Path) -> None:
+    service, agent_client = _chat_service(tmp_path, thread_id=None)
+
+    service.ask("what happened?")
+
+    workspace = tmp_path / "workspace"
+    transcript = workspace / "_vibesys_chat" / "conversation.jsonl"
+    assert json.loads(transcript.read_text()) == {
+        "question": "what happened?",
+        "answer": "the answer",
+    }
+    prompt = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    assert prompt == _EXPERIMENT_CHAT_SYSTEM_PROMPT
+    assert (workspace / "_vibesys_chat" / "instructions.md").read_text() == prompt
+
+
+def test_created_chat_thread_owns_its_state_dir_and_shares_trajectory(tmp_path: Path) -> None:
+    service, agent_client = _chat_service(tmp_path, thread_id="thread-a")
+
+    service.ask("what happened?")
+
+    workspace = tmp_path / "workspace"
+    thread_dir = workspace / "_vibesys_chat" / "threads" / "thread-a"
+    assert json.loads((thread_dir / "conversation.jsonl").read_text()) == {
+        "question": "what happened?",
+        "answer": "the answer",
+    }
+    prompt = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    # The thread reads its own conversation but the shared trajectory.
+    assert "_vibesys_chat/threads/thread-a/conversation.jsonl" in prompt
+    assert "_vibesys_chat/trajectory/state/" in prompt
+    assert (thread_dir / "instructions.md").read_text() == prompt
+    assert (workspace / "_vibesys_chat" / "trajectory").is_dir()
+    assert not (thread_dir / "trajectory").exists()
+    # The legacy transcript is untouched by thread traffic.
+    assert not (workspace / "_vibesys_chat" / "conversation.jsonl").exists()
+
+    # A follow-up turn continues from the thread's own instructions file.
+    service.ask("and then?")
+    continuation = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    assert "_vibesys_chat/threads/thread-a/instructions.md" in continuation
+
+
 def test_repository_task_exposes_its_actual_reference_path(tmp_path: Path) -> None:
     project = tmp_path / "queue"
     evaluator = _write_project(project)
@@ -416,6 +547,39 @@ def test_resume_reuses_project_and_run_id_and_only_increases_limit(tmp_path):  #
     stored = Project.open(project).state.load_run(run_id)
     assert stored.configuration.max_rounds == 2
     assert _git(project, "branch", "--show-current") == f"vibesys-runs/{run_id}"
+
+
+def test_resume_migrates_legacy_objectives_with_dirty_candidate(tmp_path):  # noqa: ANN001, ANN201
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    with _create_context(project, evaluator=evaluator) as first:
+        run_id = first.run_id
+
+    state = Project.open(project).state
+    manifest_path = state._run_manifest_path(run_id)  # noqa: SLF001  # migration fixture
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["configuration"].pop("objectives")
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _git(project, "add", str(manifest_path.relative_to(project)))
+    _git(project, "commit", "-m", "simulate legacy run manifest")
+    candidate = project / "queue.py"
+    candidate.write_text(candidate.read_text() + "\n# interrupted edit\n")
+
+    requested = _configuration().model_copy(update={"objectives": ("total_ops_per_sec:max",)})
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        exp_name=run_id,
+        existing=True,
+        configuration=requested,
+    ):
+        pass
+
+    stored = state.load_run(run_id)
+    assert stored.configuration.objectives == ("total_ops_per_sec:max",)
+    assert "# interrupted edit" in candidate.read_text()
+    assert "queue.py" in _git(project, "status", "--porcelain")
+    assert "# interrupted edit" not in _git(project, "show", "HEAD:queue.py")
 
 
 def test_collection_resume_pushes_existing_origin_on_teardown(tmp_path):  # noqa: ANN001, ANN201
@@ -602,7 +766,7 @@ def test_omnigent_accepts_active_profiler_configuration(tmp_path):  # noqa: ANN0
         profiler_kind=ProfilerKind.MACOS_CPU,
         profiler_domain=DomainName.GENERIC,
         run_environment=RunEnvironmentSpec("local"),
-        active_state_model_type=ActiveHypothesis,
+        agent_state_model_type=AgentRunState,
     ) as context:
         assert context.profiler_kind is ProfilerKind.MACOS_CPU
 

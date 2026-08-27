@@ -1,13 +1,15 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
-import type {HypothesisEntry} from '@vibesys/backend-client';
+import type {HypothesisEntry, HypothesisRound} from '@vibesys/backend-client';
 import type {SessionController} from '../session-controller.js';
 import {
+  detailedHypothesis,
   type ExperimentIndexItem,
   experimentIndexItems,
   experimentLogVisible,
   focusedPane,
   type HypothesisPlanningActivity,
   hypothesisPlanningActivity,
+  hypothesisRoundNumbers,
   type SessionState,
   selectedExperimentIndexItem,
   unownedExperimentRounds,
@@ -40,13 +42,12 @@ const KEPT_MIN_WIDTH = 104;
  * rather than restating the threshold.
  */
 export const LOG_CLAIM_PANEL_WIDTH = CLAIM_MIN_WIDTH + PANEL_CHROME_COLUMNS;
-/** Panel width that still carries the measured and verdict columns. */
+/** Panel width that still carries the measured column. */
 export const LOG_COMPACT_PANEL_WIDTH = MEASURED_MIN_WIDTH + PANEL_CHROME_COLUMNS;
 
 interface Columns {
   claim: boolean;
   measured: boolean;
-  verdict: boolean;
   kept: boolean;
   claimWidth: number;
 }
@@ -156,9 +157,17 @@ export class ExperimentLogView {
     this.output.title = focused ? ' ▸ Experiments ' : ' Experiments ';
     const width = this.#availableWidth ?? this.renderer.terminalWidth;
     if (state === this.#renderedState && width === this.#renderedWidth) return;
+    const previousDetailKey = this.#renderedState?.hypothesisDetail?.entryKey ?? null;
     this.#renderedState = state;
     this.#renderedWidth = width;
     this.#clear();
+
+    const detail = detailedHypothesis(state);
+    if (detail !== null) {
+      this.#renderDetail(detail, state);
+      if (previousDetailKey !== state.hypothesisDetail?.entryKey) this.#rows.scrollTo(0);
+      return;
+    }
 
     if (log.error !== null) {
       this.#header.content = '';
@@ -231,7 +240,7 @@ export class ExperimentLogView {
       const isSelected = item.key === selected?.key;
       if (item.kind === 'hypothesis') {
         const entryIndex = log.entries.indexOf(item.entry);
-        this.#row(item.entry, columns, isSelected, entryIndex, navigationIndex);
+        this.#row(item.entry, item.key, columns, isSelected, entryIndex);
         if (isSelected) selectedRenderIndex = renderedRows;
         renderedRows += 1;
       } else if (item.kind === 'round') {
@@ -258,9 +267,49 @@ export class ExperimentLogView {
     // reads as breakage rather than as a narrow terminal.
     const hint =
       this.#bodyWidth() >= HINT_MIN_WIDTH
-        ? '↑↓ or scroll: select · Enter or /open-round: open its rounds'
+        ? '↑↓ or scroll: select · Enter or click: open hypothesis'
         : '↑↓ · Enter';
     this.#footerLine.content = `${position} · ${hint}`;
+  }
+
+  #renderDetail(entry: HypothesisEntry, state: SessionState): void {
+    const selectedRound = state.hypothesisDetail?.selectedRound ?? null;
+    this.output.title = ` ${focusedTitlePrefix(state)}Hypothesis ${entry.hypothesis_id} `;
+    this.#header.content = hypothesisMetadata(entry);
+    this.#line('HYPOTHESIS', this.#theme.textSubtle);
+    this.#wrappedLine(
+      entry.claim?.trim() || 'No hypothesis text was recorded.',
+      this.#theme.textPrimary,
+    );
+    this.#line('', this.#theme.textPrimary);
+    this.#line('ROUNDS', this.#theme.textSubtle);
+    const rounds = hypothesisRoundNumbers(entry);
+    if (rounds.length === 0) {
+      this.#line('No recorded rounds.', this.#theme.textSubtle);
+    } else {
+      for (const roundNumber of rounds) {
+        const round = entry.rounds?.find(candidate => candidate.round === roundNumber);
+        const selected = roundNumber === selectedRound;
+        const row = new BoxRenderable(this.renderer, {
+          id: `hypothesis-round-${roundNumber}`,
+          width: '100%',
+          height: 1,
+          flexShrink: 0,
+          ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
+          onMouseUp: () => this.controller.openRound(roundNumber),
+        });
+        row.add(
+          this.#cell(
+            `${selected ? '›' : ' '} ${roundMetadata(roundNumber, round)}`,
+            this.#theme.textPrimary,
+            selected,
+          ),
+        );
+        this.#rows.add(row);
+      }
+    }
+    this.#footerLine.content =
+      '↑↓: select round · Enter or click: open trajectory · Esc: hypotheses';
   }
 
   #renderActivity(
@@ -279,10 +328,10 @@ export class ExperimentLogView {
 
   #row(
     entry: HypothesisEntry,
+    entryKey: string,
     columns: Columns,
     isSelected: boolean,
     index: number,
-    navigationIndex: number,
   ): void {
     const cells = entryCells(entry, columns);
     // The active hypothesis is called out on its own, so it stays visible
@@ -298,7 +347,7 @@ export class ExperimentLogView {
       ...selection,
       onMouseUp: () => {
         this.controller.focusPane('left');
-        this.controller.moveExperimentSelection(navigationIndex - this.#selectedNavigationIndex());
+        this.controller.openHypothesisDetail(entryKey);
       },
     });
     // The outcome is its own renderable so the resolution can carry a color of
@@ -409,6 +458,23 @@ export class ExperimentLogView {
     return text;
   }
 
+  #wrappedLine(content: string, fg: string): TextRenderable {
+    const text = new TextRenderable(this.renderer, {
+      content,
+      fg,
+      width: '100%',
+      flexShrink: 0,
+      wrapMode: 'word',
+    });
+    this.#rows.add(text);
+    return text;
+  }
+
+  /** Scroll hypothesis prose without moving the round selection. */
+  scrollBy(delta: number): void {
+    this.#rows.scrollBy(delta, 'viewport');
+  }
+
   #bodyWidth(): number {
     const width = this.#availableWidth ?? this.renderer.terminalWidth;
     return Math.max(MIN_BODY_WIDTH, width - PANEL_CHROME_COLUMNS);
@@ -444,12 +510,12 @@ export class ExperimentLogView {
 }
 
 /** Widths of every column except the claim, which absorbs what is left over. */
-const ID_WIDTH = 16;
-const ROUNDS_WIDTH = 9;
-const MEASURED_WIDTH = 12;
-const VERDICT_WIDTH = 9;
-const OUTCOME_WIDTH = 12;
+const ID_WIDTH = 15;
+const ROUNDS_WIDTH = 8;
+const MEASURED_WIDTH = 11;
+const OUTCOME_WIDTH = 11;
 const KEPT_WIDTH = 4;
+const COLUMN_GAP = '  ';
 
 export function resolveColumns(width: number): Columns {
   const claim = width >= CLAIM_MIN_WIDTH;
@@ -459,16 +525,17 @@ export function resolveColumns(width: number): Columns {
     ID_WIDTH +
     ROUNDS_WIDTH +
     OUTCOME_WIDTH +
-    (measured ? MEASURED_WIDTH + VERDICT_WIDTH : 0) +
+    (measured ? MEASURED_WIDTH : 0) +
     (kept ? KEPT_WIDTH : 0);
+  const visibleColumns = 3 + (claim ? 1 : 0) + (measured ? 1 : 0) + (kept ? 1 : 0);
+  const gutterWidth = (visibleColumns - 1) * COLUMN_GAP.length;
   return {
     claim,
     measured,
-    verdict: measured,
     kept,
     // Exactly the remaining width, so the row fills the panel without
     // overflowing it and losing the trailing columns to truncation.
-    claimWidth: claim ? Math.max(20, width - fixed) : 0,
+    claimWidth: claim ? Math.max(20, width - fixed - gutterWidth) : 0,
   };
 }
 
@@ -476,10 +543,9 @@ export function headerRow(columns: Columns): string {
   const parts = [' Hypothesis'.padEnd(ID_WIDTH), 'Rounds'.padEnd(ROUNDS_WIDTH)];
   if (columns.claim) parts.push('Implementation Details'.padEnd(columns.claimWidth));
   if (columns.measured) parts.push('Measured'.padEnd(MEASURED_WIDTH));
-  if (columns.verdict) parts.push('Verdict'.padEnd(VERDICT_WIDTH));
   parts.push('Outcome'.padEnd(OUTCOME_WIDTH));
-  if (columns.kept) parts.push('Kept');
-  return parts.join('');
+  if (columns.kept) parts.push('Kept'.padEnd(KEPT_WIDTH));
+  return parts.join(COLUMN_GAP);
 }
 
 /**
@@ -495,27 +561,35 @@ export interface EntryCells {
 export function entryCells(entry: HypothesisEntry, columns: Columns): EntryCells {
   const marker = entry.active === true ? '▸' : ' ';
   const leading = [
-    `${marker}${truncate(entry.hypothesis_id, ID_WIDTH - 1)}`.padEnd(ID_WIDTH),
-    formatRounds(entry).padEnd(ROUNDS_WIDTH),
+    fitColumn(`${marker}${truncate(entry.hypothesis_id, ID_WIDTH - 1)}`, ID_WIDTH),
+    fitColumn(formatRounds(entry), ROUNDS_WIDTH),
   ];
   if (columns.claim) {
     leading.push(
-      truncate(sentenceCase(entry.claim ?? entry.action ?? '—'), columns.claimWidth - 1).padEnd(
+      fitColumn(
+        sentenceCase(entry.title ?? entry.claim ?? entry.action ?? '—'),
         columns.claimWidth,
       ),
     );
   }
-  if (columns.measured) leading.push(formatMeasured(entry).padEnd(MEASURED_WIDTH));
-  if (columns.verdict) {
-    leading.push(sentenceCase(entry.judge_verdict ?? '—').padEnd(VERDICT_WIDTH));
-  }
+  if (columns.measured) leading.push(fitColumn(formatMeasured(entry), MEASURED_WIDTH));
   return {
-    leading: leading.join(''),
-    outcome: truncate(sentenceCase(entry.resolved_outcome ?? 'active'), OUTCOME_WIDTH - 1).padEnd(
-      OUTCOME_WIDTH,
-    ),
-    trailing: columns.kept ? (entry.kept === true ? 'Yes' : 'No') : '',
+    leading: leading.join(COLUMN_GAP),
+    // These are separate renderables so outcome can carry semantic color.
+    // Put gutters on the following segment rather than relying on trailing
+    // padding surviving across renderable boundaries.
+    outcome: `${COLUMN_GAP}${fitColumn(outcomeLabel(entry), OUTCOME_WIDTH)}`,
+    trailing: columns.kept
+      ? `${COLUMN_GAP}${fitColumn(
+          entry.kept === true ? 'Yes' : entry.kept === false ? 'No' : '—',
+          KEPT_WIDTH,
+        )}`
+      : '',
   };
+}
+
+function fitColumn(value: string, width: number): string {
+  return truncate(value, width).padEnd(width);
 }
 
 export function entryRow(entry: HypothesisEntry, columns: Columns): string {
@@ -530,10 +604,19 @@ export function entryRow(entry: HypothesisEntry, columns: Columns): string {
  */
 export function outcomeColor(theme: Theme, entry: HypothesisEntry): string {
   const outcome = entry.resolved_outcome ?? null;
-  if (entry.active === true || outcome === null) return theme.warning;
+  if (entry.active === true) return theme.warning;
+  if (outcome === null) return theme.textPrimary;
   if (outcome === 'proven') return theme.success;
   if (outcome === 'disproven' || outcome === 'rejected') return theme.error;
   return theme.textPrimary;
+}
+
+/** Map backend resolution terms to concise operator-facing hypothesis decisions. */
+export function outcomeLabel(entry: HypothesisEntry): string {
+  if (entry.active === true) return 'Active';
+  if (entry.resolved_outcome === 'proven') return 'Accepted';
+  if (entry.resolved_outcome === 'disproven') return 'Rejected';
+  return sentenceCase(entry.resolved_outcome ?? '—');
 }
 
 /** Capitalises a wire value for display without touching the rest of it. */
@@ -557,6 +640,32 @@ export function formatMeasured(entry: HypothesisEntry): string {
   }
   if (typeof entry.perf_metric === 'number') return trimNumber(entry.perf_metric);
   return '—';
+}
+
+function focusedTitlePrefix(state: SessionState): string {
+  return focusedPane(state) === 'experiments' ? '▸ ' : '';
+}
+
+function hypothesisMetadata(entry: HypothesisEntry): string {
+  const parts = [`Rounds ${formatRounds(entry)}`];
+  if (entry.judge_verdict !== null && entry.judge_verdict !== undefined) {
+    parts.push(`Judge ${sentenceCase(entry.judge_verdict)}`);
+  }
+  parts.push(`Decision ${outcomeLabel(entry)}`);
+  if (entry.kept === true) parts.push('Candidate kept');
+  else if (entry.kept === false) parts.push('Candidate reverted');
+  return parts.join(' · ');
+}
+
+function roundMetadata(roundNumber: number, round: HypothesisRound | undefined): string {
+  const parts = [`Round ${roundNumber}`];
+  if (round !== undefined) {
+    parts.push(round.reviewed ? `Judge ${round.passed ? 'pass' : 'fail'}` : 'Judge pending');
+  }
+  if (typeof round?.perf_metric === 'number') {
+    parts.push(`${trimNumber(round.perf_metric)}${round.perf_unit ? ` ${round.perf_unit}` : ''}`);
+  }
+  return parts.join(' · ');
 }
 
 function planningHypothesisLabel(existingHypotheses: number): string {

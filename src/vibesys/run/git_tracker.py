@@ -15,7 +15,7 @@ from vs_project import Project
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
-    from vs_project import ProjectGitIntegration, StateSnapshot
+    from vs_project import GitSnapshotPlan, ProjectGitIntegration, StateSnapshot
 
 
 def _normalize_project_paths(paths: Iterable[str | Path]) -> tuple[Path, ...]:
@@ -302,6 +302,44 @@ class GitTracker:
         existing committed metadata before it writes anything. Machine-local
         runtime state is never accepted or staged.
         """
+        plan = self._validated_framework_snapshot_plan(snapshot)
+        self._add_all()
+        for state_file in plan.files:
+            state_file.destination.parent.mkdir(parents=True, exist_ok=True)
+            state_file.destination.write_bytes(state_file.contents)
+            self.run(["git", "add", "--force", "--", state_file.pathspec])
+        self._commit_staged(label)
+
+    def snapshot_framework_metadata_only(
+        self,
+        label: str,
+        snapshot: StateSnapshot,
+    ) -> None:
+        """Commit selected framework metadata without staging candidate edits."""
+        plan = self._validated_framework_snapshot_plan(snapshot)
+        pathspecs = [state_file.pathspec for state_file in plan.files]
+        for state_file in plan.files:
+            state_file.destination.parent.mkdir(parents=True, exist_ok=True)
+            state_file.destination.write_bytes(state_file.contents)
+        if pathspecs:
+            self.run(["git", "add", "--force", "--", *pathspecs])
+        has_changes = bool(pathspecs) and (
+            self.run(
+                ["git", "diff", "--cached", "--quiet", "--", *pathspecs],
+                check=False,
+            ).returncode
+            != 0
+        )
+        if has_changes:
+            self.run(["git", "commit", "--only", "-m", label, "--", *pathspecs])
+        else:
+            self._log(f"[git-tracking] no changes to commit for '{label}'")
+
+    def _validated_framework_snapshot_plan(
+        self,
+        snapshot: StateSnapshot,
+    ) -> GitSnapshotPlan:
+        """Resolve selected metadata after protecting unrelated framework state."""
         plan = self._state_integration.resolve_snapshot(snapshot)
         pending = self._pending_committed_framework_metadata()
         supplied = {state_file.pathspec: state_file.contents for state_file in plan.files}
@@ -317,13 +355,7 @@ class GitTracker:
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"refusing to overwrite unexpectedly modified committed VibeSys metadata: {shown}"
             )
-
-        self._add_all()
-        for state_file in plan.files:
-            state_file.destination.parent.mkdir(parents=True, exist_ok=True)
-            state_file.destination.write_bytes(state_file.contents)
-            self.run(["git", "add", "--force", "--", state_file.pathspec])
-        self._commit_staged(label)
+        return plan
 
     def framework_snapshot_status(self, snapshot: StateSnapshot) -> FrameworkSnapshotStatus:
         """Compare an exact typed framework snapshot with the blobs in ``HEAD``."""

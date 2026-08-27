@@ -3,8 +3,10 @@ import {
   type ActiveAgentExecution,
   type ActiveExecutionCheckpoint,
   type AgentPhase,
+  type ChatThread,
   type CoreDiagnostic,
   type CoreState,
+  DEFAULT_CHAT_THREAD_ID,
   type ExecutionTodos,
   initialCoreState,
   latestDiagnosticChange,
@@ -12,6 +14,7 @@ import {
   type RoundSummary,
   reconcileActiveExecutions,
   reduceEvent,
+  reduceEventBatch,
   reduceSnapshot,
   type TodoItem,
   type TranscriptEntry,
@@ -37,11 +40,24 @@ export interface SessionState {
   roundFocus: RoundFocus;
   overlay: OverlayPanel | null;
   chatOpen: boolean;
+  /** The thread the chat surfaces show and the composer submits to. */
+  activeChatThreadId: string;
+  /** The active thread's conversation, derived from `chatConversations`. */
   chatConversation: ConversationEntry[];
+  /** Every thread's conversation (local user entries merged with replay). */
+  chatConversations: Record<string, ConversationEntry[]>;
+  /** True while the active thread awaits an answer; from `chatPendingThreads`. */
   chatPending: boolean;
+  chatPendingThreads: Record<string, boolean>;
+  /** Non-null while the thread list is open as a keyboard selection. */
+  chatThreadPicker: ChatThreadPicker | null;
+  /** Non-null while the new-thread wizard is open. */
+  newChatPicker: NewChatPicker | null;
   todosExpanded: boolean;
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
+  /** Hypothesis summary between the experiment index and a round trajectory. */
+  hypothesisDetail: HypothesisDetail | null;
   hypothesisScope: HypothesisScope | null;
   layout: LayoutState;
   /**
@@ -103,6 +119,12 @@ export interface ExperimentLogState {
   selectedUnownedRound?: number | null;
   pending: boolean;
   error: string | null;
+}
+
+/** UI-only navigation state for the selected hypothesis summary. */
+export interface HypothesisDetail {
+  entryKey: string;
+  selectedRound: number | null;
 }
 
 /** A planning phase that has not produced a hypothesis record yet. */
@@ -168,6 +190,35 @@ export interface ThemePicker {
   selected: ThemeName;
 }
 
+/**
+ * Picker choices for the new-thread wizard. This is a UI affordance only:
+ * the backend is the authority and re-validates every combination, so a
+ * stale catalog degrades to a server error rather than a wrong thread.
+ */
+export const CHAT_DRIVERS = ['agentshim', 'omnigent'] as const;
+export type ChatDriverName = (typeof CHAT_DRIVERS)[number];
+export const CHAT_DRIVER_PROVIDERS: Record<ChatDriverName, readonly string[]> = {
+  agentshim: ['claude', 'gemini', 'codex', 'opencode'],
+  omnigent: ['claude', 'codex'],
+};
+
+export interface ChatThreadPicker {
+  /** Thread id the highlight is on; Enter switches to it. */
+  selected: string;
+}
+
+/**
+ * The new-thread wizard: driver, then a provider the driver supports, then a
+ * free-text model. An empty model means the run's configured default, which
+ * only the backend knows authoritatively.
+ */
+export interface NewChatPicker {
+  step: 'driver' | 'provider' | 'model';
+  driver: ChatDriverName;
+  provider: string;
+  model: string;
+}
+
 export interface OverlayPanel {
   kind: 'detail' | 'help' | 'error';
   content: string;
@@ -213,13 +264,19 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     roundFocus: 'transcript',
     overlay: null,
     chatOpen: false,
+    activeChatThreadId: DEFAULT_CHAT_THREAD_ID,
     chatConversation: [],
+    chatConversations: {},
     chatPending: false,
+    chatPendingThreads: {},
+    chatThreadPicker: null,
+    newChatPicker: null,
     todosExpanded: false,
     themeName,
     // The experiment log is the landing view: a run's history reads as a short
     // list of claims before it reads as a long list of rounds.
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
+    hypothesisDetail: null,
     hypothesisScope: null,
     layout: {right: null, focus: 'left', zoomedPane: null},
     // Docked until the renderer measures otherwise, so the landing view carries
@@ -258,7 +315,12 @@ export function experimentLogVisible(state: SessionState): boolean {
  * it was.
  */
 export function chatDocked(state: SessionState): boolean {
-  return state.chatDockFits && state.experimentLog !== null && state.hypothesisScope === null;
+  return (
+    state.chatDockFits &&
+    state.experimentLog !== null &&
+    state.hypothesisDetail === null &&
+    state.hypothesisScope === null
+  );
 }
 
 /** True when the docked chat is the thing on screen rather than the modal. */
@@ -294,12 +356,178 @@ export function openChat(state: SessionState): SessionState {
   return {...state, overlay: null, chatOpen: true};
 }
 
+/** Keeps the singular chat fields pointing at the active thread. */
+function deriveActiveChat(state: SessionState): SessionState {
+  const chatConversation = state.chatConversations[state.activeChatThreadId] ?? [];
+  const chatPending = state.chatPendingThreads[state.activeChatThreadId] === true;
+  if (state.chatConversation === chatConversation && state.chatPending === chatPending) {
+    return state;
+  }
+  return {...state, chatConversation, chatPending};
+}
+
+/** Every thread the run knows about, the implicit default first. */
+export function chatThreads(state: SessionState): ChatThread[] {
+  return state.core.chatThreads;
+}
+
+/**
+ * What the chat surfaces call one thread. Titles are backend-owned and arrive
+ * through events; an untitled created thread reads as its agent selection.
+ */
+export function chatThreadLabel(
+  state: SessionState,
+  threadId: string = state.activeChatThreadId,
+): string {
+  const thread = state.core.chatThreads.find(candidate => candidate.id === threadId);
+  if (thread === undefined) return 'Experiment chat';
+  if (thread.title) return thread.title;
+  if (thread.driver === null && thread.provider === null) return 'Experiment chat';
+  const model = thread.model === null ? '' : ` · ${thread.model}`;
+  return `${thread.driver ?? '?'}/${thread.provider ?? '?'}${model}`;
+}
+
+/** Makes one thread the chat surface's subject and puts the keys on the chat. */
+export function switchChatThread(state: SessionState, threadId: string): SessionState {
+  return openChat(
+    deriveActiveChat({
+      ...state,
+      activeChatThreadId: threadId,
+      chatThreadPicker: null,
+      newChatPicker: null,
+    }),
+  );
+}
+
+/** Applies one thread's conversation change and refreshes the derived fields. */
+export function updateChatConversation(
+  state: SessionState,
+  threadId: string,
+  update: (entries: ConversationEntry[]) => ConversationEntry[],
+): SessionState {
+  const entries = update(state.chatConversations[threadId] ?? []).slice(-500);
+  return deriveActiveChat({
+    ...state,
+    chatConversations: {...state.chatConversations, [threadId]: entries},
+  });
+}
+
+export function setChatThreadPending(
+  state: SessionState,
+  threadId: string,
+  pending: boolean,
+): SessionState {
+  return deriveActiveChat({
+    ...state,
+    chatPendingThreads: {...state.chatPendingThreads, [threadId]: pending},
+  });
+}
+
+/** Opens the thread list as a selection, starting on the active thread. */
+export function openChatThreadPicker(state: SessionState): SessionState {
+  return {
+    ...state,
+    overlay: null,
+    themePicker: null,
+    newChatPicker: null,
+    chatThreadPicker: {selected: state.activeChatThreadId},
+  };
+}
+
+export function moveChatThreadSelection(state: SessionState, delta: number): SessionState {
+  const picker = state.chatThreadPicker;
+  if (picker === null) return state;
+  const ids = state.core.chatThreads.map(thread => thread.id);
+  const current = ids.indexOf(picker.selected);
+  const index = Math.min(ids.length - 1, Math.max(0, (current === -1 ? 0 : current) + delta));
+  const selected = ids[index];
+  if (selected === undefined || selected === picker.selected) return state;
+  return {...state, chatThreadPicker: {selected}};
+}
+
+export function closeChatThreadPicker(state: SessionState): SessionState {
+  if (state.chatThreadPicker === null) return state;
+  return {...state, chatThreadPicker: null};
+}
+
+/**
+ * Opens the new-thread wizard on its first step. The model prefill is the
+ * backend-reported live model when one has streamed in; empty text submits no
+ * override, so the backend resolves the run's configured default.
+ */
+export function openNewChatPicker(state: SessionState): SessionState {
+  const driver = CHAT_DRIVERS[0];
+  return {
+    ...state,
+    overlay: null,
+    themePicker: null,
+    chatThreadPicker: null,
+    newChatPicker: {
+      step: 'driver',
+      driver,
+      provider: CHAT_DRIVER_PROVIDERS[driver][0] ?? '',
+      model: state.core.usage?.model ?? '',
+    },
+  };
+}
+
+export function moveNewChatSelection(state: SessionState, delta: number): SessionState {
+  const picker = state.newChatPicker;
+  if (picker === null) return state;
+  if (picker.step === 'driver') {
+    const current = CHAT_DRIVERS.indexOf(picker.driver);
+    const index = Math.min(CHAT_DRIVERS.length - 1, Math.max(0, current + delta));
+    const driver = CHAT_DRIVERS[index];
+    if (driver === undefined || driver === picker.driver) return state;
+    const providers = CHAT_DRIVER_PROVIDERS[driver];
+    // The provider survives the driver change only where it stays supported.
+    const provider = providers.includes(picker.provider) ? picker.provider : (providers[0] ?? '');
+    return {...state, newChatPicker: {...picker, driver, provider}};
+  }
+  if (picker.step === 'provider') {
+    const providers = CHAT_DRIVER_PROVIDERS[picker.driver];
+    const current = providers.indexOf(picker.provider);
+    const index = Math.min(
+      providers.length - 1,
+      Math.max(0, (current === -1 ? 0 : current) + delta),
+    );
+    const provider = providers[index];
+    if (provider === undefined || provider === picker.provider) return state;
+    return {...state, newChatPicker: {...picker, provider}};
+  }
+  return state;
+}
+
+/** Enter on a non-final step: the wizard moves on with the choice kept. */
+export function advanceNewChatPicker(state: SessionState): SessionState {
+  const picker = state.newChatPicker;
+  if (picker === null || picker.step === 'model') return state;
+  const step = picker.step === 'driver' ? 'provider' : 'model';
+  return {...state, newChatPicker: {...picker, step}};
+}
+
+/** Escape: one step back, and off the first step the wizard closes. */
+export function retreatNewChatPicker(state: SessionState): SessionState {
+  const picker = state.newChatPicker;
+  if (picker === null) return state;
+  if (picker.step === 'driver') return {...state, newChatPicker: null};
+  const step = picker.step === 'model' ? 'provider' : 'driver';
+  return {...state, newChatPicker: {...picker, step}};
+}
+
+export function setNewChatModel(state: SessionState, model: string): SessionState {
+  const picker = state.newChatPicker;
+  if (picker === null || picker.step !== 'model') return state;
+  return {...state, newChatPicker: {...picker, model}};
+}
+
 export function openExperimentLog(state: SessionState): SessionState {
   const existing = state.experimentLog;
   return {
     ...state,
     overlay: null,
     chatOpen: false,
+    hypothesisDetail: null,
     hypothesisScope: null,
     selectedRound: null,
     selectedAgentKind: null,
@@ -339,8 +567,26 @@ export function setExperiments(state: SessionState, entries: HypothesisEntry[]):
       : orderedEntries.length === 0
         ? (unownedRounds[0] ?? null)
         : null;
+  const currentDetail = state.hypothesisDetail;
+  const detailEntry =
+    currentDetail === null
+      ? undefined
+      : orderedEntries.find((entry, index) => entryKey(entry, index) === currentDetail.entryKey);
+  const detailRounds = detailEntry === undefined ? [] : scopeRounds(detailEntry);
+  const hypothesisDetail =
+    currentDetail === null || detailEntry === undefined
+      ? null
+      : {
+          entryKey: currentDetail.entryKey,
+          selectedRound:
+            currentDetail.selectedRound !== null &&
+            detailRounds.includes(currentDetail.selectedRound)
+              ? currentDetail.selectedRound
+              : (detailRounds.at(-1) ?? null),
+        };
   return {
     ...state,
+    hypothesisDetail,
     experimentLog: {
       ...log,
       entries: orderedEntries,
@@ -362,7 +608,8 @@ export function failExperiments(state: SessionState, error: string): SessionStat
 
 export function moveExperimentSelection(state: SessionState, delta: number): SessionState {
   const log = state.experimentLog;
-  if (log === null || state.hypothesisScope !== null) return state;
+  if (log === null || state.hypothesisDetail !== null || state.hypothesisScope !== null)
+    return state;
   const items = experimentIndexItems(state);
   if (items.length === 0) return state;
   const selected = selectedExperimentIndexItem(state);
@@ -371,11 +618,63 @@ export function moveExperimentSelection(state: SessionState, delta: number): Ses
   return selectExperimentIndexItem(state, items[index]);
 }
 
+/** Open one hypothesis summary without entering any of its round trajectories. */
+export function openHypothesisDetail(state: SessionState, requestedKey?: string): SessionState {
+  const log = state.experimentLog;
+  if (log === null || state.hypothesisScope !== null) return state;
+  const key = requestedKey ?? log.selectedId;
+  if (key === null) return state;
+  const entry = log.entries.find((candidate, index) => entryKey(candidate, index) === key);
+  if (entry === undefined) return state;
+  const rounds = scopeRounds(entry);
+  return {
+    ...state,
+    overlay: null,
+    chatOpen: false,
+    layout: {right: null, focus: 'left', zoomedPane: null},
+    experimentLog: {
+      ...log,
+      selectedId: key,
+      selectedActivity: false,
+      selectedActivityRound: null,
+      selectedUnownedRound: null,
+    },
+    hypothesisDetail: {entryKey: key, selectedRound: rounds.at(-1) ?? null},
+  };
+}
+
+/** The durable hypothesis selected for the summary view. */
+export function detailedHypothesis(state: SessionState): HypothesisEntry | null {
+  const detail = state.hypothesisDetail;
+  const entries = state.experimentLog?.entries ?? [];
+  if (detail === null) return null;
+  return entries.find((entry, index) => entryKey(entry, index) === detail.entryKey) ?? null;
+}
+
+/** Move the round cursor within the open hypothesis summary. */
+export function moveHypothesisRoundSelection(state: SessionState, delta: number): SessionState {
+  const detail = state.hypothesisDetail;
+  const entry = detailedHypothesis(state);
+  if (detail === null || entry === null || state.hypothesisScope !== null) return state;
+  const rounds = scopeRounds(entry);
+  if (rounds.length === 0) return state;
+  const current = detail.selectedRound === null ? -1 : rounds.indexOf(detail.selectedRound);
+  const index = current === -1 ? 0 : Math.min(rounds.length - 1, Math.max(0, current + delta));
+  return {...state, hypothesisDetail: {...detail, selectedRound: rounds[index] ?? null}};
+}
+
+/** Return from a hypothesis summary to the experiment index. */
+export function leaveHypothesisDetail(state: SessionState): SessionState {
+  if (state.hypothesisDetail === null || state.hypothesisScope !== null) return state;
+  return {...state, hypothesisDetail: null};
+}
+
 /** Selects the current planning work so Enter opens its live agent turns. */
 export function selectExperimentActivity(state: SessionState): SessionState {
   const log = state.experimentLog;
   if (
     log === null ||
+    state.hypothesisDetail !== null ||
     state.hypothesisScope !== null ||
     hypothesisPlanningActivity(state) === null
   ) {
@@ -394,10 +693,14 @@ export function selectExperimentActivity(state: SessionState): SessionState {
 }
 
 /**
- * Opens the rounds behind the selected hypothesis. The log keeps its selection
- * so leaving the trajectory lands the operator back on the same row.
+ * Advances the experiment navigation by one level: index to hypothesis
+ * summary, then hypothesis summary to its selected round trajectory.
  */
 export function enterExperimentDrilldown(state: SessionState): SessionState {
+  if (state.hypothesisDetail !== null) {
+    const roundNumber = state.hypothesisDetail.selectedRound;
+    return roundNumber === null ? state : (enterExperimentRound(state, roundNumber) ?? state);
+  }
   const activity = hypothesisPlanningActivity(state);
   if (
     activity !== null &&
@@ -415,33 +718,10 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
   }
   const entry = selectedExperiment(state);
   if (entry === null || state.hypothesisScope !== null) return state;
-  const rounds = scopeRounds(entry);
-  if (rounds.length === 0) return state;
-  return {
-    ...state,
-    overlay: null,
-    // A visualization opened from the log belongs to the log. Carrying it into
-    // the round view would leave the operator reading one view's answer beside
-    // another view's transcript.
-    layout: {right: null, focus: 'left', zoomedPane: null},
-    hypothesisScope: {
-      id: entry.hypothesis_id,
-      label: hypothesisLabel(entry),
-      rounds,
-      source: 'hypothesis',
-    },
-    // Land on the hypothesis's latest round rather than on "no round". The
-    // round view is built around one round: the strip marks it, the agent graph
-    // draws its phases, the transcript carries its turns. Leaving the round
-    // unset drew an empty strip and an empty graph, and `[` walks back through
-    // the earlier rounds from here anyway.
-    selectedRound: rounds.at(-1) ?? null,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-  };
+  return openHypothesisDetail(state);
 }
 
-/** Leaves the trajectory and returns to the table with the selection intact. */
+/** Leaves a trajectory for its hypothesis summary, preserving the round cursor. */
 export function leaveExperimentDrilldown(state: SessionState): SessionState {
   if (state.hypothesisScope === null) return state;
   return {...state, hypothesisScope: null, selectedRound: null, selectedAgentKind: null};
@@ -456,10 +736,11 @@ export function enterExperimentRound(
   state: SessionState,
   roundNumber: number,
 ): SessionState | null {
-  const entry = (state.experimentLog?.entries ?? []).find(candidate =>
-    scopeRounds(candidate).includes(roundNumber),
-  );
+  const entries = state.experimentLog?.entries ?? [];
+  const entryIndex = entries.findIndex(candidate => scopeRounds(candidate).includes(roundNumber));
+  const entry = entries[entryIndex];
   if (entry === undefined) return null;
+  const entryKeyValue = entryKey(entry, entryIndex);
   const scoped: SessionState = {
     ...state,
     overlay: null,
@@ -474,10 +755,9 @@ export function enterExperimentRound(
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
+    hypothesisDetail: {entryKey: entryKeyValue, selectedRound: roundNumber},
     experimentLog:
-      state.experimentLog === null
-        ? null
-        : {...state.experimentLog, selectedId: entryKeyFor(state.experimentLog.entries, entry)},
+      state.experimentLog === null ? null : {...state.experimentLog, selectedId: entryKeyValue},
   };
   return scoped;
 }
@@ -497,6 +777,7 @@ export function enterUnownedExperimentRound(
     overlay: null,
     chatOpen: false,
     layout: {right: null, focus: 'left', zoomedPane: null},
+    hypothesisDetail: null,
     hypothesisScope: {
       id: `round-${roundNumber}`,
       label: `Round ${roundNumber}`,
@@ -526,12 +807,17 @@ function scopeRounds(entry: HypothesisEntry): number[] {
   );
 }
 
+/** Ordered round identities owned by a hypothesis, including legacy range-only records. */
+export function hypothesisRoundNumbers(entry: HypothesisEntry): number[] {
+  return scopeRounds(entry);
+}
+
 function hypothesisLabel(entry: HypothesisEntry): string {
   const range =
     entry.first_round === entry.last_round
       ? `r${entry.first_round}`
       : `r${entry.first_round}-${entry.last_round}`;
-  return `${entry.hypothesis_id} · ${range}`;
+  return `${entry.title ?? entry.hypothesis_id} · ${range}`;
 }
 
 export function selectedExperiment(state: SessionState): HypothesisEntry | null {
@@ -927,12 +1213,52 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
   const core = reduceEvent(state.core, event);
   if (core === state.core) return state;
   const diagnostic = latestDiagnosticChange(state.core, core);
-  let next: SessionState = {
+  let next: SessionState = deriveActiveChat({
     ...state,
     core,
-    chatConversation: reconcileChatTranscript(state.chatConversation, core.chatTranscript),
-  };
+    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+  });
   if (diagnostic !== null) next = reportProjectedDiagnostic(next, diagnostic);
+  return next;
+}
+
+/**
+ * Fold a backend checkpoint as one UI transition.
+ *
+ * Resumed runs can replay failures from an older process before their current
+ * ``run_started`` event. Those diagnostics remain in core history, but should
+ * not open a stale banner over the newly running session. A batch that ends in
+ * failure still reports its terminal diagnostic.
+ */
+export function applyEventBatch(
+  state: SessionState,
+  events: readonly RunEvent[],
+  activeExecutions?: ActiveExecutionCheckpoint,
+  throughSequence?: number,
+): SessionState {
+  const core = reduceEventBatch(state.core, events, activeExecutions, throughSequence);
+  if (core === state.core) return state;
+  let next: SessionState = deriveActiveChat({
+    ...state,
+    core,
+    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+  });
+  if (core.status === 'failed') {
+    const finalDiagnostic = core.diagnostics.at(-1);
+    if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
+  }
+  return next;
+}
+
+/** Folds every thread's replayed transcript into its local conversation. */
+function reconcileChatConversations(
+  conversations: Record<string, ConversationEntry[]>,
+  transcripts: Record<string, TranscriptEntry[]>,
+): Record<string, ConversationEntry[]> {
+  const next = {...conversations};
+  for (const [threadId, transcript] of Object.entries(transcripts)) {
+    next[threadId] = reconcileChatTranscript(next[threadId] ?? [], transcript);
+  }
   return next;
 }
 
@@ -1243,6 +1569,7 @@ export function showLive(state: SessionState): SessionState {
     ...state,
     overlay: null,
     chatOpen: false,
+    hypothesisDetail: null,
     hypothesisScope: null,
     selectedRound: null,
     selectedAgentKind: null,

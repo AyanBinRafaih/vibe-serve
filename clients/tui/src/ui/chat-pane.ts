@@ -5,7 +5,12 @@ import {
   type SyntaxStyle,
 } from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
-import {type ConversationEntry, chatPaneFocused, type SessionState} from '../session-model.js';
+import {
+  type ConversationEntry,
+  chatPaneFocused,
+  chatThreadLabel,
+  type SessionState,
+} from '../session-model.js';
 import {ChatComposerView, type ChatDraft} from './chat-composer.js';
 import {ConversationView} from './conversation.js';
 import {LOG_CLAIM_PANEL_WIDTH, LOG_COMPACT_PANEL_WIDTH} from './experiment-log.js';
@@ -146,7 +151,9 @@ export class ChatPaneView {
     // The column can be as narrow as its minimum, where a spelled-out "focused"
     // costs the title itself: a box with no title reads as nothing at all. The
     // marker is the one the table already uses for the row that has the keys.
-    this.output.title = focused ? ' ▸ Experiment chat ' : ' Experiment chat ';
+    // The title names the active thread so switching is visible at a glance.
+    const label = chatThreadLabel(state);
+    this.output.title = focused ? ` ▸ ${label} ` : ` ${label} `;
     this.#composer.activate(Math.max(1, width - 4), focused, state.chatPending);
     if (state.chatConversation === this.#renderedConversation) return;
     this.#renderedConversation = state.chatConversation;

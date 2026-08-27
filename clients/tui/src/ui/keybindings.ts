@@ -9,6 +9,7 @@ export interface KeybindingActions {
   inputIsEmpty(): boolean;
   closeChat(): void;
   toggleLatestPrompt(): void;
+  toggleSelectedTool(): boolean;
   /** Brings the entry the cursor moved to into view. */
   revealSelectedEntry(): void;
   selectNextAgent(): void;
@@ -18,6 +19,7 @@ export interface KeybindingActions {
   toggleTodos(): void;
   scrollRightPane(delta: number): void;
   scrollChatPane(delta: number): void;
+  scrollExperimentDetail(delta: number): void;
   scrollErrorBanner(delta: number): void;
   clearTransientStatus(): void;
   showClipboardStatus(result: Exclude<ClipboardCopyResult, 'no-selection'>): void;
@@ -43,7 +45,9 @@ export function bindKeybindings(
       key.name === 'f4' &&
       controller.state.chatOpen === false &&
       controller.state.overlay === null &&
-      controller.state.themePicker === null
+      controller.state.themePicker === null &&
+      controller.state.chatThreadPicker === null &&
+      controller.state.newChatPicker === null
     ) {
       controller.togglePaneZoom();
       key.preventDefault();
@@ -72,6 +76,37 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
+    // The new-thread wizard owns the keys wherever it was opened from — on its
+    // model step that includes ordinary typing, which must never leak into the
+    // composer or command input underneath.
+    const newChatPicker = controller.state.newChatPicker;
+    if (newChatPicker !== null) {
+      if (key.name === 'up') controller.moveNewChatSelection(-1);
+      else if (key.name === 'down') controller.moveNewChatSelection(1);
+      else if (key.name === 'escape') controller.retreatNewChatPicker();
+      else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
+        void controller.confirmNewChatPicker();
+      } else if (newChatPicker.step === 'model' && key.name === 'backspace') {
+        controller.backspaceNewChatModel();
+      } else if (newChatPicker.step === 'model' && isPrintable(key)) {
+        controller.typeNewChatModel(key.sequence);
+      } else return;
+      key.preventDefault();
+      return;
+    }
+    // The thread list is a selection: Enter switches to the highlighted thread.
+    if (controller.state.chatThreadPicker !== null) {
+      if (key.name === 'up') controller.moveChatThreadSelection(-1);
+      else if (key.name === 'down') controller.moveChatThreadSelection(1);
+      else if (key.name === 'escape') controller.closeChatThreadPicker();
+      else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
+        controller.applySelectedChatThread();
+      } else return;
+      key.preventDefault();
+      return;
+    }
+    // The focused pane takes the scroll keys. Everything else the chat or the
+    // transcript would normally handle is left alone.
     if (
       controller.state.layout.focus === 'right' &&
       controller.state.layout.right !== null &&
@@ -119,14 +154,29 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
+    // The experiment surface owns navigation while it is on screen. The index
+    // opens a hypothesis summary; that summary selects and opens one round.
+    // The input keeps priority over Enter so a typed command is never lost.
     if (experimentLogVisible(controller.state)) {
-      if (key.name === 'up') {
-        if (!actions.navigateSuggestions(-1)) controller.moveExperimentSelection(-1);
+      const detailOpen = controller.state.hypothesisDetail !== null;
+      if (key.name === 'escape' && detailOpen) controller.leaveHypothesisDetail();
+      else if (key.name === 'up') {
+        if (detailOpen) controller.moveHypothesisRoundSelection(-1);
+        else if (!actions.navigateSuggestions(-1)) controller.moveExperimentSelection(-1);
       } else if (key.name === 'down') {
-        if (!actions.navigateSuggestions(1)) controller.moveExperimentSelection(1);
-      } else if (key.name === 'pageup') controller.moveExperimentSelection(-10);
-      else if (key.name === 'pagedown') controller.moveExperimentSelection(10);
-      else if (key.name === 'return' || key.name === 'enter') {
+        if (detailOpen) controller.moveHypothesisRoundSelection(1);
+        else if (!actions.navigateSuggestions(1)) controller.moveExperimentSelection(1);
+      } else if (key.name === 'pageup') {
+        if (detailOpen) actions.scrollExperimentDetail(-1);
+        else controller.moveExperimentSelection(-10);
+      } else if (key.name === 'pagedown') {
+        if (detailOpen) actions.scrollExperimentDetail(1);
+        else controller.moveExperimentSelection(10);
+      } else if (key.name === 'return' || key.name === 'enter') {
+        // A typed command belongs to the input; let its own handler run it so
+        // one Enter is enough. An overlay is in front of the table, so Enter
+        // behind it must not move the operator somewhere they cannot see.
+
         if (!actions.inputIsEmpty()) return;
         if (controller.state.overlay === null) controller.enterExperimentDrilldown();
       } else return;
@@ -180,6 +230,16 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
+    if (
+      (key.name === 'return' || key.name === 'enter') &&
+      controller.state.roundFocus === 'transcript' &&
+      actions.inputIsEmpty() &&
+      actions.toggleSelectedTool()
+    ) {
+      actions.revealSelectedEntry();
+      key.preventDefault();
+      return;
+    }
     if (key.ctrl && key.name === 'l') {
       controller.live();
       viewport.scrollTo(viewport.scrollHeight);
@@ -221,4 +281,16 @@ export function bindKeybindings(
 
   renderer.keyInput.on('keypress', onKey);
   return () => renderer.keyInput.off('keypress', onKey);
+}
+
+/** One typed character, as opposed to a chord or a control key. */
+function isPrintable(key: KeyEvent): boolean {
+  return (
+    !key.ctrl &&
+    !key.meta &&
+    typeof key.sequence === 'string' &&
+    key.sequence.length === 1 &&
+    key.sequence >= ' ' &&
+    key.sequence !== ''
+  );
 }

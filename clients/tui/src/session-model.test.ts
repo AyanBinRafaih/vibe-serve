@@ -4,6 +4,7 @@ import type {SessionState} from './session-model.js';
 import {
   applyActiveExecutionCheckpoint,
   applyEvent,
+  applyEventBatch,
   chatDocked,
   chatPaneVisible,
   closePane,
@@ -21,8 +22,10 @@ import {
   hypothesisPlanningActivity,
   initialSessionState,
   leaveExperimentDrilldown,
+  leaveHypothesisDetail,
   markEventStreamUnavailable,
   moveExperimentSelection,
+  moveHypothesisRoundSelection,
   moveThemeSelection,
   openChat,
   openPane,
@@ -46,6 +49,59 @@ import {
   visiblePhases,
   visibleTodos,
 } from './session-model.js';
+
+describe('event batch projection', () => {
+  it('keeps the existing banner while resumed history ends in a running session', () => {
+    const before = reportError(initialSessionState(), 'Local input problem', {scope: 'input'});
+
+    const state = applyEventBatch(before, [
+      {
+        ...event(1, 'run_failed'),
+        diagnostic: {
+          code: 'interrupted',
+          summary: 'Previous process was interrupted.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+      event(2, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+    ]);
+
+    expect(state.core.status).toBe('running');
+    expect(state.core.diagnostics).toHaveLength(1);
+    expect(state.errorBanner).toEqual(before.errorBanner);
+  });
+
+  it('surfaces the final diagnostic when a batch ends in failure', () => {
+    const state = applyEventBatch(initialSessionState(), [
+      event(1, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+      {
+        ...event(2, 'run_failed'),
+        diagnostic: {
+          code: 'run_failed',
+          summary: 'The current run failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+    ]);
+
+    expect(state.core.status).toBe('failed');
+    expect(state.errorBanner).toMatchObject({message: 'The current run failed.', scope: 'run'});
+  });
+});
 
 describe('hypothesis planning activity', () => {
   function stateFor(
@@ -279,6 +335,45 @@ describe('hypothesis planning activity', () => {
       selectedActivity: false,
       selectedActivityRound: null,
     });
+  });
+});
+
+describe('hypothesis scope label', () => {
+  it('prefers the backend-supplied title over the hypothesis id', () => {
+    const state = setExperiments(initialSessionState(), [
+      {
+        hypothesis_id: 'H-01',
+        identified: true,
+        title: 'Batch decode requests',
+        first_round: 1,
+        last_round: 1,
+        rounds: [{round: 1, passed: true, reviewed: true}],
+        kept: false,
+        active: false,
+      },
+    ]);
+
+    const opened = enterExperimentDrilldown(state);
+
+    expect(opened.hypothesisScope).toMatchObject({id: 'H-01', label: 'Batch decode requests · r1'});
+  });
+
+  it('falls back to the hypothesis id when there is no title', () => {
+    const state = setExperiments(initialSessionState(), [
+      {
+        hypothesis_id: 'H-01',
+        identified: true,
+        first_round: 1,
+        last_round: 1,
+        rounds: [{round: 1, passed: true, reviewed: true}],
+        kept: false,
+        active: false,
+      },
+    ]);
+
+    const opened = enterExperimentDrilldown(state);
+
+    expect(opened.hypothesisScope).toMatchObject({id: 'H-01', label: 'H-01 · r1'});
   });
 });
 
@@ -1368,6 +1463,47 @@ describe('session event model', () => {
   });
 });
 
+describe('hypothesis detail navigation', () => {
+  const hypothesis = {
+    hypothesis_id: 'H-01',
+    identified: true,
+    claim: 'A complete causal hypothesis that must never be truncated in its detail view.',
+    first_round: 1,
+    last_round: 2,
+    rounds: [
+      {round: 1, passed: true, reviewed: true},
+      {round: 2, passed: false, reviewed: true},
+    ],
+    kept: false,
+    active: false,
+  };
+
+  it('moves from index to hypothesis to round and unwinds one level at a time', () => {
+    const landing = setExperiments(initialSessionState(), [hypothesis]);
+    const detail = enterExperimentDrilldown(landing);
+
+    expect(detail.hypothesisDetail).toEqual({entryKey: 'H-01', selectedRound: 2});
+    expect(detail.hypothesisScope).toBeNull();
+
+    const earlier = moveHypothesisRoundSelection(detail, -1);
+    expect(earlier.hypothesisDetail?.selectedRound).toBe(1);
+
+    const round = enterExperimentDrilldown(earlier);
+    expect(round.hypothesisScope).toMatchObject({id: 'H-01', rounds: [1, 2]});
+    expect(round.selectedRound).toBe(1);
+
+    const backToDetail = leaveExperimentDrilldown(round);
+    expect(backToDetail.hypothesisDetail?.selectedRound).toBe(1);
+    expect(leaveHypothesisDetail(backToDetail).hypothesisDetail).toBeNull();
+  });
+
+  it('closes a detail whose hypothesis disappears during refresh', () => {
+    const detail = enterExperimentDrilldown(setExperiments(initialSessionState(), [hypothesis]));
+
+    expect(setExperiments(detail, []).hypothesisDetail).toBeNull();
+  });
+});
+
 describe('docked experiment chat', () => {
   const entry = {
     hypothesis_id: 'H-01',
@@ -1384,8 +1520,12 @@ describe('docked experiment chat', () => {
     expect(chatDocked(landing)).toBe(true);
     expect(chatPaneVisible(landing)).toBe(true);
 
-    // Inside a hypothesis the row belongs to the transcript.
-    const scoped = enterExperimentDrilldown(landing);
+    // The hypothesis summary and its trajectories both use the full content
+    // column rather than competing with experiment chat.
+    const detail = enterExperimentDrilldown(landing);
+    expect(detail.hypothesisDetail).not.toBeNull();
+    expect(chatDocked(detail)).toBe(false);
+    const scoped = enterExperimentDrilldown(detail);
     expect(scoped.hypothesisScope).not.toBeNull();
     expect(chatDocked(scoped)).toBe(false);
   });

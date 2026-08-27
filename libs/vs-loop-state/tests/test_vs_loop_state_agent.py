@@ -38,11 +38,19 @@ def test_public_round_record_codec_round_trips_current_schema() -> None:
         perf_metric=1.0,
         perf_unit="ops/s",
         passed=True,
+        hypothesis_declared_outcome="nominated",
+        judge_verdict="pass",
         official_evaluation=True,
         official_evaluation_reason="cadence",
         metrics={"throughput": 1.0},
         candidate_disposition="retained",
         candidate_metrics={"latency": 2.0},
+        candidate_retained=True,
+        perf_direction="max",
+        perf_baseline_round=2,
+        perf_baseline_commit="b" * 40,
+        perf_baseline_metric=0.9,
+        perf_delta_pct=100 / 9,
     )
 
     payload = serialize_round_record(record)
@@ -67,6 +75,10 @@ def test_parse_round_record_applies_declared_defaults() -> None:
     assert record.reviewed is True
     assert record.official_evaluation is False
     assert record.candidate_disposition == "unassessed"
+    assert record.hypothesis_declared_outcome is None
+    assert record.judge_verdict is None
+    assert record.candidate_retained is None
+    assert record.perf_direction is None
 
 
 def test_parse_round_record_preserves_explicit_official_evaluation() -> None:

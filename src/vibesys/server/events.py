@@ -23,6 +23,7 @@ class EventType(StrEnum):  # noqa: D101  # tracked: #288
     EXPERIMENTS_CHANGED = "experiments_changed"
     RUN_INTERRUPTED = "run_interrupted"
     CHAT = "chat"
+    CHAT_THREAD_CREATED = "chat_thread_created"
     STATUS_QUERY = "status_query"
     CONTROL = "control"
     INVOCATION_STARTED = "invocation_started"
@@ -67,6 +68,25 @@ AgentOutputChannel = Literal["assistant", "analysis", "tool", "diagnostic", "pro
 class ChatData(BaseModel):  # noqa: D101  # tracked: #288
     kind: Literal["chat"] = "chat"
     answer: str
+    # The authoritative thread title, set by the server on the turn that
+    # titles a previously untitled thread so clients learn it from replay.
+    thread_title: str | None = None
+
+
+class ChatThreadCreatedData(BaseModel):
+    """Identity and resolved agent settings for one experiment-chat thread.
+
+    Replayed by clients to rebuild the thread list; the default thread is
+    implicit and never records one of these.
+    """
+
+    kind: Literal["chat_thread_created"] = "chat_thread_created"
+    thread_id: str
+    title: str = ""
+    driver: str
+    provider: str
+    model: str
+    created_at: datetime
 
 
 class InvocationStartedData(BaseModel):  # noqa: D101  # tracked: #288
@@ -102,6 +122,9 @@ class AgentExecutionStartedData(BaseModel):
     system_prompt: str = ""
     user_prompt: str = ""
     activity: AgentExecutionActivityData
+    driver: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
 
 class AgentExecutionFinishedData(BaseModel):
@@ -187,12 +210,40 @@ class ToolCallData(BaseModel):  # noqa: D101  # tracked: #288
     status: AgentStatusData | None = None
 
 
+class CommandResultPayload(BaseModel):
+    """Structured result of a command-style tool execution."""
+
+    kind: Literal["command"] = "command"
+    stdout: str
+    stderr: str
+    exit_code: int | None = None
+    duration: float | None = None
+    """Wall-clock execution time in seconds."""
+
+
+class JsonResultPayload(BaseModel):
+    """A tool result that is a JSON object or array, already parsed."""
+
+    kind: Literal["json"] = "json"
+    value: dict[str, Any] | list[Any]
+
+
+ToolResultPayload = Annotated[
+    CommandResultPayload | JsonResultPayload,
+    Field(discriminator="kind"),
+]
+"""Typed structure a producer preserved alongside the raw result text."""
+
+
 class ToolResultData(BaseModel):  # noqa: D101  # tracked: #288
     kind: Literal["tool_result"] = "tool_result"
     tool: str
     call_id: str | None = None
     content: str
     is_error: bool = False
+    # ``content`` stays the raw, always-present text (fidelity, logs, replay).
+    # Frontends render ``payload`` when present and fall back to ``content``.
+    payload: ToolResultPayload | None = None
 
 
 class TodoItemData(BaseModel):  # noqa: D101  # tracked: #288
@@ -247,6 +298,7 @@ class RoundFinishedData(BaseModel):  # noqa: D101  # tracked: #288
 
 EventData = Annotated[
     ChatData
+    | ChatThreadCreatedData
     | InvocationStartedData
     | InvocationFinishedData
     | AgentExecutionStartedData
@@ -289,6 +341,9 @@ class RunEvent(BaseModel):
     agent_kind: str | None = None
     invocation_id: str | None = None
     execution_id: str | None = None
+    # Which experiment-chat thread a chat event belongs to. None is the
+    # default thread, preserving events written before threads existed.
+    chat_thread_id: str | None = None
     data: EventData | None = None
 
     @model_validator(mode="before")
@@ -318,12 +373,9 @@ class EventStore:
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._events, self._malformed_tail_offset = self._read_unlocked()
+        self._events = _repair_legacy_sequences(self._events)
         self._sequences = [event.sequence for event in self._events]
-        self._sequences_monotonic = all(
-            previous <= current
-            for previous, current in zip(self._sequences, self._sequences[1:], strict=False)
-        )
-        self._next_sequence = max(self._sequences, default=0) + 1
+        self._next_sequence = self._sequences[-1] + 1 if self._sequences else 1
 
     def append(self, event: RunEvent) -> RunEvent:  # noqa: D102  # tracked: #288
         with self._changed:
@@ -361,13 +413,8 @@ class EventStore:
             return self._events_after_unlocked(after_sequence)
 
     def _events_after_unlocked(self, after_sequence: int) -> list[RunEvent]:
-        if self._sequences_monotonic:
-            start = bisect_right(self._sequences, after_sequence)
-            events = self._events[start:]
-        else:
-            # Preserve the historical file-order filtering semantics for a
-            # manually edited or legacy log whose sequences are not sorted.
-            events = [event for event in self._events if event.sequence > after_sequence]
+        start = bisect_right(self._sequences, after_sequence)
+        events = self._events[start:]
         return [event.model_copy(deep=True) for event in events]
 
     def _read_unlocked(self) -> tuple[list[RunEvent], int | None]:
@@ -389,6 +436,21 @@ class EventStore:
                     return events, record_offset
                 raise
         return events, None
+
+
+def _repair_legacy_sequences(events: list[RunEvent]) -> list[RunEvent]:
+    """Expose a stable, strictly increasing cursor without rewriting the audit log."""
+    repaired: list[RunEvent] = []
+    last_sequence = 0
+    for event in events:
+        repaired_event = (
+            event.model_copy(update={"sequence": last_sequence + 1}, deep=True)
+            if event.sequence <= last_sequence
+            else event
+        )
+        repaired.append(repaired_event)
+        last_sequence = repaired_event.sequence
+    return repaired
 
 
 def make_event(event_type: EventType, text: str = "", **fields: Any) -> RunEvent:  # noqa: ANN401, D103  # tracked: #288

@@ -425,9 +425,15 @@ def append_orchestrator_plan(  # noqa: D103  # tracked: #288
     revert_line = ""
     if plan.revert_to_round is not None:
         revert_line = f"- **revert_to_round**: {plan.revert_to_round}\n"
+    strategy_lines = "".join(
+        f"- **hypothesis_update**: {update.hypothesis_id} -> "
+        f"{update.disposition}: {update.reason}\n"
+        for update in plan.hypothesis_updates
+    )
     block = (
         f"## Round {round_number} — Orchestrator (plan)\n"
         f"{revert_line}"
+        f"{strategy_lines}"
         f"- **hypothesis_id**: {plan.hypothesis_id or '(unspecified)'}\n"
         f"- **reasoning**: {plan.reasoning}\n\n"
         f"### Hypothesis\n{plan.hypothesis or '(unspecified)'}\n\n"

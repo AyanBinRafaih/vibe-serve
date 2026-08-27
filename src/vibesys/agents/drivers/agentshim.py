@@ -29,6 +29,7 @@ from vibesys.agents.contracts import (
 )
 from vibesys.agents.docker_executor import DockerCommandExecutor
 from vibesys.agents.host_resource_declarations import declare_agent_host_resources
+from vibesys.server.events import CommandResultPayload
 from vs_sandbox import build_host_sandbox
 
 AGENTSHIM_CAPABILITIES = AgentCapabilities(
@@ -62,6 +63,12 @@ _PROVIDER_CLASSES: dict[str, _ProviderFactory] = {
     "codex": CodexCodingAgent,
     "opencode": OpencodeCodingAgent,
 }
+
+
+def supported_providers() -> list[str]:
+    """Return the sorted provider names the AgentShim driver can run."""
+    return sorted(_PROVIDER_CLASSES)
+
 
 _REASONING_EFFORT_PROVIDERS = frozenset({"codex", "claude"})
 _PYTHON_MCP_COMMANDS = frozenset({"python", "python3"})
@@ -157,6 +164,12 @@ class _AgentShimEventHandler:
                     "stderr": stderr,
                     "exit_code": exit_code,
                     "duration": duration,
+                    "result_payload": CommandResultPayload(
+                        stdout=stdout,
+                        stderr=stderr,
+                        exit_code=exit_code,
+                        duration=duration,
+                    ),
                 },
             )
         )
