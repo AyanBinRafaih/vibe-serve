@@ -565,7 +565,12 @@ export function entryCells(entry: HypothesisEntry, columns: Columns): EntryCells
     fitColumn(formatRounds(entry), ROUNDS_WIDTH),
   ];
   if (columns.claim) {
-    leading.push(fitColumn(sentenceCase(entry.claim ?? entry.action ?? '—'), columns.claimWidth));
+    leading.push(
+      fitColumn(
+        sentenceCase(entry.title ?? entry.claim ?? entry.action ?? '—'),
+        columns.claimWidth,
+      ),
+    );
   }
   if (columns.measured) leading.push(fitColumn(formatMeasured(entry), MEASURED_WIDTH));
   return {

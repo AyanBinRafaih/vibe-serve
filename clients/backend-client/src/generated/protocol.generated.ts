@@ -274,6 +274,7 @@ export type ProfileSkipped = boolean;
 export type Performance = PerformanceRound[];
 export type HypothesisId = string;
 export type Identified = boolean;
+export type Title = string | null;
 export type Claim = string | null;
 export type Action1 = string | null;
 export type FirstRound = number;
@@ -696,6 +697,7 @@ export interface PerformanceRound {
 export interface HypothesisEntry {
   hypothesis_id: HypothesisId;
   identified?: Identified;
+  title?: Title;
   claim?: Claim;
   action?: Action1;
   first_round: FirstRound;

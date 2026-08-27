@@ -108,6 +108,61 @@ def test_projection_surfaces_active_hypothesis_before_a_round_finishes() -> None
     assert entry.claim == "claim for H-02"
 
 
+def test_projection_uses_the_orchestrator_title_when_present() -> None:
+    hypothesis = _hypothesis(
+        "H-01",
+        1,
+        plan=OrchestratorPlan(
+            hypothesis_id="H-01",
+            title="Batch decode requests",
+            hypothesis="claim for H-01",
+            task="test H-01",
+            pass_criteria="",
+            reasoning="",
+        ),
+    )
+
+    (entry,) = build_experiment_log(AgentRunState(hypotheses=[hypothesis]))
+
+    assert entry.title == "Batch decode requests"
+
+
+def test_projection_derives_a_title_from_the_claim_when_the_plan_title_is_empty() -> None:
+    hypothesis = _hypothesis(
+        "H-01",
+        1,
+        plan=OrchestratorPlan(
+            hypothesis_id="H-01",
+            hypothesis="Batching decode requests reduces overhead. More detail follows.",
+            task="test H-01",
+            pass_criteria="",
+            reasoning="",
+        ),
+    )
+
+    (entry,) = build_experiment_log(AgentRunState(hypotheses=[hypothesis]))
+
+    assert entry.title == "Batching decode requests reduces overhead"
+
+
+def test_projection_title_is_none_without_any_text() -> None:
+    hypothesis = _hypothesis(
+        "H-01",
+        1,
+        plan=OrchestratorPlan(
+            hypothesis_id="H-01",
+            hypothesis="",
+            task="test H-01",
+            pass_criteria="",
+            reasoning="",
+        ),
+    )
+
+    (entry,) = build_experiment_log(AgentRunState(hypotheses=[hypothesis]))
+
+    assert entry.title is None
+
+
 def test_projection_orders_hypotheses_by_started_round() -> None:
     state = AgentRunState(
         hypotheses=[

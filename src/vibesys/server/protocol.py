@@ -155,6 +155,10 @@ class HypothesisEntry(ProtocolModel):
     # directory written before hypothesis tracking. The row is still returned
     # so history stays complete; clients render it as an explicit placeholder.
     identified: bool = True
+    # Backend-derived display title: the orchestrator's own title, or a
+    # fallback derived from ``claim`` when the orchestrator gave none. None
+    # when there is no text to title at all.
+    title: str | None = None
     claim: str | None = None
     action: str | None = None
     first_round: int

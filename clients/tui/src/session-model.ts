@@ -605,7 +605,7 @@ function hypothesisLabel(entry: HypothesisEntry): string {
     entry.first_round === entry.last_round
       ? `r${entry.first_round}`
       : `r${entry.first_round}-${entry.last_round}`;
-  return `${entry.hypothesis_id} · ${range}`;
+  return `${entry.title ?? entry.hypothesis_id} · ${range}`;
 }
 
 export function selectedExperiment(state: SessionState): HypothesisEntry | null {

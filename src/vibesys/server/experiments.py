@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+from vibesys.schemas import derive_hypothesis_title
 from vibesys.server.protocol import HypothesisEntry, HypothesisRound
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ def _entry(hypothesis: Hypothesis, *, active_id: str | None) -> HypothesisEntry:
     measurement = hypothesis.measurement
     return HypothesisEntry(
         hypothesis_id=hypothesis.hypothesis_id,
+        title=_text(hypothesis.plan.title) or derive_hypothesis_title(hypothesis.plan.hypothesis),
         claim=_text(hypothesis.plan.hypothesis),
         action=_text(hypothesis.plan.task),
         first_round=hypothesis.started_round,

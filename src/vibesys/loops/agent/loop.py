@@ -72,6 +72,7 @@ from vibesys.schemas import (
     ValidationRecipe,
     ValidationRecipeArtifact,
     Verdict,
+    normalize_hypothesis_title,
 )
 from vibesys.server.events import (
     BenchmarkResultData,
@@ -1079,6 +1080,7 @@ def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
         reuse_session=False,
     )
     plan.hypothesis_id = plan.hypothesis_id.strip() or f"hypothesis-{round_number:04d}"
+    plan.title = normalize_hypothesis_title(plan.title)
     _validate_orchestrator_plan_state(plan, agent_run_state)
     plan.recommended_skills, _ = _validate_skill_selections(ctx, plan.recommended_skills)
     issue_board.write_plan_artifact(progress_path, round_number, plan)
