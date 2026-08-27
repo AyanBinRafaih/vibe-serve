@@ -143,6 +143,14 @@ export class ChatPaneView {
     this.#composer.focus();
   }
 
+  navigateSuggestions(direction: 1 | -1): boolean {
+    return this.#composer.navigateSuggestions(direction);
+  }
+
+  completeSuggestion(): boolean {
+    return this.#composer.completeSuggestion();
+  }
+
   render(state: SessionState, visible: boolean, width: number): void {
     this.output.visible = visible;
     if (!visible) {

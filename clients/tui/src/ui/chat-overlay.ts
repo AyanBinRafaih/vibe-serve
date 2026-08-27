@@ -134,4 +134,12 @@ export class ChatOverlayView {
   isComposerEmpty(): boolean {
     return this.#composer.isEmpty();
   }
+
+  navigateSuggestions(direction: 1 | -1): boolean {
+    return this.#composer.navigateSuggestions(direction);
+  }
+
+  completeSuggestion(): boolean {
+    return this.#composer.completeSuggestion();
+  }
 }

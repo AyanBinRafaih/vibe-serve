@@ -385,6 +385,14 @@ export function createOpenTuiApp(
   const unbindKeys = bindKeybindings(renderer, controller, viewport, clipboard, {
     completeInput: () => commandInput.completeSuggestion(),
     navigateSuggestions: direction => commandInput.navigateSuggestions(direction),
+    // Routed to whichever chat presentation is currently on screen: the
+    // modal wins while it is open, otherwise the docked pane.
+    navigateChatSuggestions: direction =>
+      controller.state.chatOpen
+        ? chat.navigateSuggestions(direction)
+        : chatPane.navigateSuggestions(direction),
+    completeChatInput: () =>
+      controller.state.chatOpen ? chat.completeSuggestion() : chatPane.completeSuggestion(),
     // Enter belongs to a pane only when nothing is typed anywhere. Asking which
     // box has the cursor is not enough: a question waiting in the other box is
     // still a question, and Enter must never discard it to open a hypothesis.

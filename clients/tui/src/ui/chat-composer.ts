@@ -7,6 +7,7 @@ import {
 } from '@opentui/core';
 import {suggestChatSlashCommands} from '../commands.js';
 import type {ChatMenuRow, SessionState} from '../session-model.js';
+import {SuggestionMenu} from './suggestion-menu.js';
 import type {Theme} from './theme.js';
 
 const MIN_EDITOR_ROWS = 1;
@@ -27,13 +28,20 @@ class ChatTextareaRenderable extends TextareaRenderable {
   }
 }
 
-/** Draft shared by the docked and modal presentations of experiment chat. */
+/**
+ * Draft shared by the docked and modal presentations of experiment chat. The
+ * typed-command suggestion menu lives here too, alongside the text it is
+ * derived from, so switching which presentation is on screen never resets or
+ * duplicates the highlighted suggestion (see the multi-parent note on
+ * `ChatComposerView` below).
+ */
 export interface ChatDraft {
   value: string;
+  readonly suggestions: SuggestionMenu;
 }
 
 export function createChatDraft(): ChatDraft {
-  return {value: ''};
+  return {value: '', suggestions: new SuggestionMenu()};
 }
 
 /**
@@ -106,6 +114,7 @@ export class ChatComposerView {
       onContentChange: () => {
         this.draft.value = this.#editor.plainText;
         this.#resize();
+        this.#syncSuggestions();
         // Typing does not go through the controller, so the command
         // suggestions have to follow the draft rather than a state change.
         if (this.#lastState !== null) this.renderMenu(this.#lastState);
@@ -182,15 +191,42 @@ export class ChatComposerView {
         ...rows.map(({row, index}) => menuRowText(row, index === menu.selected, menu.customModels)),
       ];
     }
-    const suggestions = suggestChatSlashCommands(this.draft.value.trim());
-    if (suggestions.length === 0) return null;
-    return suggestions.map(command => `  ${command.name.padEnd(10)} ${command.description}`);
+    if (!this.draft.suggestions.visible) return null;
+    return this.draft.suggestions.renderLines(this.draft.value.trim());
+  }
+
+  /**
+   * Highlights, navigates, and Tab-completes the typed-command suggestions
+   * the same way the command bar does. Callers gate these on the menu
+   * actually showing suggestions (rather than the controller-owned
+   * `ChatMenu`), since both share the one inline list.
+   */
+  navigateSuggestions(direction: 1 | -1): boolean {
+    if (!this.draft.suggestions.navigate(direction)) return false;
+    if (this.#lastState !== null) this.renderMenu(this.#lastState);
+    return true;
+  }
+
+  completeSuggestion(): boolean {
+    const value = this.draft.suggestions.complete(this.draft.value);
+    if (value === null) return false;
+    this.#editor.setText(value);
+    this.#editor.cursorOffset = value.length;
+    return true;
+  }
+
+  /** Recomputes the typed-command matches for the draft's current text. */
+  #syncSuggestions(): void {
+    this.draft.suggestions.setMatches(suggestChatSlashCommands(this.draft.value.trim()));
   }
 
   /** Makes this editor authoritative when its presentation becomes visible. */
   activate(availableWidth: number, focused: boolean, pending: boolean): void {
     this.#availableWidth = Math.max(1, availableWidth);
-    if (this.#editor.plainText !== this.draft.value) this.#editor.setText(this.draft.value);
+    if (this.#editor.plainText !== this.draft.value) {
+      this.#editor.setText(this.draft.value);
+      this.#syncSuggestions();
+    }
     this.setFocused(focused);
     this.#box.title = pending ? ' Message · awaiting agent ' : ' Message ';
     this.#hint.content = pending
@@ -244,6 +280,7 @@ export class ChatComposerView {
     this.draft.value = '';
     this.#editor.clear();
     this.#resize();
+    this.#syncSuggestions();
     this.onSubmit(value);
   }
 }

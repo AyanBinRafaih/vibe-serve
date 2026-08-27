@@ -1,5 +1,11 @@
 import {afterEach, describe, expect, it} from 'bun:test';
-import {CliRenderEvents, InputRenderable, rgbToHex, ScrollBoxRenderable} from '@opentui/core';
+import {
+  CliRenderEvents,
+  InputRenderable,
+  rgbToHex,
+  ScrollBoxRenderable,
+  TextareaRenderable,
+} from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
 import type {ChatOptions, HypothesisEntry} from '@vibesys/backend-client';
 import {parseChatCommand} from '../commands.js';
@@ -2887,6 +2893,123 @@ describe('theming', () => {
     expect(rows.findIndex(row => row.includes('/model'))).toBeLessThan(
       rows.findIndex(row => row.includes('Message')),
     );
+  });
+
+  it('highlights and navigates the chat composer suggestions like the command bar', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    // /clear, /model, /resume: the composer's own command set, in that order.
+    await testRenderer.mockInput.typeText('/');
+    const first = await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    expect(first).toContain('› /clear');
+
+    testRenderer.mockInput.pressArrow('down');
+    const second = await testRenderer.waitForFrame(value => value.includes('› /model'));
+    expect(second).not.toContain('› /clear');
+
+    testRenderer.mockInput.pressArrow('down');
+    const third = await testRenderer.waitForFrame(value => value.includes('› /resume'));
+    expect(third).not.toContain('› /model');
+  });
+
+  it('fills the highlighted chat composer suggestion into the composer with Tab', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    testRenderer.mockInput.pressArrow('down');
+    await testRenderer.waitForFrame(value => value.includes('› /model'));
+
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('/model');
+
+    // The highlighted match already equals the typed text, so a second Tab
+    // does not clobber what was just filled in.
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    expect(editor.plainText).toBe('/model');
+  });
+
+  it('leaves the chat composer alone when Tab has no suggestion to complete', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('what is running?');
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('what is running?');
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
+  it('dismisses the chat composer suggestion menu once nothing matches', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+
+    await testRenderer.mockInput.typeText('zz');
+    const frame = await testRenderer.waitForFrame(value => value.includes('/zz'));
+    expect(frame).not.toContain('/clear');
+    expect(frame).not.toContain('/model');
+    expect(frame).not.toContain('/resume');
+
+    // Nothing to complete once the menu is gone: Tab is a no-op.
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('/zz');
+  });
+
+  it('fills the highlighted suggestion into the modal chat composer with Tab', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController({...initialSessionState(), chatOpen: true});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Ask a question about'));
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    testRenderer.mockInput.pressArrow('down');
+    await testRenderer.waitForFrame(value => value.includes('› /model'));
+
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-modal-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable))
+      throw new Error('modal composer editor was missing');
+    expect(editor.plainText).toBe('/model');
+    // Only the modal moved; the docked chat is not on screen to disturb.
+    expect(controller.state.chatOpen).toBe(true);
   });
 
   it('answers unknown composer slash input with the chat help', async () => {

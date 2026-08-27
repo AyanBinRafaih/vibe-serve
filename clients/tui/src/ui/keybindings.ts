@@ -6,6 +6,10 @@ import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 export interface KeybindingActions {
   completeInput(): boolean;
   navigateSuggestions(direction: 1 | -1): boolean;
+  /** Navigates the chat composer's own typed-command suggestions, docked or modal. */
+  navigateChatSuggestions(direction: 1 | -1): boolean;
+  /** Tab-completes the chat composer's highlighted typed-command suggestion. */
+  completeChatInput(): boolean;
   inputIsEmpty(): boolean;
   closeChat(): void;
   toggleLatestPrompt(): void;
@@ -110,16 +114,26 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    if (
-      chatPaneFocused(controller.state) &&
-      (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape')
-    ) {
-      if (key.name === 'escape') controller.focusPane('left');
-      else actions.scrollChatPane(key.name === 'pageup' ? -1 : 1);
-      key.preventDefault();
+    if (chatPaneFocused(controller.state)) {
+      if (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape') {
+        if (key.name === 'escape') controller.focusPane('left');
+        else actions.scrollChatPane(key.name === 'pageup' ? -1 : 1);
+        key.preventDefault();
+        return;
+      }
+      // The typed-command suggestions take Up/Down/Tab only while they are
+      // showing; otherwise the keys fall through to the editor underneath
+      // (multiline cursor movement, and Tab's ordinary no-op).
+      if (key.name === 'up' || key.name === 'down') {
+        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
+        return;
+      }
+      if (key.name === 'tab' && !key.shift) {
+        if (actions.completeChatInput()) key.preventDefault();
+        return;
+      }
       return;
     }
-    if (chatPaneFocused(controller.state)) return;
     if (controller.state.themePicker !== null) {
       if (key.name === 'up') controller.moveThemeSelection(-1);
       else if (key.name === 'down') controller.moveThemeSelection(1);
@@ -138,6 +152,16 @@ export function bindKeybindings(
         if (controller.state.layout.right !== null) controller.closeOverlays();
         else actions.closeChat();
         key.preventDefault();
+        return;
+      }
+      // Same suggestion-menu priority as the docked chat above.
+      if (key.name === 'up' || key.name === 'down') {
+        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
+        return;
+      }
+      if (key.name === 'tab' && !key.shift) {
+        if (actions.completeChatInput()) key.preventDefault();
+        return;
       }
       return;
     }
