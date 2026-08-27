@@ -184,7 +184,14 @@ def _create_context(  # noqa: PLR0913
 
 def _git(project: Path, *args: str) -> str:
     return subprocess.run(  # noqa: S603
-        ["git", *args],  # noqa: S607
+        [
+            "git",
+            "-c",
+            "user.name=VibeSys Test",
+            "-c",
+            "user.email=test@vibesys.invalid",
+            *args,
+        ],  # noqa: S607
         cwd=project,
         check=True,
         capture_output=True,
