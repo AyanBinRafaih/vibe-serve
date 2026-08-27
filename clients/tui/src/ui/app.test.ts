@@ -3254,6 +3254,36 @@ describe('theming', () => {
     expect(controller.state.layout.focus).toBe('left');
   });
 
+  it('shows the hypothesis title as a heading in the detail view', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 22});
+    const controller = logController();
+    controller.experiments = [
+      logEntry('H-01', 1, 1, {
+        title: 'Batch prefill to cut latency',
+        claim: 'batching the prefill step reduces latency',
+      }),
+      logEntry('H-02', 2, 2, {claim: 'untitled legacy hypothesis'}),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      hypothesisDetail: {entryKey: 'H-01', selectedRound: 1},
+    });
+
+    const titled = await testRenderer.waitForFrame(value => value.includes('Hypothesis H-01'));
+    expect(titled).toContain('Batch prefill to cut latency');
+
+    controller.publish({
+      ...controller.state,
+      hypothesisDetail: {entryKey: 'H-02', selectedRound: 2},
+    });
+    const untitled = await testRenderer.waitForFrame(value => value.includes('Hypothesis H-02'));
+    expect(untitled).toContain('untitled legacy hypothesis');
+    expect(untitled).not.toContain('Batch prefill to cut latency');
+  });
+
   it('opens hypothesis detail from a row click and keeps pane clicks routed', async () => {
     const testRenderer = await createTestRenderer({width: 200, height: 22});
     const controller = logController();
