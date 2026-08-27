@@ -32,18 +32,15 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "loguru>=0.7.2",
     "openevolve==0.3.1",
+    # Agent driver selected with `[agent].driver = "omnigent"`. A fast-moving
+    # alpha, pinned exactly; carried in the base dependencies so every install
+    # can run omnigent-configured projects without an extra.
+    "omnigent==0.10.0",
 ]
 
 [project.urls]
 Repository = "https://github.com/uw-syfi/vibesys"
 Issues = "https://github.com/uw-syfi/vibesys/issues"
-
-[project.optional-dependencies]
-# Optional agent driver selected with `[agent].driver = "omnigent"`. Kept out
-# of the base dependencies because it is a fast-moving alpha with no stability
-# policy, so users of other drivers should not carry it. Install with
-# `uv sync --extra omnigent`.
-omnigent = ["omnigent==0.10.0"]
 
 [project.scripts]
 vibesys-issue-mcp = "vs_issue_board.mcp:main"
@@ -83,11 +80,6 @@ dev = [
     # could silently change what CI enforces under the strict rule set below.
     "ruff==0.15.12",
     "twine",
-    # Optional for users, required for contributors: without it pyright cannot
-    # resolve the Omnigent backend and its tests silently skip. `uv sync --dev`
-    # (what CI runs) therefore installs it. Version comes from the extra, so
-    # there is one pin.
-    "vibesys[omnigent]",
 ]
 test = [
     "hypothesis",
