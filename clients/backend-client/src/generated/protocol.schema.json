@@ -406,6 +406,55 @@
       "title": "CommandAck",
       "type": "object"
     },
+    "CommandResultPayload": {
+      "description": "Structured result of a command-style tool execution.",
+      "properties": {
+        "kind": {
+          "const": "command",
+          "default": "command",
+          "title": "Kind",
+          "type": "string"
+        },
+        "stdout": {
+          "title": "Stdout",
+          "type": "string"
+        },
+        "stderr": {
+          "title": "Stderr",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration"
+        }
+      },
+      "required": [
+        "stdout",
+        "stderr"
+      ],
+      "title": "CommandResultPayload",
+      "type": "object"
+    },
     "ConfigurationFailedData": {
       "properties": {
         "kind": {
@@ -1107,6 +1156,35 @@
         "user_prompt"
       ],
       "title": "InvocationStartedData",
+      "type": "object"
+    },
+    "JsonResultPayload": {
+      "description": "A tool result that is a JSON object or array, already parsed.",
+      "properties": {
+        "kind": {
+          "const": "json",
+          "default": "json",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "items": {},
+              "type": "array"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "JsonResultPayload",
       "type": "object"
     },
     "JudgeResultData": {
@@ -2189,6 +2267,32 @@
           "default": false,
           "title": "Is Error",
           "type": "boolean"
+        },
+        "payload": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "command": "#/$defs/CommandResultPayload",
+                  "json": "#/$defs/JsonResultPayload"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/CommandResultPayload"
+                },
+                {
+                  "$ref": "#/$defs/JsonResultPayload"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payload"
         }
       },
       "required": [

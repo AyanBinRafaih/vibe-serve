@@ -44,6 +44,7 @@ from vibesys.agents.omnigent.providers import (
     OmnigentExecutorSpec,
     supported_providers,
 )
+from vibesys.server.events import CommandResultPayload, JsonResultPayload, ToolResultPayload
 from vs_sandbox import HostResourceContext
 
 if TYPE_CHECKING:
@@ -351,6 +352,28 @@ def _emit(observer: AgentObserver | None, event: AgentEvent) -> None:
         observer.on_event(event)
 
 
+def _tool_result_payload(
+    result: Any,  # noqa: ANN401
+    error: str | None,
+    duration: float,
+) -> ToolResultPayload:
+    """Map the structure Omnigent actually reported, never guessing.
+
+    A dict or list result is preserved as parsed JSON (coerced through
+    ``json.dumps`` so the event always serializes); anything else keeps the
+    command shape the flattened ``stdout``/``stderr`` strings already carry.
+    """
+    if isinstance(result, (dict, list)):
+        value = json.loads(json.dumps(result, default=repr))
+        return JsonResultPayload(value=value)
+    return CommandResultPayload(
+        stdout=str(result) if result is not None else "",
+        stderr=str(error) if error is not None else "",
+        exit_code=None,
+        duration=duration,
+    )
+
+
 async def _drive_turn(
     executor: Any,  # noqa: ANN401
     *,
@@ -397,6 +420,7 @@ async def _drive_turn(
                 ),
             )
         elif isinstance(event, ToolCallComplete):
+            duration = event.duration_ms / 1000
             _emit(
                 observer,
                 AgentEvent(
@@ -406,8 +430,9 @@ async def _drive_turn(
                         "stdout": str(event.result) if event.result is not None else "",
                         "stderr": str(event.error) if event.error is not None else "",
                         "exit_code": None,
-                        "duration": event.duration_ms / 1000,
+                        "duration": duration,
                         "status": getattr(event.status, "value", str(event.status)),
+                        "result_payload": _tool_result_payload(event.result, event.error, duration),
                     },
                 ),
             )

@@ -32,6 +32,7 @@ from vibesys.agents.contracts import (
     MCPServerSpec,
     SessionDisposition,
 )
+from vibesys.server.events import CommandResultPayload, JsonResultPayload
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -89,12 +90,18 @@ class _LoggerObserver:
         elif event.kind is AgentEventKind.TOOL_RESULT:
             exit_code = event.payload.get("exit_code")
             duration = event.payload.get("duration")
+            result_payload = event.payload.get("result_payload")
             self._logger.on_tool_result(
                 str(event.payload.get("tool", "unknown")),
                 stdout=str(event.payload.get("stdout", event.text or "")),
                 stderr=str(event.payload.get("stderr", "")),
                 exit_code=exit_code if isinstance(exit_code, int) else None,
                 duration=float(duration) if isinstance(duration, (int, float)) else None,
+                payload=(
+                    result_payload
+                    if isinstance(result_payload, (CommandResultPayload, JsonResultPayload))
+                    else None
+                ),
             )
         elif event.kind is AgentEventKind.USAGE and event.usage is not None:
             self._logger.update_usage(_usage_dict(event.usage))

@@ -39,6 +39,7 @@ from vibesys.agents.drivers.omnigent import (
 )
 from vibesys.agents.omnigent.providers import OMNIGENT_PROVIDER_EXECUTORS
 from vibesys.schemas import JudgeResponse
+from vibesys.server.events import CommandResultPayload, JsonResultPayload
 from vs_sandbox import HostResource, ProjectPathPolicy
 
 omnigent = pytest.importorskip("omnigent")
@@ -459,6 +460,43 @@ def test_turn_normalizes_events_usage_schema_and_session_id(tmp_path: Path) -> N
         "usage",
     ]
     driver.close()
+
+
+def test_tool_call_complete_attaches_typed_result_payloads(tmp_path: Path) -> None:
+    executor = _FakeExecutor(
+        [
+            ToolCallComplete(name="query", result={"rows": [1, 2]}, duration_ms=250),
+            ToolCallComplete(name="list", result=["a", "b"], duration_ms=100),
+            ToolCallComplete(name="shell", result="stdout text", error="boom", duration_ms=500),
+            TurnComplete(response="final"),
+        ]
+    )
+    driver, session = _session(tmp_path, executor)
+    observer = _Observer()
+
+    session.run_turn(AgentTurnRequest("go"), observer)
+    driver.close()
+
+    results = [event.payload for event in observer.events if event.kind.value == "tool_result"]
+    assert [payload["tool"] for payload in results] == ["query", "list", "shell"]
+
+    json_payload = results[0]["result_payload"]
+    assert isinstance(json_payload, JsonResultPayload)
+    assert json_payload.value == {"rows": [1, 2]}
+    # content stays the flattened string even when the payload is typed JSON.
+    assert results[0]["stdout"] == str({"rows": [1, 2]})
+
+    list_payload = results[1]["result_payload"]
+    assert isinstance(list_payload, JsonResultPayload)
+    assert list_payload.value == ["a", "b"]
+
+    command_payload = results[2]["result_payload"]
+    assert command_payload == CommandResultPayload(
+        stdout="stdout text",
+        stderr="boom",
+        exit_code=None,
+        duration=0.5,
+    )
 
 
 def test_turn_complete_response_wins_and_chunks_are_fallback(tmp_path: Path) -> None:
