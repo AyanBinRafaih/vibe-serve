@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from vibesys.loops.agent.model import AgentRunState, Hypothesis, HypothesisStrategy
 from vibesys.loops.agent.state import AgentRunStateStore
-from vibesys.schemas import OrchestratorPlan
+from vibesys.schemas import HypothesisStrategyUpdate, OrchestratorPlan
 from vs_loop_state import RoundRecord
 from vs_project import (
     PlainRunConfiguration,
@@ -217,3 +217,79 @@ def test_existing_unified_state_wins_over_legacy_inputs(tmp_path) -> None:  # no
     store.save(unified)
 
     assert store.migrate_legacy(rounds=[], local_namespace=local) == unified
+
+
+def test_legacy_migration_normalizes_rounds_without_hypothesis_ids(tmp_path) -> None:  # noqa: ANN001
+    project = _project(tmp_path)
+    portable = project.state.portable_namespace("run-1", "agent")
+    local = project.state.local_namespace("run-1", "agent")
+    record = RoundRecord(
+        round_number=1,
+        commit="a" * 40,
+        perf_metric=10.0,
+        perf_unit="ops",
+        passed=True,
+    )
+
+    migrated = AgentRunStateStore(portable).migrate_legacy(
+        rounds=[record],
+        local_namespace=local,
+        legacy_directions={"ops": "max"},
+    )
+
+    assert len(migrated.hypotheses) == 1
+    assert migrated.hypotheses[0].hypothesis_id == "legacy-round-1"
+    assert migrated.hypotheses[0].rounds[0].hypothesis_id == "legacy-round-1"
+
+
+def test_legacy_migration_replays_strategy_updates_from_active_plan(tmp_path) -> None:  # noqa: ANN001
+    project = _project(tmp_path)
+    portable = project.state.portable_namespace("run-1", "agent")
+    local = project.state.local_namespace("run-1", "agent")
+    portable.save(
+        "hypotheses.json",
+        _LegacyLedger(
+            hypotheses=[
+                _LegacyHypothesis(
+                    hypothesis_id="H-1",
+                    started_round=1,
+                    rounds=[1],
+                    strategy="completed",
+                )
+            ]
+        ),
+    )
+    first = RoundRecord(
+        round_number=1,
+        commit="a" * 40,
+        perf_metric=None,
+        perf_unit=None,
+        passed=True,
+        hypothesis_id="H-1",
+    )
+    active_plan = _plan("H-2").model_copy(
+        update={
+            "hypothesis_updates": [
+                HypothesisStrategyUpdate(
+                    hypothesis_id="H-1",
+                    disposition="abandoned",
+                    reason="A better direction supersedes it.",
+                )
+            ]
+        }
+    )
+    local.save(
+        "active.json",
+        _LegacyActive(plan=active_plan, started_round=2, parent_round=1),
+    )
+
+    migrated = AgentRunStateStore(portable).migrate_legacy(
+        rounds=[first],
+        local_namespace=local,
+    )
+
+    prior = migrated.by_id("H-1")
+    assert prior is not None
+    assert prior.strategy is HypothesisStrategy.ABANDONED
+    assert prior.strategy_reason == "A better direction supersedes it."
+    assert migrated.active_hypothesis_id == "H-2"

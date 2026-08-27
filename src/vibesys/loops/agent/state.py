@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
-from vibesys.loops.agent.hypotheses import project_round_evidence
+from vibesys.loops.agent.hypotheses import apply_strategy_updates, project_round_evidence
 from vibesys.loops.agent.model import (
     AgentRunState,
     Hypothesis,
@@ -214,11 +215,16 @@ def _migrate_legacy_state(
     prior_rounds: list[RoundRecord] = []
     for round_record in ordered_rounds:
         identifier = round_record.hypothesis_id or _legacy_unassigned_id(round_record.round_number)
+        normalized_record = (
+            round_record
+            if round_record.hypothesis_id is not None
+            else replace(round_record, hypothesis_id=identifier)
+        )
         hypothesis = state.by_id(identifier)
         assert hypothesis is not None  # noqa: S101  # created above
         projected = project_round_evidence(
             hypothesis,
-            round_record,
+            normalized_record,
             prior_rounds=prior_rounds,
             legacy_directions=legacy_directions,
         )
@@ -226,12 +232,18 @@ def _migrate_legacy_state(
             index for index, item in enumerate(state.hypotheses) if item.hypothesis_id == identifier
         )
         state.hypotheses[index] = projected
-        prior_rounds.append(round_record)
+        prior_rounds.append(normalized_record)
 
+    if active is not None:
+        state = apply_strategy_updates(state, active.plan.hypothesis_updates)
     active_identifier = _legacy_active_id(ledger, active)
     if active_identifier is not None and state.by_id(active_identifier) is not None:
-        active_hypothesis = state.by_id(active_identifier)
-        assert active_hypothesis is not None  # noqa: S101  # guarded above
+        active_index = next(
+            index
+            for index, hypothesis in enumerate(state.hypotheses)
+            if hypothesis.hypothesis_id == active_identifier
+        )
+        active_hypothesis = state.hypotheses[active_index]
         active_hypothesis.strategy = HypothesisStrategy.AVAILABLE
         active_hypothesis.strategy_reason = None
         state.active_hypothesis_id = active_identifier

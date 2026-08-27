@@ -108,7 +108,7 @@ class Hypothesis(BaseModel):
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 "hypothesis rounds must be unique and ordered"
             )
-        if any(record.hypothesis_id not in {None, self.hypothesis_id} for record in self.rounds):
+        if any(record.hypothesis_id != self.hypothesis_id for record in self.rounds):
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 "round hypothesis_id must match its owning hypothesis"
             )
@@ -151,15 +151,16 @@ class AgentRunState(BaseModel):
         return self
 
     def by_id(self, hypothesis_id: str) -> Hypothesis | None:
-        """Return one hypothesis by stable ID."""
-        return next(
+        """Return a detached hypothesis copy by stable ID."""
+        hypothesis = next(
             (item for item in self.hypotheses if item.hypothesis_id == hypothesis_id),
             None,
         )
+        return hypothesis.model_copy(deep=True) if hypothesis is not None else None
 
     @property
     def active_hypothesis(self) -> Hypothesis | None:
-        """Return the active hypothesis, if execution is in progress."""
+        """Return a detached copy of the active hypothesis, if any."""
         if self.active_hypothesis_id is None:
             return None
         return self.by_id(self.active_hypothesis_id)

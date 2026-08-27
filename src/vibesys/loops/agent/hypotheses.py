@@ -239,11 +239,19 @@ def apply_strategy_updates(
                 f"duplicate strategy update for hypothesis {change.hypothesis_id!r}"
             )
         seen.add(change.hypothesis_id)
-        item = updated.by_id(change.hypothesis_id)
-        if item is None:
+        index = next(
+            (
+                index
+                for index, item in enumerate(updated.hypotheses)
+                if item.hypothesis_id == change.hypothesis_id
+            ),
+            None,
+        )
+        if index is None:
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"strategy update names unknown hypothesis {change.hypothesis_id!r}"
             )
+        item = updated.hypotheses[index]
         if updated.active_hypothesis_id == change.hypothesis_id:
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"cannot {change.disposition} active hypothesis {change.hypothesis_id!r}"

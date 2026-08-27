@@ -118,6 +118,19 @@ def test_operational_restart_fields_live_on_the_same_hypothesis() -> None:
     assert state.active_hypothesis.feedback is None
 
 
+def test_aggregate_accessors_do_not_expose_owned_mutable_hypotheses() -> None:
+    state = start_hypothesis(AgentRunState(), _plan("H-1"), started_round=1)
+
+    by_id = state.by_id("H-1")
+    active = state.active_hypothesis
+    assert by_id is not None
+    assert active is not None
+    by_id.feedback = "mutated lookup"
+    active.feedback = "mutated active"
+
+    assert state.hypotheses[0].feedback is None
+
+
 def test_plan_strategy_updates_and_start_are_one_pure_transition() -> None:
     first = start_hypothesis(AgentRunState(), _plan("old"), started_round=1)
     completed = append_round(

@@ -2475,7 +2475,10 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         legacy_directions=legacy_metric_directions,
     )
     active_hypothesis = agent_run_state.active_hypothesis
-    _backfill_revert_commit(active_hypothesis, agent_run_state.rounds)
+    if active_hypothesis is not None and _backfill_revert_commit(
+        active_hypothesis, agent_run_state.rounds
+    ):
+        agent_run_state = update_active_hypothesis(agent_run_state, active_hypothesis)
 
     # Replace the legacy portable namespace exactly, then remove the local
     # restart checkpoint only after its unified replacement is committed.
