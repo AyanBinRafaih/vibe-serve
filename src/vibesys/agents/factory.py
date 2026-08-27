@@ -163,6 +163,7 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
 
     return AgentClient(
         driver,
+        driver_name=driver_name,
         provider=provider,
         skills=skill_source_dirs,
         compute_backend=compute_backend,

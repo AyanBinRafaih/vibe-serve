@@ -13,8 +13,13 @@ import type {AgentPhase} from '@vibesys/core-state';
  * cell coordinates. The renderer owns colors and renderables.
  */
 
-/** Border plus one content row for the kind and one for the status. */
-export const NODE_HEIGHT = 4;
+/**
+ * Border plus one content row each for the kind, the status, and the agent
+ * runtime (harness/model), whether or not the runtime row has anything to
+ * show. A fixed height keeps every node the same size instead of shifting the
+ * layout for nodes that lack runtime identity.
+ */
+export const NODE_HEIGHT = 5;
 /** Blank row between stacked agents in the same column. */
 const ROW_GAP = 2;
 /**

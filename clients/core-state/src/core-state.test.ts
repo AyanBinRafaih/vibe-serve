@@ -114,6 +114,37 @@ describe('core state projection', () => {
     });
   });
 
+  it('captures runtime identity from agent_execution_started when present', () => {
+    const state = reduceEvent(
+      initialCoreState(),
+      executionEvent(1, 'agent_execution_started', 'first', {
+        ...startedData('Implement the queue'),
+        driver: 'agentshim',
+        provider: 'codex',
+        model: 'gpt-5.1-codex-max',
+      }),
+    );
+
+    expect(state.activeExecutions['first']).toMatchObject({
+      driver: 'agentshim',
+      provider: 'codex',
+      model: 'gpt-5.1-codex-max',
+    });
+  });
+
+  it('defaults runtime identity to null when the event omits it', () => {
+    const state = reduceEvent(
+      initialCoreState(),
+      executionEvent(1, 'agent_execution_started', 'first', startedData('Implement the queue')),
+    );
+
+    expect(state.activeExecutions['first']).toMatchObject({
+      driver: null,
+      provider: null,
+      model: null,
+    });
+  });
+
   it('coalesces streamed assistant chunks by invocation', () => {
     let state = initialCoreState();
     state = reduceEvent(state, outputEvent(1, 'hello ', 'turn-1'));

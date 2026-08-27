@@ -102,6 +102,9 @@ class AgentExecutionStartedData(BaseModel):
     system_prompt: str = ""
     user_prompt: str = ""
     activity: AgentExecutionActivityData
+    driver: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
 
 class AgentExecutionFinishedData(BaseModel):

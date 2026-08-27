@@ -66,6 +66,49 @@ def test_explicit_executions_remain_independent_and_finish_idempotently(tmp_path
     )
 
 
+def test_start_agent_execution_records_runtime_identity_when_provided(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.start_agent_execution(
+        "implementer",
+        "round-1",
+        "work",
+        driver="agentshim",
+        provider="codex",
+        model="gpt-5.1-codex-max",
+    )
+
+    started = next(
+        event
+        for event in supervisor.read_events()
+        if event.type is EventType.AGENT_EXECUTION_STARTED
+    )
+    assert started.data is not None
+    assert started.data.kind == "agent_execution_started"
+    assert started.data.driver == "agentshim"
+    assert started.data.provider == "codex"
+    assert started.data.model == "gpt-5.1-codex-max"
+
+
+def test_start_agent_execution_omits_runtime_identity_by_default(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.start_agent_execution("implementer", "round-1", "work")
+
+    started = next(
+        event
+        for event in supervisor.read_events()
+        if event.type is EventType.AGENT_EXECUTION_STARTED
+    )
+    assert started.data is not None
+    assert started.data.kind == "agent_execution_started"
+    assert started.data.driver is None
+    assert started.data.provider is None
+    assert started.data.model is None
+
+
 def test_activity_tracks_todo_and_parallel_tools(tmp_path):  # noqa: ANN001, ANN201
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)

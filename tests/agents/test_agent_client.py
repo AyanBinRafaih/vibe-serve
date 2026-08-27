@@ -457,6 +457,29 @@ def test_invoke_builds_session_and_turn_contracts_and_records_usage(tmp_path: Pa
     assert {key: record[key] for key in expected} == expected
 
 
+def test_runtime_accessors_expose_configured_driver_provider_and_model() -> None:
+    client = AgentClient(
+        _FakeDriver([]),
+        driver_name="agentshim",
+        provider="claude",
+        model_name="claude-base",
+        role_models={"judge": "claude-judge"},
+    )
+
+    assert client.driver_name == "agentshim"
+    assert client.provider == "claude"
+    assert client.model_for_kind("judge") == "claude-judge"
+    assert client.model_for_kind("implementer") == "claude-base"
+
+
+def test_runtime_accessors_default_to_none_or_codex_when_unconfigured() -> None:
+    client = AgentClient(_FakeDriver([]))
+
+    assert client.driver_name is None
+    assert client.provider == "codex"
+    assert client.model_for_kind("implementer") is None
+
+
 def test_invoke_uses_fallback_only_for_unparseable_output(tmp_path: Path) -> None:
     session = _FakeSession(results=[AgentTurnResult("not json")])
     client = AgentClient(_FakeDriver([session]))

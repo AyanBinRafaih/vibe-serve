@@ -182,6 +182,9 @@ export type Stage1 = string;
 export type Attempt1 = number | null;
 export type SystemPrompt1 = string;
 export type UserPrompt1 = string;
+export type Driver = string | null;
+export type Provider = string | null;
+export type Model = string | null;
 export type Kind5 = "agent_execution_finished";
 export type Error2 = string | null;
 export type Kind6 = "output";
@@ -261,7 +264,7 @@ export type Todos = TodoItemData[];
 export type Kind23 = "usage_update";
 export type InputTokens1 = number;
 export type ContextWindow1 = number | null;
-export type Model = string | null;
+export type Model1 = string | null;
 export type Events = RunEvent[];
 export type Round = number;
 export type PerfMetric1 = number;
@@ -507,6 +510,9 @@ export interface AgentExecutionStartedData {
   system_prompt?: SystemPrompt1;
   user_prompt?: UserPrompt1;
   activity: AgentExecutionActivityData;
+  driver?: Driver;
+  provider?: Provider;
+  model?: Model;
   [k: string]: unknown;
 }
 /**
@@ -671,7 +677,7 @@ export interface UsageUpdateData {
   kind?: Kind23;
   input_tokens: InputTokens1;
   context_window?: ContextWindow1;
-  model?: Model;
+  model?: Model1;
   [k: string]: unknown;
 }
 export interface PerformanceRound {
