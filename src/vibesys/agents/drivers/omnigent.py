@@ -177,7 +177,7 @@ def _resolve_executor_spec(provider: str) -> OmnigentExecutorSpec:
 def _missing_omnigent(what: str, exc: ImportError) -> OmnigentDriverError:
     return OmnigentDriverError(
         f"{what} is not importable ({type(exc).__name__}: {exc}). "
-        "Install the Omnigent optional dependency with `uv sync --extra omnigent`."
+        "Reinstall dependencies with `uv sync` (omnigent is a base dependency)."
     )
 
 
