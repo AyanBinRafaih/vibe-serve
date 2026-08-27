@@ -40,13 +40,12 @@ const KEPT_MIN_WIDTH = 104;
  * rather than restating the threshold.
  */
 export const LOG_CLAIM_PANEL_WIDTH = CLAIM_MIN_WIDTH + PANEL_CHROME_COLUMNS;
-/** Panel width that still carries the measured and verdict columns. */
+/** Panel width that still carries the measured column. */
 export const LOG_COMPACT_PANEL_WIDTH = MEASURED_MIN_WIDTH + PANEL_CHROME_COLUMNS;
 
 interface Columns {
   claim: boolean;
   measured: boolean;
-  verdict: boolean;
   kept: boolean;
   claimWidth: number;
 }
@@ -444,12 +443,12 @@ export class ExperimentLogView {
 }
 
 /** Widths of every column except the claim, which absorbs what is left over. */
-const ID_WIDTH = 16;
-const ROUNDS_WIDTH = 9;
-const MEASURED_WIDTH = 12;
-const VERDICT_WIDTH = 9;
-const OUTCOME_WIDTH = 12;
+const ID_WIDTH = 15;
+const ROUNDS_WIDTH = 8;
+const MEASURED_WIDTH = 11;
+const OUTCOME_WIDTH = 11;
 const KEPT_WIDTH = 4;
+const COLUMN_GAP = '  ';
 
 export function resolveColumns(width: number): Columns {
   const claim = width >= CLAIM_MIN_WIDTH;
@@ -459,16 +458,17 @@ export function resolveColumns(width: number): Columns {
     ID_WIDTH +
     ROUNDS_WIDTH +
     OUTCOME_WIDTH +
-    (measured ? MEASURED_WIDTH + VERDICT_WIDTH : 0) +
+    (measured ? MEASURED_WIDTH : 0) +
     (kept ? KEPT_WIDTH : 0);
+  const visibleColumns = 3 + (claim ? 1 : 0) + (measured ? 1 : 0) + (kept ? 1 : 0);
+  const gutterWidth = (visibleColumns - 1) * COLUMN_GAP.length;
   return {
     claim,
     measured,
-    verdict: measured,
     kept,
     // Exactly the remaining width, so the row fills the panel without
     // overflowing it and losing the trailing columns to truncation.
-    claimWidth: claim ? Math.max(20, width - fixed) : 0,
+    claimWidth: claim ? Math.max(20, width - fixed - gutterWidth) : 0,
   };
 }
 
@@ -476,10 +476,9 @@ export function headerRow(columns: Columns): string {
   const parts = [' Hypothesis'.padEnd(ID_WIDTH), 'Rounds'.padEnd(ROUNDS_WIDTH)];
   if (columns.claim) parts.push('Implementation Details'.padEnd(columns.claimWidth));
   if (columns.measured) parts.push('Measured'.padEnd(MEASURED_WIDTH));
-  if (columns.verdict) parts.push('Verdict'.padEnd(VERDICT_WIDTH));
   parts.push('Outcome'.padEnd(OUTCOME_WIDTH));
-  if (columns.kept) parts.push('Kept');
-  return parts.join('');
+  if (columns.kept) parts.push('Kept'.padEnd(KEPT_WIDTH));
+  return parts.join(COLUMN_GAP);
 }
 
 /**
@@ -495,27 +494,30 @@ export interface EntryCells {
 export function entryCells(entry: HypothesisEntry, columns: Columns): EntryCells {
   const marker = entry.active === true ? '▸' : ' ';
   const leading = [
-    `${marker}${truncate(entry.hypothesis_id, ID_WIDTH - 1)}`.padEnd(ID_WIDTH),
-    formatRounds(entry).padEnd(ROUNDS_WIDTH),
+    fitColumn(`${marker}${truncate(entry.hypothesis_id, ID_WIDTH - 1)}`, ID_WIDTH),
+    fitColumn(formatRounds(entry), ROUNDS_WIDTH),
   ];
   if (columns.claim) {
-    leading.push(
-      truncate(sentenceCase(entry.claim ?? entry.action ?? '—'), columns.claimWidth - 1).padEnd(
-        columns.claimWidth,
-      ),
-    );
+    leading.push(fitColumn(sentenceCase(entry.claim ?? entry.action ?? '—'), columns.claimWidth));
   }
-  if (columns.measured) leading.push(formatMeasured(entry).padEnd(MEASURED_WIDTH));
-  if (columns.verdict) {
-    leading.push(sentenceCase(entry.judge_verdict ?? '—').padEnd(VERDICT_WIDTH));
-  }
+  if (columns.measured) leading.push(fitColumn(formatMeasured(entry), MEASURED_WIDTH));
   return {
-    leading: leading.join(''),
-    outcome: truncate(sentenceCase(entry.resolved_outcome ?? 'active'), OUTCOME_WIDTH - 1).padEnd(
+    leading: leading.join(COLUMN_GAP),
+    // These are separate renderables so outcome can carry semantic color.
+    // Put gutters on the following segment rather than relying on trailing
+    // padding surviving across renderable boundaries.
+    outcome: `${COLUMN_GAP}${fitColumn(
+      sentenceCase(entry.active === true ? 'active' : (entry.resolved_outcome ?? '—')),
       OUTCOME_WIDTH,
-    ),
-    trailing: columns.kept ? (entry.kept === true ? 'Yes' : 'No') : '',
+    )}`,
+    trailing: columns.kept
+      ? `${COLUMN_GAP}${fitColumn(entry.kept === true ? 'Yes' : 'No', KEPT_WIDTH)}`
+      : '',
   };
+}
+
+function fitColumn(value: string, width: number): string {
+  return truncate(value, width).padEnd(width);
 }
 
 export function entryRow(entry: HypothesisEntry, columns: Columns): string {
@@ -530,7 +532,8 @@ export function entryRow(entry: HypothesisEntry, columns: Columns): string {
  */
 export function outcomeColor(theme: Theme, entry: HypothesisEntry): string {
   const outcome = entry.resolved_outcome ?? null;
-  if (entry.active === true || outcome === null) return theme.warning;
+  if (entry.active === true) return theme.warning;
+  if (outcome === null) return theme.textPrimary;
   if (outcome === 'proven') return theme.success;
   if (outcome === 'disproven' || outcome === 'rejected') return theme.error;
   return theme.textPrimary;
