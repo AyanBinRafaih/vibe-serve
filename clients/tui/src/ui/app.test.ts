@@ -4,11 +4,20 @@ import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing'
 import type {HypothesisEntry} from '@vibesys/backend-client';
 import type {SessionController} from '../session-controller.js';
 import {
+  advanceNewChatPicker,
   clearAgentSelection,
   clearEntrySelection,
+  closeChatThreadPicker,
   closeOverlays,
   closePane,
   closeThemePicker,
+  moveChatThreadSelection,
+  moveNewChatSelection,
+  openChatThreadPicker,
+  openNewChatPicker,
+  retreatNewChatPicker,
+  setNewChatModel,
+  switchChatThread,
   cyclePaneFocus,
   dismissErrorBanner,
   enterExperimentDrilldown,
@@ -2500,8 +2509,9 @@ describe('theming', () => {
     await testRenderer.mockInput.typeText('/c');
     const frame = await frameAfter(testRenderer);
 
-    // Nothing to open: the chat is the column beside the table.
-    expect(frame).not.toContain('/chat');
+    // Nothing to open: the chat is the column beside the table. The thread
+    // commands (/chats, /new-chat) remain, so match /chat as a whole word.
+    expect(frame).not.toMatch(/\/chat\s/);
   });
 
   it('says when the docked chat is waiting on the agent', async () => {
@@ -2549,6 +2559,140 @@ describe('theming', () => {
       throw new Error('docked chat geometry was missing');
     expect(scroll.x).toBe(pane.x + 2);
     expect(turn.x).toBe(scroll.x);
+  });
+
+  it('switches chat threads, swapping the transcript and the composer draft', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        chatThreads: [
+          ...controller.state.core.chatThreads,
+          {
+            id: 'thread-a',
+            title: 'GPU stalls',
+            driver: 'omnigent',
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
+      },
+      chatConversations: {
+        default: [
+          {id: 'd1', kind: 'assistant', label: 'Answer', content: 'Default thread answer.'},
+        ],
+        'thread-a': [
+          {id: 't1', kind: 'assistant', label: 'Answer', content: 'Stalls come from prefill.'},
+        ],
+      },
+      chatConversation: [
+        {id: 'd1', kind: 'assistant', label: 'Answer', content: 'Default thread answer.'},
+      ],
+    });
+
+    // Focus the docked chat and leave a half-typed question on the default thread.
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('half-typed question');
+    let frame = await frameAfter(testRenderer);
+    expect(frame).toContain('Default thread answer.');
+    expect(frame).toContain('half-typed question');
+
+    controller.switchChatThread('thread-a');
+    frame = await frameAfter(testRenderer);
+    // The pane is titled by the backend-owned thread title, shows the
+    // thread's own transcript, and the other thread's draft is parked.
+    expect(frame).toContain('GPU stalls');
+    expect(frame).toContain('Stalls come from prefill.');
+    expect(frame).not.toContain('Default thread answer.');
+    expect(frame).not.toContain('half-typed question');
+
+    controller.switchChatThread('default');
+    frame = await frameAfter(testRenderer);
+    expect(frame).toContain('Default thread answer.');
+    expect(frame).not.toContain('Stalls come from prefill.');
+    // The parked draft returns with its thread.
+    expect(frame).toContain('half-typed question');
+  });
+
+  it('walks the new-thread wizard from driver to provider to model', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/new-chat');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('New chat thread'));
+    expect(testRenderer.captureCharFrame()).toContain('› agentshim');
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('› omnigent'));
+    testRenderer.mockInput.pressEnter();
+    // The provider list is narrowed to what the chosen driver supports.
+    let frame = await testRenderer.waitForFrame(value =>
+      value.includes('Provider: claude  ◂ choose'),
+    );
+    expect(frame).toContain('› claude');
+    expect(frame).not.toContain('gemini');
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Model:'));
+    // The model step takes ordinary typing instead of the composer beneath it.
+    await testRenderer.mockInput.typeText('opus');
+    frame = await testRenderer.waitForFrame(value => value.includes('Model: opus'));
+    expect(controller.state.newChatPicker).toMatchObject({
+      step: 'model',
+      driver: 'omnigent',
+      provider: 'claude',
+      model: 'opus',
+    });
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
+  it('lists the chat threads and switches to the highlighted one', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        chatThreads: [
+          ...controller.state.core.chatThreads,
+          {
+            id: 'thread-a',
+            title: 'GPU stalls',
+            driver: 'omnigent',
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/chats');
+    testRenderer.mockInput.pressEnter();
+    const frame = await testRenderer.waitForFrame(value => value.includes('Chat threads'));
+    // The implicit default is named by the client; a created thread shows the
+    // backend-owned title beside the agent it was created with.
+    expect(frame).toContain('Experiment chat');
+    expect(frame).toContain('active');
+    expect(frame).toContain('GPU stalls');
+    expect(frame).toContain('omnigent/claude');
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('› GPU stalls'));
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.state.chatThreadPicker === null);
+
+    expect(controller.state.activeChatThreadId).toBe('thread-a');
   });
 
   it('keeps the chat, the table, and the visualization on screen together', async () => {
@@ -3292,11 +3436,53 @@ class FakeController implements SessionController {
       this.#notify();
     }
     if (value.trim() === '/theme') this.openThemePicker();
+    if (value.trim() === '/new-chat') this.openNewChatPicker();
+    if (value.trim() === '/chats') this.openChatThreadPicker();
     return Promise.resolve();
   }
   closeChat(): void {
     this.state = {...this.state, chatOpen: false};
     this.#notify();
+  }
+  switchChatThread(threadId: string): void {
+    this.publish(switchChatThread(this.state, threadId));
+  }
+  openChatThreadPicker(): void {
+    this.publish(openChatThreadPicker(this.state));
+  }
+  moveChatThreadSelection(delta: number): void {
+    this.publish(moveChatThreadSelection(this.state, delta));
+  }
+  applySelectedChatThread(): void {
+    const picker = this.state.chatThreadPicker;
+    if (picker !== null) this.switchChatThread(picker.selected);
+  }
+  closeChatThreadPicker(): void {
+    this.publish(closeChatThreadPicker(this.state));
+  }
+  openNewChatPicker(): void {
+    this.publish(openNewChatPicker(this.state));
+  }
+  moveNewChatSelection(delta: number): void {
+    this.publish(moveNewChatSelection(this.state, delta));
+  }
+  confirmNewChatPicker(): Promise<void> {
+    const picker = this.state.newChatPicker;
+    if (picker === null) return Promise.resolve();
+    if (picker.step !== 'model') this.publish(advanceNewChatPicker(this.state));
+    else this.publish({...this.state, newChatPicker: null});
+    return Promise.resolve();
+  }
+  retreatNewChatPicker(): void {
+    this.publish(retreatNewChatPicker(this.state));
+  }
+  typeNewChatModel(text: string): void {
+    const picker = this.state.newChatPicker;
+    if (picker !== null) this.publish(setNewChatModel(this.state, picker.model + text));
+  }
+  backspaceNewChatModel(): void {
+    const picker = this.state.newChatPicker;
+    if (picker !== null) this.publish(setNewChatModel(this.state, picker.model.slice(0, -1)));
   }
   setTheme(themeName: ThemeName): void {
     this.state = {...this.state, themeName};

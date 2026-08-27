@@ -23,6 +23,7 @@ class EventType(StrEnum):  # noqa: D101  # tracked: #288
     EXPERIMENTS_CHANGED = "experiments_changed"
     RUN_INTERRUPTED = "run_interrupted"
     CHAT = "chat"
+    CHAT_THREAD_CREATED = "chat_thread_created"
     STATUS_QUERY = "status_query"
     CONTROL = "control"
     INVOCATION_STARTED = "invocation_started"
@@ -67,6 +68,25 @@ AgentOutputChannel = Literal["assistant", "analysis", "tool", "diagnostic", "pro
 class ChatData(BaseModel):  # noqa: D101  # tracked: #288
     kind: Literal["chat"] = "chat"
     answer: str
+    # The authoritative thread title, set by the server on the turn that
+    # titles a previously untitled thread so clients learn it from replay.
+    thread_title: str | None = None
+
+
+class ChatThreadCreatedData(BaseModel):
+    """Identity and resolved agent settings for one experiment-chat thread.
+
+    Replayed by clients to rebuild the thread list; the default thread is
+    implicit and never records one of these.
+    """
+
+    kind: Literal["chat_thread_created"] = "chat_thread_created"
+    thread_id: str
+    title: str = ""
+    driver: str
+    provider: str
+    model: str
+    created_at: datetime
 
 
 class InvocationStartedData(BaseModel):  # noqa: D101  # tracked: #288
@@ -278,6 +298,7 @@ class RoundFinishedData(BaseModel):  # noqa: D101  # tracked: #288
 
 EventData = Annotated[
     ChatData
+    | ChatThreadCreatedData
     | InvocationStartedData
     | InvocationFinishedData
     | AgentExecutionStartedData
@@ -320,6 +341,9 @@ class RunEvent(BaseModel):
     agent_kind: str | None = None
     invocation_id: str | None = None
     execution_id: str | None = None
+    # Which experiment-chat thread a chat event belongs to. None is the
+    # default thread, preserving events written before threads existed.
+    chat_thread_id: str | None = None
     data: EventData | None = None
 
     @model_validator(mode="before")

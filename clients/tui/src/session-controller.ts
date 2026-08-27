@@ -9,14 +9,15 @@ import {
 import {helpText, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
+  advanceNewChatPicker,
   applyEvent,
   applyEventBatch,
   applySnapshot,
-  type ConversationEntry,
   chatDocked,
   chatPaneVisible,
   clearAgentSelection,
   clearEntrySelection,
+  closeChatThreadPicker,
   closeOverlays,
   closePane,
   closeThemePicker,
@@ -33,17 +34,23 @@ import {
   leaveExperimentDrilldown,
   leaveHypothesisDetail,
   markEventStreamUnavailable,
+  moveChatThreadSelection,
   moveExperimentSelection,
   moveHypothesisRoundSelection,
+  moveNewChatSelection,
   moveThemeSelection,
+  type NewChatPicker,
   normalizeFocus,
   openChat,
+  openChatThreadPicker,
   openExperimentLog,
   openHypothesisDetail,
+  openNewChatPicker,
   openPane,
   openThemePicker,
   type PaneFocus,
   type PaneView,
+  retreatNewChatPicker,
   type RoundFocus,
   reportError,
   type SessionState,
@@ -57,14 +64,19 @@ import {
   selectPreviousRound,
   selectRound,
   setChatDockFits,
+  setChatThreadPending,
   setExperiments,
+  setNewChatModel,
   setPaneContent,
   setTheme,
   showDetail,
   showLive,
+  switchChatThread,
   togglePaneZoom,
   toggleTodos,
+  updateChatConversation,
 } from './session-model.js';
+import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
 import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
 
 export interface SessionController {
@@ -75,6 +87,20 @@ export interface SessionController {
   closeChat(): void;
   sendChat(value: string): Promise<void>;
   submitChat(value: string): Promise<void>;
+  /** Makes one thread the chat surfaces' subject. */
+  switchChatThread(threadId: string): void;
+  openChatThreadPicker(): void;
+  moveChatThreadSelection(delta: number): void;
+  /** Enter in the thread picker: switch to the highlighted thread. */
+  applySelectedChatThread(): void;
+  closeChatThreadPicker(): void;
+  openNewChatPicker(): void;
+  moveNewChatSelection(delta: number): void;
+  /** Enter in the wizard: next step, or create the thread on the last one. */
+  confirmNewChatPicker(): Promise<void>;
+  retreatNewChatPicker(): void;
+  typeNewChatModel(text: string): void;
+  backspaceNewChatModel(): void;
   live(): void;
   selectNextAgent(): void;
   selectPreviousAgent(): void;
@@ -131,7 +157,7 @@ export class SocketSessionController implements SessionController {
   readonly #listeners = new Set<(state: SessionState) => void>();
   #eventSubscription: EventSubscription | null = null;
   #chatMessageId = 0;
-  readonly #chatQueue: Array<{id: string; text: string}> = [];
+  readonly #chatQueue: Array<{id: string; text: string; threadId: string}> = [];
   #chatDrain: Promise<void> | null = null;
   /** Single-flight guard for semantic experiment-log invalidations. */
   #experimentFetch: Promise<void> | null = null;
@@ -286,6 +312,85 @@ export class SocketSessionController implements SessionController {
 
   closeChat(): void {
     this.#setState({...this.#state, chatOpen: false});
+  }
+
+  switchChatThread(threadId: string): void {
+    this.#setState(switchChatThread(this.#state, threadId));
+  }
+
+  openChatThreadPicker(): void {
+    this.#setState(openChatThreadPicker(this.#state));
+  }
+
+  moveChatThreadSelection(delta: number): void {
+    this.#setState(moveChatThreadSelection(this.#state, delta));
+  }
+
+  applySelectedChatThread(): void {
+    const picker = this.#state.chatThreadPicker;
+    if (picker === null) return;
+    this.switchChatThread(picker.selected);
+  }
+
+  closeChatThreadPicker(): void {
+    this.#setState(closeChatThreadPicker(this.#state));
+  }
+
+  openNewChatPicker(): void {
+    this.#setState(openNewChatPicker(this.#state));
+  }
+
+  moveNewChatSelection(delta: number): void {
+    this.#setState(moveNewChatSelection(this.#state, delta));
+  }
+
+  async confirmNewChatPicker(): Promise<void> {
+    const picker = this.#state.newChatPicker;
+    if (picker === null) return;
+    if (picker.step !== 'model') {
+      this.#setState(advanceNewChatPicker(this.#state));
+      return;
+    }
+    this.#setState({...this.#state, newChatPicker: null});
+    await this.#createChatThread(picker);
+  }
+
+  retreatNewChatPicker(): void {
+    this.#setState(retreatNewChatPicker(this.#state));
+  }
+
+  typeNewChatModel(text: string): void {
+    const picker = this.#state.newChatPicker;
+    if (picker === null) return;
+    this.#setState(setNewChatModel(this.#state, picker.model + text));
+  }
+
+  backspaceNewChatModel(): void {
+    const picker = this.#state.newChatPicker;
+    if (picker === null) return;
+    this.#setState(setNewChatModel(this.#state, picker.model.slice(0, -1)));
+  }
+
+  /**
+   * Asks the backend for a new thread. The response's replayed events carry
+   * the authoritative thread record; the client only switches to it.
+   */
+  async #createChatThread(picker: NewChatPicker): Promise<void> {
+    const model = picker.model.trim();
+    try {
+      const response = await this.client.request({
+        type: 'query.chat_thread_create',
+        driver: picker.driver,
+        provider: picker.provider,
+        ...(model === '' ? {} : {model}),
+      });
+      let state = this.#state;
+      for (const event of response.events ?? []) state = applyEvent(state, event);
+      const threadId = response.chat_thread?.thread_id;
+      this.#setState(threadId === undefined ? state : switchChatThread(state, threadId));
+    } catch (error) {
+      this.#setState(reportCaughtError(this.#state, error, 'request'));
+    }
   }
 
   async openExperimentLog(): Promise<void> {
@@ -470,20 +575,26 @@ export class SocketSessionController implements SessionController {
     const text = value.trim();
     if (!text) return Promise.resolve();
     const id = `chat-user-${++this.#chatMessageId}`;
+    // The message belongs to the thread on screen when it was typed, even if
+    // the operator switches threads before the agent gets to it.
+    const threadId = this.#state.activeChatThreadId;
     const queued = this.#state.chatPending || this.#chatQueue.length > 0;
-    this.#chatQueue.push({id, text});
-    this.#setState({
-      ...this.#state,
-      // Docked, the answer lands in the pane the operator is already looking
-      // at, so nothing has to open over the log to show it.
-      ...(chatDocked(this.#state) ? {} : {chatOpen: true}),
-      chatConversation: appendChatEntry(this.#state.chatConversation, {
-        id,
-        kind: 'user',
-        label: queued ? 'You · queued' : 'You',
-        content: text,
-      }),
-    });
+    this.#chatQueue.push({id, text, threadId});
+    this.#setState(
+      updateChatConversation(
+        {
+          ...this.#state,
+          // Docked, the answer lands in the pane the operator is already
+          // looking at, so nothing has to open over the log to show it.
+          ...(chatDocked(this.#state) ? {} : {chatOpen: true}),
+        },
+        threadId,
+        entries => [
+          ...entries,
+          {id, kind: 'user', label: queued ? 'You · queued' : 'You', content: text},
+        ],
+      ),
+    );
     if (this.#chatDrain === null) {
       const drain = this.#drainChatQueue();
       this.#chatDrain = drain.finally(() => {
@@ -494,54 +605,79 @@ export class SocketSessionController implements SessionController {
   }
 
   async #drainChatQueue(): Promise<void> {
+    const pendingThreads = new Set<string>();
     try {
       while (this.#chatQueue.length > 0) {
-        const messages = this.#chatQueue.splice(0);
+        // One request per thread: batching across threads would hand one
+        // agent another thread's question.
+        const threadId = this.#chatQueue[0]?.threadId ?? DEFAULT_CHAT_THREAD_ID;
+        const messages = this.#chatQueue.filter(message => message.threadId === threadId);
+        for (const message of messages) {
+          this.#chatQueue.splice(this.#chatQueue.indexOf(message), 1);
+        }
         const messageIds = new Set(messages.map(message => message.id));
-        this.#setState({
-          ...this.#state,
-          chatPending: true,
-          chatConversation: this.#state.chatConversation.map(entry =>
-            messageIds.has(entry.id) ? {...entry, label: 'You'} : entry,
+        pendingThreads.add(threadId);
+        this.#setState(
+          updateChatConversation(
+            setChatThreadPending(this.#state, threadId, true),
+            threadId,
+            entries =>
+              entries.map(entry => (messageIds.has(entry.id) ? {...entry, label: 'You'} : entry)),
           ),
-        });
-        await this.#requestChat(messages.map(message => message.text).join('\n\n'));
+        );
+        await this.#requestChat(messages.map(message => message.text).join('\n\n'), threadId);
+        pendingThreads.delete(threadId);
+        this.#setState(setChatThreadPending(this.#state, threadId, false));
       }
     } finally {
-      this.#setState({...this.#state, chatPending: false});
+      let state = this.#state;
+      for (const threadId of pendingThreads) {
+        state = setChatThreadPending(state, threadId, false);
+      }
+      this.#setState(state);
     }
   }
 
-  async #requestChat(text: string): Promise<void> {
+  async #requestChat(text: string, threadId: string): Promise<void> {
     try {
-      const response = await this.client.request({type: 'query.chat', text});
+      const response = await this.client.request({
+        type: 'query.chat',
+        text,
+        ...(threadId === DEFAULT_CHAT_THREAD_ID ? {} : {thread_id: threadId}),
+      });
       const answer = response.chat?.answer ?? 'No chat answer was returned.';
       let state = this.#state;
       for (const event of response.events ?? []) state = applyEvent(state, event);
       if (!(response.events ?? []).some(event => event.data?.kind === 'chat')) {
-        state = {
-          ...state,
-          chatConversation: appendChatEntry(state.chatConversation, {
+        state = updateChatConversation(state, threadId, entries => [
+          ...entries,
+          {
             id: `chat-answer-${++this.#chatMessageId}`,
             kind: 'assistant',
             label: 'Answer',
             content: answer,
-          }),
-        };
+          },
+        ]);
       }
       this.#setState(state);
     } catch (error) {
       const message = errorMessage(error);
-      this.#setState({
-        ...reportCaughtError(this.#state, error, 'request'),
-        chatConversation: appendChatEntry(this.#state.chatConversation, {
-          id: `chat-error-${++this.#chatMessageId}`,
-          kind: 'result',
-          label: 'Chat failed',
-          tone: 'failure',
-          content: message,
-        }),
-      });
+      this.#setState(
+        updateChatConversation(
+          reportCaughtError(this.#state, error, 'request'),
+          threadId,
+          entries => [
+            ...entries,
+            {
+              id: `chat-error-${++this.#chatMessageId}`,
+              kind: 'result',
+              label: 'Chat failed',
+              tone: 'failure',
+              content: message,
+            },
+          ],
+        ),
+      );
     }
   }
 
@@ -557,6 +693,14 @@ export class SocketSessionController implements SessionController {
     if (parsed.localView === 'chat') {
       this.#setState(openChat(this.#state));
       if (parsed.chatMessage) await this.sendChat(parsed.chatMessage);
+      return;
+    }
+    if (parsed.localView === 'new-chat') {
+      this.openNewChatPicker();
+      return;
+    }
+    if (parsed.localView === 'chats') {
+      this.openChatThreadPicker();
       return;
     }
     if (parsed.toggle === 'todos') {
@@ -653,13 +797,6 @@ function reportCaughtError(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function appendChatEntry(
-  conversation: ConversationEntry[],
-  entry: ConversationEntry,
-): ConversationEntry[] {
-  return [...conversation, entry].slice(-500);
 }
 
 function renderResponse(

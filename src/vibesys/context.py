@@ -6,6 +6,7 @@ import threading
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
 from pathlib import Path
@@ -15,7 +16,11 @@ from pydantic import BaseModel
 
 from vibesys import backends
 from vibesys.agents import AgentClient, build_agent_client
-from vibesys.agents.factory import agent_driver_supports_mcp_servers, resolve_agent_driver
+from vibesys.agents.factory import (
+    agent_driver_supports_mcp_servers,
+    resolve_agent_driver,
+    supported_cli_providers,
+)
 from vibesys.agents.progress import AgentProgress
 from vibesys.backends.base import ComputeBackendImpl, ContentionMonitor
 from vibesys.config import Config, as_config
@@ -84,22 +89,29 @@ from vs_project import (
 )
 
 if TYPE_CHECKING:
-    from vibesys.server.supervisor import RunSupervisor
+    from vibesys.server.supervisor import ChatThreadHandle, RunSupervisor
 
 T = TypeVar("T", bound=BaseModel)
 
 _CHAT_STATE_DIR = "_vibesys_chat"
 _CHAT_TRAJECTORY_SUFFIXES = frozenset({".json", ".jsonl", ".log", ".md", ".txt"})
+# Trajectory snapshots are shared, read-only context for every chat thread, so
+# concurrent thread syncs must not interleave their rebuild of the directory.
+_CHAT_TRAJECTORY_SYNC_LOCK = threading.Lock()
+
+
 # This is an agent instruction, not a filesystem guarantee. ProjectPathPolicy
 # cannot currently express a read-only workspace root.
-_EXPERIMENT_CHAT_SYSTEM_PROMPT = """\
+def _experiment_chat_system_prompt(conversation_path: str) -> str:
+    """Render the chat system prompt for one thread's conversation file."""
+    return f"""\
 You are the read-only investigation agent for a live VibeSys experiment. Answer the
 user's question by examining evidence instead of relying on a precomputed summary.
 
 Your working directory is the current experiment workspace. Relevant evidence is:
 - `_vibesys_chat/trajectory/state/`: the canonical portable state for this run.
 - `_vibesys_chat/trajectory/logs/`: machine-local event and run logs for this run.
-- `_vibesys_chat/conversation.jsonl`: successful earlier exchanges in this chat.
+- `{conversation_path}`: successful earlier exchanges in this chat.
 - the rest of the workspace: the current implementation, evaluator inputs, and git
   history/diffs when available.
 
@@ -111,11 +123,56 @@ inference, mention important missing evidence, and give a concise answer.
 Do not edit files, run mutating commands, start workloads, steer optimization agents,
 or claim actions you did not take. Your role is analysis only.
 """
-_EXPERIMENT_CHAT_CONTINUATION_PROMPT = """\
-Continue the read-only experiment chat. Follow `_vibesys_chat/instructions.md`,
-consult `_vibesys_chat/conversation.jsonl` when the question depends on an earlier
+
+
+def _experiment_chat_continuation_prompt(instructions_path: str, conversation_path: str) -> str:
+    """Render the follow-up prompt for one thread's chat state paths."""
+    return f"""\
+Continue the read-only experiment chat. Follow `{instructions_path}`,
+consult `{conversation_path}` when the question depends on an earlier
 exchange, and investigate the refreshed trajectory evidence before making claims.
 """
+
+
+_EXPERIMENT_CHAT_SYSTEM_PROMPT = _experiment_chat_system_prompt(
+    f"{_CHAT_STATE_DIR}/conversation.jsonl"
+)
+_EXPERIMENT_CHAT_CONTINUATION_PROMPT = _experiment_chat_continuation_prompt(
+    f"{_CHAT_STATE_DIR}/instructions.md", f"{_CHAT_STATE_DIR}/conversation.jsonl"
+)
+
+
+def _resolve_chat_thread_settings(  # noqa: PLR0913  # one boundary resolves all defaults
+    *,
+    agent_backend: str,
+    default_driver: str,
+    default_provider: str,
+    default_model: str,
+    driver: str | None,
+    provider: str | None,
+    model: str | None,
+) -> tuple[str, str, str]:
+    """Resolve one chat thread's agent selection against the run's defaults.
+
+    Rejects unsupported driver/provider combinations at creation time, with
+    errors naming the offending value, so a thread never fails only when its
+    first question arrives.
+    """
+    if agent_backend != "cli":
+        raise ValueError(  # noqa: TRY003  # surfaced to the requesting client
+            "experiment chat threads require the CLI agent backend, "
+            f"but this run uses agent backend {agent_backend!r}"
+        )
+    resolved_driver = driver or default_driver
+    resolved_provider = provider or default_provider
+    resolved_model = model or default_model
+    supported = supported_cli_providers(resolved_driver)
+    if resolved_provider not in supported:
+        raise ValueError(  # noqa: TRY003  # surfaced to the requesting client
+            f"agent driver {resolved_driver!r} does not support provider "
+            f"{resolved_provider!r}; supported providers: {', '.join(supported)}"
+        )
+    return resolved_driver, resolved_provider, resolved_model
 
 
 def _coerce_dir(raw: str | Path | None, label: str) -> Path | None:
@@ -888,15 +945,30 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
 
     experiment_chat: _ExperimentChatService | None = None
     experiment_chat_owner = ExitStack()
+    chat_thread_services: list[_ExperimentChatService] = []
     if supervisor is not None:
+        chat_supervisor = supervisor
 
-        def _build_experiment_chat() -> _ExperimentChatService:
-            """Build resources owned only by the experiment chat service."""
+        def _build_experiment_chat(
+            *,
+            thread_id: str | None = None,
+            chat_driver: str | None = None,
+            chat_provider: str | None = None,
+            chat_model_name: str | None = None,
+        ) -> _ExperimentChatService:
+            """Build resources owned only by one experiment chat service.
+
+            The default thread (``thread_id=None``) reuses the run's agent
+            selection; a created thread carries its own resolved driver,
+            provider, and model.
+            """
             resources = ExitStack()
             try:
                 chat_logger = RunLogger(log_dir, tee_stderr=False)
                 resources.callback(chat_logger.close)
-                chat_logger.switch("experiment-chat")
+                chat_logger.switch(
+                    "experiment-chat" if thread_id is None else f"experiment-chat-{thread_id[:8]}"
+                )
 
                 chat_backends: dict[str, Any] | None = None
                 chat_use_docker = False
@@ -907,16 +979,21 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                     chat_backends = {"chat": chat_environment_session.sandbox}
                     chat_use_docker = chat_environment_session.view.cli_sandboxed
 
+                chat_config = config
+                if chat_driver is not None:
+                    chat_config = config.model_copy(
+                        update={"agent": config.agent.model_copy(update={"driver": chat_driver})}
+                    )
                 chat_client = build_agent_client(
-                    config,
+                    chat_config,
                     agent_backend=agent_backend,
-                    cli_provider=cli_provider,
+                    cli_provider=chat_provider if chat_provider is not None else cli_provider,
                     backends=chat_backends,
                     skills=[src.name for src in skill_source_paths],
                     skill_source_dirs=skill_source_paths,
                     compute_backend=backend,
                     model=model,
-                    model_name=model_name,
+                    model_name=chat_model_name if chat_model_name is not None else model_name,
                     run_log_file=chat_logger.writer,
                     use_docker=chat_use_docker,
                     log_dir=log_dir,
@@ -926,7 +1003,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 resources.callback(chat_client.close)
                 return _ExperimentChatService(
                     _ExperimentChatDependencies(
-                        supervisor=supervisor,
+                        supervisor=chat_supervisor,
                         agent_client=chat_client,
                         workspace=project_root,
                         log_dir=log_dir,
@@ -936,6 +1013,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                         flush_logs=chat_logger.writer.flush,
                         environment=dict,
                         progress=lambda: None,
+                        thread_id=thread_id,
                     ),
                     resources.pop_all(),
                 )
@@ -943,6 +1021,44 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 _close_after_construction_failure(resources, construction_error)
                 raise
 
+        def _chat_thread_factory(
+            thread_id: str,
+            driver: str | None,
+            provider: str | None,
+            model_override: str | None,
+        ) -> "ChatThreadHandle":
+            """Create one thread's chat service; the run context owns cleanup."""
+            from vibesys.server.events import ChatThreadCreatedData  # noqa: PLC0415
+            from vibesys.server.supervisor import ChatThreadHandle  # noqa: PLC0415
+
+            resolved_driver, resolved_provider, resolved_model = _resolve_chat_thread_settings(
+                agent_backend=resolved_backend,
+                default_driver=resolve_agent_driver(config),
+                default_provider=resolved_cli_provider,
+                default_model=model_name,
+                driver=driver,
+                provider=provider,
+                model=model_override,
+            )
+            service = _build_experiment_chat(
+                thread_id=thread_id,
+                chat_driver=resolved_driver,
+                chat_provider=resolved_provider,
+                chat_model_name=resolved_model,
+            )
+            chat_thread_services.append(service)
+            return ChatThreadHandle(
+                spec=ChatThreadCreatedData(
+                    thread_id=thread_id,
+                    driver=resolved_driver,
+                    provider=resolved_provider,
+                    model=resolved_model,
+                    created_at=datetime.now(UTC),
+                ),
+                handler=service.ask,
+            )
+
+        supervisor.set_chat_thread_factory(_chat_thread_factory)
         try:
             experiment_chat = _build_experiment_chat()
         except Exception as exc:  # noqa: BLE001  # experiment chat is an optional surface
@@ -1009,8 +1125,11 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             run_id=run_id,
             round_transaction_coordinator=round_transaction_coordinator,
             experiment_chat=experiment_chat,
+            chat_thread_services=chat_thread_services,
         )
     except BaseException as construction_error:
+        if supervisor is not None:
+            supervisor.set_chat_thread_factory(None)
         _close_after_construction_failure(experiment_chat_owner, construction_error)
         raise
     experiment_chat_owner.pop_all()
@@ -1243,6 +1362,10 @@ class _ExperimentChatDependencies:
     flush_logs: Callable[[], None]
     environment: Callable[[], dict[str, str]]
     progress: Callable[[], AgentProgress | None]
+    # None is the default thread, which keeps the legacy _vibesys_chat/ layout
+    # so existing workspaces resume their conversation unchanged. A created
+    # thread owns _vibesys_chat/threads/<thread-id>/ instead.
+    thread_id: str | None = None
 
 
 class _ExperimentChatService:
@@ -1261,8 +1384,14 @@ class _ExperimentChatService:
         self._flush_logs = dependencies.flush_logs
         self._environment = dependencies.environment
         self._progress = dependencies.progress
+        self._thread_id = dependencies.thread_id
         self._resources = resources
         self._lock = threading.Lock()
+        relative = (self._state_dir).relative_to(self._workspace).as_posix()
+        self._system_prompt = _experiment_chat_system_prompt(f"{relative}/conversation.jsonl")
+        self._continuation_prompt = _experiment_chat_continuation_prompt(
+            f"{relative}/instructions.md", f"{relative}/conversation.jsonl"
+        )
         self._history = self._load_history()
 
     def ask(self, question: str) -> str:
@@ -1276,11 +1405,7 @@ class _ExperimentChatService:
                 diagnostic = RunInspector(self._supervisor).answer(question)
                 return f"Chat agent did not return an answer.\n\nFallback diagnostic:\n{diagnostic}"
 
-            system_prompt = (
-                _EXPERIMENT_CHAT_CONTINUATION_PROMPT
-                if self._history
-                else _EXPERIMENT_CHAT_SYSTEM_PROMPT
-            )
+            system_prompt = self._continuation_prompt if self._history else self._system_prompt
             execution = self._supervisor.start_agent_execution(
                 "chat",
                 "experiment-chat",
@@ -1337,6 +1462,12 @@ class _ExperimentChatService:
 
     @property
     def _state_dir(self) -> Path:
+        base = self._workspace / _CHAT_STATE_DIR
+        return base if self._thread_id is None else base / "threads" / self._thread_id
+
+    @property
+    def _shared_state_dir(self) -> Path:
+        """Root of the trajectory snapshots every thread reads."""
         return self._workspace / _CHAT_STATE_DIR
 
     def _load_history(self) -> list[tuple[str, str]]:
@@ -1366,26 +1497,28 @@ class _ExperimentChatService:
             self._log(f"[warn] could not persist experiment chat: {exc}")
 
     def _sync_trajectory(self) -> None:
-        trajectory_dir = self._state_dir / "trajectory"
-        if self._state_dir.is_symlink():
+        # Trajectory snapshots stay in the shared chat root: they are the same
+        # read-only evidence for every thread, refreshed by whichever thread
+        # asks next.
+        trajectory_dir = self._shared_state_dir / "trajectory"
+        if self._state_dir.is_symlink() or self._shared_state_dir.is_symlink():
             self._log(f"[warn] experiment chat state is a symlink: {self._state_dir}")
             return
         try:
             self._state_dir.mkdir(parents=True, exist_ok=True)
-            if trajectory_dir.is_symlink():
-                trajectory_dir.unlink()
-            elif trajectory_dir.exists():
-                shutil.rmtree(trajectory_dir)
-            trajectory_dir.mkdir(parents=True, exist_ok=True)
-            (self._state_dir / "instructions.md").write_text(
-                _EXPERIMENT_CHAT_SYSTEM_PROMPT, encoding="utf-8"
-            )
+            (self._state_dir / "instructions.md").write_text(self._system_prompt, encoding="utf-8")
             self._flush_logs()
-            self._write_trajectory_snapshot(
-                self._project.state.portable_run_export(self._run_id),
-                trajectory_dir / "state",
-            )
-            self._copy_trajectory_files(self._log_dir, trajectory_dir / "logs")
+            with _CHAT_TRAJECTORY_SYNC_LOCK:
+                if trajectory_dir.is_symlink():
+                    trajectory_dir.unlink()
+                elif trajectory_dir.exists():
+                    shutil.rmtree(trajectory_dir)
+                trajectory_dir.mkdir(parents=True, exist_ok=True)
+                self._write_trajectory_snapshot(
+                    self._project.state.portable_run_export(self._run_id),
+                    trajectory_dir / "state",
+                )
+                self._copy_trajectory_files(self._log_dir, trajectory_dir / "logs")
         except (OSError, ValueError) as exc:
             self._log(f"[warn] could not refresh experiment chat trajectory: {exc}")
 
@@ -1474,6 +1607,7 @@ class _RunContext:
         run_id: str,
         round_transaction_coordinator: RoundTransactionCoordinator | None = None,
         experiment_chat: _ExperimentChatService | None = None,
+        chat_thread_services: list[_ExperimentChatService] | None = None,
     ):
         self.backend = backend
         self.run_environment = run_environment
@@ -1521,6 +1655,11 @@ class _RunContext:
         self.agent_client = agent_client
         self._closed = False
         self._experiment_chat = experiment_chat
+        # Created chat threads share the run's lifetime: the factory that
+        # builds them appends here, and close() below tears them down.
+        self._chat_thread_services = (
+            chat_thread_services if chat_thread_services is not None else []
+        )
         self._progress_stack: list[AgentProgress] = []
         if self.supervisor is not None and self._experiment_chat is not None:
             self.supervisor.set_chat_handler(self._experiment_chat.ask)
@@ -1741,20 +1880,26 @@ class _RunContext:
         # Mirror backend state on _RunContext for legacy callers/tests.
         self.selected_gpu = self.device.selected_device
 
-    def close(self) -> None:  # noqa: C901  # preserve independent cleanup failures
-        if self._closed:
-            return
-        self._closed = True
+    def _close_chat_surfaces(self) -> BaseException | None:
+        """Tear down the default chat and every created thread's resources."""
         chat_error: BaseException | None = None
         experiment_chat, self._experiment_chat = self._experiment_chat, None
+        chat_threads, self._chat_thread_services = list(self._chat_thread_services), []
+        if self.supervisor is not None:
+            try:
+                # Threads never outlive the run context, even when a retained
+                # terminal presentation keeps the default chat handler alive.
+                self.supervisor.clear_chat_threads_and_drain()
+            except BaseException as exc:  # noqa: BLE001  # resource close must still run
+                chat_error = exc
         if self.supervisor is not None and experiment_chat is not None:
             try:
                 self.supervisor.clear_chat_handler_and_drain()
             except BaseException as exc:  # noqa: BLE001  # resource close must still run
-                chat_error = exc
-        if experiment_chat is not None:
+                chat_error = chat_error or exc
+        for chat_service in [*chat_threads, *([experiment_chat] if experiment_chat else [])]:
             try:
-                experiment_chat.close()
+                chat_service.close()
             except BaseException as exc:  # noqa: BLE001  # primary teardown must still run
                 if chat_error is None:
                     chat_error = exc
@@ -1762,6 +1907,13 @@ class _RunContext:
                     chat_error.add_note(
                         f"Experiment chat cleanup also failed: {type(exc).__name__}: {exc}"
                     )
+        return chat_error
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        chat_error = self._close_chat_surfaces()
         primary_error: BaseException | None = None
         try:
             # Unwinds in reverse construction order: device monitor stop +

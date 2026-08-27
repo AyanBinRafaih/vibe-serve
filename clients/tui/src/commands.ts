@@ -5,7 +5,7 @@ import {isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 type CommandRequest = Exclude<RequestInput, {type: 'query.chat'}>;
 
 export type ParsedCommand = {
-  localView?: 'chat' | 'help' | 'theme';
+  localView?: 'chat' | 'chats' | 'help' | 'new-chat' | 'theme';
   /**
    * Surfaces that also have a key. macOS reserves the function keys for system
    * controls and a terminal may keep a Control chord for itself, so every
@@ -35,6 +35,8 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   {name: '/help', description: 'Show this help'},
   {name: '/chat', description: 'Open experiment chat'},
+  {name: '/new-chat', description: 'Start a chat thread with its own agent and model'},
+  {name: '/chats', description: 'List chat threads and switch between them'},
   {name: '/pause', description: 'Pause after the current agent call'},
   {name: '/resume', description: 'Resume a paused run'},
   {name: '/steer', description: 'Guide the next agent invocation: /steer <message>'},
@@ -98,6 +100,8 @@ export function parseCommand(text: string): ParsedCommand {
     const message = chat[1]?.trim();
     return {localView: 'chat', ...(message ? {chatMessage: message} : {})};
   }
+  if (text === '/new-chat') return {localView: 'new-chat'};
+  if (text === '/chats') return {localView: 'chats'};
   const theme = text.match(/^\/theme(?:\s+(.*))?$/);
   if (theme) {
     const requested = theme[1]?.trim();

@@ -47,7 +47,9 @@ export function bindKeybindings(
       key.name === 'f4' &&
       controller.state.chatOpen === false &&
       controller.state.overlay === null &&
-      controller.state.themePicker === null
+      controller.state.themePicker === null &&
+      controller.state.chatThreadPicker === null &&
+      controller.state.newChatPicker === null
     ) {
       controller.togglePaneZoom();
       key.preventDefault();
@@ -78,6 +80,35 @@ export function bindKeybindings(
       (controller.state.layout.right !== null || chatPaneVisible(controller.state))
     ) {
       controller.cyclePaneFocus();
+      key.preventDefault();
+      return;
+    }
+    // The new-thread wizard owns the keys wherever it was opened from — on its
+    // model step that includes ordinary typing, which must never leak into the
+    // composer or command input underneath.
+    const newChatPicker = controller.state.newChatPicker;
+    if (newChatPicker !== null) {
+      if (key.name === 'up') controller.moveNewChatSelection(-1);
+      else if (key.name === 'down') controller.moveNewChatSelection(1);
+      else if (key.name === 'escape') controller.retreatNewChatPicker();
+      else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
+        void controller.confirmNewChatPicker();
+      } else if (newChatPicker.step === 'model' && key.name === 'backspace') {
+        controller.backspaceNewChatModel();
+      } else if (newChatPicker.step === 'model' && isPrintable(key)) {
+        controller.typeNewChatModel(key.sequence);
+      } else return;
+      key.preventDefault();
+      return;
+    }
+    // The thread list is a selection: Enter switches to the highlighted thread.
+    if (controller.state.chatThreadPicker !== null) {
+      if (key.name === 'up') controller.moveChatThreadSelection(-1);
+      else if (key.name === 'down') controller.moveChatThreadSelection(1);
+      else if (key.name === 'escape') controller.closeChatThreadPicker();
+      else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
+        controller.applySelectedChatThread();
+      } else return;
       key.preventDefault();
       return;
     }
@@ -286,4 +317,16 @@ export function bindKeybindings(
 
   renderer.keyInput.on('keypress', onKey);
   return () => renderer.keyInput.off('keypress', onKey);
+}
+
+/** One typed character, as opposed to a chord or a control key. */
+function isPrintable(key: KeyEvent): boolean {
+  return (
+    !key.ctrl &&
+    !key.meta &&
+    typeof key.sequence === 'string' &&
+    key.sequence.length === 1 &&
+    key.sequence >= ' ' &&
+    key.sequence !== ''
+  );
 }

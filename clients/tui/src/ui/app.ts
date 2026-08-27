@@ -13,6 +13,7 @@ import {AgentMapView} from './agent-map.js';
 import {createChatDraft} from './chat-composer.js';
 import {ChatOverlayView} from './chat-overlay.js';
 import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
+import {ChatThreadPickerView, NewChatPickerView} from './chat-pickers.js';
 import {RendererSelectionClipboard, type SelectionClipboard} from './clipboard.js';
 import {createCommandInputPanel} from './command-input.js';
 import {ConversationView} from './conversation.js';
@@ -150,6 +151,13 @@ export function createOpenTuiApp(
   const chatDraft = createChatDraft();
   const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme, chatDraft);
   const chatPane = new ChatPaneView(renderer, controller, markdownStyle, theme, chatDraft);
+  const chatThreadPicker = new ChatThreadPickerView(renderer, theme);
+  const newChatPicker = new NewChatPickerView(renderer, theme);
+  // Composer drafts are per-thread. The shared ChatDraft stays the single
+  // authority both chat surfaces read; switching threads swaps its content
+  // and parks the outgoing thread's half-typed question for its return.
+  const parkedDrafts = new Map<string, string>();
+  let draftThreadId = controller.state.activeChatThreadId;
   // Clicking either box moves the pane focus to it, so the border, the hint,
   // and the cursor never disagree about which surface is taking keystrokes.
   const commandInput = createCommandInputPanel(
@@ -204,6 +212,8 @@ export function createOpenTuiApp(
   root.add(body);
   root.add(overlay.output);
   root.add(themePicker.output);
+  root.add(chatThreadPicker.output);
+  root.add(newChatPicker.output);
   root.add(chat.output);
   renderer.root.add(root);
   commandInput.focus();
@@ -226,6 +236,8 @@ export function createOpenTuiApp(
     experimentLog.applyTheme(theme);
     rightPane.applyTheme(theme);
     themePicker.applyTheme(theme);
+    chatThreadPicker.applyTheme(theme);
+    newChatPicker.applyTheme(theme);
     conversation.applyTheme(theme, markdownStyle);
     chat.applyTheme(theme, markdownStyle);
     chatPane.applyTheme(theme, markdownStyle);
@@ -239,6 +251,13 @@ export function createOpenTuiApp(
     lastState = state;
     const releasePreviousStyle =
       state.themeName === themeName ? undefined : applyTheme(state.themeName);
+    if (state.activeChatThreadId !== draftThreadId) {
+      // Park the outgoing thread's draft and restore the incoming thread's,
+      // so switching never sends one thread's question to another's agent.
+      parkedDrafts.set(draftThreadId, chatDraft.value);
+      chatDraft.value = parkedDrafts.get(state.activeChatThreadId) ?? '';
+      draftThreadId = state.activeChatThreadId;
+    }
     const showLog = experimentLogVisible(state);
     const paneFocus = focusedPane(state);
     const zoomedPane = state.layout.zoomedPane;
@@ -357,6 +376,8 @@ export function createOpenTuiApp(
         : {...state, overlay: {kind: 'detail' as const, content: paneFallback.content}},
     );
     themePicker.render(state);
+    chatThreadPicker.render(state);
+    newChatPicker.render(state);
     chat.render(state);
     conversationActivityBar.render(state, !showLog);
     // One cursor, three places it can be. The modal owns it while it is open;

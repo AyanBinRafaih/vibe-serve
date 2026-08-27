@@ -64,6 +64,12 @@ _PROVIDER_CLASSES: dict[str, _ProviderFactory] = {
     "opencode": OpencodeCodingAgent,
 }
 
+
+def supported_providers() -> list[str]:
+    """Return the sorted provider names the AgentShim driver can run."""
+    return sorted(_PROVIDER_CLASSES)
+
+
 _REASONING_EFFORT_PROVIDERS = frozenset({"codex", "claude"})
 _PYTHON_MCP_COMMANDS = frozenset({"python", "python3"})
 
