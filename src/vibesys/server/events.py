@@ -318,12 +318,9 @@ class EventStore:
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._events, self._malformed_tail_offset = self._read_unlocked()
+        self._events = _repair_legacy_sequences(self._events)
         self._sequences = [event.sequence for event in self._events]
-        self._sequences_monotonic = all(
-            previous <= current
-            for previous, current in zip(self._sequences, self._sequences[1:], strict=False)
-        )
-        self._next_sequence = max(self._sequences, default=0) + 1
+        self._next_sequence = self._sequences[-1] + 1 if self._sequences else 1
 
     def append(self, event: RunEvent) -> RunEvent:  # noqa: D102  # tracked: #288
         with self._changed:
@@ -361,13 +358,8 @@ class EventStore:
             return self._events_after_unlocked(after_sequence)
 
     def _events_after_unlocked(self, after_sequence: int) -> list[RunEvent]:
-        if self._sequences_monotonic:
-            start = bisect_right(self._sequences, after_sequence)
-            events = self._events[start:]
-        else:
-            # Preserve the historical file-order filtering semantics for a
-            # manually edited or legacy log whose sequences are not sorted.
-            events = [event for event in self._events if event.sequence > after_sequence]
+        start = bisect_right(self._sequences, after_sequence)
+        events = self._events[start:]
         return [event.model_copy(deep=True) for event in events]
 
     def _read_unlocked(self) -> tuple[list[RunEvent], int | None]:
@@ -389,6 +381,21 @@ class EventStore:
                     return events, record_offset
                 raise
         return events, None
+
+
+def _repair_legacy_sequences(events: list[RunEvent]) -> list[RunEvent]:
+    """Expose a stable, strictly increasing cursor without rewriting the audit log."""
+    repaired: list[RunEvent] = []
+    last_sequence = 0
+    for event in events:
+        repaired_event = (
+            event.model_copy(update={"sequence": last_sequence + 1}, deep=True)
+            if event.sequence <= last_sequence
+            else event
+        )
+        repaired.append(repaired_event)
+        last_sequence = repaired_event.sequence
+    return repaired
 
 
 def make_event(event_type: EventType, text: str = "", **fields: Any) -> RunEvent:  # noqa: ANN401, D103  # tracked: #288

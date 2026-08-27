@@ -15,6 +15,7 @@ import {
   formatRounds,
   headerRow,
   outcomeColor,
+  outcomeLabel,
   resolveColumns,
   sentenceCase,
 } from './experiment-log.js';
@@ -65,7 +66,7 @@ describe('experiment log rows', () => {
     expect(row).toContain('41');
     expect(row).toContain('Batch the prefill step');
     expect(row).toContain('+12%');
-    expect(row).toContain('Proven');
+    expect(row).toContain('Accepted');
     expect(row).not.toContain('Pass');
     expect(row.trimEnd().endsWith('Yes')).toBe(true);
   });
@@ -73,7 +74,7 @@ describe('experiment log rows', () => {
   it('shows hypothesis resolution without rendering the judge verdict', () => {
     const columns = resolveColumns(WIDE);
 
-    const accepted = entryRow(
+    const disproven = entryRow(
       entry({judge_verdict: 'pass', resolved_outcome: 'disproven'}),
       columns,
     );
@@ -82,8 +83,8 @@ describe('experiment log rows', () => {
       columns,
     );
 
-    expect(accepted).toContain('Disproven');
-    expect(accepted).not.toContain('Pass');
+    expect(disproven).toContain('Rejected');
+    expect(disproven).not.toContain('Pass');
     expect(rejected).toContain('Rejected');
     expect(rejected).not.toContain('Fail');
   });
@@ -96,7 +97,7 @@ describe('experiment log rows', () => {
     const row = entryRow(entry(), columns);
     expect(row).toContain('H-07');
     expect(row).toContain('41');
-    expect(row).toContain('Proven');
+    expect(row).toContain('Accepted');
     expect(row).not.toContain('Batch the prefill step');
   });
 
@@ -202,11 +203,13 @@ describe('experiment log outcome color', () => {
     }
   });
 
-  it('spells the outcome out so color is never the only signal', () => {
+  it('maps backend resolutions to operator-facing acceptance labels', () => {
     const columns = resolveColumns(WIDE);
 
-    expect(entryRow(entry({resolved_outcome: 'proven'}), columns)).toContain('Proven');
-    expect(entryRow(entry({resolved_outcome: 'disproven'}), columns)).toContain('Disproven');
+    expect(entryRow(entry({resolved_outcome: 'proven'}), columns)).toContain('Accepted');
+    expect(entryRow(entry({resolved_outcome: 'disproven'}), columns)).toContain('Rejected');
+    expect(outcomeLabel(entry({resolved_outcome: 'rejected'}))).toBe('Rejected');
+    expect(outcomeLabel(entry({resolved_outcome: 'inconclusive'}))).toBe('Inconclusive');
   });
 });
 

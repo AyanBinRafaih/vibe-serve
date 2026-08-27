@@ -9,8 +9,8 @@ import {
 import {helpText, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
-  applyActiveExecutionCheckpoint,
   applyEvent,
+  applyEventBatch,
   applySnapshot,
   type ConversationEntry,
   chatDocked,
@@ -571,19 +571,14 @@ export class SocketSessionController implements SessionController {
       this.#refreshPaneFor([message.event]);
     }
     if (message.type === 'event_batch') {
-      let state = this.#state;
-      for (const event of message.events) state = applyEvent(state, event);
-      // Replay first, then reconcile with the checkpoint captured at the
-      // batch's watermark. This closes dangling starts from interrupted logs
-      // without letting the replay overwrite authoritative live state.
-      if (message.active_executions !== undefined) {
-        state = applyActiveExecutionCheckpoint(
-          state,
+      this.#setState(
+        applyEventBatch(
+          this.#state,
+          message.events,
           message.active_executions,
           message.through_sequence,
-        );
-      }
-      this.#setState(state);
+        ),
+      );
       this.#refreshExperimentsFor(message.events);
       this.#refreshPaneFor(message.events);
     }
