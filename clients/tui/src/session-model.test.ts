@@ -353,9 +353,12 @@ describe('hypothesis scope label', () => {
       },
     ]);
 
-    const opened = enterExperimentDrilldown(state);
+    const opened = enterExperimentRound(state, 1);
 
-    expect(opened.hypothesisScope).toMatchObject({id: 'H-01', label: 'Batch decode requests · r1'});
+    expect(opened?.hypothesisScope).toMatchObject({
+      id: 'H-01',
+      label: 'Batch decode requests · r1',
+    });
   });
 
   it('falls back to the hypothesis id when there is no title', () => {
@@ -371,9 +374,9 @@ describe('hypothesis scope label', () => {
       },
     ]);
 
-    const opened = enterExperimentDrilldown(state);
+    const opened = enterExperimentRound(state, 1);
 
-    expect(opened.hypothesisScope).toMatchObject({id: 'H-01', label: 'H-01 · r1'});
+    expect(opened?.hypothesisScope).toMatchObject({id: 'H-01', label: 'H-01 · r1'});
   });
 });
 
