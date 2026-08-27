@@ -20,6 +20,7 @@ export interface CommandInputPanel {
   /** Narrows the completions to the commands the current view offers. */
   setCommandContext(context: CommandContext): void;
   completeSuggestion(): boolean;
+  navigateSuggestions(direction: 1 | -1): boolean;
   /** True when nothing is typed, so Enter belongs to whatever pane is behind. */
   isEmpty(): boolean;
   focus(): void;
@@ -30,6 +31,21 @@ export interface CommandInputPanel {
 
 function commandSyntaxStyle(theme: Theme): SyntaxStyle {
   return SyntaxStyle.fromStyles({'slash-command': {fg: theme.accent, bold: true}});
+}
+
+function renderSuggestions(
+  matches: readonly SlashCommand[],
+  selectedIndex: number,
+  value: string,
+): string {
+  return matches
+    .map(
+      (command, index) =>
+        `${index === selectedIndex ? '›' : ' '} ${command.name.padEnd(10)} ${command.description}${
+          index === selectedIndex && command.name !== value ? '  [Tab]' : ''
+        }`,
+    )
+    .join('\n');
 }
 
 export function createCommandInputPanel(
@@ -89,6 +105,7 @@ export function createCommandInputPanel(
   });
   suggestions.add(suggestionList);
   let matches: readonly SlashCommand[] = [];
+  let selectedIndex = 0;
   let context: CommandContext = {};
 
   const updateDecorations = (value: string): void => {
@@ -99,18 +116,12 @@ export function createCommandInputPanel(
     }
 
     matches = suggestSlashCommands(value, context);
+    selectedIndex = 0;
     const visible = matches.length > 0;
     suggestions.visible = visible;
     suggestions.height = matches.length + 2;
     suggestionList.height = Math.max(1, matches.length);
-    suggestionList.content = matches
-      .map(
-        (command, index) =>
-          `${index === 0 ? '›' : ' '} ${command.name.padEnd(10)} ${command.description}${
-            index === 0 && command.name !== value ? '  [Tab]' : ''
-          }`,
-      )
-      .join('\n');
+    suggestionList.content = renderSuggestions(matches, selectedIndex, value);
   };
   const submit = (value: string): void => {
     input.value = '';
@@ -130,9 +141,16 @@ export function createCommandInputPanel(
       updateDecorations(input.value);
     },
     completeSuggestion(): boolean {
-      const suggestion = matches[0];
+      const suggestion = matches[selectedIndex];
       if (suggestion === undefined || suggestion.name === input.value) return false;
       input.value = suggestion.name;
+      selectedIndex = 0;
+      return true;
+    },
+    navigateSuggestions(direction: 1 | -1): boolean {
+      if (matches.length === 0) return false;
+      selectedIndex = (selectedIndex + direction + matches.length) % matches.length;
+      suggestionList.content = renderSuggestions(matches, selectedIndex, input.value);
       return true;
     },
     isEmpty: () => input.value.trim() === '',

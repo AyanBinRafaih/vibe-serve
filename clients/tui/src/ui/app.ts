@@ -249,8 +249,8 @@ export function createOpenTuiApp(
   let lastState: SessionState = controller.state;
   const render = (state: SessionState): void => {
     lastState = state;
-    const releasePreviousStyle =
-      state.themeName === themeName ? undefined : applyTheme(state.themeName);
+    const previewName = state.themePicker?.selected ?? state.themeName;
+    const releasePreviousStyle = previewName === themeName ? undefined : applyTheme(previewName);
     if (state.activeChatThreadId !== draftThreadId) {
       // Park the outgoing thread's draft and restore the incoming thread's,
       // so switching never sends one thread's question to another's agent.
@@ -393,6 +393,7 @@ export function createOpenTuiApp(
   };
   const unbindKeys = bindKeybindings(renderer, controller, viewport, clipboard, {
     completeInput: () => commandInput.completeSuggestion(),
+    navigateSuggestions: direction => commandInput.navigateSuggestions(direction),
     // Enter belongs to a pane only when nothing is typed anywhere. Asking which
     // box has the cursor is not enough: a question waiting in the other box is
     // still a question, and Enter must never discard it to open a hypothesis.
