@@ -39,27 +39,26 @@ input accepts these slash commands:
 The client opens on the experiment log rather than on the per-round
 transcript. It groups rounds by `hypothesis_id`, so one hypothesis held across
 continuation rounds is a single row showing the claim, the round range, what
-the implementation details, the measured result, the judge verdict, the outcome the loop
-resolved (`Accepted`, `Rejected`, or a terminal `HypothesisOutcome`), and whether
-the candidate was kept. The active hypothesis is marked with `▸` and carries no
-outcome until it resolves. `Accepted` reads in the theme's success color and
-`Rejected` in its error color; the word is always spelled out, so the reading
-does not depend on color.
+was implemented, the measured result, the outcome the loop resolved (`Accepted`,
+`Rejected`, or a terminal `HypothesisOutcome`), and whether the candidate was
+kept. The active hypothesis is marked with `▸` and carries no outcome until it
+resolves. `Accepted` reads in the theme's success color and `Rejected` in its
+error color; the word is always spelled out, so the reading does not depend on
+color.
 
 The log is the landing view and the root of the client, so no command is
 needed to reach it: it is what the client opens on, and Escape or Ctrl+L
 returns to it from anywhere.
 
-Arrow keys move the selection, the wheel and trackpad scroll the table
-independently of it, and clicking a row selects it. Enter on an empty input, or
-`/open-round`, opens the rounds behind the selected hypothesis: the ordinary
-transcript, rounds strip, and agent map, filtered to that hypothesis. The input
-keeps Enter whenever something is typed, so a command entered from the log runs
-on its first Enter and its result opens over the table. `/open-round --N`
-jumps straight to round N inside whichever hypothesis owns it. Escape steps
-back to the table with the selection intact. The log is the root view, so
-opening a hypothesis is the only route to per-round output; there is no
-unfiltered live transcript to fall back to.
+Arrow keys move the selection, and the wheel and trackpad scroll the table
+independently of it. Clicking a hypothesis, or pressing Enter on an empty input,
+opens its summary. The summary gives the full wrapped hypothesis text first,
+then brief decision metadata and its rounds. Arrow keys select a round; clicking
+it or pressing Enter opens the ordinary transcript, rounds strip, and agent map.
+Escape returns from a round to its hypothesis, then from the hypothesis to the
+index. The input keeps Enter whenever something is typed, so a command entered
+from the log runs on its first Enter. `/open-round` and `/open-round --N` remain
+explicit shortcuts directly to the selected or numbered round.
 
 The agent strip is headed `Round N flow · 45s` for the round on screen. That
 elapsed time is agent-active: wall clock minus the gaps where no agent was

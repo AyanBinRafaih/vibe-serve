@@ -22,6 +22,7 @@ from typing import Never, cast
 from vibesys.cli import bundled_tui
 from vibesys.evaluators import EvaluatorPackageRequirement, resolve_evaluator_package
 from vibesys.input_project import materialize_input_project
+from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.profilers import ACTIVE_PROFILER_KINDS
 from vibesys.resource_paths import (
     default_skill_roots,
@@ -445,7 +446,10 @@ def _verify_project_state(project_root: Path) -> None:
     if len(runs) != 1 or not runs[0].run_id.endswith("-installed-release-smoke"):
         _fail(f"Project smoke did not create exactly one run: {runs}")
     run = runs[0]
-    completed_rounds = store.load_rounds(run.run_id)
+    agent_state = AgentRunStateStore(
+        store.portable_namespace(run.run_id, "agent")
+    ).load()
+    completed_rounds = agent_state.rounds
     if len(completed_rounds) != 1 or completed_rounds[0].round_number != 1:
         _fail("Project smoke did not persist exactly one completed round")
     if store.current_run_id() != run.run_id:

@@ -22,8 +22,10 @@ import {
   hypothesisPlanningActivity,
   initialSessionState,
   leaveExperimentDrilldown,
+  leaveHypothesisDetail,
   markEventStreamUnavailable,
   moveExperimentSelection,
+  moveHypothesisRoundSelection,
   moveThemeSelection,
   openChat,
   openPane,
@@ -1422,6 +1424,47 @@ describe('session event model', () => {
   });
 });
 
+describe('hypothesis detail navigation', () => {
+  const hypothesis = {
+    hypothesis_id: 'H-01',
+    identified: true,
+    claim: 'A complete causal hypothesis that must never be truncated in its detail view.',
+    first_round: 1,
+    last_round: 2,
+    rounds: [
+      {round: 1, passed: true, reviewed: true},
+      {round: 2, passed: false, reviewed: true},
+    ],
+    kept: false,
+    active: false,
+  };
+
+  it('moves from index to hypothesis to round and unwinds one level at a time', () => {
+    const landing = setExperiments(initialSessionState(), [hypothesis]);
+    const detail = enterExperimentDrilldown(landing);
+
+    expect(detail.hypothesisDetail).toEqual({entryKey: 'H-01', selectedRound: 2});
+    expect(detail.hypothesisScope).toBeNull();
+
+    const earlier = moveHypothesisRoundSelection(detail, -1);
+    expect(earlier.hypothesisDetail?.selectedRound).toBe(1);
+
+    const round = enterExperimentDrilldown(earlier);
+    expect(round.hypothesisScope).toMatchObject({id: 'H-01', rounds: [1, 2]});
+    expect(round.selectedRound).toBe(1);
+
+    const backToDetail = leaveExperimentDrilldown(round);
+    expect(backToDetail.hypothesisDetail?.selectedRound).toBe(1);
+    expect(leaveHypothesisDetail(backToDetail).hypothesisDetail).toBeNull();
+  });
+
+  it('closes a detail whose hypothesis disappears during refresh', () => {
+    const detail = enterExperimentDrilldown(setExperiments(initialSessionState(), [hypothesis]));
+
+    expect(setExperiments(detail, []).hypothesisDetail).toBeNull();
+  });
+});
+
 describe('docked experiment chat', () => {
   const entry = {
     hypothesis_id: 'H-01',
@@ -1438,8 +1481,12 @@ describe('docked experiment chat', () => {
     expect(chatDocked(landing)).toBe(true);
     expect(chatPaneVisible(landing)).toBe(true);
 
-    // Inside a hypothesis the row belongs to the transcript.
-    const scoped = enterExperimentDrilldown(landing);
+    // The hypothesis summary and its trajectories both use the full content
+    // column rather than competing with experiment chat.
+    const detail = enterExperimentDrilldown(landing);
+    expect(detail.hypothesisDetail).not.toBeNull();
+    expect(chatDocked(detail)).toBe(false);
+    const scoped = enterExperimentDrilldown(detail);
     expect(scoped.hypothesisScope).not.toBeNull();
     expect(chatDocked(scoped)).toBe(false);
   });

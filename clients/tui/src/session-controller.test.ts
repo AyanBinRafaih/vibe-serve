@@ -647,6 +647,8 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
     controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).not.toBeNull();
+    controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).not.toBeNull();
 
     // What Ctrl+L and Escape are bound to.
@@ -715,6 +717,8 @@ describe('session controller', () => {
 
     // Per-round output is reachable only by opening a hypothesis.
     controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).not.toBeNull();
+    controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).not.toBeNull();
 
     // live() is the Ctrl+L path; it returns to the table rather than to an
@@ -744,11 +748,16 @@ describe('session controller', () => {
     controller.moveExperimentSelection(1);
 
     controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-02', selectedRound: 3});
+    expect(controller.state.hypothesisScope).toBeNull();
+
+    controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
     expect(controller.state.hypothesisScope?.label).toBe('H-02 · r2-3');
 
     controller.leaveExperimentDrilldown();
     expect(controller.state.hypothesisScope).toBeNull();
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-02', selectedRound: 3});
     expect(controller.state.experimentLog?.selectedId).toBe('H-02');
   });
 

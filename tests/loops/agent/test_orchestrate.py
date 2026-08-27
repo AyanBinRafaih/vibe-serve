@@ -2127,6 +2127,10 @@ def test_resume_migrates_legacy_hypothesis_state_without_losing_continuation(
     subprocess.run(
         [  # noqa: S607  # test fixture
             "git",
+            "-c",
+            "user.name=VibeSys Test",
+            "-c",
+            "user.email=test@vibesys.invalid",
             "commit",
             "-m",
             "test: restore legacy hypothesis state",
