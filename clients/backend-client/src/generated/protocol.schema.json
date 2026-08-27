@@ -310,6 +310,18 @@
         "answer": {
           "title": "Answer",
           "type": "string"
+        },
+        "thread_title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Title"
         }
       },
       "required": [
@@ -345,6 +357,18 @@
         "text": {
           "title": "Text",
           "type": "string"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
         }
       },
       "required": [
@@ -369,6 +393,18 @@
           "default": "none",
           "title": "Effect",
           "type": "string"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
         }
       },
       "required": [
@@ -376,6 +412,168 @@
         "answer"
       ],
       "title": "ChatResult",
+      "type": "object"
+    },
+    "ChatThreadCreateQuery": {
+      "additionalProperties": false,
+      "description": "Create a new experiment-chat thread with its own agent selection.\n\nOmitted fields resolve to the run's configured driver, provider, and\nmodel. The response carries the resolved settings and thread identity.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.chat_thread_create",
+          "default": "query.chat_thread_create",
+          "title": "Type",
+          "type": "string"
+        },
+        "driver": {
+          "anyOf": [
+            {
+              "enum": [
+                "agentshim",
+                "omnigent"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Driver"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "title": "ChatThreadCreateQuery",
+      "type": "object"
+    },
+    "ChatThreadCreatedData": {
+      "description": "Identity and resolved agent settings for one experiment-chat thread.\n\nReplayed by clients to rebuild the thread list; the default thread is\nimplicit and never records one of these.",
+      "properties": {
+        "kind": {
+          "const": "chat_thread_created",
+          "default": "chat_thread_created",
+          "title": "Kind",
+          "type": "string"
+        },
+        "thread_id": {
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        },
+        "driver": {
+          "title": "Driver",
+          "type": "string"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "driver",
+        "provider",
+        "model",
+        "created_at"
+      ],
+      "title": "ChatThreadCreatedData",
+      "type": "object"
+    },
+    "ChatThreadInfo": {
+      "additionalProperties": false,
+      "description": "Resolved identity and agent settings of one experiment-chat thread.",
+      "properties": {
+        "thread_id": {
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        },
+        "driver": {
+          "title": "Driver",
+          "type": "string"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "driver",
+        "provider",
+        "model"
+      ],
+      "title": "ChatThreadInfo",
       "type": "object"
     },
     "CommandAck": {
@@ -649,6 +847,7 @@
         "experiments_changed",
         "run_interrupted",
         "chat",
+        "chat_thread_created",
         "status_query",
         "control",
         "invocation_started",
@@ -1418,6 +1617,17 @@
           ],
           "default": null
         },
+        "chat_thread": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatThreadInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "snapshot": {
           "anyOf": [
             {
@@ -1654,6 +1864,18 @@
           "default": null,
           "title": "Execution Id"
         },
+        "chat_thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chat Thread Id"
+        },
         "data": {
           "anyOf": [
             {
@@ -1665,6 +1887,7 @@
                   "agent_output_chunk": "#/$defs/AgentOutputChunkData",
                   "benchmark_result": "#/$defs/BenchmarkResultData",
                   "chat": "#/$defs/ChatData",
+                  "chat_thread_created": "#/$defs/ChatThreadCreatedData",
                   "configuration_failed": "#/$defs/ConfigurationFailedData",
                   "experiments_changed": "#/$defs/ExperimentsChangedData",
                   "invocation_finished": "#/$defs/InvocationFinishedData",
@@ -1687,6 +1910,9 @@
               "oneOf": [
                 {
                   "$ref": "#/$defs/ChatData"
+                },
+                {
+                  "$ref": "#/$defs/ChatThreadCreatedData"
                 },
                 {
                   "$ref": "#/$defs/InvocationStartedData"
@@ -2250,6 +2476,7 @@
           "command.resume": "#/$defs/ResumeCommand",
           "command.steer": "#/$defs/SteerCommand",
           "query.chat": "#/$defs/ChatQuery",
+          "query.chat_thread_create": "#/$defs/ChatThreadCreateQuery",
           "query.events": "#/$defs/EventsQuery",
           "query.experiments": "#/$defs/ExperimentQuery",
           "query.history": "#/$defs/HistoryQuery",
@@ -2274,6 +2501,9 @@
         },
         {
           "$ref": "#/$defs/ChatQuery"
+        },
+        {
+          "$ref": "#/$defs/ChatThreadCreateQuery"
         },
         {
           "$ref": "#/$defs/HistoryQuery"
