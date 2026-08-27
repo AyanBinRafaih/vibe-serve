@@ -1,22 +1,31 @@
 import {afterEach, describe, expect, it} from 'bun:test';
-import {CliRenderEvents, InputRenderable, rgbToHex, ScrollBoxRenderable} from '@opentui/core';
+import {
+  CliRenderEvents,
+  InputRenderable,
+  rgbToHex,
+  ScrollBoxRenderable,
+  TextareaRenderable,
+} from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
-import type {HypothesisEntry} from '@vibesys/backend-client';
+import type {ChatOptions, HypothesisEntry} from '@vibesys/backend-client';
+import {parseChatCommand} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
-  advanceNewChatPicker,
+  activeChatThreadSettings,
+  chatMenuCustomModel,
+  type ChatThreadSettings,
   clearAgentSelection,
   clearEntrySelection,
-  closeChatThreadPicker,
+  closeChatMenu,
   closeOverlays,
   closePane,
   closeThemePicker,
-  moveChatThreadSelection,
-  moveNewChatSelection,
-  openChatThreadPicker,
-  openNewChatPicker,
-  retreatNewChatPicker,
-  setNewChatModel,
+  moveChatMenuSelection,
+  openChatModelMenu,
+  openChatResumeMenu,
+  selectedChatMenuRow,
+  setChatMenuCustomModel,
+  setChatModelMenuOptions,
   switchChatThread,
   cyclePaneFocus,
   dismissErrorBanner,
@@ -2125,6 +2134,58 @@ describe('theming', () => {
     expect(landing).not.toContain('Agents');
   });
 
+  it('shows a round’s agent harness and model inside a hypothesis round drilldown', async () => {
+    // The Agents pane inside a hypothesis round drilldown is the same
+    // AgentMapView the live run uses, driven by the same core.phases replayed
+    // from the full event history, so a completed historical round must
+    // carry its runtime label exactly like a live one does.
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 42, status: 'completed'}],
+        phases: [
+          {
+            kind: 'implementer',
+            status: 'completed',
+            roundNumber: 42,
+            roundLabel: 'round-42-implementer',
+            provider: 'codex',
+            model: 'gpt-5.1-codex-max',
+          },
+        ],
+        transcript: [
+          {
+            id: 'b',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'grew the block',
+            roundNumber: 42,
+          },
+        ],
+      },
+    });
+    controller.experiments = [
+      logEntry('H-08', 42, 42, {
+        claim: 'increase kv cache block',
+        resolved_outcome: 'proven',
+        rounds: [{round: 42, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressEnter(); // hypothesis summary
+    await frameAfter(testRenderer);
+    testRenderer.mockInput.pressEnter(); // round trajectory
+    const trajectory = await frameAfter(testRenderer);
+
+    expect(trajectory).toContain('Codex (GPT');
+  });
+
   it('drills from a full hypothesis summary into a round trajectory and back', async () => {
     const testRenderer = await createTestRenderer({width: 120, height: 24});
     const controller = new FakeController({
@@ -2659,46 +2720,80 @@ describe('theming', () => {
     expect(frame).toContain('half-typed question');
   });
 
-  it('walks the new-thread wizard from driver to provider to model', async () => {
-    const testRenderer = await createTestRenderer({width: 90, height: 26});
+  it('opens /model as a menu beside the composer, grouped by harness', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
     const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
 
-    await testRenderer.mockInput.typeText('/new-chat');
+    await testRenderer.mockInput.typeText('/model');
     testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(value => value.includes('New chat thread'));
-    expect(testRenderer.captureCharFrame()).toContain('› agentshim');
+    const frame = await testRenderer.waitForFrame(value => value.includes('Harness and model'));
 
-    testRenderer.mockInput.pressKey('ARROW_DOWN');
-    await testRenderer.waitForFrame(value => value.includes('› omnigent'));
-    testRenderer.mockInput.pressEnter();
-    // The provider list is narrowed to what the chosen driver supports.
-    let frame = await testRenderer.waitForFrame(value =>
-      value.includes('Provider: claude  ◂ choose'),
-    );
-    expect(frame).toContain('› claude');
-    expect(frame).not.toContain('gemini');
+    // Grouped by harness, showing exactly what the backend reported. The
+    // driver behind the run is never named.
+    expect(frame).toContain('Codex');
+    expect(frame).toContain('gpt-run');
+    expect(frame).toContain('run default');
+    expect(frame).toContain('Claude Code');
+    expect(frame).toContain('custom model');
+    expect(frame).not.toContain('agentshim');
+    expect(frame).not.toContain('omnigent');
 
-    testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(value => value.includes('Model:'));
-    // The model step takes ordinary typing instead of the composer beneath it.
-    await testRenderer.mockInput.typeText('opus');
-    frame = await testRenderer.waitForFrame(value => value.includes('Model: opus'));
-    expect(controller.state.newChatPicker).toMatchObject({
-      step: 'model',
-      driver: 'omnigent',
-      provider: 'claude',
-      model: 'opus',
-    });
-    expect(controller.chatSubmissions).toEqual([]);
+    // The menu is anchored to the composer, not centred over the screen: its
+    // rows sit in the chat column, directly above the message box.
+    const rows = frameRows(frame);
+    const menuRow = rows.findIndex(row => row.includes('Harness and model'));
+    const messageRow = rows.findIndex(row => row.includes('Message'));
+    expect(menuRow).toBeGreaterThan(-1);
+    expect(messageRow).toBeGreaterThan(menuRow);
+    const chatColumn = rows[messageRow]?.indexOf('Message') ?? 0;
+    // Both belong to the same column, so the menu never spans the whole width.
+    expect(rows[menuRow]?.indexOf('Harness and model')).toBeGreaterThan(chatColumn - 6);
+    // The table it was opened over is still on screen beside it, which a
+    // centred dialog would have covered.
+    expect(frame).toContain('Experiments');
+    expect(frame).toContain('No hypotheses have been recorded yet.');
   });
 
-  it('lists the chat threads and switches to the highlighted one', async () => {
-    const testRenderer = await createTestRenderer({width: 90, height: 26});
+  it('takes typing into a group custom entry rather than the composer', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/model');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Harness and model'));
+    // Down onto the codex group's custom entry.
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(
+      () => controller.state.chatMenu?.rows[controller.state.chatMenu.selected]?.kind === 'custom',
+    );
+
+    await testRenderer.mockInput.typeText('gpt-5.5');
+    const frame = await testRenderer.waitForFrame(value => value.includes('gpt-5.5'));
+    expect(frame).toContain('gpt-5.5');
+    // The keystrokes went to the entry, not to the question underneath it.
+    expect(controller.chatSubmissions).toEqual([]);
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.state.chatMenu === null);
+    expect(controller.createdThreads).toEqual([{provider: 'codex', model: 'gpt-5.5'}]);
+  });
+
+  it('lists the chat threads for /resume and switches to the highlighted one', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
     const controller = new FakeController(initialSessionState());
     controller.publish({
       ...controller.state,
+      experimentLog: emptyLog(),
+      layout: chatFocus(),
       core: {
         ...controller.state.core,
         chatThreads: [
@@ -2715,23 +2810,223 @@ describe('theming', () => {
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
 
-    await testRenderer.mockInput.typeText('/chats');
+    await testRenderer.mockInput.typeText('/resume');
     testRenderer.mockInput.pressEnter();
     const frame = await testRenderer.waitForFrame(value => value.includes('Chat threads'));
     // The implicit default is named by the client; a created thread shows the
-    // backend-owned title beside the agent it was created with.
+    // backend-owned title beside its harness and model. Not its driver.
     expect(frame).toContain('Experiment chat');
-    expect(frame).toContain('active');
     expect(frame).toContain('GPU stalls');
-    expect(frame).toContain('omnigent/claude');
+    expect(frame).toContain('Claude Code');
+    expect(frame).not.toContain('omnigent');
+
+    // Anchored to the composer, above the message box, not centred on screen.
+    const rows = frameRows(frame);
+    expect(rows.findIndex(row => row.includes('Chat threads'))).toBeLessThan(
+      rows.findIndex(row => row.includes('Message')),
+    );
 
     testRenderer.mockInput.pressKey('ARROW_DOWN');
     await testRenderer.waitForFrame(value => value.includes('› GPU stalls'));
     testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(() => controller.state.chatThreadPicker === null);
+    await testRenderer.waitForFrame(() => controller.state.chatMenu === null);
 
     expect(controller.state.activeChatThreadId).toBe('thread-a');
+  });
+
+  it('/clear starts a thread on the active thread settings from the composer', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({
+      ...controller.state,
+      experimentLog: emptyLog(),
+      layout: chatFocus(),
+      activeChatThreadId: 'thread-a',
+      core: {
+        ...controller.state.core,
+        chatThreads: [
+          ...controller.state.core.chatThreads,
+          {
+            id: 'thread-a',
+            title: 'GPU stalls',
+            driver: 'omnigent',
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    // The pane header names the thread and the agent answering it.
+    const opening = await frameAfter(testRenderer);
+    expect(opening).toContain('GPU stalls');
+    expect(opening).toContain('Claude Code');
+
+    await testRenderer.mockInput.typeText('/clear');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.clearedSettings.length === 1);
+
+    expect(controller.clearedSettings).toEqual([{provider: 'claude', model: 'opus'}]);
+    // A command, not a question: nothing was sent to the agent.
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
+  it('suggests the chat commands beside the composer as they are typed', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/');
+    const frame = await testRenderer.waitForFrame(value => value.includes('/resume'));
+
+    // Only the chat's own commands, and only beside the composer.
+    expect(frame).toContain('/clear');
+    expect(frame).toContain('/model');
+    expect(frame).toContain('/resume');
+    const rows = frameRows(frame);
+    expect(rows.findIndex(row => row.includes('/model'))).toBeLessThan(
+      rows.findIndex(row => row.includes('Message')),
+    );
+  });
+
+  it('highlights and navigates the chat composer suggestions like the command bar', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    // /clear, /model, /resume: the composer's own command set, in that order.
+    await testRenderer.mockInput.typeText('/');
+    const first = await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    expect(first).toContain('› /clear');
+
+    testRenderer.mockInput.pressArrow('down');
+    const second = await testRenderer.waitForFrame(value => value.includes('› /model'));
+    expect(second).not.toContain('› /clear');
+
+    testRenderer.mockInput.pressArrow('down');
+    const third = await testRenderer.waitForFrame(value => value.includes('› /resume'));
+    expect(third).not.toContain('› /model');
+  });
+
+  it('fills the highlighted chat composer suggestion into the composer with Tab', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    testRenderer.mockInput.pressArrow('down');
+    await testRenderer.waitForFrame(value => value.includes('› /model'));
+
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('/model');
+
+    // The highlighted match already equals the typed text, so a second Tab
+    // does not clobber what was just filled in.
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    expect(editor.plainText).toBe('/model');
+  });
+
+  it('leaves the chat composer alone when Tab has no suggestion to complete', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('what is running?');
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('what is running?');
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
+  it('dismisses the chat composer suggestion menu once nothing matches', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+
+    await testRenderer.mockInput.typeText('zz');
+    const frame = await testRenderer.waitForFrame(value => value.includes('/zz'));
+    expect(frame).not.toContain('/clear');
+    expect(frame).not.toContain('/model');
+    expect(frame).not.toContain('/resume');
+
+    // Nothing to complete once the menu is gone: Tab is a no-op.
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('/zz');
+  });
+
+  it('fills the highlighted suggestion into the modal chat composer with Tab', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController({...initialSessionState(), chatOpen: true});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Ask a question about'));
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    testRenderer.mockInput.pressArrow('down');
+    await testRenderer.waitForFrame(value => value.includes('› /model'));
+
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-modal-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable))
+      throw new Error('modal composer editor was missing');
+    expect(editor.plainText).toBe('/model');
+    // Only the modal moved; the docked chat is not on screen to disturb.
+    expect(controller.state.chatOpen).toBe(true);
+  });
+
+  it('answers unknown composer slash input with the chat help', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/threads');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatHelpShown.length === 1);
+
+    expect(controller.chatHelpShown[0]).toContain('/model');
+    expect(controller.submissions).toEqual([]);
+    expect(controller.chatSubmissions).toEqual([]);
   });
 
   it('keeps the chat, the table, and the visualization on screen together', async () => {
@@ -3321,6 +3616,21 @@ async function frameAfter(testRenderer: TestRendererSetup): Promise<string> {
   return testRenderer.captureCharFrame();
 }
 
+/** A captured frame as its screen rows, for asserting where something sits. */
+function frameRows(frame: string): string[] {
+  return frame.split('\n');
+}
+
+/** The landing view, which is where the chat is a docked pane. */
+function emptyLog(): NonNullable<SessionState['experimentLog']> {
+  return {entries: [], selectedId: null, pending: false, error: null};
+}
+
+/** Puts the keys on the docked chat, which is where its commands are typed. */
+function chatFocus(): SessionState['layout'] {
+  return {right: null, focus: 'chat', zoomedPane: null};
+}
+
 /**
  * A bare ESC is held by the stdin parser until its escape-sequence timeout
  * expires, so the key lands a beat after it is pressed.
@@ -3435,6 +3745,23 @@ class FakeController implements SessionController {
   readonly #listeners = new Set<(state: SessionState) => void>();
   readonly submissions: string[] = [];
   readonly chatSubmissions: string[] = [];
+  /** Chat-scoped help the composer answered unknown slash input with. */
+  readonly chatHelpShown: string[] = [];
+  readonly createdThreads: ChatThreadSettings[] = [];
+  readonly clearedSettings: (ChatThreadSettings | null)[] = [];
+  /** Stands in for the backend's `query.chat_options` response. */
+  chatOptions: ChatOptions = {
+    providers: [
+      {
+        provider: 'codex',
+        models: [
+          {model: 'gpt-run', source: 'run', default: true},
+          {model: 'gpt-5.6-sol', source: 'suggested', default: false},
+        ],
+      },
+      {provider: 'claude', models: [{model: 'claude-opus-5', source: 'suggested', default: false}]},
+    ],
+  };
   liveCalls = 0;
 
   /**
@@ -3475,8 +3802,6 @@ class FakeController implements SessionController {
       this.#notify();
     }
     if (value.trim() === '/theme') this.openThemePicker();
-    if (value.trim() === '/new-chat') this.openNewChatPicker();
-    if (value.trim() === '/chats') this.openChatThreadPicker();
     return Promise.resolve();
   }
   closeChat(): void {
@@ -3486,42 +3811,43 @@ class FakeController implements SessionController {
   switchChatThread(threadId: string): void {
     this.publish(switchChatThread(this.state, threadId));
   }
-  openChatThreadPicker(): void {
-    this.publish(openChatThreadPicker(this.state));
+  openChatResumeMenu(): void {
+    this.publish(openChatResumeMenu(this.state));
   }
-  moveChatThreadSelection(delta: number): void {
-    this.publish(moveChatThreadSelection(this.state, delta));
-  }
-  applySelectedChatThread(): void {
-    const picker = this.state.chatThreadPicker;
-    if (picker !== null) this.switchChatThread(picker.selected);
-  }
-  closeChatThreadPicker(): void {
-    this.publish(closeChatThreadPicker(this.state));
-  }
-  openNewChatPicker(): void {
-    this.publish(openNewChatPicker(this.state));
-  }
-  moveNewChatSelection(delta: number): void {
-    this.publish(moveNewChatSelection(this.state, delta));
-  }
-  confirmNewChatPicker(): Promise<void> {
-    const picker = this.state.newChatPicker;
-    if (picker === null) return Promise.resolve();
-    if (picker.step !== 'model') this.publish(advanceNewChatPicker(this.state));
-    else this.publish({...this.state, newChatPicker: null});
+  openChatModelMenu(): Promise<void> {
+    // Mocked protocol response: the client renders exactly what it receives.
+    this.publish(setChatModelMenuOptions(openChatModelMenu(this.state), this.chatOptions));
     return Promise.resolve();
   }
-  retreatNewChatPicker(): void {
-    this.publish(retreatNewChatPicker(this.state));
+  clearChatThread(): Promise<void> {
+    this.clearedSettings.push(activeChatThreadSettings(this.state));
+    return Promise.resolve();
   }
-  typeNewChatModel(text: string): void {
-    const picker = this.state.newChatPicker;
-    if (picker !== null) this.publish(setNewChatModel(this.state, picker.model + text));
+  moveChatMenuSelection(delta: number): void {
+    this.publish(moveChatMenuSelection(this.state, delta));
   }
-  backspaceNewChatModel(): void {
-    const picker = this.state.newChatPicker;
-    if (picker !== null) this.publish(setNewChatModel(this.state, picker.model.slice(0, -1)));
+  confirmChatMenu(): Promise<void> {
+    const row = selectedChatMenuRow(this.state);
+    if (row === null) return Promise.resolve();
+    if (row.kind === 'thread') {
+      this.switchChatThread(row.threadId);
+      return Promise.resolve();
+    }
+    if (row.kind !== 'model' && row.kind !== 'custom') return Promise.resolve();
+    const model = row.kind === 'custom' ? chatMenuCustomModel(this.state).trim() : row.model;
+    if (model === '') return Promise.resolve();
+    this.createdThreads.push({provider: row.provider, model});
+    this.publish(closeChatMenu(this.state));
+    return Promise.resolve();
+  }
+  closeChatMenu(): void {
+    this.publish(closeChatMenu(this.state));
+  }
+  typeChatMenuCustomModel(text: string): void {
+    this.publish(setChatMenuCustomModel(this.state, chatMenuCustomModel(this.state) + text));
+  }
+  backspaceChatMenuCustomModel(): void {
+    this.publish(setChatMenuCustomModel(this.state, chatMenuCustomModel(this.state).slice(0, -1)));
   }
   setTheme(themeName: ThemeName): void {
     this.state = {...this.state, themeName};
@@ -3543,7 +3869,16 @@ class FakeController implements SessionController {
   submitChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text.startsWith('/')) return this.sendChat(value);
-    return this.submitCommand(text);
+    const parsed = parseChatCommand(text);
+    if (parsed.command === 'clear') return this.clearChatThread();
+    if (parsed.command === 'model') return this.openChatModelMenu();
+    if (parsed.command === 'resume') {
+      this.openChatResumeMenu();
+      return Promise.resolve();
+    }
+    if (parsed.global === true) return this.submitCommand(text);
+    this.chatHelpShown.push(parsed.help ?? '');
+    return Promise.resolve();
   }
 
   sendChat(value: string): Promise<void> {

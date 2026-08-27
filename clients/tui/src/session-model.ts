@@ -1,4 +1,10 @@
-import type {Diagnostic, HypothesisEntry, RunEvent, RunSnapshot} from '@vibesys/backend-client';
+import type {
+  ChatOptions,
+  Diagnostic,
+  HypothesisEntry,
+  RunEvent,
+  RunSnapshot,
+} from '@vibesys/backend-client';
 import {
   type ActiveAgentExecution,
   type ActiveExecutionCheckpoint,
@@ -19,6 +25,7 @@ import {
   type TodoItem,
   type TranscriptEntry,
 } from '@vibesys/core-state';
+import {agentRuntimeLabel} from './ui/agent-runtime-label.js';
 import {DEFAULT_THEME_NAME, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export interface SessionState {
@@ -49,10 +56,8 @@ export interface SessionState {
   /** True while the active thread awaits an answer; from `chatPendingThreads`. */
   chatPending: boolean;
   chatPendingThreads: Record<string, boolean>;
-  /** Non-null while the thread list is open as a keyboard selection. */
-  chatThreadPicker: ChatThreadPicker | null;
-  /** Non-null while the new-thread wizard is open. */
-  newChatPicker: NewChatPicker | null;
+  /** Non-null while the composer's inline command menu is open. */
+  chatMenu: ChatMenu | null;
   todosExpanded: boolean;
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
@@ -191,30 +196,39 @@ export interface ThemePicker {
 }
 
 /**
- * Picker choices for the new-thread wizard. This is a UI affordance only:
- * the backend is the authority and re-validates every combination, so a
- * stale catalog degrades to a server error rather than a wrong thread.
+ * One row of the inline menu anchored to the chat composer. Only `model`,
+ * `custom`, and `thread` rows are selectable; headers and notes are structure.
  */
-export const CHAT_DRIVERS = ['agentshim', 'omnigent'] as const;
-export type ChatDriverName = (typeof CHAT_DRIVERS)[number];
-export const CHAT_DRIVER_PROVIDERS: Record<ChatDriverName, readonly string[]> = {
-  agentshim: ['claude', 'gemini', 'codex', 'opencode'],
-  omnigent: ['claude', 'codex'],
-};
-
-export interface ChatThreadPicker {
-  /** Thread id the highlight is on; Enter switches to it. */
-  selected: string;
-}
+export type ChatMenuRow =
+  | {kind: 'header'; label: string}
+  | {kind: 'note'; label: string}
+  | {kind: 'model'; label: string; provider: string; model: string; isDefault: boolean}
+  | {kind: 'custom'; label: string; provider: string}
+  | {kind: 'thread'; label: string; detail: string; threadId: string; active: boolean};
 
 /**
- * The new-thread wizard: driver, then a provider the driver supports, then a
- * free-text model. An empty model means the run's configured default, which
- * only the backend knows authoritatively.
+ * The chat composer's own selection surface, rendered adjacent to the composer
+ * rather than as a dialog over the view. Rows are computed once when the menu
+ * opens, so the renderer stays a projection of state and a frame test can read
+ * exactly what an operator sees.
+ *
+ * The client enumerates nothing: `model` rows come from the backend's
+ * `query.chat_options` response verbatim.
  */
-export interface NewChatPicker {
-  step: 'driver' | 'provider' | 'model';
-  driver: ChatDriverName;
+export interface ChatMenu {
+  kind: 'model' | 'resume';
+  title: string;
+  rows: ChatMenuRow[];
+  /** Index of the highlighted row, or -1 while there is nothing to select. */
+  selected: number;
+  pending: boolean;
+  error: string | null;
+  /** Free text typed into each provider's custom entry, keyed by provider. */
+  customModels: Record<string, string>;
+}
+
+/** The agent selection a new thread should inherit, or null for the run's. */
+export interface ChatThreadSettings {
   provider: string;
   model: string;
 }
@@ -269,8 +283,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     chatConversations: {},
     chatPending: false,
     chatPendingThreads: {},
-    chatThreadPicker: null,
-    newChatPicker: null,
+    chatMenu: null,
     todosExpanded: false,
     themeName,
     // The experiment log is the landing view: a run's history reads as a short
@@ -373,7 +386,9 @@ export function chatThreads(state: SessionState): ChatThread[] {
 
 /**
  * What the chat surfaces call one thread. Titles are backend-owned and arrive
- * through events; an untitled created thread reads as its agent selection.
+ * through events; an untitled created thread reads as its harness and model.
+ * The agent driver never appears: which driver backs a run is a deployment
+ * detail, and every thread inherits the run's.
  */
 export function chatThreadLabel(
   state: SessionState,
@@ -382,21 +397,51 @@ export function chatThreadLabel(
   const thread = state.core.chatThreads.find(candidate => candidate.id === threadId);
   if (thread === undefined) return 'Experiment chat';
   if (thread.title) return thread.title;
-  if (thread.driver === null && thread.provider === null) return 'Experiment chat';
-  const model = thread.model === null ? '' : ` · ${thread.model}`;
-  return `${thread.driver ?? '?'}/${thread.provider ?? '?'}${model}`;
+  return agentRuntimeLabel(thread.provider, thread.model) ?? 'Experiment chat';
+}
+
+/**
+ * What a chat surface puts in its header: the thread's name, and its runtime
+ * when the name does not already spell one out. An operator switching threads
+ * needs to see both which conversation this is and which agent answers it.
+ */
+export function chatThreadHeading(
+  state: SessionState,
+  threadId: string = state.activeChatThreadId,
+): string {
+  const label = chatThreadLabel(state, threadId);
+  const runtime = chatThreadRuntimeLabel(state, threadId);
+  return runtime === null || runtime === label ? label : `${label} · ${runtime}`;
+}
+
+/**
+ * The active thread's runtime, e.g. `"Codex (GPT 5.5)"`. Null for a thread the
+ * backend has not described, which is the default thread before any answer.
+ */
+export function chatThreadRuntimeLabel(
+  state: SessionState,
+  threadId: string = state.activeChatThreadId,
+): string | null {
+  const thread = state.core.chatThreads.find(candidate => candidate.id === threadId);
+  if (thread === undefined) return null;
+  return agentRuntimeLabel(thread.provider, thread.model);
+}
+
+/**
+ * What a thread started from this one should inherit. Null means the thread
+ * carries no selection of its own, so the backend resolves the run's.
+ */
+export function activeChatThreadSettings(state: SessionState): ChatThreadSettings | null {
+  const thread = state.core.chatThreads.find(
+    candidate => candidate.id === state.activeChatThreadId,
+  );
+  if (thread === undefined || thread.provider === null || thread.model === null) return null;
+  return {provider: thread.provider, model: thread.model};
 }
 
 /** Makes one thread the chat surface's subject and puts the keys on the chat. */
 export function switchChatThread(state: SessionState, threadId: string): SessionState {
-  return openChat(
-    deriveActiveChat({
-      ...state,
-      activeChatThreadId: threadId,
-      chatThreadPicker: null,
-      newChatPicker: null,
-    }),
-  );
+  return openChat(deriveActiveChat({...state, activeChatThreadId: threadId, chatMenu: null}));
 }
 
 /** Applies one thread's conversation change and refreshes the derived fields. */
@@ -423,102 +468,150 @@ export function setChatThreadPending(
   });
 }
 
-/** Opens the thread list as a selection, starting on the active thread. */
-export function openChatThreadPicker(state: SessionState): SessionState {
+/** `/resume`: the thread list, as an inline selection on the active thread. */
+export function openChatResumeMenu(state: SessionState): SessionState {
+  const rows: ChatMenuRow[] = state.core.chatThreads.map(thread => ({
+    kind: 'thread' as const,
+    label: chatThreadLabel(state, thread.id),
+    detail: agentRuntimeLabel(thread.provider, thread.model) ?? 'run agent',
+    threadId: thread.id,
+    active: thread.id === state.activeChatThreadId,
+  }));
+  const active = rows.findIndex(row => row.kind === 'thread' && row.active);
   return {
     ...state,
     overlay: null,
     themePicker: null,
-    newChatPicker: null,
-    chatThreadPicker: {selected: state.activeChatThreadId},
-  };
-}
-
-export function moveChatThreadSelection(state: SessionState, delta: number): SessionState {
-  const picker = state.chatThreadPicker;
-  if (picker === null) return state;
-  const ids = state.core.chatThreads.map(thread => thread.id);
-  const current = ids.indexOf(picker.selected);
-  const index = Math.min(ids.length - 1, Math.max(0, (current === -1 ? 0 : current) + delta));
-  const selected = ids[index];
-  if (selected === undefined || selected === picker.selected) return state;
-  return {...state, chatThreadPicker: {selected}};
-}
-
-export function closeChatThreadPicker(state: SessionState): SessionState {
-  if (state.chatThreadPicker === null) return state;
-  return {...state, chatThreadPicker: null};
-}
-
-/**
- * Opens the new-thread wizard on its first step. The model prefill is the
- * backend-reported live model when one has streamed in; empty text submits no
- * override, so the backend resolves the run's configured default.
- */
-export function openNewChatPicker(state: SessionState): SessionState {
-  const driver = CHAT_DRIVERS[0];
-  return {
-    ...state,
-    overlay: null,
-    themePicker: null,
-    chatThreadPicker: null,
-    newChatPicker: {
-      step: 'driver',
-      driver,
-      provider: CHAT_DRIVER_PROVIDERS[driver][0] ?? '',
-      model: state.core.usage?.model ?? '',
+    chatMenu: {
+      kind: 'resume',
+      title: 'Chat threads',
+      rows,
+      selected: active === -1 ? firstSelectable(rows) : active,
+      pending: false,
+      error: null,
+      customModels: {},
     },
   };
 }
 
-export function moveNewChatSelection(state: SessionState, delta: number): SessionState {
-  const picker = state.newChatPicker;
-  if (picker === null) return state;
-  if (picker.step === 'driver') {
-    const current = CHAT_DRIVERS.indexOf(picker.driver);
-    const index = Math.min(CHAT_DRIVERS.length - 1, Math.max(0, current + delta));
-    const driver = CHAT_DRIVERS[index];
-    if (driver === undefined || driver === picker.driver) return state;
-    const providers = CHAT_DRIVER_PROVIDERS[driver];
-    // The provider survives the driver change only where it stays supported.
-    const provider = providers.includes(picker.provider) ? picker.provider : (providers[0] ?? '');
-    return {...state, newChatPicker: {...picker, driver, provider}};
+/** `/model`: opened empty, then filled by the backend's chat options. */
+export function openChatModelMenu(state: SessionState): SessionState {
+  return {
+    ...state,
+    overlay: null,
+    themePicker: null,
+    chatMenu: {
+      kind: 'model',
+      title: 'Harness and model',
+      rows: [{kind: 'note', label: 'Loading options…'}],
+      selected: -1,
+      pending: true,
+      error: null,
+      customModels: {},
+    },
+  };
+}
+
+/**
+ * Renders exactly what the backend returned: one group per provider it says is
+ * valid, its models beneath, and a free-text entry per group for a model the
+ * suggestion list does not carry.
+ */
+export function setChatModelMenuOptions(state: SessionState, options: ChatOptions): SessionState {
+  const menu = state.chatMenu;
+  if (menu === null || menu.kind !== 'model') return state;
+  const rows: ChatMenuRow[] = [];
+  for (const group of options.providers ?? []) {
+    rows.push({kind: 'header', label: agentRuntimeLabel(group.provider, null) ?? group.provider});
+    for (const option of group.models ?? []) {
+      rows.push({
+        kind: 'model',
+        label: option.default ? `${option.model}  · run default` : option.model,
+        provider: group.provider,
+        model: option.model,
+        isDefault: option.default === true,
+      });
+    }
+    rows.push({kind: 'custom', label: 'custom model…', provider: group.provider});
   }
-  if (picker.step === 'provider') {
-    const providers = CHAT_DRIVER_PROVIDERS[picker.driver];
-    const current = providers.indexOf(picker.provider);
-    const index = Math.min(
-      providers.length - 1,
-      Math.max(0, (current === -1 ? 0 : current) + delta),
-    );
-    const provider = providers[index];
-    if (provider === undefined || provider === picker.provider) return state;
-    return {...state, newChatPicker: {...picker, provider}};
+  if (rows.length === 0) rows.push({kind: 'note', label: 'This run offers no chat harness.'});
+  return {...state, chatMenu: {...menu, rows, selected: firstSelectable(rows), pending: false}};
+}
+
+export function failChatMenu(state: SessionState, message: string): SessionState {
+  const menu = state.chatMenu;
+  if (menu === null) return state;
+  return {
+    ...state,
+    chatMenu: {
+      ...menu,
+      rows: [{kind: 'note', label: message}],
+      selected: -1,
+      pending: false,
+      error: message,
+    },
+  };
+}
+
+export function moveChatMenuSelection(state: SessionState, delta: number): SessionState {
+  const menu = state.chatMenu;
+  if (menu === null || delta === 0) return state;
+  const step = delta > 0 ? 1 : -1;
+  let selected = menu.selected;
+  for (let remaining = Math.abs(delta); remaining > 0; remaining -= 1) {
+    const next = nextSelectable(menu.rows, selected, step);
+    if (next === selected) break;
+    selected = next;
   }
-  return state;
+  if (selected === menu.selected) return state;
+  return {...state, chatMenu: {...menu, selected}};
 }
 
-/** Enter on a non-final step: the wizard moves on with the choice kept. */
-export function advanceNewChatPicker(state: SessionState): SessionState {
-  const picker = state.newChatPicker;
-  if (picker === null || picker.step === 'model') return state;
-  const step = picker.step === 'driver' ? 'provider' : 'model';
-  return {...state, newChatPicker: {...picker, step}};
+export function closeChatMenu(state: SessionState): SessionState {
+  if (state.chatMenu === null) return state;
+  return {...state, chatMenu: null};
 }
 
-/** Escape: one step back, and off the first step the wizard closes. */
-export function retreatNewChatPicker(state: SessionState): SessionState {
-  const picker = state.newChatPicker;
-  if (picker === null) return state;
-  if (picker.step === 'driver') return {...state, newChatPicker: null};
-  const step = picker.step === 'model' ? 'provider' : 'driver';
-  return {...state, newChatPicker: {...picker, step}};
+/** The row Enter acts on, or null while nothing selectable is highlighted. */
+export function selectedChatMenuRow(state: SessionState): ChatMenuRow | null {
+  const menu = state.chatMenu;
+  if (menu === null || menu.selected < 0) return null;
+  return menu.rows[menu.selected] ?? null;
 }
 
-export function setNewChatModel(state: SessionState, model: string): SessionState {
-  const picker = state.newChatPicker;
-  if (picker === null || picker.step !== 'model') return state;
-  return {...state, newChatPicker: {...picker, model}};
+/** Text typed into the highlighted custom entry, empty when none is. */
+export function chatMenuCustomModel(state: SessionState): string {
+  const row = selectedChatMenuRow(state);
+  if (row === null || row.kind !== 'custom') return '';
+  return state.chatMenu?.customModels[row.provider] ?? '';
+}
+
+export function setChatMenuCustomModel(state: SessionState, model: string): SessionState {
+  const menu = state.chatMenu;
+  const row = selectedChatMenuRow(state);
+  if (menu === null || row === null || row.kind !== 'custom') return state;
+  return {
+    ...state,
+    chatMenu: {...menu, customModels: {...menu.customModels, [row.provider]: model}},
+  };
+}
+
+function isSelectable(row: ChatMenuRow): boolean {
+  return row.kind === 'model' || row.kind === 'custom' || row.kind === 'thread';
+}
+
+function firstSelectable(rows: readonly ChatMenuRow[]): number {
+  const index = rows.findIndex(isSelectable);
+  return index;
+}
+
+/** The next selectable index in `step` direction, or `from` when there is none. */
+function nextSelectable(rows: readonly ChatMenuRow[], from: number, step: number): number {
+  for (let index = from + step; index >= 0 && index < rows.length; index += step) {
+    const row = rows[index];
+    if (row !== undefined && isSelectable(row)) return index;
+  }
+  return from < 0 ? firstSelectable(rows) : from;
 }
 
 export function openExperimentLog(state: SessionState): SessionState {

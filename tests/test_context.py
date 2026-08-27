@@ -384,6 +384,9 @@ def _chat_service(
             flush_logs=lambda: None,
             environment=dict,
             progress=lambda: None,
+            driver="agentshim",
+            provider="codex",
+            model="gpt-test",
             thread_id=thread_id,
         )
     )
@@ -431,6 +434,27 @@ def test_created_chat_thread_owns_its_state_dir_and_shares_trajectory(tmp_path: 
     service.ask("and then?")
     continuation = agent_client.invoke_text.call_args.kwargs["system_prompt"]
     assert "_vibesys_chat/threads/thread-a/instructions.md" in continuation
+
+
+def test_chat_execution_events_carry_the_threads_runtime_identity(tmp_path: Path) -> None:
+    """A chat execution is labelled like a round agent's, not as an anonymous chat."""
+    service, _ = _chat_service(tmp_path, thread_id="thread-a")
+
+    service.ask("what happened?")
+
+    recorded = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "run-events.jsonl").read_text().splitlines()
+        if line
+    ]
+    started = [
+        event for event in recorded if event["type"] == EventType.AGENT_EXECUTION_STARTED.value
+    ]
+    assert len(started) == 1
+    assert started[0]["agent_kind"] == "chat"
+    assert started[0]["data"]["driver"] == "agentshim"
+    assert started[0]["data"]["provider"] == "codex"
+    assert started[0]["data"]["model"] == "gpt-test"
 
 
 def test_repository_task_exposes_its_actual_reference_path(tmp_path: Path) -> None:

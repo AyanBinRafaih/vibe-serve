@@ -6,12 +6,8 @@ import {
   SyntaxStyle,
   TextRenderable,
 } from '@opentui/core';
-import {
-  type CommandContext,
-  type SlashCommand,
-  slashCommandRange,
-  suggestSlashCommands,
-} from '../commands.js';
+import {type CommandContext, slashCommandRange, suggestSlashCommands} from '../commands.js';
+import {SuggestionMenu} from './suggestion-menu.js';
 import type {Theme} from './theme.js';
 
 export interface CommandInputPanel {
@@ -31,21 +27,6 @@ export interface CommandInputPanel {
 
 function commandSyntaxStyle(theme: Theme): SyntaxStyle {
   return SyntaxStyle.fromStyles({'slash-command': {fg: theme.accent, bold: true}});
-}
-
-function renderSuggestions(
-  matches: readonly SlashCommand[],
-  selectedIndex: number,
-  value: string,
-): string {
-  return matches
-    .map(
-      (command, index) =>
-        `${index === selectedIndex ? '›' : ' '} ${command.name.padEnd(10)} ${command.description}${
-          index === selectedIndex && command.name !== value ? '  [Tab]' : ''
-        }`,
-    )
-    .join('\n');
 }
 
 export function createCommandInputPanel(
@@ -104,8 +85,7 @@ export function createCommandInputPanel(
     content: '',
   });
   suggestions.add(suggestionList);
-  let matches: readonly SlashCommand[] = [];
-  let selectedIndex = 0;
+  const menu = new SuggestionMenu();
   let context: CommandContext = {};
 
   const updateDecorations = (value: string): void => {
@@ -115,13 +95,11 @@ export function createCommandInputPanel(
       input.addHighlightByCharRange({...range, styleId: commandStyleId});
     }
 
-    matches = suggestSlashCommands(value, context);
-    selectedIndex = 0;
-    const visible = matches.length > 0;
-    suggestions.visible = visible;
-    suggestions.height = matches.length + 2;
-    suggestionList.height = Math.max(1, matches.length);
-    suggestionList.content = renderSuggestions(matches, selectedIndex, value);
+    menu.setMatches(suggestSlashCommands(value, context));
+    suggestions.visible = menu.visible;
+    suggestions.height = menu.matches.length + 2;
+    suggestionList.height = Math.max(1, menu.matches.length);
+    suggestionList.content = menu.renderLines(value).join('\n');
   };
   const submit = (value: string): void => {
     input.value = '';
@@ -141,16 +119,14 @@ export function createCommandInputPanel(
       updateDecorations(input.value);
     },
     completeSuggestion(): boolean {
-      const suggestion = matches[selectedIndex];
-      if (suggestion === undefined || suggestion.name === input.value) return false;
-      input.value = suggestion.name;
-      selectedIndex = 0;
+      const value = menu.complete(input.value);
+      if (value === null) return false;
+      input.value = value;
       return true;
     },
     navigateSuggestions(direction: 1 | -1): boolean {
-      if (matches.length === 0) return false;
-      selectedIndex = (selectedIndex + direction + matches.length) % matches.length;
-      suggestionList.content = renderSuggestions(matches, selectedIndex, input.value);
+      if (!menu.navigate(direction)) return false;
+      suggestionList.content = menu.renderLines(input.value).join('\n');
       return true;
     },
     isEmpty: () => input.value.trim() === '',

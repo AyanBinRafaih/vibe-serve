@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 
 from vibesys.server import RunSupervisor
+from vibesys.server.chat_options import ChatRunSettings
 from vibesys.server.events import ChatData, ChatThreadCreatedData, EventType, RunEvent, make_event
 from vibesys.server.protocol import (
+    ChatOptionsQuery,
     ChatQuery,
     ChatThreadCreateQuery,
     ChatThreadInfo,
@@ -197,6 +199,69 @@ def test_service_creates_threads_and_routes_threaded_chat(tmp_path):  # noqa: AN
     assert [event.chat_thread_id for event in chat_events] == [created.chat_thread.thread_id]
 
 
+def test_chat_options_group_by_provider_and_mark_the_run_model(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    supervisor.set_chat_run_settings(
+        ChatRunSettings(
+            driver="omnigent",
+            provider="codex",
+            model="gpt-5.5-run",
+            role_models=("gpt-5.6-outer", "gpt-5.5-run"),
+        )
+    )
+    service = SupervisionService(supervisor)
+
+    options = service.execute(ChatOptionsQuery()).chat_options
+    assert options is not None
+
+    # Only providers the run's configured driver supports, and no driver field
+    # anywhere in the response: a client never chooses one.
+    assert [group.provider for group in options.providers] == ["claude", "codex"]
+    assert "driver" not in options.model_dump()
+
+    codex = next(group for group in options.providers if group.provider == "codex")
+    assert codex.models[0].model == "gpt-5.5-run"
+    assert codex.models[0].source == "run"
+    assert codex.models[0].default is True
+    # The role override follows the run model; the duplicate role entry is not
+    # repeated, and the curated suggestions come last.
+    assert [option.model for option in codex.models[:2]] == ["gpt-5.5-run", "gpt-5.6-outer"]
+    assert codex.models[1].source == "role"
+    assert {option.source for option in codex.models[2:]} == {"suggested"}
+
+    # Another provider gets suggestions only, and nothing is marked default.
+    claude = next(group for group in options.providers if group.provider == "claude")
+    assert {option.source for option in claude.models} == {"suggested"}
+    assert [option.model for option in claude.models if option.default] == []
+    assert sum(option.default for group in options.providers for option in group.models) == 1
+
+
+def test_chat_options_are_absent_before_a_run_context_attaches(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    response = SupervisionService(supervisor).execute(ChatOptionsQuery())
+
+    # None distinguishes bootstrap from a run that genuinely offers nothing.
+    assert response.ok is True
+    assert response.chat_options is None
+
+
+def test_chat_thread_create_defaults_its_driver_to_the_runs(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+    calls: list[tuple[str, str | None, str | None, str | None]] = []
+    supervisor.set_chat_thread_factory(_factory(calls, "thread-agent"))
+    service = SupervisionService(supervisor)
+
+    # The client sends provider and model only; the driver stays the run's.
+    created = service.execute(ChatThreadCreateQuery(provider="claude", model="opus"))
+
+    assert calls == [(created.chat_thread.thread_id, None, "claude", "opus")]
+    assert created.chat_thread.driver == "agentshim"
+
+
 def test_chat_thread_wire_shapes_round_trip():  # noqa: ANN201
     request = ChatThreadCreateQuery(driver="omnigent", provider="codex", model="o4", title="t")
     assert ChatThreadCreateQuery.model_validate_json(request.model_dump_json()) == request
@@ -233,6 +298,10 @@ def test_chat_thread_wire_shapes_round_trip():  # noqa: ANN201
     restored_chat = RunEvent.model_validate_json(chat_event.model_dump_json())
     assert isinstance(restored_chat.data, ChatData)
     assert restored_chat.data.thread_title == "why?"
+
+    assert ChatOptionsQuery.model_validate_json(ChatOptionsQuery().model_dump_json()).type == (
+        "query.chat_options"
+    )
 
     response = Response.model_validate_json(
         Response(

@@ -6,11 +6,14 @@ from typing import TYPE_CHECKING, Literal
 
 from vibesys.loops.agent.hypotheses import reproject_run_evidence
 from vibesys.loops.agent.state import AgentRunStateStore
+from vibesys.server.chat_options import build_chat_options
 from vibesys.server.events import EventType, RunEvent
 from vibesys.server.experiments import build_experiment_log
 from vibesys.server.inspector import RunInspector
 from vibesys.server.protocol import (
     ActiveAgentExecution,
+    ChatOptions,
+    ChatOptionsQuery,
     ChatQuery,
     ChatResult,
     ChatThreadCreateQuery,
@@ -50,6 +53,8 @@ class SupervisionService:
             return self._execute_chat(request)
         if isinstance(request, ChatThreadCreateQuery):
             return self._execute_chat_thread_create(request)
+        if isinstance(request, ChatOptionsQuery):
+            return Response(request_id=request.request_id, chat_options=self.chat_options())
         if isinstance(request, HistoryQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/history")
             return Response(request_id=request.request_id, events=self.history_events())
@@ -117,6 +122,11 @@ class SupervisionService:
             ),
             events=self.supervisor.read_events(sequence),
         )
+
+    def chat_options(self) -> ChatOptions | None:
+        """Enumerate the run's chat agent selections, or None before attach."""
+        settings = self.supervisor.chat_run_settings
+        return None if settings is None else build_chat_options(settings)
 
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         return self.supervisor.snapshot()

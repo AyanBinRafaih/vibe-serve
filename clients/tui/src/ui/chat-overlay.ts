@@ -5,7 +5,7 @@ import {
   type SyntaxStyle,
 } from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
-import {chatThreadLabel, type SessionState} from '../session-model.js';
+import {chatThreadHeading, type SessionState} from '../session-model.js';
 import {ChatComposerView, type ChatDraft} from './chat-composer.js';
 import {ConversationView} from './conversation.js';
 import type {Theme} from './theme.js';
@@ -83,6 +83,9 @@ export class ChatOverlayView {
     );
     this.#transcript.add(this.#conversation.output);
     this.output.add(this.#transcript);
+    // Anchored to the composer, matching the docked pane: the same commands
+    // read the same way whichever presentation the chat is in.
+    this.output.add(this.#composer.menu);
     this.output.add(this.#composer.output);
   }
 
@@ -117,8 +120,9 @@ export class ChatOverlayView {
   render(state: SessionState): void {
     this.output.visible = state.chatOpen;
     if (!state.chatOpen) return;
-    this.output.title = ` ${chatThreadLabel(state)} `;
+    this.output.title = ` ${chatThreadHeading(state)} `;
     this.#composer.activate(Math.max(1, this.output.width - 4), true, state.chatPending);
+    this.#composer.renderMenu(state);
     this.#conversation.render(state);
     this.#transcript.scrollTo(this.#transcript.scrollHeight);
   }
@@ -129,5 +133,13 @@ export class ChatOverlayView {
 
   isComposerEmpty(): boolean {
     return this.#composer.isEmpty();
+  }
+
+  navigateSuggestions(direction: 1 | -1): boolean {
+    return this.#composer.navigateSuggestions(direction);
+  }
+
+  completeSuggestion(): boolean {
+    return this.#composer.completeSuggestion();
   }
 }

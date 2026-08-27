@@ -1053,14 +1053,15 @@ describe('session controller', () => {
     expect(controller.state.chatConversation).toHaveLength(0);
   });
 
-  it('reports an unknown slash command in the chat instead of asking the agent', async () => {
+  it('shows the chat help for an unknown slash command instead of asking the agent', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
     await controller.submitChat('/nope');
 
-    expect(controller.state.errorBanner).toMatchObject({scope: 'input'});
-    expect(controller.state.errorBanner?.message).toContain('Unknown command');
+    // Chat-scoped help, not the global surface's "unknown command" banner.
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.chatConversation.at(-1)?.content).toContain('/clear');
     expect(transport.requests).toEqual([]);
   });
 
@@ -1081,30 +1082,47 @@ describe('session controller', () => {
     expect(controller.state.chatConversation.at(-1)?.content).toBe('Nothing yet.');
   });
 
-  it('creates a chat thread from the wizard and switches to it', async () => {
+  it('renders /model from the backend options, grouped by harness', async () => {
     const transport = new ThreadTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
 
-    await controller.submitCommand('/new-chat');
-    expect(controller.state.newChatPicker).toMatchObject({step: 'driver', driver: 'agentshim'});
+    await controller.submitChat('/model');
 
-    controller.moveNewChatSelection(1);
-    await controller.confirmNewChatPicker();
-    expect(controller.state.newChatPicker).toMatchObject({step: 'provider', driver: 'omnigent'});
-    controller.moveNewChatSelection(1);
-    await controller.confirmNewChatPicker();
-    expect(controller.state.newChatPicker?.step).toBe('model');
-    controller.typeNewChatModel('o4');
-    await controller.confirmNewChatPicker();
+    expect(transport.requests.at(-1)).toEqual({type: 'query.chat_options'});
+    const menu = controller.state.chatMenu;
+    expect(menu?.kind).toBe('model');
+    expect(menu?.pending).toBe(false);
+    // Exactly what the backend returned: harness groups, their models, and one
+    // free-text entry per group. The client enumerates nothing of its own.
+    expect(menu?.rows.map(row => [row.kind, row.label])).toEqual([
+      ['header', 'Codex'],
+      ['model', 'gpt-run  \u00b7 run default'],
+      ['model', 'gpt-5.6-sol'],
+      ['custom', 'custom model\u2026'],
+      ['header', 'Claude Code'],
+      ['model', 'claude-opus-5'],
+      ['custom', 'custom model\u2026'],
+    ]);
+    // Headers are structure, so the highlight starts on the first real choice.
+    expect(menu?.selected).toBe(1);
+  });
+
+  it('starts a thread on the selected model, sending no driver', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+    controller.moveChatMenuSelection(1);
+    await controller.confirmChatMenu();
 
     expect(transport.requests.at(-1)).toEqual({
       type: 'query.chat_thread_create',
-      driver: 'omnigent',
       provider: 'codex',
-      model: 'o4',
+      model: 'gpt-5.6-sol',
     });
-    expect(controller.state.newChatPicker).toBeNull();
+    expect(controller.state.chatMenu).toBeNull();
     // The thread record comes from the replayed backend event, and the
     // client switches the chat surfaces to it.
     expect(controller.state.core.chatThreads.map(thread => thread.id)).toEqual([
@@ -1114,14 +1132,127 @@ describe('session controller', () => {
     expect(controller.state.activeChatThreadId).toBe('thread-1');
   });
 
+  it('accepts a typed model from a group\u2019s custom entry', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+    // Down to the Claude group's custom entry, skipping the group headers.
+    controller.moveChatMenuSelection(4);
+    expect(controller.state.chatMenu?.rows[controller.state.chatMenu.selected]).toMatchObject({
+      kind: 'custom',
+      provider: 'claude',
+    });
+    for (const character of 'claude-sonnet-5') controller.typeChatMenuCustomModel(character);
+    controller.backspaceChatMenuCustomModel();
+    controller.typeChatMenuCustomModel('5');
+    await controller.confirmChatMenu();
+
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat_thread_create',
+      provider: 'claude',
+      model: 'claude-sonnet-5',
+    });
+    expect(controller.state.activeChatThreadId).toBe('thread-1');
+  });
+
+  it('leaves an empty custom entry alone rather than guessing a model', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+    controller.moveChatMenuSelection(2);
+    await controller.confirmChatMenu();
+
+    expect(transport.requests.at(-1)).toEqual({type: 'query.chat_options'});
+    expect(controller.state.chatMenu?.kind).toBe('model');
+  });
+
+  it('reports a chat-options failure in the menu instead of an empty list', async () => {
+    const transport = new ThreadTransport();
+    transport.chatOptions = null;
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+
+    expect(controller.state.chatMenu?.error).toContain('has not reported its chat options');
+    expect(controller.state.chatMenu?.selected).toBe(-1);
+  });
+
+  it('/clear starts a fresh thread on the current thread\u2019s settings', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submitChat('/model');
+    controller.moveChatMenuSelection(1);
+    await controller.confirmChatMenu();
+    await controller.sendChat('what changed?');
+
+    await controller.submitChat('/clear');
+
+    // Same harness and model, a new thread, and the old one still listed.
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat_thread_create',
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+    });
+    expect(controller.state.activeChatThreadId).toBe('thread-2');
+    expect(controller.state.core.chatThreads.map(thread => thread.id)).toEqual([
+      'default',
+      'thread-1',
+      'thread-2',
+    ]);
+    // The cleared thread keeps its transcript, so /resume gets it back intact.
+    expect(controller.state.chatConversations['thread-1']?.map(item => item.content)).toEqual([
+      'what changed?',
+      'Thread answer.',
+    ]);
+    expect(controller.state.chatConversation).toEqual([]);
+  });
+
+  it('/clear on the default thread lets the backend resolve the run settings', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/clear');
+
+    expect(transport.requests.at(-1)).toEqual({type: 'query.chat_thread_create'});
+  });
+
+  it('answers unknown slash input in the composer with the chat help', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    const before = transport.requests.length;
+
+    await controller.submitChat('/threads');
+
+    // No request at all, and no global "unknown command" error banner.
+    expect(transport.requests.length).toBe(before);
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.chatConversation.at(-1)?.content).toContain('/model');
+  });
+
+  it('still forwards a global command typed into the composer', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/pause');
+
+    expect(transport.requests.at(-1)).toEqual({type: 'command.pause'});
+  });
+
   it('sends chat to the active thread and keeps transcripts apart', async () => {
     const transport = new ThreadTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submitCommand('/new-chat');
-    await controller.confirmNewChatPicker();
-    await controller.confirmNewChatPicker();
-    await controller.confirmNewChatPicker();
+    await controller.submitChat('/model');
+    await controller.confirmChatMenu();
     expect(controller.state.activeChatThreadId).toBe('thread-1');
 
     await controller.sendChat('which kernel changed?');
@@ -1152,22 +1283,34 @@ describe('session controller', () => {
     ]);
   });
 
-  it('opens the thread picker and switches with the selection', async () => {
+  it('/resume lists the threads with their runtime and switches', async () => {
     const transport = new ThreadTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submitCommand('/new-chat');
-    await controller.confirmNewChatPicker();
-    await controller.confirmNewChatPicker();
-    await controller.confirmNewChatPicker();
+    await controller.submitChat('/model');
+    await controller.confirmChatMenu();
     controller.switchChatThread('default');
 
-    await controller.submitCommand('/chats');
-    expect(controller.state.chatThreadPicker).toEqual({selected: 'default'});
-    controller.moveChatThreadSelection(1);
-    controller.applySelectedChatThread();
+    await controller.submitChat('/resume');
 
-    expect(controller.state.chatThreadPicker).toBeNull();
+    const menu = controller.state.chatMenu;
+    expect(menu?.kind).toBe('resume');
+    expect(menu?.rows.map(row => [row.kind, row.label])).toEqual([
+      ['thread', 'Experiment chat'],
+      ['thread', 'Codex (GPT Run)'],
+    ]);
+    // The runtime is spelled out beside each thread, harness and model only.
+    expect(menu?.rows.map(row => (row.kind === 'thread' ? row.detail : null))).toEqual([
+      'run agent',
+      'Codex (GPT Run)',
+    ]);
+    // The highlight starts on the thread that is currently on screen.
+    expect(menu?.selected).toBe(0);
+
+    controller.moveChatMenuSelection(1);
+    await controller.confirmChatMenu();
+
+    expect(controller.state.chatMenu).toBeNull();
     expect(controller.state.activeChatThreadId).toBe('thread-1');
   });
 
@@ -1348,6 +1491,20 @@ class DeferredChatTransport implements SupervisionTransport {
 class ThreadTransport implements SupervisionTransport {
   readonly requests: RequestInput[] = [];
   #sequence = 0;
+  #threads = 0;
+  /** Providers and models the backend says this run offers. */
+  chatOptions: NonNullable<ProtocolResponse['chat_options']> | null = {
+    providers: [
+      {
+        provider: 'codex',
+        models: [
+          {model: 'gpt-run', source: 'run', default: true},
+          {model: 'gpt-5.6-sol', source: 'suggested', default: false},
+        ],
+      },
+      {provider: 'claude', models: [{model: 'claude-opus-5', source: 'suggested', default: false}]},
+    ],
+  };
 
   request(input: RequestInput): Promise<ProtocolResponse> {
     this.requests.push(input);
@@ -1363,16 +1520,20 @@ class ThreadTransport implements SupervisionTransport {
     if (input.type === 'query.experiments') {
       return Promise.resolve({...base, experiments: [], experiments_ready: true});
     }
+    if (input.type === 'query.chat_options') {
+      return Promise.resolve({...base, chat_options: this.chatOptions});
+    }
     if (input.type === 'query.chat_thread_create') {
+      const threadId = `thread-${++this.#threads}`;
+      // The backend resolves the run's own driver; the client never sends one.
+      const settings = {
+        driver: 'agentshim',
+        provider: input.provider ?? 'codex',
+        model: input.model ?? 'gpt-run',
+      };
       return Promise.resolve({
         ...base,
-        chat_thread: {
-          thread_id: 'thread-1',
-          title: '',
-          driver: input.driver ?? 'agentshim',
-          provider: input.provider ?? 'codex',
-          model: input.model ?? 'gpt-run',
-        },
+        chat_thread: {thread_id: threadId, title: '', ...settings},
         events: [
           {
             sequence: ++this.#sequence,
@@ -1380,14 +1541,12 @@ class ThreadTransport implements SupervisionTransport {
             type: 'chat_thread_created' as const,
             agent_kind: 'chat',
             round_label: 'experiment-chat',
-            chat_thread_id: 'thread-1',
+            chat_thread_id: threadId,
             data: {
               kind: 'chat_thread_created' as const,
-              thread_id: 'thread-1',
+              thread_id: threadId,
               title: '',
-              driver: input.driver ?? 'agentshim',
-              provider: input.provider ?? 'codex',
-              model: input.model ?? 'gpt-run',
+              ...settings,
               created_at: '2026-01-01T00:00:01Z',
             },
           },

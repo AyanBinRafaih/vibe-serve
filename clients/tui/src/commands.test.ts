@@ -1,9 +1,13 @@
 import {describe, expect, it} from 'bun:test';
 import {
   availableCommands,
+  chatHelpText,
   helpText,
+  parseChatCommand,
   parseCommand,
   slashCommandRange,
+  SLASH_COMMANDS,
+  suggestChatSlashCommands,
   suggestSlashCommands,
 } from './commands.js';
 
@@ -97,28 +101,28 @@ describe('command surface by view', () => {
 
     expect(docked).not.toContain('/chat');
     expect(docked).toContain('/perf');
-    // The thread commands stay: they are about which thread, not about
-    // opening a chat that is already on screen.
-    expect(docked).toContain('/chats');
-    expect(docked).toContain('/new-chat');
     expect(helpText({chatDocked: true})).not.toMatch(/\/chat\s/);
-    expect(suggestSlashCommands('/c', {chatDocked: true}).map(command => command.name)).toEqual([
-      '/chats',
-    ]);
+    expect(suggestSlashCommands('/c', {chatDocked: true}).map(command => command.name)).toEqual([]);
   });
 
   it('offers /chat everywhere the chat is not already on screen', () => {
     expect(availableCommands().map(command => command.name)).toContain('/chat');
     expect(helpText()).toMatch(/\/chat\s/);
-    expect(suggestSlashCommands('/c').map(command => command.name)).toEqual(['/chat', '/chats']);
+    expect(suggestSlashCommands('/c').map(command => command.name)).toEqual(['/chat']);
   });
 
-  it('parses the chat thread commands as local views', () => {
-    expect(parseCommand('/new-chat')).toEqual({localView: 'new-chat'});
-    expect(parseCommand('/chats')).toEqual({localView: 'chats'});
-    // Arguments are not part of this iteration's surface.
-    expect(parseCommand('/chats extra').error).toContain('Unknown command');
-    expect(parseCommand('/new-chat codex').error).toContain('Unknown command');
+  it('keeps chat control out of the global command surface', () => {
+    // Chat is controlled from the chat composer, so the global registry
+    // carries no thread commands at all and never claims to.
+    const names = SLASH_COMMANDS.map(command => command.name);
+    expect(names).not.toContain('/new-chat');
+    expect(names).not.toContain('/chats');
+    expect(names).not.toContain('/model');
+    expect(names).not.toContain('/clear');
+    expect(helpText()).not.toContain('/new-chat');
+    expect(helpText()).not.toContain('/chats');
+    expect(parseCommand('/new-chat').error).toContain('Unknown command');
+    expect(parseCommand('/chats').error).toContain('Unknown command');
   });
 
   it('reaches the todo and prompt toggles by name', () => {
@@ -134,13 +138,54 @@ describe('command surface by view', () => {
   });
 });
 
+describe('chat composer commands', () => {
+  it('resolves the chat-scoped commands', () => {
+    expect(parseChatCommand('/clear')).toEqual({command: 'clear'});
+    expect(parseChatCommand('/model')).toEqual({command: 'model'});
+    expect(parseChatCommand('/resume')).toEqual({command: 'resume'});
+  });
+
+  it('shadows /resume: in the chat it resumes a thread, not the run', () => {
+    // The global surface keeps /resume for a paused run; the composer's own
+    // command wins where it was typed, so the two never compete.
+    expect(parseChatCommand('/resume').command).toBe('resume');
+    expect(parseCommand('/resume')).toEqual({request: {type: 'command.resume'}});
+  });
+
+  it('forwards global commands the composer has always accepted', () => {
+    expect(parseChatCommand('/pause')).toEqual({global: true});
+    expect(parseChatCommand('/steer look at the cache')).toEqual({global: true});
+    expect(parseChatCommand('/perf')).toEqual({global: true});
+  });
+
+  it('answers unknown slash input with the chat help, not the global error', () => {
+    const parsed = parseChatCommand('/threads');
+    expect(parsed.command).toBeUndefined();
+    expect(parsed.global).toBeUndefined();
+    expect(parsed.help).toBe(chatHelpText());
+    expect(parsed.help).toContain('/model');
+    expect(parsed.help).toContain('/resume');
+    expect(parsed.help).not.toContain('Unknown command');
+  });
+
+  it('suggests only the chat commands from a slash prefix', () => {
+    expect(suggestChatSlashCommands('/').map(command => command.name)).toEqual([
+      '/clear',
+      '/model',
+      '/resume',
+    ]);
+    expect(suggestChatSlashCommands('/m').map(command => command.name)).toEqual(['/model']);
+    expect(suggestChatSlashCommands('/pa')).toEqual([]);
+    expect(suggestChatSlashCommands('/model ')).toEqual([]);
+    expect(suggestChatSlashCommands('what changed?')).toEqual([]);
+  });
+});
+
 describe('slash-command input helpers', () => {
   it('suggests available commands from a slash prefix', () => {
     expect(suggestSlashCommands('/').map(command => command.name)).toEqual([
       '/help',
       '/chat',
-      '/new-chat',
-      '/chats',
       '/pause',
       '/resume',
       '/steer',

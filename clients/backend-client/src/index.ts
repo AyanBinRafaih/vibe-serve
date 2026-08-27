@@ -5,6 +5,9 @@ export {
   SupervisionError,
 } from './client.js';
 export type {
+  ChatModelOption,
+  ChatOptions,
+  ChatProviderOptions,
   Diagnostic,
   HypothesisEntry,
   HypothesisRound,

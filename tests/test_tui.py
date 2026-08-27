@@ -1015,6 +1015,9 @@ def test_run_context_chat_exposes_trajectory_without_inlining_it_in_prompt(tmp_p
             flush_logs=ctx.logger.file.flush,
             environment=dict,
             progress=lambda: None,
+            driver="agentshim",
+            provider="codex",
+            model="gpt-test",
         )
     )
 

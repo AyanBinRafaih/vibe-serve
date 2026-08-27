@@ -6,6 +6,10 @@ import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 export interface KeybindingActions {
   completeInput(): boolean;
   navigateSuggestions(direction: 1 | -1): boolean;
+  /** Navigates the chat composer's own typed-command suggestions, docked or modal. */
+  navigateChatSuggestions(direction: 1 | -1): boolean;
+  /** Tab-completes the chat composer's highlighted typed-command suggestion. */
+  completeChatInput(): boolean;
   inputIsEmpty(): boolean;
   closeChat(): void;
   toggleLatestPrompt(): void;
@@ -46,8 +50,7 @@ export function bindKeybindings(
       controller.state.chatOpen === false &&
       controller.state.overlay === null &&
       controller.state.themePicker === null &&
-      controller.state.chatThreadPicker === null &&
-      controller.state.newChatPicker === null
+      controller.state.chatMenu === null
     ) {
       controller.togglePaneZoom();
       key.preventDefault();
@@ -76,32 +79,26 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // The new-thread wizard owns the keys wherever it was opened from — on its
-    // model step that includes ordinary typing, which must never leak into the
-    // composer or command input underneath.
-    const newChatPicker = controller.state.newChatPicker;
-    if (newChatPicker !== null) {
-      if (key.name === 'up') controller.moveNewChatSelection(-1);
-      else if (key.name === 'down') controller.moveNewChatSelection(1);
-      else if (key.name === 'escape') controller.retreatNewChatPicker();
+    // The composer's inline menu owns the keys while it is open. On a custom
+    // model entry that includes ordinary typing, which must never leak into
+    // the composer underneath; anywhere else typing dismisses the menu and
+    // goes back to writing a question, so the keystroke is left alone.
+    const chatMenu = controller.state.chatMenu;
+    if (chatMenu !== null) {
+      const onCustomEntry = chatMenu.rows[chatMenu.selected]?.kind === 'custom';
+      if (key.name === 'up') controller.moveChatMenuSelection(-1);
+      else if (key.name === 'down') controller.moveChatMenuSelection(1);
+      else if (key.name === 'escape') controller.closeChatMenu();
       else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
-        void controller.confirmNewChatPicker();
-      } else if (newChatPicker.step === 'model' && key.name === 'backspace') {
-        controller.backspaceNewChatModel();
-      } else if (newChatPicker.step === 'model' && isPrintable(key)) {
-        controller.typeNewChatModel(key.sequence);
-      } else return;
-      key.preventDefault();
-      return;
-    }
-    // The thread list is a selection: Enter switches to the highlighted thread.
-    if (controller.state.chatThreadPicker !== null) {
-      if (key.name === 'up') controller.moveChatThreadSelection(-1);
-      else if (key.name === 'down') controller.moveChatThreadSelection(1);
-      else if (key.name === 'escape') controller.closeChatThreadPicker();
-      else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
-        controller.applySelectedChatThread();
-      } else return;
+        void controller.confirmChatMenu();
+      } else if (onCustomEntry && key.name === 'backspace') {
+        controller.backspaceChatMenuCustomModel();
+      } else if (onCustomEntry && isPrintable(key)) {
+        controller.typeChatMenuCustomModel(key.sequence);
+      } else {
+        if (isPrintable(key)) controller.closeChatMenu();
+        return;
+      }
       key.preventDefault();
       return;
     }
@@ -117,16 +114,26 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    if (
-      chatPaneFocused(controller.state) &&
-      (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape')
-    ) {
-      if (key.name === 'escape') controller.focusPane('left');
-      else actions.scrollChatPane(key.name === 'pageup' ? -1 : 1);
-      key.preventDefault();
+    if (chatPaneFocused(controller.state)) {
+      if (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape') {
+        if (key.name === 'escape') controller.focusPane('left');
+        else actions.scrollChatPane(key.name === 'pageup' ? -1 : 1);
+        key.preventDefault();
+        return;
+      }
+      // The typed-command suggestions take Up/Down/Tab only while they are
+      // showing; otherwise the keys fall through to the editor underneath
+      // (multiline cursor movement, and Tab's ordinary no-op).
+      if (key.name === 'up' || key.name === 'down') {
+        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
+        return;
+      }
+      if (key.name === 'tab' && !key.shift) {
+        if (actions.completeChatInput()) key.preventDefault();
+        return;
+      }
       return;
     }
-    if (chatPaneFocused(controller.state)) return;
     if (controller.state.themePicker !== null) {
       if (key.name === 'up') controller.moveThemeSelection(-1);
       else if (key.name === 'down') controller.moveThemeSelection(1);
@@ -145,6 +152,16 @@ export function bindKeybindings(
         if (controller.state.layout.right !== null) controller.closeOverlays();
         else actions.closeChat();
         key.preventDefault();
+        return;
+      }
+      // Same suggestion-menu priority as the docked chat above.
+      if (key.name === 'up' || key.name === 'down') {
+        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
+        return;
+      }
+      if (key.name === 'tab' && !key.shift) {
+        if (actions.completeChatInput()) key.preventDefault();
+        return;
       }
       return;
     }

@@ -6,18 +6,20 @@ import {
   type ServerMessage,
   SupervisionError,
 } from '@vibesys/backend-client';
-import {helpText, parseCommand} from './commands.js';
+import {helpText, parseChatCommand, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
-  advanceNewChatPicker,
+  activeChatThreadSettings,
   applyEvent,
   applyEventBatch,
   applySnapshot,
   chatDocked,
+  chatMenuCustomModel,
   chatPaneVisible,
+  type ChatThreadSettings,
   clearAgentSelection,
   clearEntrySelection,
-  closeChatThreadPicker,
+  closeChatMenu,
   closeOverlays,
   closePane,
   closeThemePicker,
@@ -26,6 +28,7 @@ import {
   enterExperimentDrilldown,
   enterExperimentRound,
   enterUnownedExperimentRound,
+  failChatMenu,
   failExperiments,
   failPane,
   focusPane,
@@ -34,23 +37,20 @@ import {
   leaveExperimentDrilldown,
   leaveHypothesisDetail,
   markEventStreamUnavailable,
-  moveChatThreadSelection,
+  moveChatMenuSelection,
   moveExperimentSelection,
   moveHypothesisRoundSelection,
-  moveNewChatSelection,
   moveThemeSelection,
-  type NewChatPicker,
   normalizeFocus,
   openChat,
-  openChatThreadPicker,
+  openChatModelMenu,
+  openChatResumeMenu,
   openExperimentLog,
   openHypothesisDetail,
-  openNewChatPicker,
   openPane,
   openThemePicker,
   type PaneFocus,
   type PaneView,
-  retreatNewChatPicker,
   type RoundFocus,
   reportError,
   type SessionState,
@@ -63,10 +63,12 @@ import {
   selectPreviousAgent,
   selectPreviousRound,
   selectRound,
+  selectedChatMenuRow,
   setChatDockFits,
+  setChatMenuCustomModel,
+  setChatModelMenuOptions,
   setChatThreadPending,
   setExperiments,
-  setNewChatModel,
   setPaneContent,
   setTheme,
   showDetail,
@@ -89,18 +91,18 @@ export interface SessionController {
   submitChat(value: string): Promise<void>;
   /** Makes one thread the chat surfaces' subject. */
   switchChatThread(threadId: string): void;
-  openChatThreadPicker(): void;
-  moveChatThreadSelection(delta: number): void;
-  /** Enter in the thread picker: switch to the highlighted thread. */
-  applySelectedChatThread(): void;
-  closeChatThreadPicker(): void;
-  openNewChatPicker(): void;
-  moveNewChatSelection(delta: number): void;
-  /** Enter in the wizard: next step, or create the thread on the last one. */
-  confirmNewChatPicker(): Promise<void>;
-  retreatNewChatPicker(): void;
-  typeNewChatModel(text: string): void;
-  backspaceNewChatModel(): void;
+  /** `/resume`: the thread list, inline beside the composer. */
+  openChatResumeMenu(): void;
+  /** `/model`: the backend's harness and model options, inline. */
+  openChatModelMenu(): Promise<void>;
+  /** `/clear`: a fresh thread on this thread's settings, switched to. */
+  clearChatThread(): Promise<void>;
+  moveChatMenuSelection(delta: number): void;
+  /** Enter in the menu: switch threads, or start one on the chosen model. */
+  confirmChatMenu(): Promise<void>;
+  closeChatMenu(): void;
+  typeChatMenuCustomModel(text: string): void;
+  backspaceChatMenuCustomModel(): void;
   live(): void;
   selectNextAgent(): void;
   selectPreviousAgent(): void;
@@ -318,73 +320,83 @@ export class SocketSessionController implements SessionController {
     this.#setState(switchChatThread(this.#state, threadId));
   }
 
-  openChatThreadPicker(): void {
-    this.#setState(openChatThreadPicker(this.#state));
+  openChatResumeMenu(): void {
+    this.#setState(openChatResumeMenu(this.#state));
   }
 
-  moveChatThreadSelection(delta: number): void {
-    this.#setState(moveChatThreadSelection(this.#state, delta));
-  }
-
-  applySelectedChatThread(): void {
-    const picker = this.#state.chatThreadPicker;
-    if (picker === null) return;
-    this.switchChatThread(picker.selected);
-  }
-
-  closeChatThreadPicker(): void {
-    this.#setState(closeChatThreadPicker(this.#state));
-  }
-
-  openNewChatPicker(): void {
-    this.#setState(openNewChatPicker(this.#state));
-  }
-
-  moveNewChatSelection(delta: number): void {
-    this.#setState(moveNewChatSelection(this.#state, delta));
-  }
-
-  async confirmNewChatPicker(): Promise<void> {
-    const picker = this.#state.newChatPicker;
-    if (picker === null) return;
-    if (picker.step !== 'model') {
-      this.#setState(advanceNewChatPicker(this.#state));
-      return;
+  async openChatModelMenu(): Promise<void> {
+    this.#setState(openChatModelMenu(this.#state));
+    try {
+      const response = await this.client.request({type: 'query.chat_options'});
+      const options = response.chat_options;
+      this.#setState(
+        options === null || options === undefined
+          ? failChatMenu(this.#state, 'This run has not reported its chat options yet.')
+          : setChatModelMenuOptions(this.#state, options),
+      );
+    } catch (error) {
+      this.#setState(
+        reportCaughtError(failChatMenu(this.#state, errorMessage(error)), error, 'request'),
+      );
     }
-    this.#setState({...this.#state, newChatPicker: null});
-    await this.#createChatThread(picker);
-  }
-
-  retreatNewChatPicker(): void {
-    this.#setState(retreatNewChatPicker(this.#state));
-  }
-
-  typeNewChatModel(text: string): void {
-    const picker = this.#state.newChatPicker;
-    if (picker === null) return;
-    this.#setState(setNewChatModel(this.#state, picker.model + text));
-  }
-
-  backspaceNewChatModel(): void {
-    const picker = this.#state.newChatPicker;
-    if (picker === null) return;
-    this.#setState(setNewChatModel(this.#state, picker.model.slice(0, -1)));
   }
 
   /**
-   * Asks the backend for a new thread. The response's replayed events carry
-   * the authoritative thread record; the client only switches to it.
+   * `/clear` keeps the operator on the same agent: the new thread inherits the
+   * current thread's settings, and the old thread stays resumable through
+   * `/resume`. Threads are immutable in their agent and model by design, so a
+   * fresh conversation is a fresh thread.
    */
-  async #createChatThread(picker: NewChatPicker): Promise<void> {
-    const model = picker.model.trim();
+  async clearChatThread(): Promise<void> {
+    await this.#createChatThread(activeChatThreadSettings(this.#state));
+  }
+
+  moveChatMenuSelection(delta: number): void {
+    this.#setState(moveChatMenuSelection(this.#state, delta));
+  }
+
+  async confirmChatMenu(): Promise<void> {
+    const row = selectedChatMenuRow(this.#state);
+    if (row === null) return;
+    if (row.kind === 'thread') {
+      this.switchChatThread(row.threadId);
+      return;
+    }
+    if (row.kind !== 'model' && row.kind !== 'custom') return;
+    const model = row.kind === 'custom' ? chatMenuCustomModel(this.#state).trim() : row.model;
+    // A custom entry with nothing typed is not a choice yet; the menu stays
+    // open rather than silently starting a thread on the run's default.
+    if (model === '') return;
+    this.#setState(closeChatMenu(this.#state));
+    await this.#createChatThread({provider: row.provider, model});
+  }
+
+  closeChatMenu(): void {
+    this.#setState(closeChatMenu(this.#state));
+  }
+
+  typeChatMenuCustomModel(text: string): void {
+    this.#setState(setChatMenuCustomModel(this.#state, chatMenuCustomModel(this.#state) + text));
+  }
+
+  backspaceChatMenuCustomModel(): void {
+    this.#setState(
+      setChatMenuCustomModel(this.#state, chatMenuCustomModel(this.#state).slice(0, -1)),
+    );
+  }
+
+  /**
+   * Asks the backend for a new thread and switches to it. No driver is sent:
+   * the run's driver is a deployment detail the backend owns. The response's
+   * replayed events carry the authoritative thread record.
+   */
+  async #createChatThread(settings: ChatThreadSettings | null): Promise<void> {
     try {
       const response = await this.client.request({
         type: 'query.chat_thread_create',
-        driver: picker.driver,
-        provider: picker.provider,
-        ...(model === '' ? {} : {model}),
+        ...(settings === null ? {} : {provider: settings.provider, model: settings.model}),
       });
-      let state = this.#state;
+      let state = closeChatMenu(this.#state);
       for (const event of response.events ?? []) state = applyEvent(state, event);
       const threadId = response.chat_thread?.thread_id;
       this.#setState(threadId === undefined ? state : switchChatThread(state, threadId));
@@ -561,14 +573,36 @@ export class SocketSessionController implements SessionController {
   }
 
   /**
-   * What the chat input submits. A slash command runs through exactly the same
-   * path as the main input, so the two surfaces cannot disagree about what a
-   * command does; anything else is a question for the chat agent.
+   * What the chat composer submits. Chat is controlled from the chat, so its
+   * own commands resolve here first; a command that belongs to the global
+   * surface (`/pause`, `/perf`, …) still runs through exactly the same path as
+   * the main input, and anything else is a question for the chat agent.
    */
   submitChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text.startsWith('/')) return this.sendChat(value);
-    return this.submitCommand(text);
+    const parsed = parseChatCommand(text);
+    if (parsed.command === 'clear') return this.clearChatThread();
+    if (parsed.command === 'model') return this.openChatModelMenu();
+    if (parsed.command === 'resume') {
+      this.openChatResumeMenu();
+      return Promise.resolve();
+    }
+    if (parsed.global === true) return this.submitCommand(text);
+    // Unknown slash input answers with the chat's own help rather than
+    // falling through to a global "unknown command" error.
+    this.#setState(
+      updateChatConversation(this.#state, this.#state.activeChatThreadId, entries => [
+        ...entries,
+        {
+          id: `chat-help-${++this.#chatMessageId}`,
+          kind: 'status',
+          label: 'Chat commands',
+          content: parsed.help ?? '',
+        },
+      ]),
+    );
+    return Promise.resolve();
   }
 
   sendChat(value: string): Promise<void> {
@@ -693,14 +727,6 @@ export class SocketSessionController implements SessionController {
     if (parsed.localView === 'chat') {
       this.#setState(openChat(this.#state));
       if (parsed.chatMessage) await this.sendChat(parsed.chatMessage);
-      return;
-    }
-    if (parsed.localView === 'new-chat') {
-      this.openNewChatPicker();
-      return;
-    }
-    if (parsed.localView === 'chats') {
-      this.openChatThreadPicker();
       return;
     }
     if (parsed.toggle === 'todos') {
