@@ -97,14 +97,28 @@ describe('command surface by view', () => {
 
     expect(docked).not.toContain('/chat');
     expect(docked).toContain('/perf');
-    expect(helpText({chatDocked: true})).not.toContain('/chat');
-    expect(suggestSlashCommands('/c', {chatDocked: true})).toEqual([]);
+    // The thread commands stay: they are about which thread, not about
+    // opening a chat that is already on screen.
+    expect(docked).toContain('/chats');
+    expect(docked).toContain('/new-chat');
+    expect(helpText({chatDocked: true})).not.toMatch(/\/chat\s/);
+    expect(suggestSlashCommands('/c', {chatDocked: true}).map(command => command.name)).toEqual([
+      '/chats',
+    ]);
   });
 
   it('offers /chat everywhere the chat is not already on screen', () => {
     expect(availableCommands().map(command => command.name)).toContain('/chat');
-    expect(helpText()).toContain('/chat');
-    expect(suggestSlashCommands('/c').map(command => command.name)).toEqual(['/chat']);
+    expect(helpText()).toMatch(/\/chat\s/);
+    expect(suggestSlashCommands('/c').map(command => command.name)).toEqual(['/chat', '/chats']);
+  });
+
+  it('parses the chat thread commands as local views', () => {
+    expect(parseCommand('/new-chat')).toEqual({localView: 'new-chat'});
+    expect(parseCommand('/chats')).toEqual({localView: 'chats'});
+    // Arguments are not part of this iteration's surface.
+    expect(parseCommand('/chats extra').error).toContain('Unknown command');
+    expect(parseCommand('/new-chat codex').error).toContain('Unknown command');
   });
 
   it('reaches the todo and prompt toggles by name', () => {
@@ -125,6 +139,8 @@ describe('slash-command input helpers', () => {
     expect(suggestSlashCommands('/').map(command => command.name)).toEqual([
       '/help',
       '/chat',
+      '/new-chat',
+      '/chats',
       '/pause',
       '/resume',
       '/steer',

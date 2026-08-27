@@ -3,8 +3,10 @@ import {
   type ActiveAgentExecution,
   type ActiveExecutionCheckpoint,
   type AgentPhase,
+  type ChatThread,
   type CoreDiagnostic,
   type CoreState,
+  DEFAULT_CHAT_THREAD_ID,
   type ExecutionTodos,
   initialCoreState,
   latestDiagnosticChange,
@@ -38,8 +40,19 @@ export interface SessionState {
   roundFocus: RoundFocus;
   overlay: OverlayPanel | null;
   chatOpen: boolean;
+  /** The thread the chat surfaces show and the composer submits to. */
+  activeChatThreadId: string;
+  /** The active thread's conversation, derived from `chatConversations`. */
   chatConversation: ConversationEntry[];
+  /** Every thread's conversation (local user entries merged with replay). */
+  chatConversations: Record<string, ConversationEntry[]>;
+  /** True while the active thread awaits an answer; from `chatPendingThreads`. */
   chatPending: boolean;
+  chatPendingThreads: Record<string, boolean>;
+  /** Non-null while the thread list is open as a keyboard selection. */
+  chatThreadPicker: ChatThreadPicker | null;
+  /** Non-null while the new-thread wizard is open. */
+  newChatPicker: NewChatPicker | null;
   todosExpanded: boolean;
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
@@ -169,6 +182,35 @@ export interface ThemePicker {
   selected: ThemeName;
 }
 
+/**
+ * Picker choices for the new-thread wizard. This is a UI affordance only:
+ * the backend is the authority and re-validates every combination, so a
+ * stale catalog degrades to a server error rather than a wrong thread.
+ */
+export const CHAT_DRIVERS = ['agentshim', 'omnigent'] as const;
+export type ChatDriverName = (typeof CHAT_DRIVERS)[number];
+export const CHAT_DRIVER_PROVIDERS: Record<ChatDriverName, readonly string[]> = {
+  agentshim: ['claude', 'gemini', 'codex', 'opencode'],
+  omnigent: ['claude', 'codex'],
+};
+
+export interface ChatThreadPicker {
+  /** Thread id the highlight is on; Enter switches to it. */
+  selected: string;
+}
+
+/**
+ * The new-thread wizard: driver, then a provider the driver supports, then a
+ * free-text model. An empty model means the run's configured default, which
+ * only the backend knows authoritatively.
+ */
+export interface NewChatPicker {
+  step: 'driver' | 'provider' | 'model';
+  driver: ChatDriverName;
+  provider: string;
+  model: string;
+}
+
 export interface OverlayPanel {
   kind: 'detail' | 'help' | 'error';
   content: string;
@@ -214,8 +256,13 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     roundFocus: 'transcript',
     overlay: null,
     chatOpen: false,
+    activeChatThreadId: DEFAULT_CHAT_THREAD_ID,
     chatConversation: [],
+    chatConversations: {},
     chatPending: false,
+    chatPendingThreads: {},
+    chatThreadPicker: null,
+    newChatPicker: null,
     todosExpanded: false,
     themeName,
     // The experiment log is the landing view: a run's history reads as a short
@@ -293,6 +340,171 @@ export function openChat(state: SessionState): SessionState {
     return {...state, overlay: null, layout: {...state.layout, focus: 'chat'}};
   }
   return {...state, overlay: null, chatOpen: true};
+}
+
+/** Keeps the singular chat fields pointing at the active thread. */
+function deriveActiveChat(state: SessionState): SessionState {
+  const chatConversation = state.chatConversations[state.activeChatThreadId] ?? [];
+  const chatPending = state.chatPendingThreads[state.activeChatThreadId] === true;
+  if (state.chatConversation === chatConversation && state.chatPending === chatPending) {
+    return state;
+  }
+  return {...state, chatConversation, chatPending};
+}
+
+/** Every thread the run knows about, the implicit default first. */
+export function chatThreads(state: SessionState): ChatThread[] {
+  return state.core.chatThreads;
+}
+
+/**
+ * What the chat surfaces call one thread. Titles are backend-owned and arrive
+ * through events; an untitled created thread reads as its agent selection.
+ */
+export function chatThreadLabel(
+  state: SessionState,
+  threadId: string = state.activeChatThreadId,
+): string {
+  const thread = state.core.chatThreads.find(candidate => candidate.id === threadId);
+  if (thread === undefined) return 'Experiment chat';
+  if (thread.title) return thread.title;
+  if (thread.driver === null && thread.provider === null) return 'Experiment chat';
+  const model = thread.model === null ? '' : ` · ${thread.model}`;
+  return `${thread.driver ?? '?'}/${thread.provider ?? '?'}${model}`;
+}
+
+/** Makes one thread the chat surface's subject and puts the keys on the chat. */
+export function switchChatThread(state: SessionState, threadId: string): SessionState {
+  return openChat(
+    deriveActiveChat({
+      ...state,
+      activeChatThreadId: threadId,
+      chatThreadPicker: null,
+      newChatPicker: null,
+    }),
+  );
+}
+
+/** Applies one thread's conversation change and refreshes the derived fields. */
+export function updateChatConversation(
+  state: SessionState,
+  threadId: string,
+  update: (entries: ConversationEntry[]) => ConversationEntry[],
+): SessionState {
+  const entries = update(state.chatConversations[threadId] ?? []).slice(-500);
+  return deriveActiveChat({
+    ...state,
+    chatConversations: {...state.chatConversations, [threadId]: entries},
+  });
+}
+
+export function setChatThreadPending(
+  state: SessionState,
+  threadId: string,
+  pending: boolean,
+): SessionState {
+  return deriveActiveChat({
+    ...state,
+    chatPendingThreads: {...state.chatPendingThreads, [threadId]: pending},
+  });
+}
+
+/** Opens the thread list as a selection, starting on the active thread. */
+export function openChatThreadPicker(state: SessionState): SessionState {
+  return {
+    ...state,
+    overlay: null,
+    themePicker: null,
+    newChatPicker: null,
+    chatThreadPicker: {selected: state.activeChatThreadId},
+  };
+}
+
+export function moveChatThreadSelection(state: SessionState, delta: number): SessionState {
+  const picker = state.chatThreadPicker;
+  if (picker === null) return state;
+  const ids = state.core.chatThreads.map(thread => thread.id);
+  const current = ids.indexOf(picker.selected);
+  const index = Math.min(ids.length - 1, Math.max(0, (current === -1 ? 0 : current) + delta));
+  const selected = ids[index];
+  if (selected === undefined || selected === picker.selected) return state;
+  return {...state, chatThreadPicker: {selected}};
+}
+
+export function closeChatThreadPicker(state: SessionState): SessionState {
+  if (state.chatThreadPicker === null) return state;
+  return {...state, chatThreadPicker: null};
+}
+
+/**
+ * Opens the new-thread wizard on its first step. The model prefill is the
+ * backend-reported live model when one has streamed in; empty text submits no
+ * override, so the backend resolves the run's configured default.
+ */
+export function openNewChatPicker(state: SessionState): SessionState {
+  const driver = CHAT_DRIVERS[0];
+  return {
+    ...state,
+    overlay: null,
+    themePicker: null,
+    chatThreadPicker: null,
+    newChatPicker: {
+      step: 'driver',
+      driver,
+      provider: CHAT_DRIVER_PROVIDERS[driver][0] ?? '',
+      model: state.core.usage?.model ?? '',
+    },
+  };
+}
+
+export function moveNewChatSelection(state: SessionState, delta: number): SessionState {
+  const picker = state.newChatPicker;
+  if (picker === null) return state;
+  if (picker.step === 'driver') {
+    const current = CHAT_DRIVERS.indexOf(picker.driver);
+    const index = Math.min(CHAT_DRIVERS.length - 1, Math.max(0, current + delta));
+    const driver = CHAT_DRIVERS[index];
+    if (driver === undefined || driver === picker.driver) return state;
+    const providers = CHAT_DRIVER_PROVIDERS[driver];
+    // The provider survives the driver change only where it stays supported.
+    const provider = providers.includes(picker.provider) ? picker.provider : (providers[0] ?? '');
+    return {...state, newChatPicker: {...picker, driver, provider}};
+  }
+  if (picker.step === 'provider') {
+    const providers = CHAT_DRIVER_PROVIDERS[picker.driver];
+    const current = providers.indexOf(picker.provider);
+    const index = Math.min(
+      providers.length - 1,
+      Math.max(0, (current === -1 ? 0 : current) + delta),
+    );
+    const provider = providers[index];
+    if (provider === undefined || provider === picker.provider) return state;
+    return {...state, newChatPicker: {...picker, provider}};
+  }
+  return state;
+}
+
+/** Enter on a non-final step: the wizard moves on with the choice kept. */
+export function advanceNewChatPicker(state: SessionState): SessionState {
+  const picker = state.newChatPicker;
+  if (picker === null || picker.step === 'model') return state;
+  const step = picker.step === 'driver' ? 'provider' : 'model';
+  return {...state, newChatPicker: {...picker, step}};
+}
+
+/** Escape: one step back, and off the first step the wizard closes. */
+export function retreatNewChatPicker(state: SessionState): SessionState {
+  const picker = state.newChatPicker;
+  if (picker === null) return state;
+  if (picker.step === 'driver') return {...state, newChatPicker: null};
+  const step = picker.step === 'model' ? 'provider' : 'driver';
+  return {...state, newChatPicker: {...picker, step}};
+}
+
+export function setNewChatModel(state: SessionState, model: string): SessionState {
+  const picker = state.newChatPicker;
+  if (picker === null || picker.step !== 'model') return state;
+  return {...state, newChatPicker: {...picker, model}};
 }
 
 export function openExperimentLog(state: SessionState): SessionState {
@@ -928,11 +1140,11 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
   const core = reduceEvent(state.core, event);
   if (core === state.core) return state;
   const diagnostic = latestDiagnosticChange(state.core, core);
-  let next: SessionState = {
+  let next: SessionState = deriveActiveChat({
     ...state,
     core,
-    chatConversation: reconcileChatTranscript(state.chatConversation, core.chatTranscript),
-  };
+    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+  });
   if (diagnostic !== null) next = reportProjectedDiagnostic(next, diagnostic);
   return next;
 }
@@ -953,14 +1165,26 @@ export function applyEventBatch(
 ): SessionState {
   const core = reduceEventBatch(state.core, events, activeExecutions, throughSequence);
   if (core === state.core) return state;
-  let next: SessionState = {
+  let next: SessionState = deriveActiveChat({
     ...state,
     core,
-    chatConversation: reconcileChatTranscript(state.chatConversation, core.chatTranscript),
-  };
+    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+  });
   if (core.status === 'failed') {
     const finalDiagnostic = core.diagnostics.at(-1);
     if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
+  }
+  return next;
+}
+
+/** Folds every thread's replayed transcript into its local conversation. */
+function reconcileChatConversations(
+  conversations: Record<string, ConversationEntry[]>,
+  transcripts: Record<string, TranscriptEntry[]>,
+): Record<string, ConversationEntry[]> {
+  const next = {...conversations};
+  for (const [threadId, transcript] of Object.entries(transcripts)) {
+    next[threadId] = reconcileChatTranscript(next[threadId] ?? [], transcript);
   }
   return next;
 }
