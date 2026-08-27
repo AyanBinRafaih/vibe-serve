@@ -126,7 +126,11 @@ export function bindKeybindings(
         if (!actions.navigateSuggestions(1)) controller.moveExperimentSelection(1);
       } else if (key.name === 'pageup') controller.moveExperimentSelection(-10);
       else if (key.name === 'pagedown') controller.moveExperimentSelection(10);
-      else if (key.name === 'return' || key.name === 'enter') {
+      else if (key.name === 'tab' && !key.shift) {
+        // The table has no agent strip to cycle through, so Tab belongs to the
+        // suggestion it would otherwise complete, or nothing at all.
+        if (!actions.completeInput()) return;
+      } else if (key.name === 'return' || key.name === 'enter') {
         if (!actions.inputIsEmpty()) return;
         if (controller.state.overlay === null) controller.enterExperimentDrilldown();
       } else return;
