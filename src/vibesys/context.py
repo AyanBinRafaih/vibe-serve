@@ -85,7 +85,6 @@ from vs_project import (
 
 if TYPE_CHECKING:
     from vibesys.server.supervisor import RunSupervisor
-    from vs_loop_state import RoundRecord
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -156,6 +155,18 @@ def _resume_configuration_update(
     limit_field = "max_generations" if recorded.outer_loop == "evolve" else "max_rounds"
     recorded_core = recorded.model_dump(exclude={limit_field})
     requested_core = requested.model_dump(exclude={limit_field})
+    migrate_agent_objectives = (
+        recorded.outer_loop == "agent"
+        and requested.outer_loop == "agent"
+        and "objectives" not in recorded.model_fields_set
+        and bool(requested_core.get("objectives"))
+    )
+    if migrate_agent_objectives:
+        # Runs created before objective directions entered AgentRunConfiguration
+        # omitted this field entirely. Adopt the requested value once so resume
+        # can normalize legacy hypothesis evidence; an explicitly recorded
+        # value remains immutable like every other non-limit setting.
+        recorded_core["objectives"] = requested_core["objectives"]
     changed = sorted(
         field for field, value in requested_core.items() if recorded_core.get(field) != value
     )
@@ -183,7 +194,7 @@ def _resume_configuration_update(
                 ),
             )
         )
-    return requested if requested_limit > recorded_limit else None
+    return requested if requested_limit > recorded_limit or migrate_agent_objectives else None
 
 
 @overload
@@ -245,7 +256,7 @@ def create_run_context(  # noqa: PLR0913  # tracked: #288
     environment_hooks: EnvironmentHooks | None = None,
     remote_repo: str | None = None,
     repo_visibility: RepositoryVisibility = RepositoryVisibility.PRIVATE,
-    active_state_model_type: type[BaseModel] | None = None,
+    agent_state_model_type: type[BaseModel] | None = None,
 ) -> "_RunContext":
     """Build a fully wired :class:`_RunContext`.
 
@@ -286,7 +297,7 @@ def create_run_context(  # noqa: PLR0913  # tracked: #288
             environment_hooks=environment_hooks,
             remote_repo=remote_repo,
             repo_visibility=repo_visibility,
-            active_state_model_type=active_state_model_type,
+            agent_state_model_type=agent_state_model_type,
         )
     except BaseException as construction_error:
         _close_after_construction_failure(teardown_stack, construction_error)
@@ -336,7 +347,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     environment_hooks: EnvironmentHooks | None,
     remote_repo: str | None,
     repo_visibility: RepositoryVisibility,
-    active_state_model_type: type[BaseModel] | None,
+    agent_state_model_type: type[BaseModel] | None,
 ) -> "_RunContext":
     config = as_config(config)
     for source in workspace_sources:
@@ -603,23 +614,39 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             effective_configuration,
         )
         if configuration_update is not None:
-            pending = git.pending_changes()
-            if pending:
-                raise ConfigurationError(
-                    ConfigurationDiagnostic(
-                        code="project_resume_configuration_dirty",
-                        stage="resume_resolution",
-                        message=(
-                            "commit or discard pending project changes before increasing "
-                            f"the run limit: {', '.join(pending)}"
-                        ),
-                    )
-                )
-            project_state.update_run_configuration(run_id, configuration_update)
-            git.snapshot_with_framework_metadata(
-                "vibesys: increase run limit",
-                project_state.run_manifest_snapshot(run_id),
+            limit_field = (
+                "max_generations"
+                if run_manifest.configuration.outer_loop == "evolve"
+                else "max_rounds"
             )
+            limit_increased = getattr(configuration_update, limit_field) > getattr(
+                run_manifest.configuration, limit_field
+            )
+            if limit_increased:
+                pending = git.pending_changes()
+                if pending:
+                    raise ConfigurationError(
+                        ConfigurationDiagnostic(
+                            code="project_resume_configuration_dirty",
+                            stage="resume_resolution",
+                            message=(
+                                "commit or discard pending project changes before increasing "
+                                f"the run limit: {', '.join(pending)}"
+                            ),
+                        )
+                    )
+            project_state.update_run_configuration(run_id, configuration_update)
+            snapshot = project_state.run_manifest_snapshot(run_id)
+            if limit_increased:
+                git.snapshot_with_framework_metadata(
+                    "vibesys: update run configuration",
+                    snapshot,
+                )
+            else:
+                git.snapshot_framework_metadata_only(
+                    "vibesys: migrate run configuration",
+                    snapshot,
+                )
         project_state.set_current_run(run_id)
     else:
         project_state.create_project(project_root.name)
@@ -647,13 +674,13 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         )
 
     if project_configuration.outer_loop == "agent":
-        if active_state_model_type is None:
-            raise ValueError("agent runs require an active state model type")  # noqa: TRY003  # tracked: #288
+        if agent_state_model_type is None:
+            raise ValueError("agent runs require an agent state model type")  # noqa: TRY003  # tracked: #288
         round_transaction_coordinator = RoundTransactionCoordinator(
             project,
             git,
             run_id,
-            active_state_model_type=active_state_model_type,
+            agent_state_model_type=agent_state_model_type,
         )
         if existing:
             recovery = round_transaction_coordinator.recover()
@@ -1515,9 +1542,9 @@ class _RunContext:
 
     def begin_completed_round(
         self,
-        record: "RoundRecord",
+        round_number: int,
         *,
-        active_transition: StateTransition,
+        state_transition: StateTransition,
     ) -> None:
         """Journal a completed project round before mutating local state."""
         if self._round_transaction_coordinator is None:
@@ -1525,8 +1552,8 @@ class _RunContext:
         if self._pending_round_transaction is not None:
             raise RuntimeError("a completed-round transaction is already active")  # noqa: TRY003  # tracked: #288
         self._pending_round_transaction = self._round_transaction_coordinator.begin(
-            record,
-            active_transition=active_transition,
+            round_number,
+            state_transition=state_transition,
         )
 
     def persist_completed_round(self) -> None:

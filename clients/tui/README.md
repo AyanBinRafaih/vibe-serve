@@ -40,10 +40,10 @@ The client opens on the experiment log rather than on the per-round
 transcript. It groups rounds by `hypothesis_id`, so one hypothesis held across
 continuation rounds is a single row showing the claim, the round range, what
 the implementation details, the measured result, the judge verdict, the outcome the loop
-resolved (`Proven`, `Rejected`, or a terminal `HypothesisOutcome`), and whether
+resolved (`Accepted`, `Rejected`, or a terminal `HypothesisOutcome`), and whether
 the candidate was kept. The active hypothesis is marked with `▸` and carries no
-outcome until it resolves. `Proven` reads in the theme's success color and
-`Disproven` in its error color; the word is always spelled out, so the reading
+outcome until it resolves. `Accepted` reads in the theme's success color and
+`Rejected` in its error color; the word is always spelled out, so the reading
 does not depend on color.
 
 The log is the landing view and the root of the client, so no command is

@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -5,13 +6,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vibesys.context import _RunContext, create_candidate_context, create_run_context
+from vibesys.context import (
+    _resume_configuration_update,
+    _RunContext,
+    create_candidate_context,
+    create_run_context,
+)
 from vibesys.domains.base import DomainName
 from vibesys.domains.environment import EnvironmentPatch, NoopEnvironmentHooks
 from vibesys.domains.llm_serving.hooks import LLMServingEnvironmentHooks
 from vibesys.errors import ConfigurationError
 from vibesys.input_manifest import WorkspaceSource
-from vibesys.loops.agent.model import ActiveHypothesis
+from vibesys.loops.agent.model import AgentRunState
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.run import RunLogger, RunPaths, RunStateNamespace
 from vibesys.sandbox.run_environment import RunEnvironmentSpec
@@ -74,6 +80,15 @@ def _configuration(max_rounds: int = 1) -> AgentRunConfiguration:
         official_eval_every=1,
         memory_layout="files",
     )
+
+
+def test_resume_adopts_objectives_omitted_by_legacy_agent_manifest() -> None:
+    requested = _configuration().model_copy(update={"objectives": ("throughput:max",)})
+    legacy_payload = requested.model_dump(exclude={"objectives"})
+    recorded = AgentRunConfiguration.model_validate(legacy_payload)
+
+    assert "objectives" not in recorded.model_fields_set
+    assert _resume_configuration_update(recorded, requested) == requested
 
 
 def _write_project(root: Path, *, evaluator_name: str = "checker") -> Path:
@@ -163,7 +178,7 @@ def _create_context(  # noqa: PLR0913
         agent_backend="stub",
         environment_hooks=hooks or NoopEnvironmentHooks(),
         remote_repo=remote_repo,
-        active_state_model_type=ActiveHypothesis,
+        agent_state_model_type=AgentRunState,
     )
 
 
@@ -418,6 +433,39 @@ def test_resume_reuses_project_and_run_id_and_only_increases_limit(tmp_path):  #
     assert _git(project, "branch", "--show-current") == f"vibesys-runs/{run_id}"
 
 
+def test_resume_migrates_legacy_objectives_with_dirty_candidate(tmp_path):  # noqa: ANN001, ANN201
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    with _create_context(project, evaluator=evaluator) as first:
+        run_id = first.run_id
+
+    state = Project.open(project).state
+    manifest_path = state._run_manifest_path(run_id)  # noqa: SLF001  # migration fixture
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["configuration"].pop("objectives")
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _git(project, "add", str(manifest_path.relative_to(project)))
+    _git(project, "commit", "-m", "simulate legacy run manifest")
+    candidate = project / "queue.py"
+    candidate.write_text(candidate.read_text() + "\n# interrupted edit\n")
+
+    requested = _configuration().model_copy(update={"objectives": ("total_ops_per_sec:max",)})
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        exp_name=run_id,
+        existing=True,
+        configuration=requested,
+    ):
+        pass
+
+    stored = state.load_run(run_id)
+    assert stored.configuration.objectives == ("total_ops_per_sec:max",)
+    assert "# interrupted edit" in candidate.read_text()
+    assert "queue.py" in _git(project, "status", "--porcelain")
+    assert "# interrupted edit" not in _git(project, "show", "HEAD:queue.py")
+
+
 def test_collection_resume_pushes_existing_origin_on_teardown(tmp_path):  # noqa: ANN001, ANN201
     source = tmp_path / "input"
     evaluator = _write_project(source)
@@ -602,7 +650,7 @@ def test_omnigent_accepts_active_profiler_configuration(tmp_path):  # noqa: ANN0
         profiler_kind=ProfilerKind.MACOS_CPU,
         profiler_domain=DomainName.GENERIC,
         run_environment=RunEnvironmentSpec("local"),
-        active_state_model_type=ActiveHypothesis,
+        agent_state_model_type=AgentRunState,
     ) as context:
         assert context.profiler_kind is ProfilerKind.MACOS_CPU
 

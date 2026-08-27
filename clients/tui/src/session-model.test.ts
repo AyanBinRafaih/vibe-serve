@@ -4,6 +4,7 @@ import type {SessionState} from './session-model.js';
 import {
   applyActiveExecutionCheckpoint,
   applyEvent,
+  applyEventBatch,
   chatDocked,
   chatPaneVisible,
   closePane,
@@ -46,6 +47,59 @@ import {
   visiblePhases,
   visibleTodos,
 } from './session-model.js';
+
+describe('event batch projection', () => {
+  it('keeps the existing banner while resumed history ends in a running session', () => {
+    const before = reportError(initialSessionState(), 'Local input problem', {scope: 'input'});
+
+    const state = applyEventBatch(before, [
+      {
+        ...event(1, 'run_failed'),
+        diagnostic: {
+          code: 'interrupted',
+          summary: 'Previous process was interrupted.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+      event(2, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+    ]);
+
+    expect(state.core.status).toBe('running');
+    expect(state.core.diagnostics).toHaveLength(1);
+    expect(state.errorBanner).toEqual(before.errorBanner);
+  });
+
+  it('surfaces the final diagnostic when a batch ends in failure', () => {
+    const state = applyEventBatch(initialSessionState(), [
+      event(1, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+      {
+        ...event(2, 'run_failed'),
+        diagnostic: {
+          code: 'run_failed',
+          summary: 'The current run failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+    ]);
+
+    expect(state.core.status).toBe('failed');
+    expect(state.errorBanner).toMatchObject({message: 'The current run failed.', scope: 'run'});
+  });
+});
 
 describe('hypothesis planning activity', () => {
   function stateFor(

@@ -1894,7 +1894,7 @@ describe('theming', () => {
     expect(landing).toContain('Implementation Details');
     expect(landing).toContain('Outcome');
     expect(landing).toContain('H-07');
-    expect(landing).toContain('Proven');
+    expect(landing).toContain('Accepted');
     expect(landing).not.toContain('Verdict');
     expect(landing).not.toContain('Pass');
     // Per-round detail is what the operator opts into, not what greets them.
@@ -2063,8 +2063,8 @@ describe('theming', () => {
       await controller.openExperimentLog();
       await frameAfter(testRenderer);
 
-      expect(spanColors(testRenderer, 'Proven')?.fg).toBe(theme.success);
-      expect(spanColors(testRenderer, 'Disproven')?.fg).toBe(theme.error);
+      expect(spanColors(testRenderer, 'Accepted')?.fg).toBe(theme.success);
+      expect(spanColors(testRenderer, 'Rejected')?.fg).toBe(theme.error);
       expect(spanColors(testRenderer, 'Active')?.fg).toBe(theme.warning);
       // The claim keeps body text: only the resolution is colored.
       expect(spanColors(testRenderer, 'Batch the prefill step')?.fg).toBe(theme.textPrimary);

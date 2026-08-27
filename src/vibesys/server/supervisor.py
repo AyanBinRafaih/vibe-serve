@@ -117,8 +117,11 @@ class RunSupervisor:
         self._canonical_execution_ids: set[str] = set()
         self._legacy_invocation_ids: set[str] = set()
         self._run_status = "starting"
+        # One durable event stream is both the live subscription source and
+        # the replay source. A process starts on a bootstrap directory before
+        # it knows the project run; ``attach`` moves that short prefix into the
+        # run's durable store once the context is available.
         self._store: EventStore | None = None
-        self._audit_store: EventStore | None = None
         self._pending_events: list[RunEvent] = []
         self.log_dir: Path | None = None
         self._project_run: ProjectRunState | None = None
@@ -163,27 +166,32 @@ class RunSupervisor:
         if (project is None) != (run_id is None):
             raise ValueError("project and run_id must be provided together")  # noqa: TRY003  # tracked: #288
         log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir = log_dir
         events_path = log_dir / "run-events.jsonl"
         with self._condition:
             if project is not None and run_id is not None:
                 self._project_run = ProjectRunState(project, run_id)
             store = self._store
-            if store is not None and run_id is not None:
-                store.run_id = run_id
-            if store is not None and (store.path == events_path or self._audit_store is not None):
+            if store is not None and store.path == events_path:
+                if run_id is not None:
+                    store.run_id = run_id
+                self.log_dir = log_dir
                 return
-            if store is None:
-                store = EventStore(events_path, run_id=run_id or log_dir.parent.name)
-                self._store = store
-                self._index_execution_lifecycle(store.read())
-                pending, self._pending_events = self._pending_events, []
-            else:
-                self._audit_store = EventStore(events_path, run_id=run_id or log_dir.parent.name)
-                pending = store.read()
-        for event in pending:
-            (self._audit_store or store).append(event)
-        if self._audit_store is None:
+            durable = EventStore(events_path, run_id=run_id or log_dir.parent.name)
+            # A resumed run already owns durable events. Index them before
+            # replay so legacy invocation records retain their canonical
+            # execution projection.
+            self._index_execution_lifecycle(durable.read())
+            pending = store.read() if store is not None else self._pending_events
+            self._pending_events = []
+            # Appending through EventStore gives bootstrap events the next
+            # durable sequence numbers, rather than preserving a second,
+            # colliding sequence space from the temporary server directory.
+            for event in pending:
+                self._index_execution_lifecycle([durable.append(event)])
+            self._store = durable
+            self.log_dir = log_dir
+            started_fresh = store is None
+        if started_fresh:
             self.record(EventType.SERVER_STARTED, status=EventStatus.ACTIVE)
         with self._condition:
             self._run_status = "running"
@@ -336,9 +344,6 @@ class RunSupervisor:
                 return event
             recorded = store.append(event)
             self._index_execution_lifecycle([recorded])
-            audit_store = self._audit_store
-            if audit_store is not None:
-                audit_store.append(event)
             return recorded
 
     def record_failure(  # noqa: PLR0913  # failure event fields belong at this boundary
@@ -454,8 +459,8 @@ class RunSupervisor:
             )
 
     def read_history_events(self) -> list[RunEvent]:
-        """Return the durable session history, including earlier attachments."""
-        store = self._audit_store or self._store
+        """Return the same durable event history used for subscription replay."""
+        store = self._store
         return _canonical_execution_events(store.read()) if store else []
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288

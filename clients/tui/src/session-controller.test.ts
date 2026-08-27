@@ -103,6 +103,64 @@ describe('session controller', () => {
     expect(controller.state.core.activeExecutions).toEqual({});
   });
 
+  it('does not surface an old failure banner when a replay batch resumes running', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emit({
+      type: 'event_batch',
+      events: [
+        {
+          ...event(1, 'run_failed'),
+          diagnostic: {
+            code: 'interrupted',
+            summary: 'A previous process was interrupted.',
+            scope: 'run',
+            severity: 'fatal',
+            retryability: 'never',
+          },
+        },
+        {
+          ...event(2, 'run_started'),
+          data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+        },
+      ],
+      through_sequence: 2,
+      active_executions: [],
+    });
+
+    expect(controller.state.core.status).toBe('running');
+    expect(controller.state.errorBanner).toBeNull();
+  });
+
+  it('shows the final failure from a terminal event batch', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emit({
+      type: 'event_batch',
+      events: [
+        {
+          ...event(1, 'run_failed'),
+          diagnostic: {
+            code: 'run_failed',
+            summary: 'The current run failed.',
+            scope: 'run',
+            severity: 'fatal',
+            retryability: 'never',
+          },
+        },
+      ],
+      through_sequence: 1,
+      active_executions: [],
+    });
+
+    expect(controller.state.core.status).toBe('failed');
+    expect(controller.state.errorBanner).toMatchObject({message: 'The current run failed.'});
+  });
+
   it('keeps terminal state when the stream closes after completion', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);

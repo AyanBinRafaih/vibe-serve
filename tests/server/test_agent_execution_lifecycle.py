@@ -165,6 +165,56 @@ def test_checkpoint_watermark_and_active_state_are_consistent(tmp_path):  # noqa
     assert active == []
 
 
+def test_resume_moves_bootstrap_events_into_durable_subscription_history(tmp_path):  # noqa: ANN001, ANN201
+    """A resumed TUI must replay prior rounds and the current process together."""
+    durable_dir = tmp_path / "durable"
+    durable_dir.mkdir()
+    legacy_execution_id = "a" * 32
+    durable = EventStore(durable_dir / "run-events.jsonl", "run-1")
+    durable.append(
+        RunEvent(
+            timestamp=datetime.now(UTC),
+            type=EventType.INVOCATION_STARTED,
+            status=EventStatus.ACTIVE,
+            agent_kind="implementer",
+            round_label="round-1-implementer",
+            invocation_id=legacy_execution_id,
+            data=InvocationStartedData(system_prompt="system", user_prompt="prior work"),
+        )
+    )
+
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    supervisor.publish_agent_output(
+        "bootstrap work",
+        agent_kind="orchestrator",
+        round_label="round-2-plan",
+    )
+    supervisor.attach(durable_dir)
+    supervisor.publish_agent_output(
+        "current work",
+        agent_kind="implementer",
+        round_label="round-2-implementer",
+    )
+
+    through_sequence, events, _active = supervisor.subscription_checkpoint(0)
+
+    assert [event.sequence for event in events] == list(range(1, through_sequence + 1))
+    assert any(
+        event.type is EventType.AGENT_EXECUTION_STARTED
+        and event.execution_id == legacy_execution_id
+        and event.round_label == "round-1-implementer"
+        for event in events
+    )
+    output = [
+        event.data.content
+        for event in events
+        if event.data is not None and event.data.kind == "agent_output_chunk"
+    ]
+    assert output == ["bootstrap work", "current work"]
+    assert supervisor.read_history_events() == events
+
+
 def test_streamed_text_does_not_override_active_tool(tmp_path):  # noqa: ANN001, ANN201
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)

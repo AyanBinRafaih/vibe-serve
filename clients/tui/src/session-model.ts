@@ -12,6 +12,7 @@ import {
   type RoundSummary,
   reconcileActiveExecutions,
   reduceEvent,
+  reduceEventBatch,
   reduceSnapshot,
   type TodoItem,
   type TranscriptEntry,
@@ -933,6 +934,34 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
     chatConversation: reconcileChatTranscript(state.chatConversation, core.chatTranscript),
   };
   if (diagnostic !== null) next = reportProjectedDiagnostic(next, diagnostic);
+  return next;
+}
+
+/**
+ * Fold a backend checkpoint as one UI transition.
+ *
+ * Resumed runs can replay failures from an older process before their current
+ * ``run_started`` event. Those diagnostics remain in core history, but should
+ * not open a stale banner over the newly running session. A batch that ends in
+ * failure still reports its terminal diagnostic.
+ */
+export function applyEventBatch(
+  state: SessionState,
+  events: readonly RunEvent[],
+  activeExecutions?: ActiveExecutionCheckpoint,
+  throughSequence?: number,
+): SessionState {
+  const core = reduceEventBatch(state.core, events, activeExecutions, throughSequence);
+  if (core === state.core) return state;
+  let next: SessionState = {
+    ...state,
+    core,
+    chatConversation: reconcileChatTranscript(state.chatConversation, core.chatTranscript),
+  };
+  if (core.status === 'failed') {
+    const finalDiagnostic = core.diagnostics.at(-1);
+    if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
+  }
   return next;
 }
 

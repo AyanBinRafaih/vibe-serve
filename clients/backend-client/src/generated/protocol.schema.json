@@ -798,7 +798,7 @@
     },
     "HypothesisEntry": {
       "additionalProperties": false,
-      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is the terminal value the agent loop itself recorded\nfor the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``\nmember). It is copied, never recomputed, so the client cannot drift from\nthe framework's resolution semantics.",
+      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is copied from the backend's typed hypothesis state,\nnever recomputed by the server or client.",
       "properties": {
         "hypothesis_id": {
           "title": "Hypothesis Id",
@@ -913,9 +913,45 @@
           "title": "Perf Delta Pct"
         },
         "kept": {
-          "default": false,
-          "title": "Kept",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kept"
+        },
+        "strategy_disposition": {
+          "anyOf": [
+            {
+              "enum": [
+                "available",
+                "parked",
+                "abandoned"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Disposition"
+        },
+        "strategy_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Reason"
         },
         "active": {
           "default": false,

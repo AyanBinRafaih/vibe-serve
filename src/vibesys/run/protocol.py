@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from vibesys.profilers import ProfilerKind
     from vibesys.run.git_tracker import GitTracker
     from vibesys.run.state import RunState
-    from vs_loop_state import RoundRecord
     from vs_project import Project, StateTransition
 
 T = TypeVar("T", bound=BaseModel)
@@ -105,9 +104,9 @@ class LoopContext(Protocol):  # noqa: D101  # tracked: #288
 
     def begin_completed_round(  # noqa: D102  # tracked: #288
         self,
-        record: RoundRecord,
+        round_number: int,
         *,
-        active_transition: StateTransition,
+        state_transition: StateTransition,
     ) -> None: ...
 
     def persist_completed_round(self) -> None: ...  # noqa: D102  # tracked: #288

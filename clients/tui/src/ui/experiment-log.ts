@@ -506,12 +506,12 @@ export function entryCells(entry: HypothesisEntry, columns: Columns): EntryCells
     // These are separate renderables so outcome can carry semantic color.
     // Put gutters on the following segment rather than relying on trailing
     // padding surviving across renderable boundaries.
-    outcome: `${COLUMN_GAP}${fitColumn(
-      sentenceCase(entry.active === true ? 'active' : (entry.resolved_outcome ?? '—')),
-      OUTCOME_WIDTH,
-    )}`,
+    outcome: `${COLUMN_GAP}${fitColumn(outcomeLabel(entry), OUTCOME_WIDTH)}`,
     trailing: columns.kept
-      ? `${COLUMN_GAP}${fitColumn(entry.kept === true ? 'Yes' : 'No', KEPT_WIDTH)}`
+      ? `${COLUMN_GAP}${fitColumn(
+          entry.kept === true ? 'Yes' : entry.kept === false ? 'No' : '—',
+          KEPT_WIDTH,
+        )}`
       : '',
   };
 }
@@ -537,6 +537,14 @@ export function outcomeColor(theme: Theme, entry: HypothesisEntry): string {
   if (outcome === 'proven') return theme.success;
   if (outcome === 'disproven' || outcome === 'rejected') return theme.error;
   return theme.textPrimary;
+}
+
+/** Map backend resolution terms to concise operator-facing hypothesis decisions. */
+export function outcomeLabel(entry: HypothesisEntry): string {
+  if (entry.active === true) return 'Active';
+  if (entry.resolved_outcome === 'proven') return 'Accepted';
+  if (entry.resolved_outcome === 'disproven') return 'Rejected';
+  return sentenceCase(entry.resolved_outcome ?? '—');
 }
 
 /** Capitalises a wire value for display without touching the rest of it. */

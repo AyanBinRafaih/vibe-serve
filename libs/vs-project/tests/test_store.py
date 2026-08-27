@@ -719,6 +719,7 @@ def test_run_manifest_persists_complete_agent_loop_behavior(tmp_path: Path) -> N
         "modality": "text_generation",
         "model": "gpt-5",
         "official_eval_every": 3,
+        "objectives": [],
         "operator_constraints": ["Do not change the ABI"],
         "outer_loop": "agent",
         "outer_model": "gpt-5.6-sol",
@@ -1102,6 +1103,38 @@ def test_state_namespace_prepares_and_applies_exact_typed_transition(tmp_path: P
     deletion = slot.deserialize_transition(slot.serialize_transition(slot.transition(None)))
     slot.apply(deletion)
     assert namespace.load_optional("active.json", _Cursor) is None
+
+
+def test_typed_state_slot_snapshots_exact_replacement(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run = _run(store)
+    namespace = store.state.portable_namespace(run.run_id, "agent")
+    slot = namespace.slot("state.json", _Cursor)
+    transition = slot.transition(_Cursor(round=3, phase="judge"))
+
+    snapshot = slot.snapshot_transition(transition)
+
+    assert snapshot == StateSnapshot._create(
+        namespace_root=PurePosixPath(f".vibesys/state/runs/{run.run_id}/agent"),
+        files=(
+            StateFile(
+                relative_path=PurePosixPath("state.json"),
+                contents=b'{\n  "phase": "judge",\n  "round": 3\n}\n',
+            ),
+        ),
+    )
+
+
+def test_typed_state_slot_cannot_snapshot_deletion(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run = _run(store)
+    slot = store.state.portable_namespace(run.run_id, "agent").slot(
+        "state.json",
+        _Cursor,
+    )
+
+    with pytest.raises(ProjectStateError, match="deletion transition"):
+        slot.snapshot_transition(slot.transition(None))
 
 
 def test_state_namespace_rejects_transition_for_another_namespace(tmp_path: Path) -> None:

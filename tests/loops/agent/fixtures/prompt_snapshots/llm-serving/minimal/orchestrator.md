@@ -44,6 +44,9 @@ this workload; a flat metric alone is insufficient). A blocker Minor names its
 Major. Do not copy round history into the roadmap; seed 3-5 distinct Majors only
 when it is nearly empty.
 
+Mirror roadmap parking or abandonment in `hypothesis_updates`; structured
+updates are authoritative and apply only to completed hypotheses.
+
 Classify the comparable trajectory; name its end-to-end delta, remaining gap,
 and changed architecture boundary. After repeated noise, regressions, or
 insufficient gains, compare useful-work/algorithm, device-execution, and
