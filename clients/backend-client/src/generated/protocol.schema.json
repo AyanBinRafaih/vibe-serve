@@ -809,6 +809,18 @@
           "title": "Identified",
           "type": "boolean"
         },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
         "claim": {
           "anyOf": [
             {

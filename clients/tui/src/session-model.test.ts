@@ -336,6 +336,45 @@ describe('hypothesis planning activity', () => {
   });
 });
 
+describe('hypothesis scope label', () => {
+  it('prefers the backend-supplied title over the hypothesis id', () => {
+    const state = setExperiments(initialSessionState(), [
+      {
+        hypothesis_id: 'H-01',
+        identified: true,
+        title: 'Batch decode requests',
+        first_round: 1,
+        last_round: 1,
+        rounds: [{round: 1, passed: true, reviewed: true}],
+        kept: false,
+        active: false,
+      },
+    ]);
+
+    const opened = enterExperimentDrilldown(state);
+
+    expect(opened.hypothesisScope).toMatchObject({id: 'H-01', label: 'Batch decode requests · r1'});
+  });
+
+  it('falls back to the hypothesis id when there is no title', () => {
+    const state = setExperiments(initialSessionState(), [
+      {
+        hypothesis_id: 'H-01',
+        identified: true,
+        first_round: 1,
+        last_round: 1,
+        rounds: [{round: 1, passed: true, reviewed: true}],
+        kept: false,
+        active: false,
+      },
+    ]);
+
+    const opened = enterExperimentDrilldown(state);
+
+    expect(opened.hypothesisScope).toMatchObject({id: 'H-01', label: 'H-01 · r1'});
+  });
+});
+
 describe('unowned rounds', () => {
   it('opens an observed round and keeps its turns scoped to that round', () => {
     const state = {
