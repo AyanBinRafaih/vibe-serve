@@ -31,12 +31,15 @@ import {
   focusRound,
   initialSessionState,
   leaveExperimentDrilldown,
+  leaveHypothesisDetail,
   markEventStreamUnavailable,
   moveExperimentSelection,
+  moveHypothesisRoundSelection,
   moveThemeSelection,
   normalizeFocus,
   openChat,
   openExperimentLog,
+  openHypothesisDetail,
   openPane,
   openThemePicker,
   type PaneFocus,
@@ -100,9 +103,12 @@ export interface SessionController {
   togglePaneZoom(): void;
   setChatDockFits(fits: boolean): void;
   moveExperimentSelection(delta: number): void;
+  openHypothesisDetail(entryKey?: string): void;
+  moveHypothesisRoundSelection(delta: number): void;
   selectExperimentActivity(): void;
   enterExperimentDrilldown(): void;
   leaveExperimentDrilldown(): void;
+  leaveHypothesisDetail(): void;
   openThemePicker(): void;
   moveThemeSelection(delta: number): void;
   applySelectedTheme(): void;
@@ -306,7 +312,14 @@ export class SocketSessionController implements SessionController {
         `Already inside ${scope.id}. Esc returns to the experiment log.`,
       );
     }
-    const opened = enterExperimentDrilldown(this.#state);
+    const firstStep = enterExperimentDrilldown(this.#state);
+    // The ordinary UI stops at the hypothesis summary. `/open-round` names a
+    // round-level action explicitly, so it advances through that summary to
+    // the currently selected (latest by default) round.
+    const opened =
+      firstStep.hypothesisDetail !== null && firstStep.hypothesisScope === null
+        ? enterExperimentDrilldown(firstStep)
+        : firstStep;
     return opened === this.#state
       ? showDetail(this.#state, 'Select a hypothesis first, or use /open-round --N.')
       : opened;
@@ -394,6 +407,14 @@ export class SocketSessionController implements SessionController {
     this.#setState(moveExperimentSelection(this.#state, delta));
   }
 
+  openHypothesisDetail(entryKey?: string): void {
+    this.#setState(openHypothesisDetail(this.#state, entryKey));
+  }
+
+  moveHypothesisRoundSelection(delta: number): void {
+    this.#setState(moveHypothesisRoundSelection(this.#state, delta));
+  }
+
   selectExperimentActivity(): void {
     this.#setState(selectExperimentActivity(this.#state));
   }
@@ -404,6 +425,10 @@ export class SocketSessionController implements SessionController {
 
   leaveExperimentDrilldown(): void {
     this.#setState(leaveExperimentDrilldown(this.#state));
+  }
+
+  leaveHypothesisDetail(): void {
+    this.#setState(leaveHypothesisDetail(this.#state));
   }
 
   async #loadExperiments(): Promise<void> {

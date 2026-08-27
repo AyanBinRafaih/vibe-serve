@@ -18,10 +18,13 @@ import {
   focusRound,
   initialSessionState,
   leaveExperimentDrilldown,
+  leaveHypothesisDetail,
   moveExperimentSelection,
+  moveHypothesisRoundSelection,
   moveThemeSelection,
   normalizeFocus,
   openExperimentLog,
+  openHypothesisDetail,
   openPane,
   type PaneFocus,
   type PaneView,
@@ -1904,7 +1907,7 @@ describe('theming', () => {
     expect(landing).not.toContain('Agents');
   });
 
-  it('opens the round trajectory behind a hypothesis and steps back out', async () => {
+  it('drills from a full hypothesis summary into a round trajectory and back', async () => {
     const testRenderer = await createTestRenderer({width: 120, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
@@ -1947,7 +1950,8 @@ describe('theming', () => {
         rounds: [{round: 41, passed: true, reviewed: true}],
       }),
       logEntry('H-08', 42, 43, {
-        claim: 'bigger KV cache block',
+        claim:
+          'Increasing the KV cache block should reduce allocator synchronization across producer and consumer operations without changing queue ordering.',
         resolved_outcome: 'rejected',
         rounds: [
           {round: 42, passed: false, reviewed: false},
@@ -1963,6 +1967,19 @@ describe('theming', () => {
     expect(table).not.toContain('grew the block');
 
     testRenderer.mockInput.pressKey('ARROW_DOWN');
+    testRenderer.mockInput.pressEnter();
+    const detail = await frameAfter(testRenderer);
+
+    expect(detail).toContain('Hypothesis H-08');
+    expect(detail).toContain(
+      'Increasing the KV cache block should reduce allocator synchronization',
+    );
+    expect(detail).toContain('without changing queue ordering.');
+    expect(detail).toContain('Decision Rejected');
+    expect(detail).toContain('Round 42 · Judge pending');
+    expect(detail).toContain('Round 43 · Judge fail');
+    expect(controller.state.hypothesisScope).toBeNull();
+
     testRenderer.mockInput.pressEnter();
     const trajectory = await frameAfter(testRenderer);
 
@@ -1980,9 +1997,13 @@ describe('theming', () => {
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-08', rounds: [42, 43]});
 
     testRenderer.mockInput.pressKey('ESCAPE');
-    const back = await frameAfterEscape(testRenderer);
-    expect(back).toContain('Implementation Details');
-    expect(back).not.toContain('grew the block');
+    const backToHypothesis = await frameAfterEscape(testRenderer);
+    expect(backToHypothesis).toContain('Increasing the KV cache block');
+    expect(backToHypothesis).not.toContain('grew the block');
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const backToIndex = await frameAfterEscape(testRenderer);
+    expect(backToIndex).toContain('Implementation Details');
     expect(controller.state.experimentLog?.selectedId).toBe('H-08');
   });
 
@@ -2504,12 +2525,18 @@ describe('theming', () => {
     expect(controller.state.layout.focus).toBe('left');
   });
 
-  it('focuses hypothesis panes from their inner content and routes the next key', async () => {
+  it('opens hypothesis detail from a row click and keeps pane clicks routed', async () => {
     const testRenderer = await createTestRenderer({width: 200, height: 22});
     const controller = logController();
     controller.experiments = [
       logEntry('H-07', 41, 41, {claim: 'batch the prefill step'}),
-      logEntry('H-08', 42, 42, {claim: 'increase the cache block'}),
+      logEntry('H-08', 42, 43, {
+        claim: 'increase the cache block',
+        rounds: [
+          {round: 42, passed: true, reviewed: true},
+          {round: 43, passed: false, reviewed: true},
+        ],
+      }),
     ];
     controller.paneContent = 'Performance · tok_s\nbest r7 1135 tok_s';
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -2519,7 +2546,8 @@ describe('theming', () => {
     let frame = await frameAfter(testRenderer);
     expect(controller.state.layout.focus).toBe('right');
 
-    // A table row both selects its hypothesis and focuses Experiments.
+    // A table row opens the hypothesis summary directly and gives it the full
+    // content row, closing an unrelated visualization.
     let lines = frame.split('\n');
     let row = lines.findIndex(line => line.includes('H-08'));
     let column = (lines[row]?.indexOf('H-08') ?? 0) + 2;
@@ -2527,10 +2555,28 @@ describe('theming', () => {
     frame = await frameAfter(testRenderer);
     expect(controller.state.layout.focus).toBe('left');
     expect(controller.state.experimentLog?.selectedId).toBe('H-08');
-    expect(frame).toContain('▸ Experiments');
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-08', selectedRound: 43});
+    expect(controller.state.layout.right).toBeNull();
+    expect(frame).toContain('▸ Hypothesis H-08');
     testRenderer.mockInput.pressKey('ARROW_UP');
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.hypothesisDetail?.selectedRound).toBe(42);
+
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('Round 42'));
+    column = (lines[row]?.indexOf('Round 42') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
     await frameAfter(testRenderer);
-    expect(controller.state.experimentLog?.selectedId).toBe('H-07');
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'H-08'});
+    expect(controller.state.selectedRound).toBe(42);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.hypothesisDetail?.selectedRound).toBe(42);
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    await controller.openPane('perf');
+    frame = await frameAfter(testRenderer);
 
     // The chart body is inside a scroll surface. Clicking it focuses the
     // performance pane, so Escape is routed there and closes it.
@@ -3207,6 +3253,12 @@ class FakeController implements SessionController {
   moveExperimentSelection(delta: number): void {
     this.publish(moveExperimentSelection(this.state, delta));
   }
+  openHypothesisDetail(entryKey?: string): void {
+    this.publish(openHypothesisDetail(this.state, entryKey));
+  }
+  moveHypothesisRoundSelection(delta: number): void {
+    this.publish(moveHypothesisRoundSelection(this.state, delta));
+  }
   selectExperimentActivity(): void {
     this.publish(selectExperimentActivity(this.state));
   }
@@ -3252,6 +3304,9 @@ class FakeController implements SessionController {
   }
   leaveExperimentDrilldown(): void {
     this.publish(leaveExperimentDrilldown(this.state));
+  }
+  leaveHypothesisDetail(): void {
+    this.publish(leaveHypothesisDetail(this.state));
   }
 
   subscribe(listener: (state: SessionState) => void): () => void {
