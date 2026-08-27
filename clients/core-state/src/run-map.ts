@@ -32,6 +32,9 @@ export interface AgentPhase {
   invocationId?: string;
   startedAt?: string;
   finishedAt?: string;
+  driver?: string | null;
+  provider?: string | null;
+  model?: string | null;
 }
 
 export interface RunMapState {
@@ -83,6 +86,11 @@ function applyPhaseEvent(state: RunMapState, event: RunEvent): AgentPhase[] {
   const finished = event.type === 'agent_execution_finished' || event.type === 'phase_finished';
   if (!started && !finished) return ensurePhase(phases, kind, roundNumber);
   const executionId = event.execution_id ?? event.invocation_id ?? undefined;
+  const data = event.data;
+  const runtime =
+    started && data?.kind === 'agent_execution_started'
+      ? {driver: data.driver ?? null, provider: data.provider ?? null, model: data.model ?? null}
+      : {};
   return upsertPhase(phases, {
     kind,
     status: started ? 'active' : terminalPhaseStatus(event.status),
@@ -90,6 +98,7 @@ function applyPhaseEvent(state: RunMapState, event: RunEvent): AgentPhase[] {
     roundLabel: event.round_label ?? null,
     ...(executionId ? {executionId, invocationId: executionId} : {}),
     ...(started ? {startedAt: event.timestamp} : {finishedAt: event.timestamp}),
+    ...runtime,
   });
 }
 

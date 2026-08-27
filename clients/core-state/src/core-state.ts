@@ -18,6 +18,9 @@ export interface ActiveAgentExecution {
   assignment: string;
   startedAt: string;
   activity: {mode: AgentExecutionMode; summary: string; tool?: string | null};
+  driver?: string | null;
+  provider?: string | null;
+  model?: string | null;
 }
 
 export interface TodoItem {
@@ -300,6 +303,9 @@ function applyAgentExecutionEvent(state: CoreState, event: RunEvent): CoreState 
             summary: data.activity.summary,
             tool: data.activity.tool ?? null,
           },
+          driver: data.driver ?? null,
+          provider: data.provider ?? null,
+          model: data.model ?? null,
         },
       },
     };

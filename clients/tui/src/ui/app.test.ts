@@ -1052,6 +1052,86 @@ describe('OpenTUI presentation', () => {
     expect(frame).not.toContain('▶');
   });
 
+  it('shows each graph node’s agent harness and model, when known', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'completed',
+            roundNumber: 1,
+            roundLabel: 'round-1-plan',
+            provider: 'codex',
+            model: 'gpt-5.1-codex-max',
+          },
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    // Graph nodes are narrow enough that the label truncates like every other
+    // node line; this stays inside the kept prefix regardless of node width.
+    expect(frame).toContain('Codex (GPT');
+    // The implementer node carries no runtime identity, so its row stays
+    // blank rather than reusing the orchestrator's label.
+    const implementerRow = frame.split('\n').find(line => line.includes('implementer'));
+    expect(implementerRow).toBeDefined();
+  });
+
+  it('shows the stacked strip’s runtime label when the terminal is too narrow for a graph', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 30});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'completed',
+            roundNumber: 1,
+            roundLabel: 'round-1-plan',
+            // Short enough to stay on one line in the narrow stacked column;
+            // the wrapping case for a long label is covered elsewhere.
+            provider: 'codex',
+            model: 'gpt-5',
+          },
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+          {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    // Confirms the stacked (non-graph) layout is in play, as in the sibling
+    // narrow-terminal test above.
+    expect(frame).toContain('        ↓');
+    expect(frame).toContain('Codex (GPT 5)');
+  });
+
   it('holds the agent-active elapsed time of a finished round', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({

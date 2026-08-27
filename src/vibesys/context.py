@@ -1631,8 +1631,16 @@ class _RunContext:
         supervisor = getattr(self, "supervisor", None)
         execution_id: str | None = None
         if supervisor is not None:
+            client = self.agent_client
+            model_for_kind = getattr(client, "model_for_kind", None)
             execution = supervisor.start_agent_execution(
-                kind, round_label, user_prompt, system_prompt
+                kind,
+                round_label,
+                user_prompt,
+                system_prompt,
+                driver=getattr(client, "driver_name", None),
+                provider=getattr(client, "provider", None),
+                model=model_for_kind(kind) if callable(model_for_kind) else None,
             )
             user_prompt = execution.user_prompt
             execution_id = execution.execution_id

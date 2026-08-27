@@ -26,6 +26,47 @@ describe('run map projection', () => {
     expect(roundAgentElapsedMs(round, new Date('2026-01-01T00:00:05Z'))).toBe(2000);
   });
 
+  it('captures the agent runtime identity on start and keeps it after finish', () => {
+    let state = applyRunMapEvent(emptyRunMap(), {
+      ...execution(1, 'agent_execution_started', 'a'),
+      data: {
+        kind: 'agent_execution_started',
+        stage: 'implementation',
+        attempt: 1,
+        system_prompt: '',
+        user_prompt: 'Implement',
+        activity: {
+          kind: 'agent_execution_activity_changed',
+          mode: 'thinking',
+          summary: 'Starting',
+          tool: null,
+        },
+        driver: 'agentshim',
+        provider: 'codex',
+        model: 'gpt-5.1-codex-max',
+      },
+    });
+    state = applyRunMapEvent(state, execution(2, 'agent_execution_finished', 'a'));
+
+    expect(state.phases.filter(phase => phase.kind === 'implementer')).toMatchObject([
+      {
+        executionId: 'a',
+        status: 'completed',
+        driver: 'agentshim',
+        provider: 'codex',
+        model: 'gpt-5.1-codex-max',
+      },
+    ]);
+  });
+
+  it('defaults the runtime identity to null when the event omits it', () => {
+    const state = applyRunMapEvent(emptyRunMap(), execution(1, 'agent_execution_started', 'a'));
+
+    expect(state.phases.filter(phase => phase.kind === 'implementer')).toMatchObject([
+      {driver: null, provider: null, model: null},
+    ]);
+  });
+
   it('closes active timing when a run is interrupted', () => {
     let state = applyRunMapEvent(emptyRunMap(), execution(1, 'agent_execution_started', 'a'));
     state = applyRunMapEvent(state, {
