@@ -242,11 +242,23 @@ export type Tool2 = string;
 export type CallId1 = string | null;
 export type Content3 = string;
 export type IsError = boolean;
-export type Kind20 = "todo_update";
+export type Payload = (CommandResultPayload | JsonResultPayload) | null;
+export type Kind20 = "command";
+export type Stdout = string;
+export type Stderr = string;
+export type ExitCode1 = number | null;
+export type Duration = number | null;
+export type Kind21 = "json";
+export type Value1 =
+  | {
+      [k: string]: unknown;
+    }
+  | unknown[];
+export type Kind22 = "todo_update";
 export type Content4 = string;
 export type Status2 = string;
 export type Todos = TodoItemData[];
-export type Kind21 = "usage_update";
+export type Kind23 = "usage_update";
 export type InputTokens1 = number;
 export type ContextWindow1 = number | null;
 export type Model = string | null;
@@ -623,10 +635,30 @@ export interface ToolResultData {
   call_id?: CallId1;
   content: Content3;
   is_error?: IsError;
+  payload?: Payload;
+  [k: string]: unknown;
+}
+/**
+ * Structured result of a command-style tool execution.
+ */
+export interface CommandResultPayload {
+  kind?: Kind20;
+  stdout: Stdout;
+  stderr: Stderr;
+  exit_code?: ExitCode1;
+  duration?: Duration;
+  [k: string]: unknown;
+}
+/**
+ * A tool result that is a JSON object or array, already parsed.
+ */
+export interface JsonResultPayload {
+  kind?: Kind21;
+  value: Value1;
   [k: string]: unknown;
 }
 export interface TodoUpdateData {
-  kind?: Kind20;
+  kind?: Kind22;
   todos?: Todos;
   [k: string]: unknown;
 }
@@ -636,7 +668,7 @@ export interface TodoItemData {
   [k: string]: unknown;
 }
 export interface UsageUpdateData {
-  kind?: Kind21;
+  kind?: Kind23;
   input_tokens: InputTokens1;
   context_window?: ContextWindow1;
   model?: Model;

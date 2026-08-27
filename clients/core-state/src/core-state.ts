@@ -48,6 +48,8 @@ export interface BenchmarkRecord {
 
 type RunEventData = NonNullable<RunEvent['data']>;
 export type TypedToolResult = Extract<RunEventData, {kind?: 'tool_result'}>;
+/** Typed structure a producer preserved alongside the raw tool-result text. */
+export type ToolResultPayload = NonNullable<TypedToolResult['payload']>;
 
 export interface TranscriptEntry {
   id: string;

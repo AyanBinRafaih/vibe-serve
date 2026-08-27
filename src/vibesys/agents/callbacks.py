@@ -13,7 +13,7 @@ from vibesys.agents.progress import AgentProgress
 from vibesys.agents.todos import todos_from_tool_call
 from vibesys.render.format import format_status_prefix
 from vibesys.render.sink import output_sink
-from vibesys.server.events import AgentOutputChannel, AgentStatusData
+from vibesys.server.events import AgentOutputChannel, AgentStatusData, ToolResultPayload
 
 ContextWindowLookup = Callable[[str | None], int | None]
 """Resolves a model name to its context window size in tokens.
@@ -339,6 +339,7 @@ class AgentLogger(BaseCallbackHandler):
         *,
         call_id: str | None = None,
         is_error: bool = False,
+        payload: ToolResultPayload | None = None,
     ) -> None:
         full_text = str(content)
         pending = self._pending_tool_calls[name]
@@ -355,6 +356,7 @@ class AgentLogger(BaseCallbackHandler):
             full_text,
             call_id=resolved_call_id,
             is_error=is_error,
+            payload=payload,
             agent_kind=self._agent_kind,
             round_label=self._round_label,
             invocation_id=self._invocation_id,
@@ -413,17 +415,19 @@ class AgentLogger(BaseCallbackHandler):
             normalized = {"args": str(args)}
         self.log_tool_call(tool, normalized)
 
-    def on_tool_result(  # noqa: D102  # tracked: #288
+    def on_tool_result(  # noqa: D102, PLR0913  # tracked: #288
         self,
         tool: str,
         stdout: str = "",
         stderr: str = "",
         exit_code: int | None = None,
         duration: float | None = None,  # noqa: ARG002 - protocol parity
+        *,
+        payload: ToolResultPayload | None = None,
     ) -> None:
         is_error = bool(stderr) or (exit_code not in (None, 0))
         content = stdout or stderr
-        self.log_tool_result(tool, content, is_error=is_error)
+        self.log_tool_result(tool, content, is_error=is_error, payload=payload)
 
     def on_usage(self, usage: dict[str, Any]) -> None:  # noqa: D102  # tracked: #288
         self.update_usage(usage)
@@ -481,9 +485,10 @@ class AgentLogger(BaseCallbackHandler):
         content: str,
         *,
         is_error: bool = False,
+        payload: ToolResultPayload | None = None,
     ) -> None:
         """Emit a tool result the same way ``on_tool_end`` does."""
-        self._emit_tool_result(name, content, is_error=is_error)
+        self._emit_tool_result(name, content, is_error=is_error, payload=payload)
 
     def _publish(
         self,

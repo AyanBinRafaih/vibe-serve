@@ -169,6 +169,34 @@ describe('core state projection', () => {
     expect(state.transcript[0]?.toolResponse).toBeUndefined();
   });
 
+  it('carries the typed result payload onto the merged transcript entry', () => {
+    let state = reduceEvent(initialCoreState(), {
+      ...baseEvent(1, 'tool_call'),
+      invocation_id: 'turn',
+      data: {kind: 'tool_call', tool: 'shell', call_id: 'call-1', args: {cmd: 'ls'}},
+    });
+    state = reduceEvent(state, {
+      ...baseEvent(2, 'tool_result'),
+      invocation_id: 'turn',
+      data: {
+        kind: 'tool_result',
+        tool: 'shell',
+        call_id: 'call-1',
+        content: 'file.txt',
+        payload: {kind: 'command', stdout: 'file.txt', stderr: '', exit_code: 0, duration: 0.1},
+      },
+    });
+
+    expect(state.transcript).toHaveLength(1);
+    expect(state.transcript[0]?.toolResult?.payload).toEqual({
+      kind: 'command',
+      stdout: 'file.txt',
+      stderr: '',
+      exit_code: 0,
+      duration: 0.1,
+    });
+  });
+
   it('keeps chat-agent events out of the experiment transcript', () => {
     const chat = {
       ...outputEvent(1, 'answer'),
