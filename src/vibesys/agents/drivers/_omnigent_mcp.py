@@ -42,7 +42,7 @@ def _native_mcp_api() -> _NativeMCPAPI:
     except ImportError as exc:
         raise OmnigentMCPError(
             f"Omnigent MCP support is not importable ({type(exc).__name__}: {exc}). "
-            "Install the Omnigent optional dependency with `uv sync --extra omnigent`."
+            "Reinstall dependencies with `uv sync` (omnigent is a base dependency)."
         ) from exc
     return _NativeMCPAPI(
         agent_spec=AgentSpec,

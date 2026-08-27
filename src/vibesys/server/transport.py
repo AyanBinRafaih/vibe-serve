@@ -15,7 +15,6 @@ from pydantic import BaseModel, TypeAdapter
 
 from vibesys.server.protocol import (
     EventBatchMessage,
-    EventMessage,
     ProtocolErrorMessage,
     ProtocolRequest,
     Response,
@@ -85,9 +84,19 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                     return
                 time.sleep(0.05)
                 continue
-            for event in events:
-                self._write_message(EventMessage(event=event))
-                cursor = event.sequence
+            # ``wait_for_events`` only tells us that the stream changed. Take
+            # one watermark-consistent snapshot before writing so a resumed
+            # run, or a burst of live output, reaches the client as one state
+            # transition instead of thousands of repaint-triggering messages.
+            through_sequence, events, active_executions = service.subscription_checkpoint(cursor)
+            self._write_message(
+                EventBatchMessage(
+                    events=events,
+                    through_sequence=through_sequence,
+                    active_executions=active_executions,
+                )
+            )
+            cursor = through_sequence
 
     def _write_stream_error(self, request_id: str, error: Exception) -> None:
         """Report a replay or stream failure without hiding a live connection."""

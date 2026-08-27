@@ -45,6 +45,23 @@ class SnapshotQuery(Request):  # noqa: D101  # tracked: #288
 class ChatQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.chat"] = "query.chat"
     text: str
+    # None targets the default thread, preserving pre-thread clients.
+    thread_id: str | None = None
+
+
+class ChatThreadCreateQuery(Request):
+    """Create a new experiment-chat thread with its own agent selection.
+
+    Omitted fields resolve to the run's configured driver, provider, and
+    model. The response carries the resolved settings and thread identity.
+    """
+
+    type: Literal["query.chat_thread_create"] = "query.chat_thread_create"
+    driver: Literal["agentshim", "omnigent"] | None = None
+    provider: str | None = None
+    model: str | None = None
+    # Without a title the server derives one from the thread's first message.
+    title: str | None = None
 
 
 class HistoryQuery(Request):  # noqa: D101  # tracked: #288
@@ -78,6 +95,7 @@ ProtocolRequest = Annotated[
     | SteerCommand
     | SnapshotQuery
     | ChatQuery
+    | ChatThreadCreateQuery
     | HistoryQuery
     | PerformanceQuery
     | ExperimentQuery
@@ -119,6 +137,18 @@ class ChatResult(ProtocolModel):  # noqa: D101  # tracked: #288
     question: str
     answer: str
     effect: Literal["none"] = "none"
+    # Echoes the requested thread; None is the default thread.
+    thread_id: str | None = None
+
+
+class ChatThreadInfo(ProtocolModel):
+    """Resolved identity and agent settings of one experiment-chat thread."""
+
+    thread_id: str
+    title: str = ""
+    driver: str
+    provider: str
+    model: str
 
 
 class PerformanceRound(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -146,10 +176,8 @@ class HypothesisRound(ProtocolModel):
 class HypothesisEntry(ProtocolModel):
     """One unit of investigation: a hypothesis and every round it spans.
 
-    ``resolved_outcome`` is the terminal value the agent loop itself recorded
-    for the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``
-    member). It is copied, never recomputed, so the client cannot drift from
-    the framework's resolution semantics.
+    ``resolved_outcome`` is copied from the backend's typed hypothesis state,
+    never recomputed by the server or client.
     """
 
     hypothesis_id: str
@@ -157,24 +185,30 @@ class HypothesisEntry(ProtocolModel):
     # directory written before hypothesis tracking. The row is still returned
     # so history stays complete; clients render it as an explicit placeholder.
     identified: bool = True
+    # Backend-derived display title: the orchestrator's own title, or a
+    # fallback derived from ``claim`` when the orchestrator gave none. None
+    # when there is no text to title at all.
+    title: str | None = None
     claim: str | None = None
     action: str | None = None
     first_round: int
     last_round: int
     rounds: list[HypothesisRound] = Field(default_factory=list)
     resolved_outcome: str | None = None
-    # ``pass``/``fail`` from the closing round, or None when independent review
-    # was deferred by sparse-review policy and the round is still provisional.
+    # Independent review from the authoritative hypothesis state.
     judge_verdict: Literal["pass", "fail"] | None = None
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
-    # Change against the last measured round preceding this hypothesis. None
-    # when either side is unmeasured or the baseline is zero.
+    # Causal delta paired with ``perf_metric`` by the hypothesis state. None
+    # means no official comparison is available.
     perf_delta_pct: FiniteFloat | None = None
-    # Integration, not truth: whether a framework-owned gate accepted the
-    # candidate or it was retained on the Pareto frontier. Deliberately
-    # independent of ``resolved_outcome``.
-    kept: bool = False
+    # Integration, not truth: the framework's explicit retention decision.
+    # None means legacy or not yet assessed, never "official evaluation ran".
+    kept: bool | None = None
+    # Orchestrator strategy is separate from empirical resolution and
+    # candidate retention. It is structured backend state, not roadmap prose.
+    strategy_disposition: Literal["available", "parked", "abandoned"] | None = None
+    strategy_reason: str | None = None
     active: bool = False
 
 
@@ -187,6 +221,7 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     diagnostic: Diagnostic | None = None
     ack: CommandAck | None = None
     chat: ChatResult | None = None
+    chat_thread: ChatThreadInfo | None = None
     snapshot: RunSnapshot | None = None
     events: list[RunEvent] = Field(default_factory=list)
     performance: list[PerformanceRound] = Field(default_factory=list)

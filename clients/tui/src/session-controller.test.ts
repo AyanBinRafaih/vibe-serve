@@ -103,6 +103,64 @@ describe('session controller', () => {
     expect(controller.state.core.activeExecutions).toEqual({});
   });
 
+  it('does not surface an old failure banner when a replay batch resumes running', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emit({
+      type: 'event_batch',
+      events: [
+        {
+          ...event(1, 'run_failed'),
+          diagnostic: {
+            code: 'interrupted',
+            summary: 'A previous process was interrupted.',
+            scope: 'run',
+            severity: 'fatal',
+            retryability: 'never',
+          },
+        },
+        {
+          ...event(2, 'run_started'),
+          data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+        },
+      ],
+      through_sequence: 2,
+      active_executions: [],
+    });
+
+    expect(controller.state.core.status).toBe('running');
+    expect(controller.state.errorBanner).toBeNull();
+  });
+
+  it('shows the final failure from a terminal event batch', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emit({
+      type: 'event_batch',
+      events: [
+        {
+          ...event(1, 'run_failed'),
+          diagnostic: {
+            code: 'run_failed',
+            summary: 'The current run failed.',
+            scope: 'run',
+            severity: 'fatal',
+            retryability: 'never',
+          },
+        },
+      ],
+      through_sequence: 1,
+      active_executions: [],
+    });
+
+    expect(controller.state.core.status).toBe('failed');
+    expect(controller.state.errorBanner).toMatchObject({message: 'The current run failed.'});
+  });
+
   it('keeps terminal state when the stream closes after completion', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
@@ -331,12 +389,12 @@ describe('session controller', () => {
     await controller.start();
 
     await controller.submitCommand('/help');
-    expect(controller.state.overlay?.content).not.toContain('/chat');
+    expect(controller.state.overlay?.content).not.toMatch(/\/chat\s/);
 
     // Inside a hypothesis the chat is a dialog again, so the command returns.
     controller.enterExperimentDrilldown();
     await controller.submitCommand('/help');
-    expect(controller.state.overlay?.content).toContain('/chat');
+    expect(controller.state.overlay?.content).toMatch(/\/chat\s/);
   });
 
   it('carries the modal conversation back into the docked pane', async () => {
@@ -589,6 +647,8 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
     controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).not.toBeNull();
+    controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).not.toBeNull();
 
     // What Ctrl+L and Escape are bound to.
@@ -657,6 +717,8 @@ describe('session controller', () => {
 
     // Per-round output is reachable only by opening a hypothesis.
     controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).not.toBeNull();
+    controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).not.toBeNull();
 
     // live() is the Ctrl+L path; it returns to the table rather than to an
@@ -686,11 +748,16 @@ describe('session controller', () => {
     controller.moveExperimentSelection(1);
 
     controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-02', selectedRound: 3});
+    expect(controller.state.hypothesisScope).toBeNull();
+
+    controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
     expect(controller.state.hypothesisScope?.label).toBe('H-02 · r2-3');
 
     controller.leaveExperimentDrilldown();
     expect(controller.state.hypothesisScope).toBeNull();
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-02', selectedRound: 3});
     expect(controller.state.experimentLog?.selectedId).toBe('H-02');
   });
 
@@ -1014,6 +1081,96 @@ describe('session controller', () => {
     expect(controller.state.chatConversation.at(-1)?.content).toBe('Nothing yet.');
   });
 
+  it('creates a chat thread from the wizard and switches to it', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitCommand('/new-chat');
+    expect(controller.state.newChatPicker).toMatchObject({step: 'driver', driver: 'agentshim'});
+
+    controller.moveNewChatSelection(1);
+    await controller.confirmNewChatPicker();
+    expect(controller.state.newChatPicker).toMatchObject({step: 'provider', driver: 'omnigent'});
+    controller.moveNewChatSelection(1);
+    await controller.confirmNewChatPicker();
+    expect(controller.state.newChatPicker?.step).toBe('model');
+    controller.typeNewChatModel('o4');
+    await controller.confirmNewChatPicker();
+
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat_thread_create',
+      driver: 'omnigent',
+      provider: 'codex',
+      model: 'o4',
+    });
+    expect(controller.state.newChatPicker).toBeNull();
+    // The thread record comes from the replayed backend event, and the
+    // client switches the chat surfaces to it.
+    expect(controller.state.core.chatThreads.map(thread => thread.id)).toEqual([
+      'default',
+      'thread-1',
+    ]);
+    expect(controller.state.activeChatThreadId).toBe('thread-1');
+  });
+
+  it('sends chat to the active thread and keeps transcripts apart', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submitCommand('/new-chat');
+    await controller.confirmNewChatPicker();
+    await controller.confirmNewChatPicker();
+    await controller.confirmNewChatPicker();
+    expect(controller.state.activeChatThreadId).toBe('thread-1');
+
+    await controller.sendChat('which kernel changed?');
+
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat',
+      text: 'which kernel changed?',
+      thread_id: 'thread-1',
+    });
+    expect(controller.state.chatConversations['thread-1']?.map(entry => entry.content)).toEqual([
+      'which kernel changed?',
+      'Thread answer.',
+    ]);
+    expect(controller.state.chatConversations['default'] ?? []).toEqual([]);
+
+    // Switching swaps what the singular selectors show; nothing is lost.
+    controller.switchChatThread('default');
+    expect(controller.state.chatConversation).toEqual([]);
+    await controller.sendChat('and the default thread?');
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat',
+      text: 'and the default thread?',
+    });
+    controller.switchChatThread('thread-1');
+    expect(controller.state.chatConversation.map(entry => entry.content)).toEqual([
+      'which kernel changed?',
+      'Thread answer.',
+    ]);
+  });
+
+  it('opens the thread picker and switches with the selection', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submitCommand('/new-chat');
+    await controller.confirmNewChatPicker();
+    await controller.confirmNewChatPicker();
+    await controller.confirmNewChatPicker();
+    controller.switchChatThread('default');
+
+    await controller.submitCommand('/chats');
+    expect(controller.state.chatThreadPicker).toEqual({selected: 'default'});
+    controller.moveChatThreadSelection(1);
+    controller.applySelectedChatThread();
+
+    expect(controller.state.chatThreadPicker).toBeNull();
+    expect(controller.state.activeChatThreadId).toBe('thread-1');
+  });
+
   it('reports an unknown theme as an error without switching', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
@@ -1172,6 +1329,91 @@ class DeferredChatTransport implements SupervisionTransport {
         effect: 'none',
       },
     });
+  }
+
+  subscribe(
+    _afterSequence: number,
+    _onMessage: (message: ServerMessage) => void,
+    _onDisconnect: (error: Error) => void,
+  ): Promise<EventSubscription> {
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/** A backend that creates one thread and answers threaded chat. */
+class ThreadTransport implements SupervisionTransport {
+  readonly requests: RequestInput[] = [];
+  #sequence = 0;
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    this.requests.push(input);
+    const base = {
+      protocol_version: 1 as const,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true,
+    };
+    if (input.type === 'query.snapshot') {
+      return Promise.resolve({...base, snapshot: {run_id: 'run', status: 'running', sequence: 0}});
+    }
+    if (input.type === 'query.experiments') {
+      return Promise.resolve({...base, experiments: [], experiments_ready: true});
+    }
+    if (input.type === 'query.chat_thread_create') {
+      return Promise.resolve({
+        ...base,
+        chat_thread: {
+          thread_id: 'thread-1',
+          title: '',
+          driver: input.driver ?? 'agentshim',
+          provider: input.provider ?? 'codex',
+          model: input.model ?? 'gpt-run',
+        },
+        events: [
+          {
+            sequence: ++this.#sequence,
+            timestamp: '2026-01-01T00:00:01Z',
+            type: 'chat_thread_created' as const,
+            agent_kind: 'chat',
+            round_label: 'experiment-chat',
+            chat_thread_id: 'thread-1',
+            data: {
+              kind: 'chat_thread_created' as const,
+              thread_id: 'thread-1',
+              title: '',
+              driver: input.driver ?? 'agentshim',
+              provider: input.provider ?? 'codex',
+              model: input.model ?? 'gpt-run',
+              created_at: '2026-01-01T00:00:01Z',
+            },
+          },
+        ],
+      });
+    }
+    if (input.type === 'query.chat') {
+      const threadId = input.thread_id ?? null;
+      return Promise.resolve({
+        ...base,
+        chat: {question: input.text, answer: 'Thread answer.', effect: 'none' as const},
+        events: [
+          {
+            sequence: ++this.#sequence,
+            timestamp: '2026-01-01T00:00:02Z',
+            type: 'chat' as const,
+            agent_kind: 'chat',
+            round_label: 'experiment-chat',
+            text: input.text,
+            ...(threadId === null ? {} : {chat_thread_id: threadId}),
+            data: {kind: 'chat' as const, answer: 'Thread answer.'},
+          },
+        ],
+      });
+    }
+    return Promise.resolve(base);
   }
 
   subscribe(

@@ -4,11 +4,20 @@ import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing'
 import type {HypothesisEntry} from '@vibesys/backend-client';
 import type {SessionController} from '../session-controller.js';
 import {
+  advanceNewChatPicker,
   clearAgentSelection,
   clearEntrySelection,
+  closeChatThreadPicker,
   closeOverlays,
   closePane,
   closeThemePicker,
+  moveChatThreadSelection,
+  moveNewChatSelection,
+  openChatThreadPicker,
+  openNewChatPicker,
+  retreatNewChatPicker,
+  setNewChatModel,
+  switchChatThread,
   cyclePaneFocus,
   dismissErrorBanner,
   enterExperimentDrilldown,
@@ -18,10 +27,13 @@ import {
   focusRound,
   initialSessionState,
   leaveExperimentDrilldown,
+  leaveHypothesisDetail,
   moveExperimentSelection,
+  moveHypothesisRoundSelection,
   moveThemeSelection,
   normalizeFocus,
   openExperimentLog,
+  openHypothesisDetail,
   openPane,
   type PaneFocus,
   type PaneView,
@@ -1049,6 +1061,86 @@ describe('OpenTUI presentation', () => {
     expect(frame).not.toContain('▶');
   });
 
+  it('shows each graph node’s agent harness and model, when known', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'completed',
+            roundNumber: 1,
+            roundLabel: 'round-1-plan',
+            provider: 'codex',
+            model: 'gpt-5.1-codex-max',
+          },
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    // Graph nodes are narrow enough that the label truncates like every other
+    // node line; this stays inside the kept prefix regardless of node width.
+    expect(frame).toContain('Codex (GPT');
+    // The implementer node carries no runtime identity, so its row stays
+    // blank rather than reusing the orchestrator's label.
+    const implementerRow = frame.split('\n').find(line => line.includes('implementer'));
+    expect(implementerRow).toBeDefined();
+  });
+
+  it('shows the stacked strip’s runtime label when the terminal is too narrow for a graph', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 30});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'completed',
+            roundNumber: 1,
+            roundLabel: 'round-1-plan',
+            // Short enough to stay on one line in the narrow stacked column;
+            // the wrapping case for a long label is covered elsewhere.
+            provider: 'codex',
+            model: 'gpt-5',
+          },
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+          {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    // Confirms the stacked (non-graph) layout is in play, as in the sibling
+    // narrow-terminal test above.
+    expect(frame).toContain('        ↓');
+    expect(frame).toContain('Codex (GPT 5)');
+  });
+
   it('holds the agent-active elapsed time of a finished round', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
@@ -1308,7 +1400,97 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('2 passed'));
     expect(frame).toContain('→ Bash(command="pytest")');
+    expect(frame).toContain('← 2 passed');
     expect(frame.match(/╭/g)).toHaveLength(5);
+  });
+
+  it('renders a typed command payload with labeled stderr and exit code', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: '1 failed',
+            toolName: 'Bash',
+            toolArguments: {command: 'pytest'},
+            toolResult: {
+              kind: 'tool_result',
+              tool: 'Bash',
+              content: '1 failed',
+              payload: {
+                kind: 'command',
+                stdout: '1 failed',
+                stderr: 'assertion error',
+                exit_code: 1,
+                duration: 0.4,
+              },
+            },
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('exit code: 1'));
+    expect(frame).toContain('← 1 failed');
+    expect(frame).toContain('stderr:');
+    expect(frame).toContain('assertion error');
+  });
+
+  it('collapses, prettifies, and expands long JSON tool responses', async () => {
+    const response = JSON.stringify(
+      Object.fromEntries(Array.from({length: 12}, (_, index) => [`field_${index}`, index])),
+    );
+    const testRenderer = await createTestRenderer({width: 100, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedEntryId: 'tool',
+      core: {
+        ...initialSessionState().core,
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: response,
+            toolName: 'Read',
+            toolArguments: {path: 'run-state.json'},
+            toolResult: {kind: 'tool_result', tool: 'Read', content: response},
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const collapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(collapsed).toContain('← {');
+    expect(collapsed).toContain('"field_0": 0');
+    expect(collapsed).not.toContain('"field_11": 11');
+
+    testRenderer.mockInput.pressEnter();
+    const expanded = await testRenderer.waitForFrame(value => value.includes('"field_11": 11'));
+    expect(expanded).toContain('click or Enter to collapse response');
+
+    // Expanding scrolls the card's tail into view, so click the collapse hint,
+    // which the previous assertion proves is on screen.
+    const hint = 'click or Enter to collapse response';
+    const lines = expanded.split('\n');
+    const row = lines.findIndex(line => line.includes(hint));
+    const column = (lines[row]?.indexOf(hint) ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    const recollapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(recollapsed).not.toContain('"field_11": 11');
   });
 
   it('collapses prompts and expands the latest prompt with Ctrl+P', async () => {
@@ -1931,7 +2113,11 @@ describe('theming', () => {
     const landing = await frameAfter(testRenderer);
     expect(landing).toContain('Experiments');
     expect(landing).toContain('Implementation Details');
+    expect(landing).toContain('Outcome');
     expect(landing).toContain('H-07');
+    expect(landing).toContain('Accepted');
+    expect(landing).not.toContain('Verdict');
+    expect(landing).not.toContain('Pass');
     // Per-round detail is what the operator opts into, not what greets them.
     expect(landing).not.toContain('round 41 detail');
     // The rounds strip and agent map are per-round chrome; neither is drawn.
@@ -1939,7 +2125,7 @@ describe('theming', () => {
     expect(landing).not.toContain('Agents');
   });
 
-  it('opens the round trajectory behind a hypothesis and steps back out', async () => {
+  it('drills from a full hypothesis summary into a round trajectory and back', async () => {
     const testRenderer = await createTestRenderer({width: 120, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
@@ -1982,7 +2168,8 @@ describe('theming', () => {
         rounds: [{round: 41, passed: true, reviewed: true}],
       }),
       logEntry('H-08', 42, 43, {
-        claim: 'bigger KV cache block',
+        claim:
+          'Increasing the KV cache block should reduce allocator synchronization across producer and consumer operations without changing queue ordering.',
         resolved_outcome: 'rejected',
         rounds: [
           {round: 42, passed: false, reviewed: false},
@@ -1998,6 +2185,19 @@ describe('theming', () => {
     expect(table).not.toContain('grew the block');
 
     testRenderer.mockInput.pressKey('ARROW_DOWN');
+    testRenderer.mockInput.pressEnter();
+    const detail = await frameAfter(testRenderer);
+
+    expect(detail).toContain('Hypothesis H-08');
+    expect(detail).toContain(
+      'Increasing the KV cache block should reduce allocator synchronization',
+    );
+    expect(detail).toContain('without changing queue ordering.');
+    expect(detail).toContain('Decision Rejected');
+    expect(detail).toContain('Round 42 · Judge pending');
+    expect(detail).toContain('Round 43 · Judge fail');
+    expect(controller.state.hypothesisScope).toBeNull();
+
     testRenderer.mockInput.pressEnter();
     const trajectory = await frameAfter(testRenderer);
 
@@ -2015,9 +2215,13 @@ describe('theming', () => {
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-08', rounds: [42, 43]});
 
     testRenderer.mockInput.pressKey('ESCAPE');
-    const back = await frameAfterEscape(testRenderer);
-    expect(back).toContain('Implementation Details');
-    expect(back).not.toContain('grew the block');
+    const backToHypothesis = await frameAfterEscape(testRenderer);
+    expect(backToHypothesis).toContain('Increasing the KV cache block');
+    expect(backToHypothesis).not.toContain('grew the block');
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const backToIndex = await frameAfterEscape(testRenderer);
+    expect(backToIndex).toContain('Implementation Details');
     expect(controller.state.experimentLog?.selectedId).toBe('H-08');
   });
 
@@ -2098,8 +2302,8 @@ describe('theming', () => {
       await controller.openExperimentLog();
       await frameAfter(testRenderer);
 
-      expect(spanColors(testRenderer, 'Proven')?.fg).toBe(theme.success);
-      expect(spanColors(testRenderer, 'Disproven')?.fg).toBe(theme.error);
+      expect(spanColors(testRenderer, 'Accepted')?.fg).toBe(theme.success);
+      expect(spanColors(testRenderer, 'Rejected')?.fg).toBe(theme.error);
       expect(spanColors(testRenderer, 'Active')?.fg).toBe(theme.warning);
       // The claim keeps body text: only the resolution is colored.
       expect(spanColors(testRenderer, 'Batch the prefill step')?.fg).toBe(theme.textPrimary);
@@ -2344,8 +2548,9 @@ describe('theming', () => {
     await testRenderer.mockInput.typeText('/c');
     const frame = await frameAfter(testRenderer);
 
-    // Nothing to open: the chat is the column beside the table.
-    expect(frame).not.toContain('/chat');
+    // Nothing to open: the chat is the column beside the table. The thread
+    // commands (/chats, /new-chat) remain, so match /chat as a whole word.
+    expect(frame).not.toMatch(/\/chat\s/);
   });
 
   it('says when the docked chat is waiting on the agent', async () => {
@@ -2393,6 +2598,140 @@ describe('theming', () => {
       throw new Error('docked chat geometry was missing');
     expect(scroll.x).toBe(pane.x + 2);
     expect(turn.x).toBe(scroll.x);
+  });
+
+  it('switches chat threads, swapping the transcript and the composer draft', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        chatThreads: [
+          ...controller.state.core.chatThreads,
+          {
+            id: 'thread-a',
+            title: 'GPU stalls',
+            driver: 'omnigent',
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
+      },
+      chatConversations: {
+        default: [
+          {id: 'd1', kind: 'assistant', label: 'Answer', content: 'Default thread answer.'},
+        ],
+        'thread-a': [
+          {id: 't1', kind: 'assistant', label: 'Answer', content: 'Stalls come from prefill.'},
+        ],
+      },
+      chatConversation: [
+        {id: 'd1', kind: 'assistant', label: 'Answer', content: 'Default thread answer.'},
+      ],
+    });
+
+    // Focus the docked chat and leave a half-typed question on the default thread.
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('half-typed question');
+    let frame = await frameAfter(testRenderer);
+    expect(frame).toContain('Default thread answer.');
+    expect(frame).toContain('half-typed question');
+
+    controller.switchChatThread('thread-a');
+    frame = await frameAfter(testRenderer);
+    // The pane is titled by the backend-owned thread title, shows the
+    // thread's own transcript, and the other thread's draft is parked.
+    expect(frame).toContain('GPU stalls');
+    expect(frame).toContain('Stalls come from prefill.');
+    expect(frame).not.toContain('Default thread answer.');
+    expect(frame).not.toContain('half-typed question');
+
+    controller.switchChatThread('default');
+    frame = await frameAfter(testRenderer);
+    expect(frame).toContain('Default thread answer.');
+    expect(frame).not.toContain('Stalls come from prefill.');
+    // The parked draft returns with its thread.
+    expect(frame).toContain('half-typed question');
+  });
+
+  it('walks the new-thread wizard from driver to provider to model', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/new-chat');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('New chat thread'));
+    expect(testRenderer.captureCharFrame()).toContain('› agentshim');
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('› omnigent'));
+    testRenderer.mockInput.pressEnter();
+    // The provider list is narrowed to what the chosen driver supports.
+    let frame = await testRenderer.waitForFrame(value =>
+      value.includes('Provider: claude  ◂ choose'),
+    );
+    expect(frame).toContain('› claude');
+    expect(frame).not.toContain('gemini');
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Model:'));
+    // The model step takes ordinary typing instead of the composer beneath it.
+    await testRenderer.mockInput.typeText('opus');
+    frame = await testRenderer.waitForFrame(value => value.includes('Model: opus'));
+    expect(controller.state.newChatPicker).toMatchObject({
+      step: 'model',
+      driver: 'omnigent',
+      provider: 'claude',
+      model: 'opus',
+    });
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
+  it('lists the chat threads and switches to the highlighted one', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        chatThreads: [
+          ...controller.state.core.chatThreads,
+          {
+            id: 'thread-a',
+            title: 'GPU stalls',
+            driver: 'omnigent',
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('/chats');
+    testRenderer.mockInput.pressEnter();
+    const frame = await testRenderer.waitForFrame(value => value.includes('Chat threads'));
+    // The implicit default is named by the client; a created thread shows the
+    // backend-owned title beside the agent it was created with.
+    expect(frame).toContain('Experiment chat');
+    expect(frame).toContain('active');
+    expect(frame).toContain('GPU stalls');
+    expect(frame).toContain('omnigent/claude');
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('› GPU stalls'));
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.state.chatThreadPicker === null);
+
+    expect(controller.state.activeChatThreadId).toBe('thread-a');
   });
 
   it('keeps the chat, the table, and the visualization on screen together', async () => {
@@ -2539,12 +2878,18 @@ describe('theming', () => {
     expect(controller.state.layout.focus).toBe('left');
   });
 
-  it('focuses hypothesis panes from their inner content and routes the next key', async () => {
+  it('opens hypothesis detail from a row click and keeps pane clicks routed', async () => {
     const testRenderer = await createTestRenderer({width: 200, height: 22});
     const controller = logController();
     controller.experiments = [
       logEntry('H-07', 41, 41, {claim: 'batch the prefill step'}),
-      logEntry('H-08', 42, 42, {claim: 'increase the cache block'}),
+      logEntry('H-08', 42, 43, {
+        claim: 'increase the cache block',
+        rounds: [
+          {round: 42, passed: true, reviewed: true},
+          {round: 43, passed: false, reviewed: true},
+        ],
+      }),
     ];
     controller.paneContent = 'Performance · tok_s\nbest r7 1135 tok_s';
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -2554,7 +2899,8 @@ describe('theming', () => {
     let frame = await frameAfter(testRenderer);
     expect(controller.state.layout.focus).toBe('right');
 
-    // A table row both selects its hypothesis and focuses Experiments.
+    // A table row opens the hypothesis summary directly and gives it the full
+    // content row, closing an unrelated visualization.
     let lines = frame.split('\n');
     let row = lines.findIndex(line => line.includes('H-08'));
     let column = (lines[row]?.indexOf('H-08') ?? 0) + 2;
@@ -2562,10 +2908,28 @@ describe('theming', () => {
     frame = await frameAfter(testRenderer);
     expect(controller.state.layout.focus).toBe('left');
     expect(controller.state.experimentLog?.selectedId).toBe('H-08');
-    expect(frame).toContain('▸ Experiments');
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-08', selectedRound: 43});
+    expect(controller.state.layout.right).toBeNull();
+    expect(frame).toContain('▸ Hypothesis H-08');
     testRenderer.mockInput.pressKey('ARROW_UP');
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.hypothesisDetail?.selectedRound).toBe(42);
+
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('Round 42'));
+    column = (lines[row]?.indexOf('Round 42') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
     await frameAfter(testRenderer);
-    expect(controller.state.experimentLog?.selectedId).toBe('H-07');
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'H-08'});
+    expect(controller.state.selectedRound).toBe(42);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.hypothesisDetail?.selectedRound).toBe(42);
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    await controller.openPane('perf');
+    frame = await frameAfter(testRenderer);
 
     // The chart body is inside a scroll surface. Clicking it focuses the
     // performance pane, so Escape is routed there and closes it.
@@ -3111,11 +3475,53 @@ class FakeController implements SessionController {
       this.#notify();
     }
     if (value.trim() === '/theme') this.openThemePicker();
+    if (value.trim() === '/new-chat') this.openNewChatPicker();
+    if (value.trim() === '/chats') this.openChatThreadPicker();
     return Promise.resolve();
   }
   closeChat(): void {
     this.state = {...this.state, chatOpen: false};
     this.#notify();
+  }
+  switchChatThread(threadId: string): void {
+    this.publish(switchChatThread(this.state, threadId));
+  }
+  openChatThreadPicker(): void {
+    this.publish(openChatThreadPicker(this.state));
+  }
+  moveChatThreadSelection(delta: number): void {
+    this.publish(moveChatThreadSelection(this.state, delta));
+  }
+  applySelectedChatThread(): void {
+    const picker = this.state.chatThreadPicker;
+    if (picker !== null) this.switchChatThread(picker.selected);
+  }
+  closeChatThreadPicker(): void {
+    this.publish(closeChatThreadPicker(this.state));
+  }
+  openNewChatPicker(): void {
+    this.publish(openNewChatPicker(this.state));
+  }
+  moveNewChatSelection(delta: number): void {
+    this.publish(moveNewChatSelection(this.state, delta));
+  }
+  confirmNewChatPicker(): Promise<void> {
+    const picker = this.state.newChatPicker;
+    if (picker === null) return Promise.resolve();
+    if (picker.step !== 'model') this.publish(advanceNewChatPicker(this.state));
+    else this.publish({...this.state, newChatPicker: null});
+    return Promise.resolve();
+  }
+  retreatNewChatPicker(): void {
+    this.publish(retreatNewChatPicker(this.state));
+  }
+  typeNewChatModel(text: string): void {
+    const picker = this.state.newChatPicker;
+    if (picker !== null) this.publish(setNewChatModel(this.state, picker.model + text));
+  }
+  backspaceNewChatModel(): void {
+    const picker = this.state.newChatPicker;
+    if (picker !== null) this.publish(setNewChatModel(this.state, picker.model.slice(0, -1)));
   }
   setTheme(themeName: ThemeName): void {
     this.state = {...this.state, themeName};
@@ -3242,6 +3648,12 @@ class FakeController implements SessionController {
   moveExperimentSelection(delta: number): void {
     this.publish(moveExperimentSelection(this.state, delta));
   }
+  openHypothesisDetail(entryKey?: string): void {
+    this.publish(openHypothesisDetail(this.state, entryKey));
+  }
+  moveHypothesisRoundSelection(delta: number): void {
+    this.publish(moveHypothesisRoundSelection(this.state, delta));
+  }
   selectExperimentActivity(): void {
     this.publish(selectExperimentActivity(this.state));
   }
@@ -3287,6 +3699,9 @@ class FakeController implements SessionController {
   }
   leaveExperimentDrilldown(): void {
     this.publish(leaveExperimentDrilldown(this.state));
+  }
+  leaveHypothesisDetail(): void {
+    this.publish(leaveHypothesisDetail(this.state));
   }
 
   subscribe(listener: (state: SessionState) => void): () => void {

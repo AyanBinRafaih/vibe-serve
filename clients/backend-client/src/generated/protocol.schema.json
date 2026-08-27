@@ -166,6 +166,42 @@
         },
         "activity": {
           "$ref": "#/$defs/AgentExecutionActivityData"
+        },
+        "driver": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Driver"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
         }
       },
       "required": [
@@ -310,6 +346,18 @@
         "answer": {
           "title": "Answer",
           "type": "string"
+        },
+        "thread_title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Title"
         }
       },
       "required": [
@@ -345,6 +393,18 @@
         "text": {
           "title": "Text",
           "type": "string"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
         }
       },
       "required": [
@@ -369,6 +429,18 @@
           "default": "none",
           "title": "Effect",
           "type": "string"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
         }
       },
       "required": [
@@ -376,6 +448,168 @@
         "answer"
       ],
       "title": "ChatResult",
+      "type": "object"
+    },
+    "ChatThreadCreateQuery": {
+      "additionalProperties": false,
+      "description": "Create a new experiment-chat thread with its own agent selection.\n\nOmitted fields resolve to the run's configured driver, provider, and\nmodel. The response carries the resolved settings and thread identity.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.chat_thread_create",
+          "default": "query.chat_thread_create",
+          "title": "Type",
+          "type": "string"
+        },
+        "driver": {
+          "anyOf": [
+            {
+              "enum": [
+                "agentshim",
+                "omnigent"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Driver"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "title": "ChatThreadCreateQuery",
+      "type": "object"
+    },
+    "ChatThreadCreatedData": {
+      "description": "Identity and resolved agent settings for one experiment-chat thread.\n\nReplayed by clients to rebuild the thread list; the default thread is\nimplicit and never records one of these.",
+      "properties": {
+        "kind": {
+          "const": "chat_thread_created",
+          "default": "chat_thread_created",
+          "title": "Kind",
+          "type": "string"
+        },
+        "thread_id": {
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        },
+        "driver": {
+          "title": "Driver",
+          "type": "string"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "driver",
+        "provider",
+        "model",
+        "created_at"
+      ],
+      "title": "ChatThreadCreatedData",
+      "type": "object"
+    },
+    "ChatThreadInfo": {
+      "additionalProperties": false,
+      "description": "Resolved identity and agent settings of one experiment-chat thread.",
+      "properties": {
+        "thread_id": {
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        },
+        "driver": {
+          "title": "Driver",
+          "type": "string"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "driver",
+        "provider",
+        "model"
+      ],
+      "title": "ChatThreadInfo",
       "type": "object"
     },
     "CommandAck": {
@@ -404,6 +638,55 @@
         "status"
       ],
       "title": "CommandAck",
+      "type": "object"
+    },
+    "CommandResultPayload": {
+      "description": "Structured result of a command-style tool execution.",
+      "properties": {
+        "kind": {
+          "const": "command",
+          "default": "command",
+          "title": "Kind",
+          "type": "string"
+        },
+        "stdout": {
+          "title": "Stdout",
+          "type": "string"
+        },
+        "stderr": {
+          "title": "Stderr",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration"
+        }
+      },
+      "required": [
+        "stdout",
+        "stderr"
+      ],
+      "title": "CommandResultPayload",
       "type": "object"
     },
     "ConfigurationFailedData": {
@@ -649,6 +932,7 @@
         "experiments_changed",
         "run_interrupted",
         "chat",
+        "chat_thread_created",
         "status_query",
         "control",
         "invocation_started",
@@ -798,7 +1082,7 @@
     },
     "HypothesisEntry": {
       "additionalProperties": false,
-      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is the terminal value the agent loop itself recorded\nfor the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``\nmember). It is copied, never recomputed, so the client cannot drift from\nthe framework's resolution semantics.",
+      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is copied from the backend's typed hypothesis state,\nnever recomputed by the server or client.",
       "properties": {
         "hypothesis_id": {
           "title": "Hypothesis Id",
@@ -808,6 +1092,18 @@
           "default": true,
           "title": "Identified",
           "type": "boolean"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
         },
         "claim": {
           "anyOf": [
@@ -913,9 +1209,45 @@
           "title": "Perf Delta Pct"
         },
         "kept": {
-          "default": false,
-          "title": "Kept",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kept"
+        },
+        "strategy_disposition": {
+          "anyOf": [
+            {
+              "enum": [
+                "available",
+                "parked",
+                "abandoned"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Disposition"
+        },
+        "strategy_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Reason"
         },
         "active": {
           "default": false,
@@ -1071,6 +1403,35 @@
         "user_prompt"
       ],
       "title": "InvocationStartedData",
+      "type": "object"
+    },
+    "JsonResultPayload": {
+      "description": "A tool result that is a JSON object or array, already parsed.",
+      "properties": {
+        "kind": {
+          "const": "json",
+          "default": "json",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "items": {},
+              "type": "array"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "JsonResultPayload",
       "type": "object"
     },
     "JudgeResultData": {
@@ -1382,6 +1743,17 @@
           ],
           "default": null
         },
+        "chat_thread": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatThreadInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "snapshot": {
           "anyOf": [
             {
@@ -1618,6 +1990,18 @@
           "default": null,
           "title": "Execution Id"
         },
+        "chat_thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chat Thread Id"
+        },
         "data": {
           "anyOf": [
             {
@@ -1629,6 +2013,7 @@
                   "agent_output_chunk": "#/$defs/AgentOutputChunkData",
                   "benchmark_result": "#/$defs/BenchmarkResultData",
                   "chat": "#/$defs/ChatData",
+                  "chat_thread_created": "#/$defs/ChatThreadCreatedData",
                   "configuration_failed": "#/$defs/ConfigurationFailedData",
                   "experiments_changed": "#/$defs/ExperimentsChangedData",
                   "invocation_finished": "#/$defs/InvocationFinishedData",
@@ -1651,6 +2036,9 @@
               "oneOf": [
                 {
                   "$ref": "#/$defs/ChatData"
+                },
+                {
+                  "$ref": "#/$defs/ChatThreadCreatedData"
                 },
                 {
                   "$ref": "#/$defs/InvocationStartedData"
@@ -2153,6 +2541,32 @@
           "default": false,
           "title": "Is Error",
           "type": "boolean"
+        },
+        "payload": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "command": "#/$defs/CommandResultPayload",
+                  "json": "#/$defs/JsonResultPayload"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/CommandResultPayload"
+                },
+                {
+                  "$ref": "#/$defs/JsonResultPayload"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payload"
         }
       },
       "required": [
@@ -2214,6 +2628,7 @@
           "command.resume": "#/$defs/ResumeCommand",
           "command.steer": "#/$defs/SteerCommand",
           "query.chat": "#/$defs/ChatQuery",
+          "query.chat_thread_create": "#/$defs/ChatThreadCreateQuery",
           "query.events": "#/$defs/EventsQuery",
           "query.experiments": "#/$defs/ExperimentQuery",
           "query.history": "#/$defs/HistoryQuery",
@@ -2238,6 +2653,9 @@
         },
         {
           "$ref": "#/$defs/ChatQuery"
+        },
+        {
+          "$ref": "#/$defs/ChatThreadCreateQuery"
         },
         {
           "$ref": "#/$defs/HistoryQuery"

@@ -261,7 +261,7 @@ def test_side_channel_chat_output_is_tagged_without_changing_active_agent(tmp_pa
     assert agent_events[1].data.content == "experiment output"  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
 
 
-def test_bootstrap_events_migrate_to_run_audit_without_replacing_history(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+def test_bootstrap_events_join_durable_replay_without_replacing_history(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     store, run_id = _project_run(tmp_path / "project")
     logs = store.state.log_directory(run_id)
     historical = RunSupervisor()
@@ -283,18 +283,15 @@ def test_bootstrap_events_migrate_to_run_audit_without_replacing_history(tmp_pat
         "server_ready",
         "run_started",
     ]
-    assert [event.type for event in supervisor.read_events()] == [
-        "server_started",
-        "server_ready",
-        "run_started",
-    ]
-    assert [event.type for event in supervisor.read_history_events()] == [
+    expected_types = [
         "server_started",
         "run_finished",
         "server_started",
         "server_ready",
         "run_started",
     ]
+    assert [event.type for event in supervisor.read_events()] == expected_types
+    assert [event.type for event in supervisor.read_history_events()] == expected_types
     assert supervisor.project_run is not None
     assert supervisor.project_run.project is store
     assert supervisor.project_run.run_id == run_id
@@ -320,7 +317,11 @@ def test_history_query_reads_prior_and_current_session_events(tmp_path):  # noqa
         "round-1",
         "round-2",
     ]
-    assert {event.round_label for event in supervisor.read_events()} == {None, "round-2"}
+    assert {event.round_label for event in supervisor.read_events()} == {
+        None,
+        "round-1",
+        "round-2",
+    }
 
 
 def test_performance_query_reads_canonical_completed_rounds(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1126,13 +1127,18 @@ def test_socket_subscription_replays_then_streams_new_events(tmp_path):  # noqa:
             stream.flush()
             subscribed = json.loads(stream.readline())
             replay = json.loads(stream.readline())
-            supervisor.record(EventType.CHAT, "hello", status="answered")
+            # Keep both appends inside the supervisor lock so the stream loop
+            # observes one post-subscription burst at its next checkpoint.
+            with supervisor._condition:  # noqa: SLF001  # transport boundary contract
+                supervisor.record(EventType.CHAT, "hello", status="answered")
+                supervisor.record(EventType.STATUS_QUERY, "/history")
             streamed = json.loads(stream.readline())
 
     assert subscribed["type"] == "subscribed"
     assert replay["type"] == "event_batch"
-    assert streamed["type"] == "event"
-    assert streamed["event"]["type"] == "chat"
+    assert streamed["type"] == "event_batch"
+    assert [event["type"] for event in streamed["events"]] == ["chat", "status_query"]
+    assert streamed["through_sequence"] == streamed["events"][-1]["sequence"]
 
 
 def test_socket_subscription_reports_structured_stream_failures(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1430,6 +1436,9 @@ def test_run_context_records_invocation_boundary(tmp_path):  # noqa: ANN001, ANN
     ctx.supervisor = supervisor
     ctx.agent_client = Mock()
     ctx.agent_client.invoke.return_value = {"summary": "measured"}
+    ctx.agent_client.driver_name = "agentshim"
+    ctx.agent_client.provider = "codex"
+    ctx.agent_client.model_for_kind = Mock(return_value="gpt-5.1-codex-max")
     ctx._paths = RunPaths(  # noqa: SLF001  # tracked: #288
         project_root=tmp_path,
         log_dir=tmp_path / "logs",
@@ -1453,6 +1462,12 @@ def test_run_context_records_invocation_boundary(tmp_path):  # noqa: ANN001, ANN
     events = _events(tmp_path / "run-events.jsonl")
     started = next(event for event in events if event["type"] == "invocation_started")
     assert started["data"]["user_prompt"] == "original"
+    execution_started = next(
+        event for event in events if event["type"] == "agent_execution_started"
+    )
+    assert execution_started["data"]["driver"] == "agentshim"
+    assert execution_started["data"]["provider"] == "codex"
+    assert execution_started["data"]["model"] == "gpt-5.1-codex-max"
 
 
 def test_committed_protocol_schema_matches_python_contract():  # noqa: ANN201  # tracked: #288

@@ -7,7 +7,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Callable, Generator  # noqa: TC003  # tracked: #288
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -29,6 +29,7 @@ from vibesys.server.events import (
     AgentOutputChannel,
     AgentOutputChunkData,
     ChatData,
+    ChatThreadCreatedData,
     EventData,
     EventStatus,
     EventStore,
@@ -102,6 +103,23 @@ class TerminalChatResource:
     close: Callable[[], None]
 
 
+@dataclass(frozen=True)
+class ChatThreadHandle:
+    """Resolved thread settings and the handler that answers its questions."""
+
+    spec: ChatThreadCreatedData
+    handler: Callable[[str], str]
+
+
+ChatThreadFactory = Callable[[str, str | None, str | None, str | None], ChatThreadHandle]
+"""Builds one thread's chat service: (thread_id, driver, provider, model).
+
+None arguments resolve to the run's configured defaults. The factory raises
+``ValueError`` for an unsupported driver/provider combination; resource
+cleanup for the built service stays with the factory's owner (the run
+context), not the supervisor."""
+
+
 class RunSupervisor:
     """Own pause state, invocation metadata, and the run audit store."""
 
@@ -117,14 +135,23 @@ class RunSupervisor:
         self._canonical_execution_ids: set[str] = set()
         self._legacy_invocation_ids: set[str] = set()
         self._run_status = "starting"
+        # One durable event stream is both the live subscription source and
+        # the replay source. A process starts on a bootstrap directory before
+        # it knows the project run; ``attach`` moves that short prefix into the
+        # run's durable store once the context is available.
         self._store: EventStore | None = None
-        self._audit_store: EventStore | None = None
         self._pending_events: list[RunEvent] = []
         self.log_dir: Path | None = None
         self._project_run: ProjectRunState | None = None
         self._current_kind: str | None = None
         self._current_round: str | None = None
         self._chat_handler: Callable[[str], str] | None = None
+        # Per-thread chat routing. Specs replay from CHAT_THREAD_CREATED
+        # events so a resumed run can rebuild handlers on demand through the
+        # context-owned factory.
+        self._chat_thread_factory: ChatThreadFactory | None = None
+        self._chat_thread_handlers: dict[str, Callable[[str], str]] = {}
+        self._chat_thread_specs: dict[str, ChatThreadCreatedData] = {}
         self._active_chat_calls = 0
         self._retain_terminal_chat = False
         self._terminal_chat_resource: TerminalChatResource | None = None
@@ -163,27 +190,32 @@ class RunSupervisor:
         if (project is None) != (run_id is None):
             raise ValueError("project and run_id must be provided together")  # noqa: TRY003  # tracked: #288
         log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir = log_dir
         events_path = log_dir / "run-events.jsonl"
         with self._condition:
             if project is not None and run_id is not None:
                 self._project_run = ProjectRunState(project, run_id)
             store = self._store
-            if store is not None and run_id is not None:
-                store.run_id = run_id
-            if store is not None and (store.path == events_path or self._audit_store is not None):
+            if store is not None and store.path == events_path:
+                if run_id is not None:
+                    store.run_id = run_id
+                self.log_dir = log_dir
                 return
-            if store is None:
-                store = EventStore(events_path, run_id=run_id or log_dir.parent.name)
-                self._store = store
-                self._index_execution_lifecycle(store.read())
-                pending, self._pending_events = self._pending_events, []
-            else:
-                self._audit_store = EventStore(events_path, run_id=run_id or log_dir.parent.name)
-                pending = store.read()
-        for event in pending:
-            (self._audit_store or store).append(event)
-        if self._audit_store is None:
+            durable = EventStore(events_path, run_id=run_id or log_dir.parent.name)
+            # A resumed run already owns durable events. Index them before
+            # replay so legacy invocation records retain their canonical
+            # execution projection.
+            self._index_execution_lifecycle(durable.read())
+            pending = store.read() if store is not None else self._pending_events
+            self._pending_events = []
+            # Appending through EventStore gives bootstrap events the next
+            # durable sequence numbers, rather than preserving a second,
+            # colliding sequence space from the temporary server directory.
+            for event in pending:
+                self._index_execution_lifecycle([durable.append(event)])
+            self._store = durable
+            self.log_dir = log_dir
+            started_fresh = store is None
+        if started_fresh:
             self.record(EventType.SERVER_STARTED, status=EventStatus.ACTIVE)
         with self._condition:
             self._run_status = "running"
@@ -336,9 +368,6 @@ class RunSupervisor:
                 return event
             recorded = store.append(event)
             self._index_execution_lifecycle([recorded])
-            audit_store = self._audit_store
-            if audit_store is not None:
-                audit_store.append(event)
             return recorded
 
     def record_failure(  # noqa: PLR0913  # failure event fields belong at this boundary
@@ -454,8 +483,8 @@ class RunSupervisor:
             )
 
     def read_history_events(self) -> list[RunEvent]:
-        """Return the durable session history, including earlier attachments."""
-        store = self._audit_store or self._store
+        """Return the same durable event history used for subscription replay."""
+        store = self._store
         return _canonical_execution_events(store.read()) if store else []
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
@@ -506,6 +535,21 @@ class RunSupervisor:
 
     def _index_execution_lifecycle(self, events: list[RunEvent]) -> None:
         for event in events:
+            if event.type is EventType.CHAT_THREAD_CREATED and isinstance(
+                event.data, ChatThreadCreatedData
+            ):
+                self._chat_thread_specs.setdefault(event.data.thread_id, event.data)
+            if (
+                event.type is EventType.CHAT
+                and event.chat_thread_id is not None
+                and isinstance(event.data, ChatData)
+                and event.data.thread_title
+            ):
+                spec = self._chat_thread_specs.get(event.chat_thread_id)
+                if spec is not None and not spec.title:
+                    self._chat_thread_specs[event.chat_thread_id] = spec.model_copy(
+                        update={"title": event.data.thread_title}
+                    )
             if event.execution_id is None:
                 continue
             if event.type in {
@@ -525,7 +569,9 @@ class RunSupervisor:
         with self._condition:
             return self._chat_handler is not None
 
-    def chat(self, text: str) -> str:  # noqa: D102  # tracked: #288
+    def chat(self, text: str, thread_id: str | None = None) -> str:  # noqa: D102  # tracked: #288
+        if thread_id is not None:
+            return self._thread_chat(text, thread_id)
         with self._condition:
             handler = self._chat_handler
             if handler is not None:
@@ -557,6 +603,124 @@ class RunSupervisor:
         finally:
             if handler is not None:
                 self._release_chat_call()
+
+    def _thread_chat(self, text: str, thread_id: str) -> str:
+        """Route one question to a created thread's handler and audit it."""
+        handler = self._resolve_thread_handler(thread_id)
+        if isinstance(handler, str):
+            # A routing failure is an answer to this caller, not run history:
+            # no CHAT event is recorded for a thread that cannot answer.
+            return handler
+        with self._condition:
+            self._active_chat_calls += 1
+        try:
+            answer = handler(text)
+            thread_title = self._title_thread_if_needed(thread_id, text)
+            self.record(
+                EventType.CHAT,
+                text,
+                status=EventStatus.ANSWERED,
+                agent_kind="chat",
+                round_label="experiment-chat",
+                chat_thread_id=thread_id,
+                data=ChatData(answer=answer, thread_title=thread_title),
+            )
+            return answer
+        finally:
+            self._release_chat_call()
+
+    def _title_thread_if_needed(self, thread_id: str, question: str) -> str | None:
+        """Derive and store an untitled thread's title from its first message."""
+        with self._condition:
+            spec = self._chat_thread_specs.get(thread_id)
+            if spec is None or spec.title:
+                return None
+            title = _chat_thread_title(question)
+            if not title:
+                return None
+            self._chat_thread_specs[thread_id] = spec.model_copy(update={"title": title})
+            return title
+
+    def _resolve_thread_handler(self, thread_id: str) -> Callable[[str], str] | str:
+        """Return the thread's handler, or the error answer explaining why not."""
+        with self._condition:
+            handler = self._chat_thread_handlers.get(thread_id)
+            spec = self._chat_thread_specs.get(thread_id)
+            factory = self._chat_thread_factory
+        if handler is not None:
+            return handler
+        if spec is None:
+            return (
+                f"Unknown experiment chat thread {thread_id!r}. Create one with "
+                "/new-chat, or omit the thread to use the default experiment chat."
+            )
+        if factory is None:
+            return (
+                f"Experiment chat thread {thread_id!r} cannot answer right now "
+                f"({self._chat_unavailable_reason()})."
+            )
+        try:
+            handle = factory(thread_id, spec.driver, spec.provider, spec.model)
+        except Exception as exc:  # noqa: BLE001  # routing failures become answers
+            return (
+                f"Could not restore experiment chat thread {thread_id!r}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        with self._condition:
+            return self._chat_thread_handlers.setdefault(thread_id, handle.handler)
+
+    def set_chat_thread_factory(self, factory: ChatThreadFactory | None) -> None:
+        """Install the context-owned builder for per-thread chat services."""
+        with self._condition:
+            self._chat_thread_factory = factory
+
+    def create_chat_thread(
+        self,
+        *,
+        driver: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        title: str | None = None,
+    ) -> ChatThreadCreatedData:
+        """Create one chat thread, record its durable event, and register it.
+
+        An untitled thread is titled by the server from its first message.
+        """
+        with self._condition:
+            factory = self._chat_thread_factory
+        if factory is None:
+            raise RuntimeError(  # noqa: TRY003  # surfaced to the requesting client
+                "Experiment chat threads are not available for this run "
+                f"({self._chat_unavailable_reason()})"
+            )
+        thread_id = uuid.uuid4().hex
+        handle = factory(thread_id, driver, provider, model)
+        spec = handle.spec
+        if title is not None and title.strip():
+            spec = spec.model_copy(update={"title": title.strip()})
+        with self._condition:
+            self._chat_thread_specs[spec.thread_id] = spec
+            self._chat_thread_handlers[spec.thread_id] = handle.handler
+        self.record(
+            EventType.CHAT_THREAD_CREATED,
+            agent_kind="chat",
+            round_label="experiment-chat",
+            chat_thread_id=spec.thread_id,
+            data=spec,
+        )
+        return spec
+
+    def chat_threads(self) -> list[ChatThreadCreatedData]:
+        """Return every created thread's replayable spec, oldest first."""
+        with self._condition:
+            return sorted(self._chat_thread_specs.values(), key=lambda spec: spec.created_at)
+
+    def clear_chat_threads_and_drain(self) -> None:
+        """Stop routing thread chat and wait for in-flight calls to release."""
+        with self._condition:
+            self._chat_thread_factory = None
+            self._chat_thread_handlers.clear()
+            self._wait_for_chat_drain_locked(timeout=_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS)
 
     def _release_chat_call(self) -> None:
         """Release one handler lease and close a retired resource when safe."""
@@ -698,6 +862,9 @@ class RunSupervisor:
         *,
         consume_steering: bool = True,
         participates_in_run_control: bool = True,
+        driver: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> AgentExecutionHandle:
         """Start one prompt-to-result execution and return its explicit identity."""
         with self._condition:
@@ -738,6 +905,9 @@ class RunSupervisor:
                     system_prompt=system_prompt,
                     user_prompt=effective_prompt,
                     activity=activity,
+                    driver=driver,
+                    provider=provider,
+                    model=model,
                 ),
             )
             self._active_executions[execution_id] = active
@@ -1008,6 +1178,19 @@ class RunSupervisor:
         with self._condition:
             self._error_diagnostics[key] = (error, diagnostic)
         return diagnostic
+
+
+_CHAT_THREAD_TITLE_MAX_CHARS = 40
+
+
+def _chat_thread_title(question: str) -> str:
+    """Title a thread from its first message: first line, cut on a word."""
+    line = next((part.strip() for part in question.strip().splitlines() if part.strip()), "")
+    if len(line) <= _CHAT_THREAD_TITLE_MAX_CHARS:
+        return line
+    cut = line[:_CHAT_THREAD_TITLE_MAX_CHARS]
+    head, separator, _rest = cut.rpartition(" ")
+    return f"{head.rstrip() if separator else cut}…"
 
 
 def _attempt_from_label(round_label: str) -> int | None:

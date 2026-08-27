@@ -5,8 +5,7 @@ owns session reuse, skill setup, response parsing, logging, usage records, and
 lifecycle. A driver owns native executor setup, policy translation, turns,
 events, and cleanup. Unsupported requirements fail before a session starts.
 
-Omitting `driver` selects `agentshim`. Select the optional Omnigent driver
-directly:
+Omitting `driver` selects `agentshim`. Select the Omnigent driver directly:
 
 ```toml
 [agent]
@@ -14,12 +13,8 @@ backend = "cli"
 driver = "omnigent"
 ```
 
-Contributors get the dependency from `uv sync --dev`. End-user installations
-need the optional extra:
-
-```bash
-uv sync --extra omnigent
-```
+The `omnigent` package is a base dependency (pinned exactly in
+`pyproject.toml`), so every install carries it; `uv sync` is enough.
 
 ## Omnigent constraints
 

@@ -3,6 +3,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -39,18 +40,81 @@ class TestEventStore:
         assert appended.run_id == "active-run"
         assert [event.sequence for event in store.read(after_sequence=1)] == [2, 3]
 
-    def test_legacy_out_of_order_sequences_keep_file_order_filtering(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_legacy_out_of_order_sequences_get_stable_monotonic_cursors(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"
         _write_events(
             path,
             [_persisted_event(2, "two"), _persisted_event(1, "one"), _persisted_event(3, "three")],
         )
+        original = path.read_bytes()
 
         store = EventStore(path, run_id="active-run")
 
-        assert [event.text for event in store.read(after_sequence=1)] == ["two", "three"]
-        assert store.append(make_event(EventType.OUTPUT, "four")).sequence == 4
-        assert [event.text for event in store.read(after_sequence=2)] == ["three", "four"]
+        assert [(event.sequence, event.text) for event in store.read()] == [
+            (2, "two"),
+            (3, "one"),
+            (4, "three"),
+        ]
+        assert path.read_bytes() == original
+        assert [event.text for event in store.read(after_sequence=2)] == ["one", "three"]
+        assert store.append(make_event(EventType.OUTPUT, "four")).sequence == 5
+
+        reopened = EventStore(path, run_id="reopened-run")
+        assert [(event.sequence, event.text) for event in reopened.read()] == [
+            (2, "two"),
+            (3, "one"),
+            (4, "three"),
+            (5, "four"),
+        ]
+
+    def test_legacy_duplicate_sequences_preserve_every_payload(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        _write_events(
+            path,
+            [
+                _persisted_event(1, "one"),
+                _persisted_event(2, "first two"),
+                _persisted_event(2, "second two"),
+                _persisted_event(3, "three"),
+            ],
+        )
+
+        store = EventStore(path, run_id="active-run")
+
+        assert [(event.sequence, event.text) for event in store.read()] == [
+            (1, "one"),
+            (2, "first two"),
+            (3, "second two"),
+            (4, "three"),
+        ]
+        assert [event.text for event in store.read(after_sequence=2)] == [
+            "second two",
+            "three",
+        ]
+
+    def test_legacy_sequence_resets_replay_every_payload_across_cursors(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        raw_sequences = [*range(7690, 7711), *range(7690, 7715), *range(7711, 7738)]
+        _write_events(
+            path,
+            [
+                _persisted_event(sequence, f"payload-{index}")
+                for index, sequence in enumerate(raw_sequences)
+            ],
+        )
+        store = EventStore(path, run_id="active-run")
+
+        replayed: list[RunEvent] = []
+        cursor = 0
+        while batch := store.read(after_sequence=cursor)[:7]:
+            replayed.extend(batch)
+            cursor = batch[-1].sequence
+
+        assert [event.text for event in replayed] == [
+            f"payload-{index}" for index in range(len(raw_sequences))
+        ]
+        assert all(previous.sequence < current.sequence for previous, current in pairwise(replayed))
+        assert store.last_sequence == replayed[-1].sequence
 
     def test_repeated_tail_reads_do_not_reparse_history(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"

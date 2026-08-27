@@ -4518,15 +4518,11 @@ dependencies = [
     { name = "loguru" },
     { name = "mcp" },
     { name = "modal" },
+    { name = "omnigent" },
     { name = "openevolve" },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-]
-
-[package.optional-dependencies]
-omnigent = [
-    { name = "omnigent" },
 ]
 
 [package.dev-dependencies]
@@ -4544,7 +4540,6 @@ dev = [
     { name = "respx" },
     { name = "ruff" },
     { name = "twine" },
-    { name = "vibesys", extra = ["omnigent"] },
     { name = "vs-bench" },
 ]
 test = [
@@ -4566,13 +4561,12 @@ requires-dist = [
     { name = "loguru", specifier = ">=0.7.2" },
     { name = "mcp", specifier = ">=1.0,<2" },
     { name = "modal", specifier = ">=1.4.2" },
-    { name = "omnigent", marker = "extra == 'omnigent'", specifier = "==0.10.0" },
+    { name = "omnigent", specifier = "==0.10.0" },
     { name = "openevolve", specifier = "==0.3.1" },
     { name = "pydantic", specifier = ">=2" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "pyyaml", specifier = ">=6" },
 ]
-provides-extras = ["omnigent"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -4589,7 +4583,6 @@ dev = [
     { name = "respx" },
     { name = "ruff", specifier = "==0.15.12" },
     { name = "twine" },
-    { name = "vibesys", extras = ["omnigent"] },
     { name = "vs-bench", editable = "sdk/vs-bench" },
 ]
 test = [

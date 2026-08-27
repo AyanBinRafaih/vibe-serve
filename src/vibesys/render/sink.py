@@ -27,9 +27,11 @@ from vibesys.server.events import (
     TodoUpdateData,
     ToolCallData,
     ToolResultData,
+    ToolResultPayload,
     UsageUpdateData,
     make_event,
 )
+from vibesys.server.tool_payloads import classify_tool_result
 
 EventHandler = Callable[[RunEvent], None]
 
@@ -105,13 +107,24 @@ class OutputSink:
         *,
         call_id: str | None = None,
         is_error: bool = False,
+        payload: ToolResultPayload | None = None,
         agent_kind: str | None = None,
         round_label: str | None = None,
         invocation_id: str | None = None,
     ) -> None:
+        # A producer that received real structure pre-empts the classifier's
+        # best-effort guess over the flattened text.
+        if payload is None:
+            payload = classify_tool_result(content)
         self._emit(
             EventType.TOOL_RESULT,
-            ToolResultData(tool=tool, call_id=call_id, content=content, is_error=is_error),
+            ToolResultData(
+                tool=tool,
+                call_id=call_id,
+                content=content,
+                is_error=is_error,
+                payload=payload,
+            ),
             agent_kind=agent_kind,
             round_label=round_label,
             invocation_id=invocation_id,
