@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from vibesys.main import _tui_defaults_from_argv, main
-from vibesys.repository import InteractiveSetupDefaults
+from vibesys.repository import InteractiveSetupDefaults, RepositoryVisibility
 from vibesys.server.protocol import TuiDefaultsQuery
 from vibesys.server.runtime import run_server
 from vibesys.server.service import SupervisionService
@@ -24,7 +24,7 @@ def _defaults(theme: TuiTheme) -> InteractiveSetupDefaults:
         experiment_name="experiment-1",
         repository_owner=None,
         repository_name="experiment-1",
-        visibility="private",
+        visibility=RepositoryVisibility.PRIVATE,
         theme=theme,
     )
 

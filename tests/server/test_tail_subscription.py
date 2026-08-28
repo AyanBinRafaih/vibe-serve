@@ -8,10 +8,11 @@ would otherwise lose, and the backfill query that walks history backwards.
 import json
 import socket
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -34,7 +35,7 @@ _TIMESTAMP = datetime(2026, 1, 1, tzinfo=UTC)
 _ROUND_EVERY = 25
 
 
-def _event(sequence: int, event_type: EventType, **fields: object) -> RunEvent:
+def _event(sequence: int, event_type: EventType, **fields: Any) -> RunEvent:  # noqa: ANN401  # tracked: #288
     return RunEvent(
         sequence=sequence, run_id="persisted-run", timestamp=_TIMESTAMP, type=event_type, **fields
     )
@@ -121,7 +122,7 @@ def _attach(tmp_path: Path, events: list[RunEvent]) -> RunSupervisor:
 @contextmanager
 def _live_subscription(
     service: SupervisionService, request: SubscribeRequest
-) -> Iterator[Callable[[], dict]]:
+) -> Generator[Callable[[], dict]]:
     """Open one real subscription and yield a reader over its messages."""
     socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108
     with SupervisionSocketServer(socket_path, service):  # noqa: SIM117

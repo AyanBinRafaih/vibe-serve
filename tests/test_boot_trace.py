@@ -13,7 +13,7 @@ from vibesys import boot_trace
 
 
 @pytest.fixture(autouse=True)
-def _quiet_and_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+def _quiet_and_empty(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
     """Start each test with the trace off and nothing left buffered."""
     monkeypatch.delenv(boot_trace.BOOT_TRACE_ENV, raising=False)
     boot_trace.drain_log_lines()
