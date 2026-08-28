@@ -5,6 +5,7 @@ import pytest
 
 from vibesys.backends import SandboxKind
 from vibesys.backends.cuda import CudaBackend
+from vs_sandbox import DockerSandbox
 
 
 def test_cpu_only_control_plane_docker_skips_gpu_runtime(
@@ -23,5 +24,6 @@ def test_cpu_only_control_plane_docker_skips_gpu_runtime(
     )
 
     pick_device.assert_not_called()
+    assert isinstance(sandbox, DockerSandbox)
     assert sandbox._gpus is None  # noqa: SLF001  # tracked: #288
     assert backend.selected_device is None

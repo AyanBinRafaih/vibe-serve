@@ -8,13 +8,16 @@ import asyncio
 import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
 from vibesys.agents.contracts import MCPServerSpec
 from vibesys.agents.drivers import _omnigent_mcp as subject
 from vibesys.agents.drivers._omnigent_mcp import OmnigentMCPError, OmnigentMCPTools
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 
 @dataclass
@@ -57,6 +60,7 @@ class _FakeManager:
         self.specs: list[_FakeAgentSpec] = []
         self.calls: list[tuple[Any, ...]] = []
         self.shutdown_calls = 0
+        self.shutdown_override: Callable[[], Awaitable[None]] | None = None
         self.instances.append(self)
 
     async def schemas_for(self, spec: _FakeAgentSpec) -> Any:  # noqa: ANN401
@@ -79,6 +83,9 @@ class _FakeManager:
         return "profile result"
 
     async def shutdown(self) -> None:
+        if self.shutdown_override is not None:
+            await self.shutdown_override()
+            return
         self.shutdown_calls += 1
 
 
@@ -339,7 +346,7 @@ def test_close_can_retry_after_shutdown_failure(tmp_path) -> None:  # noqa: ANN0
         if shutdown_attempts == 1:
             raise RuntimeError("cleanup failed")
 
-    manager.shutdown = flaky_shutdown
+    manager.shutdown_override = flaky_shutdown
 
     with pytest.raises(RuntimeError, match="cleanup failed"):
         asyncio.run(tools.close())

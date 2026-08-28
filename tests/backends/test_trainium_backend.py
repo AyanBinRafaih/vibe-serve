@@ -13,13 +13,15 @@ from vibesys.backends.trainium import TrainiumBackend
 from vibesys.constants import ComputeBackend
 from vibesys.main import _add_common_args
 from vibesys.profilers import ProfilerKind
+from vs_sandbox import DockerSandbox
 
 
 def _make_backend(tmp_path, devices=("/dev/neuron0",)) -> TrainiumBackend:  # noqa: ANN001  # tracked: #288
     impl = backends.get(ComputeBackend.TRAINIUM, log_dir=tmp_path / "logs")
+    assert isinstance(impl, TrainiumBackend)
     # Pin a deterministic device set so tests don't depend on host hardware.
     impl._devices = list(devices)  # noqa: SLF001  # tracked: #288
-    return impl  # pyright: ignore[reportReturnType]  # tracked: #297
+    return impl
 
 
 class TestTrainiumRegistry:
@@ -53,6 +55,7 @@ class TestTrainiumSandbox:
             log_path=None,
         )
         # DockerSandbox stores the device list and skips --gpus.
+        assert isinstance(sb, DockerSandbox)
         assert sb._devices == ["/dev/neuron0", "/dev/neuron1"]  # noqa: SLF001  # tracked: #288
         assert sb._gpus is None  # noqa: SLF001  # tracked: #288
         # Persistent compile cache is bind-mounted and passthrough-registered.

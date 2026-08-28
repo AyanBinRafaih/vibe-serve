@@ -112,10 +112,11 @@ def _sigint_handler(signum: int, frame: FrameType | None) -> None:
     # Restore original handler FIRST to prevent recursive re-entry
     # while the interrupt unwinds through caller cleanup.
     signal.signal(signal.SIGINT, _original_sigint)
-    if callable(_original_sigint):
-        _original_sigint(signum, frame)
-    else:
+    # signal.Handlers and signal.Signals are IntEnum, so the int/None test is
+    # the exact complement of callable() for anything getsignal() can return.
+    if _original_sigint is None or isinstance(_original_sigint, int):
         raise KeyboardInterrupt
+    _original_sigint(signum, frame)
 
 
 signal.signal(signal.SIGINT, _sigint_handler)

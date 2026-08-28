@@ -7,6 +7,7 @@ import json
 import socket
 import threading
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -21,8 +22,10 @@ from vibesys.skypilot.protocol import (
     encode_message,
 )
 
+type _Frame = ArtifactFrame | ErrorFrame | OutputFrame | ResultFrame
 
-def _serve_frames(socket_path: Path, frames: list[object]) -> threading.Thread:
+
+def _serve_frames(socket_path: Path, frames: list[_Frame]) -> threading.Thread:
     ready = threading.Event()
 
     def serve() -> None:
@@ -35,7 +38,7 @@ def _serve_frames(socket_path: Path, frames: list[object]) -> threading.Thread:
                 reader = connection.makefile("rb")
                 request = json.loads(reader.readline())
                 for frame in frames:
-                    connection.sendall(encode_message(frame))  # type: ignore[arg-type]
+                    connection.sendall(encode_message(frame))
                 if any(isinstance(frame, ResultFrame) for frame in frames):
                     acknowledgement = json.loads(reader.readline())
                     assert acknowledgement["type"] == "ack"
@@ -54,7 +57,9 @@ def _serve_frames(socket_path: Path, frames: list[object]) -> threading.Thread:
     [("COMPLETED", 0), ("APPLICATION_FAILED", 1), ("CANCELLED", 130)],
 )
 def test_helper_relays_streams_and_maps_terminal_status(
-    tmp_path: Path, status: str, expected: int
+    tmp_path: Path,
+    status: Literal["COMPLETED", "APPLICATION_FAILED", "CANCELLED"],
+    expected: int,
 ) -> None:
     path = tmp_path / "bridge.sock"
     thread = _serve_frames(
@@ -62,11 +67,7 @@ def test_helper_relays_streams_and_maps_terminal_status(
         [
             OutputFrame(type="stdout", data="out\n"),
             OutputFrame(type="stderr", data="err\n"),
-            ResultFrame(
-                status=status,  # pyright: ignore[reportArgumentType]
-                sky_exit_code=0,
-                remote_job_id=7,
-            ),
+            ResultFrame(status=status, sky_exit_code=0, remote_job_id=7),
         ],
     )
     stdout, stderr = io.StringIO(), io.StringIO()

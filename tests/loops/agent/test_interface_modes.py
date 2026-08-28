@@ -9,9 +9,11 @@ artifact requirements.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from vibesys.config import as_config
 from vibesys.domains.base import DomainName, DomainRole
 from vibesys.domains.registry import resolve_domain
 from vibesys.domains.rendering import render_domain_section
@@ -40,7 +42,8 @@ def test_cli_exposes_only_process_boundary_modes():  # noqa: ANN201  # tracked: 
 
     parser = _build_agent_parser()
     action = next(action for action in parser._actions if action.dest == "interface")  # noqa: SLF001  # tracked: #288
-    assert set(action.choices) == {"inprocess", "service"}  # pyright: ignore[reportArgumentType]  # tracked: #297
+    assert action.choices is not None
+    assert set(action.choices) == {"inprocess", "service"}
     assert action.default == "inprocess"
     assert all(action.dest != "language" for action in parser._actions)  # noqa: SLF001  # tracked: #288
 
@@ -73,7 +76,7 @@ def test_loop_constants_and_rejects_unknown_interface():  # noqa: ANN201  # trac
     assert _INTERFACES == ("inprocess", "service")
     with pytest.raises(ValueError, match="interface"):
         run_agent_loop(
-            config=None,  # pyright: ignore[reportArgumentType]  # tracked: #297
+            config=as_config({"model": {"name": "test-model"}}),
             exp_name="e",
             input_path="/x",
             accuracy_command="accuracy-checker",
@@ -118,8 +121,10 @@ def test_standalone_profiler_none_has_no_prompt_template():  # noqa: ANN201  # t
 def test_standalone_profiler_rejects_unknown_kind():  # noqa: ANN201  # tracked: #288
     from vibesys.loops.agent.loop import _profiler_prompt_template  # noqa: PLC0415  # tracked: #288
 
+    # The runtime guard is the subject here, so the declared type is violated
+    # deliberately: a caller that skips static checking must still be rejected.
     with pytest.raises(TypeError, match="ProfilerKind"):
-        _profiler_prompt_template("bogus")  # pyright: ignore[reportArgumentType]  # tracked: #297
+        _profiler_prompt_template(cast("ProfilerKind", "bogus"))
 
 
 def _render_implementer(interface: str, *, modality: str | None = None) -> str:

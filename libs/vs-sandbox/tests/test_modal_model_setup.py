@@ -49,8 +49,9 @@ def mock_modal(monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
     monkeypatch.setattr(modal, "App", MagicMock(return_value=fake_app))
     monkeypatch.setattr(modal.Image, "debian_slim", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(modal.Volume, "from_name", MagicMock(return_value=fake_volume))
-    monkeypatch.setattr(modal.Secret, "from_dict", MagicMock(return_value=MagicMock()))
-    return {"volume": fake_volume, "app": fake_app}
+    secret_from_dict = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(modal.Secret, "from_dict", secret_from_dict)
+    return {"volume": fake_volume, "app": fake_app, "secret_from_dict": secret_from_dict}
 
 
 class TestEnsureModelVolume:
@@ -100,8 +101,6 @@ class TestEnsureModelVolume:
         mock_modal["app"].run.assert_called_once()
 
     def test_forwards_hf_token_as_secret(self, mock_modal):  # noqa: ANN001, ANN201  # tracked: #288
-        import modal  # noqa: PLC0415  # tracked: #288
-
         from vs_sandbox.modal_model_setup import (  # noqa: PLC0415  # tracked: #288
             ensure_model_volume,
         )
@@ -110,11 +109,9 @@ class TestEnsureModelVolume:
 
         ensure_model_volume("x/y", hf_token="hf_tok", log=lambda *_: None)  # noqa: S106  # tracked: #288
 
-        modal.Secret.from_dict.assert_called_once_with({"HF_TOKEN": "hf_tok"})
+        mock_modal["secret_from_dict"].assert_called_once_with({"HF_TOKEN": "hf_tok"})
 
     def test_reads_hf_token_from_env(self, mock_modal, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
-        import modal  # noqa: PLC0415  # tracked: #288
-
         from vs_sandbox.modal_model_setup import (  # noqa: PLC0415  # tracked: #288
             ensure_model_volume,
         )
@@ -125,4 +122,4 @@ class TestEnsureModelVolume:
 
         ensure_model_volume("x/y", log=lambda *_: None)
 
-        modal.Secret.from_dict.assert_called_once_with({"HF_TOKEN": "from_env"})
+        mock_modal["secret_from_dict"].assert_called_once_with({"HF_TOKEN": "from_env"})

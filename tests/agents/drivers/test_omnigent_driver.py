@@ -283,7 +283,7 @@ def test_distinct_tool_helpers_snapshot_their_own_environment_without_command_re
             ).strip()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [
+            futures: list[concurrent.futures.Future[Any]] = [
                 pool.submit(
                     asyncio.run,
                     os_tools.dispatch("sys_os_shell", {"command": "cargo test"}),

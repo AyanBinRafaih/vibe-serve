@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
 
+import pytest
+
 from vibesys.agents.progress import CandidateProgress, RoundProgress
 from vibesys.context import _RunContext
 from vibesys.run import RunPaths
@@ -14,7 +16,7 @@ def _judge_fallback() -> JudgeResponse:
     )
 
 
-def _make_context(tmp_path):  # noqa: ANN001, ANN202  # tracked: #288
+def _make_context(tmp_path, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN001, ANN202  # tracked: #288
     ctx = object.__new__(_RunContext)
     ctx._progress_stack = []  # noqa: SLF001  # tracked: #288
     ctx._paths = RunPaths(  # noqa: SLF001  # tracked: #288
@@ -22,7 +24,7 @@ def _make_context(tmp_path):  # noqa: ANN001, ANN202  # tracked: #288
         log_dir=tmp_path / "logs",
         run_log_path=tmp_path / "run.log",
     )
-    ctx.gpu_env = dict
+    monkeypatch.setattr(ctx, "gpu_env", dict)
     ctx.agent_client = MagicMock()
     ctx.agent_client.invoke.return_value = _judge_fallback()
     return ctx
@@ -33,8 +35,8 @@ def test_progress_rendering_is_loop_owned():  # noqa: ANN201  # tracked: #288
     assert CandidateProgress(2, 8, 1, 4).label() == "Round 2/8 Cand 1/4"
 
 
-def test_run_context_progress_scope_restores_previous(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    ctx = _make_context(tmp_path)
+def test_run_context_progress_scope_restores_previous(tmp_path, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN001, ANN201  # tracked: #288
+    ctx = _make_context(tmp_path, monkeypatch)
     outer = RoundProgress(1, 3)
     inner = CandidateProgress(2, 3, 1, 2)
 
@@ -47,8 +49,8 @@ def test_run_context_progress_scope_restores_previous(tmp_path):  # noqa: ANN001
     assert ctx.current_progress() is None
 
 
-def test_run_context_injects_current_progress(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    ctx = _make_context(tmp_path)
+def test_run_context_injects_current_progress(tmp_path, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN001, ANN201  # tracked: #288
+    ctx = _make_context(tmp_path, monkeypatch)
     progress = RoundProgress(2, 5)
 
     with ctx.progress(progress):
@@ -64,8 +66,8 @@ def test_run_context_injects_current_progress(tmp_path):  # noqa: ANN001, ANN201
     assert ctx.agent_client.invoke.call_args.kwargs["progress"] is progress
 
 
-def test_run_context_explicit_progress_overrides_scope(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    ctx = _make_context(tmp_path)
+def test_run_context_explicit_progress_overrides_scope(tmp_path, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN001, ANN201  # tracked: #288
+    ctx = _make_context(tmp_path, monkeypatch)
     scoped = RoundProgress(2, 5)
     explicit = CandidateProgress(2, 5, 1, 3)
 

@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -263,7 +264,7 @@ class TestSharedAbstraction:
 
     def test_base_is_abstract(self):  # noqa: ANN202  # tracked: #288
         with pytest.raises(TypeError):
-            hostsandbox.WorkspaceSandbox(workspace=Path("/x"))  # pyright: ignore[reportAbstractUsage]  # tracked: #297
+            hostsandbox.WorkspaceSandbox(workspace=Path("/x"))
 
     def test_backends_share_fields_and_wrap(self):  # noqa: ANN202  # tracked: #288
         host = hostsandbox.HostSandbox(
@@ -304,7 +305,7 @@ class TestMacosBuild:
         assert sb.workspace == workspace.resolve()
 
     def test_missing_sandbox_exec_returns_none(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN202  # tracked: #288
-        self._patch(monkeypatch, sandbox_exec=None)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        self._patch(monkeypatch, sandbox_exec=None)
         logs: list[str] = []
         assert hostsandbox.build(tmp_path, env={}, log=logs.append) is None
         assert any("sandbox-exec" in m for m in logs)
@@ -434,6 +435,11 @@ class _StubAgent(CLICodingAgent[CLIGenerationSession]):
         timeout: int | None = None,
         silent: bool = False,  # noqa: FBT001, FBT002  # tracked: #288
     ) -> CLIGenerationSession:
+        # agentshim declares ``timeout: int`` with a 300s default, but forwards
+        # ``None`` unchanged as "no timeout" -- which is what the base agent's
+        # ``int | None`` contract means. Pass the value through untouched, the
+        # way the real provider sessions do.
+        optional_timeout: dict[str, Any] = {"timeout": timeout}
         return CLIGenerationSession(
             binary_name=self.binary_name,
             env=self.env,
@@ -441,7 +447,7 @@ class _StubAgent(CLICodingAgent[CLIGenerationSession]):
             cmd=cmd,
             logger=self.logger,
             cwd=cwd,
-            timeout=timeout,  # pyright: ignore[reportArgumentType]  # tracked: #297
+            **optional_timeout,
             silent=silent,
             event_handler=self.event_handler,
             executor=self.executor,

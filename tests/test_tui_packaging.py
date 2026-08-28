@@ -7,7 +7,7 @@ import json
 from pathlib import Path  # noqa: TC003
 
 import pytest
-from tui_packaging import (  # pyright: ignore[reportMissingImports]
+from tui_packaging import (
     TuiPackagingError,
     stage_prebuilt_tui,
     validate_tui_payload,

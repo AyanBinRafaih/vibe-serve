@@ -159,9 +159,9 @@ class EvaluatorInput(BaseModel):
                     "evaluator source cannot be combined with name or version"
                 )
             return self
-        if any(value is None for value in package_values):
+        if self.name is None or self.version is None:
             raise ValueError("a packaged evaluator requires both name and version")  # noqa: TRY003
-        EvaluatorPackageRequirement(name=self.name, version=self.version)  # type: ignore[arg-type]
+        EvaluatorPackageRequirement(name=self.name, version=self.version)
         return self
 
     @property

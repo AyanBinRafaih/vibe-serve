@@ -215,6 +215,10 @@ def _install_helper_environment_hook() -> None:
             from omnigent.inner import os_env as omnigent_os_env  # noqa: PLC0415
         except ImportError as exc:
             raise _missing_omnigent("Omnigent OS-environment tools", exc) from exc
+        # The seam is a private module-level function of a pinned dependency, so
+        # both the read and the rebind below go through the dynamic module
+        # attribute rather than a declared symbol.
+        os_env_module: Any = omnigent_os_env
         original = getattr(omnigent_os_env, "build_helper_env", None)
         if not callable(original):
             raise OmnigentDriverError(
@@ -222,12 +226,14 @@ def _install_helper_environment_hook() -> None:
                 "this integration requires the private Omnigent 0.10.0 helper API"
             )
 
-        def build_helper_env(parent_environment: Any, sandbox: Any) -> dict[str, str]:  # noqa: ANN401
+        # Parameter names match Omnigent's own ``build_helper_env`` so callers
+        # that pass them by keyword keep working through the patch.
+        def build_helper_env(parent_env: Any, sandbox: Any) -> dict[str, str]:  # noqa: ANN401
             explicit = getattr(sandbox, _EXPLICIT_HELPER_ENV_ATTR, None)
-            source = explicit if isinstance(explicit, MappingProxyType) else parent_environment
+            source = explicit if isinstance(explicit, MappingProxyType) else parent_env
             return cast("dict[str, str]", original(source, sandbox))
 
-        omnigent_os_env.build_helper_env = build_helper_env
+        os_env_module.build_helper_env = build_helper_env
         _helper_environment_hook_installed = True
 
 

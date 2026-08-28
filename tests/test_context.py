@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vibesys import boot_trace
+from vibesys.config import Config
 from vibesys.context import (
     _EXPERIMENT_CHAT_SYSTEM_PROMPT,
     _ExperimentChatDependencies,
@@ -165,7 +166,7 @@ def _create_context(  # noqa: PLR0913
     hooks=None,  # noqa: ANN001
 ) -> _RunContext:
     return create_run_context(
-        config={"model": {"name": "gpt-test"}},  # pyright: ignore[reportArgumentType]
+        config=Config.model_validate({"model": {"name": "gpt-test"}}),
         exp_name=exp_name,
         runs_dir=runs_dir,
         input_path=str(project),
@@ -695,6 +696,7 @@ def test_resume_reuses_project_and_run_id_and_only_increases_limit(tmp_path):  #
         assert resumed.run_id == run_id
 
     stored = Project.open(project).state.load_run(run_id)
+    assert isinstance(stored.configuration, AgentRunConfiguration)
     assert stored.configuration.max_rounds == 2
     assert _git(project, "branch", "--show-current") == f"vibesys-runs/{run_id}"
 
@@ -726,6 +728,7 @@ def test_resume_migrates_legacy_objectives_with_dirty_candidate(tmp_path):  # no
         pass
 
     stored = state.load_run(run_id)
+    assert isinstance(stored.configuration, AgentRunConfiguration)
     assert stored.configuration.objectives == ("total_ops_per_sec:max",)
     assert "# interrupted edit" in candidate.read_text()
     assert "queue.py" in _git(project, "status", "--porcelain")
@@ -873,7 +876,7 @@ def test_direct_run_rejects_unmaterialized_workspace_source(tmp_path):  # noqa: 
 
     with pytest.raises(ConfigurationError, match="pass --runs-dir"):
         create_run_context(
-            config={"model": {"name": "gpt-test"}},  # pyright: ignore[reportArgumentType]
+            config=Config.model_validate({"model": {"name": "gpt-test"}}),
             exp_name="queue",
             runs_dir=None,
             input_path=str(project),
@@ -902,10 +905,12 @@ def test_omnigent_accepts_active_profiler_configuration(tmp_path):  # noqa: ANN0
     )
 
     with create_run_context(
-        config={  # pyright: ignore[reportArgumentType]
-            "model": {"name": "gpt-test"},
-            "agent": {"backend": "cli", "driver": "omnigent", "cli_provider": "codex"},
-        },
+        config=Config.model_validate(
+            {
+                "model": {"name": "gpt-test"},
+                "agent": {"backend": "cli", "driver": "omnigent", "cli_provider": "codex"},
+            }
+        ),
         exp_name="queue",
         runs_dir=None,
         input_path=str(project),
@@ -949,7 +954,7 @@ def test_candidate_context_uses_project_worktree_directory(tmp_path):  # noqa: A
         assert parent_commit is not None
         candidate = create_candidate_context(
             parent,
-            config={"model": {"name": "gpt-test"}},  # pyright: ignore[reportArgumentType]
+            config=Config.model_validate({"model": {"name": "gpt-test"}}),
             generation=2,
             child_idx=3,
             parent_commit=parent_commit,

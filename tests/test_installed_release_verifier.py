@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from scripts import verify_installed_release as verifier  # pyright: ignore[reportMissingImports]
+from scripts import verify_installed_release as verifier
 
 from vibesys.cli import BundledTui
 

@@ -60,8 +60,8 @@ class CudaBackend:
         # Sandboxes built so far, so maybe_rebalance can find them without
         # the caller having to thread them back in.
         # (kind, sandbox) tuples — kind is recorded at registration time so
-        # ``reselect_device`` can dispatch without isinstance checks against
-        # cross-package types (which break test mocking).
+        # ``reselect_device`` dispatches on the requested kind rather than on
+        # the concrete sandbox class.
         self._sandboxes: list[tuple[SandboxKind, SandboxBackendProtocol]] = []
 
     # -- ComputeBackendImpl protocol ---------------------------------------------
@@ -176,19 +176,29 @@ class CudaBackend:
         )
         self._save_gpu_metadata(new_gpu)
 
+        # Deferred for the same reason as in make_sandbox; by the time a
+        # rebalance happens both modules are already imported.
+        from deepagents.backends import LocalShellBackend  # noqa: PLC0415  # tracked: #288
+
+        from vs_sandbox import DockerSandbox  # noqa: PLC0415  # tracked: #288
+
         # Kind-dispatched pokes at sandbox internals: DOCKER entries are
         # always DockerSandbox (stop/start/_gpus), LOCAL entries are always
-        # LocalShellBackend (_env).
+        # LocalShellBackend (_env). The recorded kind still selects the
+        # branch; the assertions only state that registration invariant so
+        # the concrete attributes resolve.
         for kind, sb in self._sandboxes:
             if kind is SandboxKind.DOCKER:
-                sb.stop()  # pyright: ignore[reportAttributeAccessIssue]
-                sb._gpus = self._docker_gpu_spec()  # pyright: ignore[reportAttributeAccessIssue]  # noqa: SLF001  # tracked: #288
-                sb.start()  # re-runs setup_fns  # pyright: ignore[reportAttributeAccessIssue]
+                assert isinstance(sb, DockerSandbox)  # noqa: S101  # registration invariant
+                sb.stop()
+                sb._gpus = self._docker_gpu_spec()  # noqa: SLF001  # tracked: #288
+                sb.start()  # re-runs setup_fns
             elif kind is SandboxKind.LOCAL:
-                env = getattr(sb, "_env", None)
+                assert isinstance(sb, LocalShellBackend)  # noqa: S101  # registration invariant
+                env: dict[str, str] | None = getattr(sb, "_env", None)
                 if env is None:
                     env = {}
-                    sb._env = env  # pyright: ignore[reportAttributeAccessIssue]  # noqa: SLF001  # tracked: #288
+                    sb._env = env  # noqa: SLF001  # tracked: #288
                 env["CUDA_VISIBLE_DEVICES"] = str(new_gpu.index)
             # SandboxKind.MODAL: remote GPU, nothing to restart.
 

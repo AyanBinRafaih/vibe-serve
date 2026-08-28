@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import subprocess
 import tomllib
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -17,6 +16,7 @@ from vibesys.run.project import (
     provision_project,
 )
 from vibesys.run.workspace import Workspace
+from vibesys.sandbox.run_environment import LocalEnvironment
 from vs_project import Project
 
 if TYPE_CHECKING:
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 def _workspace(destination: Path, *, project_root: Path) -> Workspace:
     return Workspace(
         destination,
-        run_environment=SimpleNamespace(isolated=False),  # pyright: ignore[reportArgumentType]
+        run_environment=LocalEnvironment(),
         backend=MagicMock(),
         log=MagicMock(),
         project_root=project_root,

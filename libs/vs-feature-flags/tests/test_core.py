@@ -1,8 +1,12 @@
 from enum import StrEnum
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from vs_feature_flags import FeatureDefinition, FeatureRegistry
+
+if TYPE_CHECKING:
+    from collections.abc import MutableMapping
 
 
 class ExampleFlag(StrEnum):
@@ -68,6 +72,9 @@ def test_registry_rejects_definitions_for_another_enum():  # noqa: ANN201  # tra
 
 def test_definitions_mapping_is_read_only():  # noqa: ANN201  # tracked: #288
     registry = _registry()
+    # The property hands out a read-only view. Take it as mutable so the
+    # assignment below is the runtime behavior under test, not a type error.
+    definitions = cast("MutableMapping[ExampleFlag, FeatureDefinition]", registry.definitions)
 
     with pytest.raises(TypeError):
-        registry.definitions[ExampleFlag.NEW_LOOP] = FeatureDefinition(description="Changed.")  # pyright: ignore[reportIndexIssue]  # tracked: #297
+        definitions[ExampleFlag.NEW_LOOP] = FeatureDefinition(description="Changed.")

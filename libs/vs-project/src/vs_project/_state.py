@@ -6,10 +6,9 @@ integration capabilities. It never invokes Git and has no knowledge of VibeSys
 CLI arguments, agent providers, or evaluator implementations.
 """
 
-# These private values are shared only between cooperating types in this module.
-# pyright: reportPrivateUsage=false
-
-# These boundary errors deliberately embed the offending metadata path and value.
+# SLF001: these private values are shared only between cooperating types in this
+# module. TRY003: these boundary errors deliberately embed the offending
+# metadata path and value.
 # ruff: noqa: SLF001, TRY003
 
 from __future__ import annotations
@@ -130,9 +129,7 @@ class StateDocument:
     def _create(cls, project_relative_path: PurePosixPath, contents: bytes) -> Self:
         """Construct a validated package-owned document."""
         _validate_project_state_path(project_relative_path)
-        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-            contents, bytes
-        ):
+        if not isinstance(contents, bytes):
             raise TypeError("state document contents must be bytes")
         try:
             payload = json.loads(contents)
@@ -185,9 +182,7 @@ class StateFile:
     def __post_init__(self) -> None:
         """Reject unsafe paths and mutable or textual contents."""
         _validate_snapshot_relative_path(self.relative_path)
-        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-            self.contents, bytes
-        ):
+        if not isinstance(self.contents, bytes):
             raise TypeError("state snapshot file contents must be bytes")
 
 
@@ -207,16 +202,9 @@ class StateSnapshot:
     def _create(cls, namespace_root: PurePosixPath, files: tuple[StateFile, ...]) -> Self:
         """Construct a validated package-owned snapshot."""
         _validate_snapshot_root(namespace_root)
-        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-            files, tuple
-        ):
+        if not isinstance(files, tuple):
             raise TypeError("state snapshot files must be an immutable tuple")
-        if any(
-            not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-                item, StateFile
-            )
-            for item in files
-        ):
+        if any(not isinstance(item, StateFile) for item in files):
             raise TypeError("state snapshot files must contain StateFile values")
         paths = tuple(item.relative_path for item in files)
         if paths != tuple(sorted(paths, key=PurePosixPath.as_posix)):
@@ -680,7 +668,7 @@ class StateSlot[ModelT: BaseModel]:
 
     def deserialize_transition(self, payload: bytes) -> StateTransition:
         """Parse and schema-validate a transition for exactly this slot."""
-        if not isinstance(payload, bytes):  # pyright: ignore[reportUnnecessaryIsInstance]
+        if not isinstance(payload, bytes):
             raise TypeError("serialized state transition must be bytes")
         try:
             raw = json.loads(payload)
@@ -1743,9 +1731,7 @@ def _validate_state_relative_path(raw_path: str | PurePosixPath) -> PurePosixPat
 
 
 def _validate_project_state_path(path: PurePosixPath) -> None:
-    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-        path, PurePosixPath
-    ):
+    if not isinstance(path, PurePosixPath):
         raise TypeError("state document paths must be PurePosixPath values")
     try:
         _validate_state_relative_path(path)
@@ -1756,9 +1742,7 @@ def _validate_project_state_path(path: PurePosixPath) -> None:
 
 
 def _validate_snapshot_relative_path(path: PurePosixPath) -> None:
-    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-        path, PurePosixPath
-    ):
+    if not isinstance(path, PurePosixPath):
         raise TypeError("state snapshot paths must be PurePosixPath values")
     try:
         _validate_state_relative_path(path)

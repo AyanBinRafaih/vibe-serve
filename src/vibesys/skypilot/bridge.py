@@ -47,6 +47,7 @@ from vibesys.skypilot.runner import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from io import BufferedIOBase
 
     from vibesys.skypilot.config import ResolvedSkyPilotResources
     from vibesys.skypilot.runner import SkyPilotJobRunner
@@ -332,7 +333,9 @@ class SkyPilotBridge:
             except Exception as exc:  # noqa: BLE001
                 self._log(f"[warn] SkyPilot job cancellation failed: {type(exc).__name__}")
 
-    def _handle(self, reader: object, writer: object, connection: socket.socket) -> None:
+    def _handle(
+        self, reader: BufferedIOBase, writer: BufferedIOBase, connection: socket.socket
+    ) -> None:
         with self._handler_condition:
             self._active_handlers += 1
         try:
@@ -349,8 +352,10 @@ class SkyPilotBridge:
                 self._active_handlers -= 1
                 self._handler_condition.notify_all()
 
-    def _handle_request(self, reader: object, writer: object, connection: socket.socket) -> None:
-        payload = reader.readline(_MAX_REQUEST_BYTES + 1)  # type: ignore[attr-defined]
+    def _handle_request(
+        self, reader: BufferedIOBase, writer: BufferedIOBase, connection: socket.socket
+    ) -> None:
+        payload = reader.readline(_MAX_REQUEST_BYTES + 1)
         if not payload or len(payload) > _MAX_REQUEST_BYTES or not payload.endswith(b"\n"):
             raise ValueError("invalid bridge request framing")  # noqa: TRY003
         request = decode_request(payload)
@@ -400,8 +405,8 @@ class SkyPilotBridge:
         command: tuple[str, ...],
         record: InvocationRecord,
         staging: Path,
-        reader: object,
-        writer: object,
+        reader: BufferedIOBase,
+        writer: BufferedIOBase,
         connection: socket.socket,
     ) -> None:
         self._log(f"[skypilot] running trusted {request.kind} evaluator")
@@ -643,8 +648,8 @@ class SkyPilotBridge:
     def _deliver(
         self,
         record: InvocationRecord,
-        reader: object,
-        writer: object,
+        reader: BufferedIOBase,
+        writer: BufferedIOBase,
         lock: threading.Lock | None = None,
     ) -> None:
         """Replay a durable terminal payload and persist explicit acknowledgement."""
@@ -672,7 +677,7 @@ class SkyPilotBridge:
             ),
             lock,
         )
-        payload = reader.readline(_MAX_REQUEST_BYTES + 1)  # type: ignore[attr-defined]
+        payload = reader.readline(_MAX_REQUEST_BYTES + 1)
         acknowledgement = decode_ack(payload)
         if acknowledgement.invocation_id != record.invocation_id:
             raise ValueError("acknowledgement invocation mismatch")  # noqa: TRY003
@@ -848,7 +853,7 @@ class SkyPilotBridge:
     @classmethod
     def _write_output(
         cls,
-        writer: object,
+        writer: BufferedIOBase,
         stream: Literal["stdout", "stderr"],
         data: str,
         lock: threading.Lock,
@@ -865,11 +870,11 @@ class SkyPilotBridge:
 
     @staticmethod
     def _write(
-        writer: object,
+        writer: BufferedIOBase,
         message: OutputFrame | ArtifactFrame | ResultFrame | AckedFrame | ErrorFrame,
         lock: threading.Lock | None = None,
     ) -> None:
         context = lock or threading.Lock()
         with context:
-            writer.write(encode_message(message))  # type: ignore[attr-defined]
-            writer.flush()  # type: ignore[attr-defined]
+            writer.write(encode_message(message))
+            writer.flush()

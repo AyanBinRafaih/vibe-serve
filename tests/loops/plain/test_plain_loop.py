@@ -853,8 +853,9 @@ def test_resume_retries_previously_blocked_issue(  # noqa: ANN201  # tracked: #2
 
     exp_dir = _run_exp_dir(tmp_path)
     pre_resume = IssueBoard(_store_path(exp_dir)).get(1)
-    assert pre_resume.status == IssueStatus.BLOCKED  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
-    assert pre_resume.attempts == 2  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert pre_resume is not None
+    assert pre_resume.status == IssueStatus.BLOCKED
+    assert pre_resume.attempts == 2
 
     # Phase 2: resume. The blocked issue should be reopened with a fresh
     # attempt budget; this time the implementer/judge cycle passes.
@@ -882,11 +883,12 @@ def test_resume_retries_previously_blocked_issue(  # noqa: ANN201  # tracked: #2
     assert result2 is True
 
     post_resume = IssueBoard(_store_path(exp_dir)).get(1)
-    assert post_resume.status == IssueStatus.CLOSED  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert post_resume is not None
+    assert post_resume.status == IssueStatus.CLOSED
     # Reopen reset attempts to 0; the successful retry counts as attempt 1.
-    assert post_resume.attempts == 1  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert post_resume.attempts == 1
     # The blocked->open transition is recorded in history.
-    actions = [evt.action for evt in post_resume.history]  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    actions = [evt.action for evt in post_resume.history]
     assert "blocked->open" in actions
 
 

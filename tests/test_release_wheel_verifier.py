@@ -12,8 +12,8 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from scripts import verify_release_wheel as verifier  # pyright: ignore[reportMissingImports]
-from wheel_targets import TARGETS  # pyright: ignore[reportMissingImports]
+from scripts import verify_release_wheel as verifier
+from wheel_targets import TARGETS
 
 FRAMEWORK_PACKAGES = (
     "vibesys",

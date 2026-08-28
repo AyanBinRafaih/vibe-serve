@@ -22,6 +22,11 @@ def _persisted_event(sequence: int, text: str = "") -> RunEvent:
     )
 
 
+def _assign(target: object, field: str, value: object) -> None:
+    """Assign a frozen model field, whose rejection is a runtime contract."""
+    setattr(target, field, value)
+
+
 def _write_events(path: Path, events: list[RunEvent]) -> None:
     path.write_text("".join(event.model_dump_json() + "\n" for event in events))
 
@@ -199,7 +204,7 @@ class TestEventStore:
 
         first_read = store.read()
         with pytest.raises(ValidationError):
-            first_read[0].text = "mutated"
+            _assign(first_read[0], "text", "mutated")
 
         assert appended.text == "durable"
         assert store.read()[0].text == "durable"
@@ -221,10 +226,10 @@ class TestEventStore:
         )
 
         with pytest.raises(ValidationError):
-            appended.sequence = 99
+            _assign(appended, "sequence", 99)
         assert isinstance(appended.data, ToolCallData)
         with pytest.raises(ValidationError):
-            appended.data.tool = "Write"
+            _assign(appended.data, "tool", "Write")
 
     def test_append_does_not_publish_cache_state_when_file_close_fails(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from scripts.build_release_wheel import (  # pyright: ignore[reportMissingImports]
+from scripts.build_release_wheel import (
     BuildEnvironment,
     ReleaseBuildError,
     build_release_wheel,

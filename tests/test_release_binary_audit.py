@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from scripts.audit_release_wheel import (  # pyright: ignore[reportMissingImports]
+from scripts.audit_release_wheel import (
     BinaryAuditError,
     parse_lipo_architectures,
     parse_macos_build_versions,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from packaging_support import release_has_native_payload  # pyright: ignore[reportMissingImports]
+from packaging_support import release_has_native_payload
 
 
 @pytest.mark.parametrize(

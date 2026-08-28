@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,6 +18,9 @@ from vibesys.config import Config
 from vs_sandbox import HostResource, HostResourceAccess
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
     from vibesys.agents.client import AgentClient
 
 
@@ -25,20 +28,29 @@ def _config(**agent: object) -> Config:
     return Config.model_validate({"model": {"name": "m"}, "agent": agent})
 
 
-def _build(config: Config, **overrides: object) -> AgentClient:
-    kwargs: dict[str, object] = {
-        "agent_backend": None,
-        "cli_provider": None,
-        "backends": None,
-        "skills": [],
-        "skill_source_dirs": [],
-        "model": None,
-        "model_name": "m",
-        "run_log_file": None,
-        "use_docker": False,
-    }
-    kwargs.update(overrides)
-    return build_agent_client(config, **kwargs)  # pyright: ignore[reportArgumentType]
+def _build(  # noqa: PLR0913
+    config: Config,
+    *,
+    backends: dict[str, Any] | None = None,
+    model_name: str = "m",
+    use_docker: bool = False,
+    log_dir: Path | None = None,
+    host_resources: Iterable[HostResource] = (),
+) -> AgentClient:
+    return build_agent_client(
+        config,
+        agent_backend=None,
+        cli_provider=None,
+        backends=backends,
+        skills=[],
+        skill_source_dirs=[],
+        model=None,
+        model_name=model_name,
+        run_log_file=None,
+        use_docker=use_docker,
+        log_dir=log_dir,
+        host_resources=host_resources,
+    )
 
 
 def test_agentshim_is_the_default_driver() -> None:
@@ -64,6 +76,7 @@ def test_agentshim_docker_configuration_is_preserved() -> None:
         use_docker=True,
     )
 
+    assert isinstance(client._driver, AgentShimDriver)  # noqa: SLF001
     assert client._driver._docker_sandboxes is backends  # noqa: SLF001
 
 
