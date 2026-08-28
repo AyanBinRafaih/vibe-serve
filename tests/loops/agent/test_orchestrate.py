@@ -271,7 +271,7 @@ def _invoke_orchestrate(tmp_path, ref_file, runner, **kwargs):  # noqa: ANN001, 
     defaults.update(kwargs)
     with (
         patch("vibesys.context.build_model", return_value="mock-model"),
-        patch("vibesys.backends.cuda.LocalShellBackend"),
+        patch("vibesys.backends.cuda.make_local_shell_sandbox"),
         patch("vibesys.context.build_agent_client", return_value=runner),
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
         patch(

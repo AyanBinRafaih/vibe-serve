@@ -160,6 +160,17 @@ export interface SupervisionTransport {
 }
 
 /**
+ * Sink for one-off boot measurements the client takes of itself.
+ *
+ * The experiment log is the landing view, and how long it sits on "Loading
+ * experiments..." is a client-observable number the backend's own stage timings
+ * cannot report: it spans the request, the backend gate, and the reply. It goes
+ * to stderr rather than into the UI because it is a developer diagnostic, not
+ * session state. The entrypoint picks the sink; the controller only reports.
+ */
+export type StartupTrace = (line: string) => void;
+
+/**
  * How much history the boot subscribe asks for. A long-lived run holds tens of
  * thousands of events, and replaying all of them costs seconds of wire, parse,
  * and fold before the first frame. A thousand events covers what an operator
@@ -179,6 +190,14 @@ export class SocketSessionController implements SessionController {
   /** Single-flight guard for semantic experiment-log invalidations. */
   #experimentFetch: Promise<void> | null = null;
   #experimentRefreshPending = false;
+  /**
+   * When the client first asked for experiments, and whether the answer has
+   * been timed yet. The first request can be answered `experiments_ready:
+   * false`, so the elapsed time spans every retry until entries actually land,
+   * which is exactly how long the landing view shows "Loading experiments...".
+   */
+  #experimentsRequestedAt: number | null = null;
+  #experimentsLoadTraced = false;
   #paneFetch: Promise<void> | null = null;
   /** Single-flight guard for on-demand history backfill. */
   #historyFetch: Promise<boolean> | null = null;
@@ -202,6 +221,7 @@ export class SocketSessionController implements SessionController {
   constructor(
     private readonly client: SupervisionTransport,
     themeName: ThemeName = DEFAULT_THEME_NAME,
+    private readonly trace: StartupTrace = () => {},
   ) {
     this.#state = initialSessionState(themeName);
   }
@@ -662,6 +682,7 @@ export class SocketSessionController implements SessionController {
   }
 
   async #loadExperiments(): Promise<void> {
+    this.#experimentsRequestedAt ??= performance.now();
     if (this.#experimentFetch !== null) return this.#experimentFetch;
     const fetch = this.#requestExperiments().finally(() => {
       this.#experimentFetch = null;
@@ -678,11 +699,21 @@ export class SocketSessionController implements SessionController {
     try {
       const response = await this.client.request({type: 'query.experiments'});
       if (response.experiments_ready === false) return;
-      this.#setState(setExperiments(this.#state, response.experiments ?? []));
+      const entries = response.experiments ?? [];
+      this.#setState(setExperiments(this.#state, entries));
+      this.#traceExperimentsLoaded(entries.length);
     } catch (error) {
       const message = errorMessage(error);
       this.#setState(reportCaughtError(failExperiments(this.#state, message), error, 'request'));
     }
+  }
+
+  /** Reports the first delivery only: later refreshes are not a boot cost. */
+  #traceExperimentsLoaded(entryCount: number): void {
+    if (this.#experimentsLoadTraced || this.#experimentsRequestedAt === null) return;
+    this.#experimentsLoadTraced = true;
+    const elapsed = Math.round(performance.now() - this.#experimentsRequestedAt);
+    this.trace(`experiments loaded in ${elapsed}ms (${entryCount} entries)`);
   }
 
   /**

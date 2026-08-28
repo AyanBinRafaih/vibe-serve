@@ -830,6 +830,43 @@ describe('session controller', () => {
     expect(controller.state.experimentLog?.selectedId).toBe('H-resumed');
   });
 
+  it('reports how long the landing view waited for experiments', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const traced: string[] = [];
+    const controller = new SocketSessionController(transport, undefined, line => traced.push(line));
+
+    await controller.start();
+
+    expect(traced).toHaveLength(1);
+    expect(traced[0]).toMatch(/^experiments loaded in \d+ms \(1 entries\)$/);
+  });
+
+  it('times the whole wait across a closed gate, and reports it once', async () => {
+    const transport = new FakeTransport();
+    transport.experimentsReady = false;
+    const traced: string[] = [];
+    const controller = new SocketSessionController(transport, undefined, line => traced.push(line));
+
+    await controller.start();
+    expect(traced).toEqual([]);
+
+    transport.experiments = [entry('H-resumed', 1, 1, {active: true}), entry('H-02', 2, 2, {})];
+    transport.experimentsReady = true;
+    transport.emit({type: 'event', event: event(1, 'experiments_changed')});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(traced).toEqual([expect.stringMatching(/^experiments loaded in \d+ms \(2 entries\)$/)]);
+
+    // A later refresh is not a boot cost, so it does not report again.
+    transport.emit({type: 'event', event: event(2, 'experiments_changed')});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(traced).toHaveLength(1);
+  });
+
   it('coalesces refetches when a burst of experiment changes lands', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);

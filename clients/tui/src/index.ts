@@ -17,6 +17,12 @@ const renderer = await createCliRenderer({exitOnCtrlC: false});
 const controller = new SocketSessionController(
   client,
   resolveTheme(process.env['VIBESYS_THEME']).name,
+  // Boot measurements go to stderr: they are developer diagnostics, not
+  // session state. The renderer holds the alternate screen, so the line never
+  // lands in the operator's scrollback; `vs 2>trace.log` captures it.
+  line => {
+    process.stderr.write(`${line}\n`);
+  },
 );
 const app = createOpenTuiApp(renderer, controller);
 const startupSmokeMarker = process.env['VIBESYS_RELEASE_SMOKE_MARKER'];
