@@ -69,9 +69,14 @@ with no recorded agent time is headed `Round N flow` alone.
 
 `Measured` shows the verified metric for the round that resolved the
 hypothesis, as a delta against the last measurement preceding it once there is
-one to compare against. The framework records a verified metric only when its
-own official evaluation ran, on the sparse cadence or the final round, so a
-hypothesis resolved between evaluations legitimately shows no measurement.
+one to compare against, or as the absolute value with its unit before that.
+When every measured hypothesis shares one objective direction the column
+header carries it as an arrow (`Measured ↑` for maximize, `↓` for minimize),
+so a signed delta reads as good or bad without task knowledge. The hypothesis
+summary spells the measurement out in words: metric name, direction, absolute
+value, baseline, and delta. The framework records a verified metric only when
+its own official evaluation ran, on the sparse cadence or the final round, so
+a hypothesis resolved between evaluations legitimately shows no measurement.
 
 The table refetches when an agent phase or a round finishes, so it stays
 current without being reopened. Rows are ordered by first round and never

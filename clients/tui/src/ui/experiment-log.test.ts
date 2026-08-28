@@ -14,6 +14,8 @@ import {
   formatMeasured,
   formatRounds,
   headerRow,
+  hypothesisMetadata,
+  measuredDirection,
   outcomeColor,
   outcomeLabel,
   resolveColumns,
@@ -120,6 +122,65 @@ describe('experiment log rows', () => {
     expect(formatMeasured(entry({perf_delta_pct: -2}))).toBe('-2.0%');
     expect(formatMeasured(entry({perf_delta_pct: null, perf_metric: 2412.5}))).toBe('2412.5');
     expect(formatMeasured(entry({perf_delta_pct: null, perf_metric: null}))).toBe('—');
+  });
+
+  it('labels an absolute metric with its unit and keeps the delta unitless', () => {
+    expect(
+      formatMeasured(entry({perf_delta_pct: null, perf_metric: 55434.2, perf_unit: 'ops/s'})),
+    ).toBe('55434.2 ops/s');
+    expect(formatMeasured(entry({perf_delta_pct: -2, perf_unit: 'ops/s'}))).toBe('-2.0%');
+  });
+
+  it('points the header the way improvement goes when the log agrees on one', () => {
+    const columns = resolveColumns(WIDE);
+
+    expect(headerRow(columns, 'max')).toContain('Measured ↑');
+    expect(headerRow(columns, 'min')).toContain('Measured ↓');
+    expect(headerRow(columns)).not.toContain('↑');
+  });
+
+  it('finds the direction shared by every measured entry', () => {
+    expect(measuredDirection([entry(), entry({perf_direction: 'max'})])).toBe('max');
+    expect(measuredDirection([entry()])).toBe(null);
+    expect(
+      measuredDirection([entry({perf_direction: 'max'}), entry({perf_direction: 'min'})]),
+    ).toBe(null);
+  });
+
+  it('spells out the measurement in the drill-down metadata', () => {
+    const metadata = hypothesisMetadata(
+      entry({
+        perf_metric: 55434.2,
+        perf_unit: 'total_ops_per_sec',
+        perf_metric_name: 'total_ops_per_sec',
+        perf_direction: 'max',
+        perf_baseline_value: 52340.1,
+        perf_delta_pct: 5.9,
+      }),
+    );
+
+    expect(metadata).toContain('Metric total_ops_per_sec (maximize)');
+    expect(metadata).toContain('Measured 55434.2');
+    expect(metadata).toContain('Baseline 52340.1');
+    expect(metadata).toContain('Delta +5.9%');
+    // The unit here is the metric name; the identity clause already carries
+    // it, so the numbers stay bare instead of repeating it twice.
+    expect(metadata).not.toContain('55434.2 total_ops_per_sec');
+  });
+
+  it('keeps a distinct unit next to the numbers in the metadata', () => {
+    const metadata = hypothesisMetadata(
+      entry({
+        perf_metric: 2412.5,
+        perf_unit: 'ops/s',
+        perf_metric_name: 'throughput',
+        perf_direction: 'min',
+        perf_delta_pct: null,
+      }),
+    );
+
+    expect(metadata).toContain('Metric throughput (minimize)');
+    expect(metadata).toContain('Measured 2412.5 ops/s');
   });
 
   it('renders a record with no hypothesis id as an explicit placeholder', () => {
