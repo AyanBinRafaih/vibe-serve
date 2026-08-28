@@ -3,6 +3,7 @@
 import json
 import shutil
 import threading
+import time
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
@@ -406,6 +407,24 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     repo_visibility: RepositoryVisibility,
     agent_state_model_type: type[BaseModel] | None,
 ) -> "_RunContext":
+    stage_clock = time.perf_counter()
+    context_start = stage_clock
+    buffered_logs: list[str] = []
+    stage_sink: Callable[[str], None] = buffered_logs.append
+
+    def _stage(name: str) -> None:
+        """Log elapsed time since the previous stage checkpoint.
+
+        Routes through ``buffered_logs`` until the run logger exists, then
+        through ``logger.lprint`` (see the reassignment of ``stage_sink``
+        below), matching how every other pre-logger diagnostic in this
+        function is surfaced.
+        """
+        nonlocal stage_clock
+        now = time.perf_counter()
+        stage_sink(f"context stage {name}: {(now - stage_clock) * 1000:.0f}ms")
+        stage_clock = now
+
     config = as_config(config)
     for source in workspace_sources:
         if not source.strip_git:
@@ -461,7 +480,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 )
             ) from exc
 
-    buffered_logs: list[str] = []
+    _stage("config_and_inputs")
     backend_impl = backends.get(
         backend,
         log_dir=Project.log_directory_for(project_root, run_id),
@@ -472,6 +491,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     resolved_cli_provider = cli_provider or config.agent.cli_provider or "codex"
     model = None if resolved_backend == "cli" else build_model(config)
     model_name = config.model.name
+    _stage("backend_and_model")
     resolved_profiler_kind = resolve_profiler_kind(
         profiler_kind,
         domain=profiler_domain,
@@ -507,6 +527,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 message=profiler_preflight.error_message(),
             )
         )
+    _stage("profiler_preflight")
 
     profiler_support_path: str | None = None
     profiler_support_name: str | None = None
@@ -582,10 +603,12 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     else:
         workspace_files.create()
 
+    _stage("workspace_materialize")
     project = Project.open(project_root)
     project_state = project.state
     log_dir = project_state.log_directory(run_id)
     log_dir.mkdir(parents=True, exist_ok=True)
+    _stage("project_open")
     from vibesys.server.registry import active_supervisor  # noqa: PLC0415  # tracked: #288
 
     supervisor = active_supervisor()
@@ -594,8 +617,10 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     logger = RunLogger(log_dir)
     teardown_stack.callback(logger.close)
     hook_log[0] = logger.lprint
+    stage_sink = logger.lprint
     for message in buffered_logs:
         logger.lprint(message)
+    _stage("log_bootstrap")
 
     if supervisor is None:
         renderer = HeadlessRenderer()
@@ -608,6 +633,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     )
     if existing:
         workspace_files.repair()
+        _stage("workspace_repair")
 
     project_excluded_dirs = set(workspace_files.excluded_dirs)
     if profiler_support_name is not None:
@@ -623,6 +649,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         ),
     )
     git.init(existing, trusted_input_baseline=trusted_input_baseline)
+    _stage("git_tracker_init")
     effective_configuration = project_configuration.model_copy(
         update={"profiler": resolved_profiler_kind.value}
     )
@@ -729,6 +756,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             f"vibesys: initialize run {run_id}",
             project_state.initialization_snapshot(run_id),
         )
+    _stage("project_state_resume")
 
     if project_configuration.outer_loop == "agent":
         if agent_state_model_type is None:
@@ -744,6 +772,8 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             if recovery is not RoundRecoveryOutcome.NO_TRANSACTION:
                 logger.lprint(f"[project] recovered round transaction: {recovery.value}")
 
+    _stage("round_transaction_recovery")
+
     if supervisor is not None:
         supervisor.attach(log_dir, project=project, run_id=run_id)
         from vibesys.server.events import (  # noqa: PLC0415  # tracked: #288
@@ -754,6 +784,9 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         supervisor.record(
             EventType.EXPERIMENTS_CHANGED,
             data=ExperimentsChangedData(reason="project_attached"),
+        )
+        logger.lprint(
+            f"experiments gate open after {(time.perf_counter() - context_start) * 1000:.0f}ms"
         )
 
     project_ref_dir = (
@@ -797,6 +830,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         extra_input_excludes=environment_patch.copy_excludes,
     )
     workspace_files.setup(plan, existing=True)
+    _stage("workspace_setup")
 
     runtime_state = project_state.portable_namespace(run_id, "runtime")
     objective_document: Path | None = None
@@ -892,6 +926,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         state_namespace=project_state.local_namespace(run_id, "skypilot"),
     )
     session = teardown_stack.enter_context(environment.open(run_environment_request))
+    _stage("environment_open")
     # Snapshot the agent-facing commands once the session is open; the
     # view's paths are fixed for the session lifetime.
     commands = RunCommands(
@@ -905,6 +940,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     device = DeviceLease(backend_impl, log_dir=log_dir, run_environment_view=session.view)
     teardown_stack.callback(device.close)
     device.start_monitor()
+    _stage("device_monitor_start")
 
     # Build the backend-agnostic agent client. Loops invoke this instead
     # of calling create_deep_agent / vibesys._agent_cli directly. The cli
@@ -939,6 +975,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         project_path_policy=project_path_policy,
         require_host_sandbox=not session.view.cli_sandboxed,
     )
+    _stage("agent_client_build")
     close_agent_client = getattr(agent_client, "close", None)
     if callable(close_agent_client):
         teardown_stack.callback(close_agent_client)

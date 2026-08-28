@@ -263,6 +263,44 @@ def test_run_context_announces_canonical_experiment_state(tmp_path):  # noqa: AN
         REGISTRY.deactivate(supervisor)
 
 
+def test_context_assembly_logs_stage_timings(tmp_path):  # noqa: ANN001, ANN201
+    """Every assembly stage up to and past the experiments gate logs its elapsed time.
+
+    This is a regression guard for the diagnostic used to find where
+    ``create_run_context`` spends time before the TUI's hypothesis screen
+    can leave "loading experiments..." (the gate flips when the second
+    ``supervisor.attach`` records ``EXPERIMENTS_CHANGED``).
+    """
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            log_text = ctx.run_log_path.read_text()
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+    for stage in (
+        "config_and_inputs",
+        "backend_and_model",
+        "profiler_preflight",
+        "workspace_materialize",
+        "project_open",
+        "log_bootstrap",
+        "git_tracker_init",
+        "project_state_resume",
+        "round_transaction_recovery",
+        "workspace_setup",
+        "environment_open",
+        "device_monitor_start",
+        "agent_client_build",
+    ):
+        assert f"context stage {stage}: " in log_text, f"missing stage timing for {stage!r}"
+    assert "experiments gate open after " in log_text
+
+
 def test_retained_experiment_chat_uses_one_dedicated_client_across_run_teardown(
     tmp_path: Path,
 ) -> None:
