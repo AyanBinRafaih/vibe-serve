@@ -164,7 +164,6 @@ def test_the_mock_driver_writes_a_run_sized_event_history(recorded_run):  # noqa
     assert len(lines) >= _TARGET_EVENTS
 
 
-@pytest.mark.xfail(reason="pending transport tail re-bootstrap fix", strict=False)
 def test_a_store_attached_after_subscribe_still_delivers_only_a_tail(recorded_run, booted):  # noqa: ANN001, ANN201
     """The real boot order: subscribe first, attach the run's store second.
 
@@ -200,7 +199,6 @@ def test_a_store_attached_after_subscribe_still_delivers_only_a_tail(recorded_ru
     )
 
 
-@pytest.mark.xfail(reason="pending transport tail re-bootstrap fix", strict=False)
 def test_a_late_attach_still_replays_the_run_level_spine(recorded_run, booted):  # noqa: ANN001, ANN201
     """A bounded batch is only correct if it still carries run-level state.
 
