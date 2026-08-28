@@ -143,10 +143,27 @@ export function createOpenTuiApp(
   const experimentLog = new ExperimentLogView(renderer, controller, theme);
   const rightPane = new RightPaneView(renderer, theme, () => controller.focusPane('right'));
   const themePicker = new ThemePickerView(renderer, theme);
-  const conversation = new ConversationView(renderer, controller, markdownStyle, theme, {
-    showsSelection: true,
-    onFocusRequest: focusTranscript,
-  });
+  // Scrolling back past the rendered window materializes the next block of
+  // history. The viewport owns scroll position, so it absorbs the height the
+  // revealed cards add and the reader keeps looking at the same content.
+  const revealOlderEntries = (): void => {
+    const heightBefore = viewport.scrollHeight;
+    const top = viewport.scrollTop;
+    if (!conversation.revealOlderEntries()) return;
+    const grew = viewport.scrollHeight - heightBefore;
+    if (grew > 0) viewport.scrollTo(top + grew);
+  };
+  const conversation: ConversationView = new ConversationView(
+    renderer,
+    controller,
+    markdownStyle,
+    theme,
+    {
+      showsSelection: true,
+      onFocusRequest: focusTranscript,
+      onRevealOlder: revealOlderEntries,
+    },
+  );
   const chatDraft = createChatDraft();
   const chat = new ChatOverlayView(renderer, controller, markdownStyle, theme, chatDraft);
   const chatPane = new ChatPaneView(renderer, controller, markdownStyle, theme, chatDraft);
@@ -401,6 +418,7 @@ export function createOpenTuiApp(
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
     toggleSelectedTool: () => conversation.toggleSelectedTool(),
+    revealOlderEntries: revealOlderEntries,
     revealSelectedEntry: () => {
       const card = conversation.selectedCard();
       if (card !== null) viewport.scrollChildIntoView(card.id);

@@ -1610,6 +1610,56 @@ describe('OpenTUI presentation', () => {
     expect(testRenderer.renderer.root.findDescendantById('event-entry-999')).not.toBe(lastCard);
   });
 
+  it('paints only the tail of a huge transcript, then reveals history on scroll', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const controller = new FakeController(hugeTranscriptState(20_000));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 19999'));
+    // Only a bounded tail gets cards: the newest entry is on screen, the run's
+    // older history is not built at all.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBeDefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBeUndefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19799')).toBeUndefined();
+
+    testRenderer.mockInput.pressKey('HOME');
+    await testRenderer.waitForFrame(() => true);
+
+    // Scrolling back materializes the next block, so the capped history stays
+    // reachable rather than being discarded.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19799')).toBeDefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBeDefined();
+  });
+
+  it('appends live entries incrementally on a windowed transcript', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const state = hugeTranscriptState(20_000);
+    const controller = new FakeController(state);
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 19999'));
+    const tailCard = testRenderer.renderer.root.findDescendantById('event-entry-19999');
+
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        transcript: [
+          ...state.core.transcript,
+          {id: 'entry-20000', kind: 'status' as const, content: 'event 20000'},
+        ],
+      },
+    });
+    await testRenderer.waitForFrame(value => value.includes('event 20000'));
+
+    // The window anchor held, so the append stayed a prefix extension and the
+    // cards already on screen were not rebuilt.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBe(tailCard);
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-20000')).toBeDefined();
+  });
+
   it('selects an agent with Tab and filters the transcript', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
@@ -3714,6 +3764,22 @@ function spanColors(
     }
   }
   return undefined;
+}
+
+/** A run long enough that building every card would block the first frame. */
+function hugeTranscriptState(entries: number): SessionState {
+  const initial = initialSessionState();
+  return {
+    ...initial,
+    core: {
+      ...initial.core,
+      transcript: Array.from({length: entries}, (_, index) => ({
+        id: `entry-${index}`,
+        kind: 'status' as const,
+        content: `event ${index}`,
+      })),
+    },
+  };
 }
 
 function registerCleanup(

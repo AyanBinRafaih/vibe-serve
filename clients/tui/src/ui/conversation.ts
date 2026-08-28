@@ -2,6 +2,8 @@ import {
   BoxRenderable,
   type CliRenderer,
   MarkdownRenderable,
+  // The terminal mouse event, not the DOM global of the same name.
+  type MouseEvent as TerminalMouseEvent,
   type SyntaxStyle,
   TextRenderable,
 } from '@opentui/core';
@@ -20,7 +22,23 @@ export interface ConversationViewOptions {
   showsSelection?: boolean;
   /** Gives the containing semantic pane focus when any conversation surface is clicked. */
   onFocusRequest?: () => void;
+  /**
+   * Asked for entries older than the rendered window when a scroll gesture
+   * reaches back past it. The container owns scrolling, so it decides how to
+   * keep the viewport steady across the newly materialized cards.
+   */
+  onRevealOlder?: () => void;
 }
+
+/**
+ * Above this many visible entries the first paint renders only a tail window.
+ * Below it a full build costs a few hundred milliseconds, which is not worth
+ * the windowing bookkeeping.
+ */
+const CONVERSATION_WINDOW_THRESHOLD = 2_000;
+
+/** How many entries a windowed paint materializes, and grows by on demand. */
+const CONVERSATION_WINDOW = 200;
 
 export class ConversationView {
   readonly output: BoxRenderable;
@@ -37,6 +55,14 @@ export class ConversationView {
   #renderedCards: BoxRenderable[] = [];
   #renderedSelection: string | null = null;
   #selectedId: string | null = null;
+  /** First visible entry the window renders; 0 once it covers everything. */
+  #windowStart = 0;
+  /**
+   * The entry `#windowStart` pointed at when it was last resolved. It survives
+   * the invalidations that clear `#renderedConversation`, so expanding the
+   * window is not undone by a selection move, a theme swap, or a toggle.
+   */
+  #windowAnchor: ConversationEntry | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
@@ -52,6 +78,7 @@ export class ConversationView {
     this.#renderMarkdown = options.renderMarkdown ?? true;
     this.#showsSelection = options.showsSelection ?? false;
     this.#onFocusRequest = options.onFocusRequest;
+    const onRevealOlder = options.onRevealOlder;
     // The bordered surface owns horizontal inset so transcript siblings, such
     // as a fixed footer, share the same content origin as these turn cards.
     this.output = new BoxRenderable(renderer, {
@@ -59,7 +86,34 @@ export class ConversationView {
       width: '100%',
       flexDirection: 'column',
       ...(this.#onFocusRequest === undefined ? {} : {onMouseUp: this.#onFocusRequest}),
+      // Not consumed: the containing scroll box still handles the wheel. This
+      // only notices that the reader is heading into history.
+      ...(onRevealOlder === undefined
+        ? {}
+        : {
+            onMouseScroll: (event: TerminalMouseEvent): void => {
+              if (event.scroll?.direction === 'up' && this.hasOlderEntries()) onRevealOlder();
+            },
+          }),
     });
+  }
+
+  /** Whether entries older than the rendered window are still unmaterialized. */
+  hasOlderEntries(): boolean {
+    return this.#windowStart > 0;
+  }
+
+  /**
+   * Materializes the next block of older entries, returning whether the window
+   * actually grew. Callers own any scroll compensation for the added cards.
+   */
+  revealOlderEntries(): boolean {
+    if (this.#windowStart === 0) return false;
+    this.#windowStart = Math.max(0, this.#windowStart - CONVERSATION_WINDOW);
+    const entries = this.#selectConversation(this.controller.state);
+    this.#windowAnchor = entries[this.#windowStart] ?? null;
+    this.#renderConversation(entries);
+    return true;
   }
 
   render(state: SessionState): void {
@@ -128,7 +182,39 @@ export class ConversationView {
     this.#renderedCards = [];
   }
 
-  #renderConversation(entries: ConversationEntry[]): void {
+  /**
+   * The slice of the conversation that gets cards.
+   *
+   * A boot against a long-lived run lands 20k entries in one frame, and one
+   * card is several native renderables, so building them all blocks the first
+   * paint (and, past roughly 6k cards, exhausts the renderer's native
+   * handles). The window keeps the tail immediate; older entries materialize
+   * when the reader scrolls back for them.
+   *
+   * The anchor keeps `#windowStart` pointing at the same entry across renders,
+   * so live appends stay a prefix extension of what is on screen and still
+   * take the incremental path.
+   */
+  #windowed(entries: ConversationEntry[]): ConversationEntry[] {
+    if (entries.length <= CONVERSATION_WINDOW_THRESHOLD) {
+      this.#windowStart = 0;
+      this.#windowAnchor = null;
+      return entries;
+    }
+    if (this.#windowAnchor === null || entries[this.#windowStart] !== this.#windowAnchor) {
+      this.#windowStart = entries.length - CONVERSATION_WINDOW;
+    }
+    if (this.#selectedId !== null) {
+      // A cursor above the window has to stay reachable and revealable.
+      const selected = entries.findIndex(entry => entry.id === this.#selectedId);
+      if (selected !== -1 && selected < this.#windowStart) this.#windowStart = selected;
+    }
+    this.#windowAnchor = entries[this.#windowStart] ?? null;
+    return entries.slice(this.#windowStart);
+  }
+
+  #renderConversation(conversation: ConversationEntry[]): void {
+    const entries = this.#windowed(conversation);
     if (
       sameEntries(entries, this.#renderedConversation) &&
       (entries.length > 0 || this.output.getChildren().length > 0)
@@ -140,6 +226,21 @@ export class ConversationView {
         this.output.add(card);
         this.#renderedCards.push(card);
       }
+      this.#renderedConversation = entries;
+      return;
+    }
+    const revealed = entrySuffixOffset(this.#renderedConversation, entries);
+    if (revealed > 0) {
+      // The window grew backwards: only the newly revealed head needs cards.
+      const cards: BoxRenderable[] = [];
+      for (let index = revealed - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        if (entry === undefined) continue;
+        const card = this.#renderEntry(entry);
+        this.output.add(card, 0);
+        cards.unshift(card);
+      }
+      this.#renderedCards = [...cards, ...this.#renderedCards];
       this.#renderedConversation = entries;
       return;
     }
@@ -380,6 +481,13 @@ function isEntryPrefix(prefix: ConversationEntry[], entries: ConversationEntry[]
     prefix.length < entries.length &&
     prefix.every((entry, index) => entry === entries[index])
   );
+}
+
+/** How many entries were revealed ahead of an unchanged rendered tail, or 0. */
+function entrySuffixOffset(rendered: ConversationEntry[], entries: ConversationEntry[]): number {
+  const offset = entries.length - rendered.length;
+  if (rendered.length === 0 || offset <= 0) return 0;
+  return rendered.every((entry, index) => entry === entries[index + offset]) ? offset : 0;
 }
 
 function singleChangedEntryIndex(
