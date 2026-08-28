@@ -867,6 +867,37 @@ describe('session controller', () => {
     expect(traced).toHaveLength(1);
   });
 
+  it('adds a since-launch suffix when a launch start time is given', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const traced: string[] = [];
+    const launchStartMs = Date.now() - 25;
+    const controller = new SocketSessionController(
+      transport,
+      undefined,
+      line => traced.push(line),
+      launchStartMs,
+    );
+
+    await controller.start();
+
+    expect(traced).toHaveLength(1);
+    expect(traced[0]).toMatch(/^experiments loaded in \d+ms \(1 entries; \d+ms since launch\)$/);
+  });
+
+  it('omits the since-launch suffix when no launch start time is given', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const traced: string[] = [];
+    const controller = new SocketSessionController(transport, undefined, line => traced.push(line));
+
+    await controller.start();
+
+    expect(traced).toHaveLength(1);
+    expect(traced[0]).toMatch(/^experiments loaded in \d+ms \(1 entries\)$/);
+    expect(traced[0]).not.toContain('since launch');
+  });
+
   it('coalesces refetches when a burst of experiment changes lands', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);

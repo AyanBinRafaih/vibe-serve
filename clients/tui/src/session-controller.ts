@@ -222,6 +222,15 @@ export class SocketSessionController implements SessionController {
     private readonly client: SupervisionTransport,
     themeName: ThemeName = DEFAULT_THEME_NAME,
     private readonly trace: StartupTrace = () => {},
+    /**
+     * Epoch-ms timestamp the launcher recorded before spawning the backend
+     * (`VIBESYS_LAUNCH_START_MS`, read by the entrypoint). Present in the
+     * real client, absent in tests and any launch path that predates it.
+     * When set, `#traceExperimentsLoaded` reports wall time since launch
+     * alongside its own request-to-response measurement, since the gap
+     * between the two is the dispatch preamble the request timer cannot see.
+     */
+    private readonly launchStartMs?: number,
   ) {
     this.#state = initialSessionState(themeName);
   }
@@ -713,7 +722,11 @@ export class SocketSessionController implements SessionController {
     if (this.#experimentsLoadTraced || this.#experimentsRequestedAt === null) return;
     this.#experimentsLoadTraced = true;
     const elapsed = Math.round(performance.now() - this.#experimentsRequestedAt);
-    this.trace(`experiments loaded in ${elapsed}ms (${entryCount} entries)`);
+    const sinceLaunch =
+      this.launchStartMs === undefined
+        ? ''
+        : `; ${Math.round(Date.now() - this.launchStartMs)}ms since launch`;
+    this.trace(`experiments loaded in ${elapsed}ms (${entryCount} entries${sinceLaunch})`);
   }
 
   /**

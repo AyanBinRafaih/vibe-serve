@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -111,6 +112,10 @@ def test_interactive_execs_launcher_with_python_env(monkeypatch, tmp_path):  # n
     assert captured["env"]["VIBESYS_PYTHON"] == sys.executable  # pyright: ignore[reportIndexIssue]
     assert captured["env"]["VIBESYS_TUI_RUNTIME"] == str(bundle.runtime)  # pyright: ignore[reportIndexIssue]
     assert captured["env"]["BUN_CONFIG_SKIP_INSTALL_PACKAGES"] == "1"  # pyright: ignore[reportIndexIssue]
+    # Read by clients/tui/src/index.ts to anchor the StartupTrace to when the
+    # user ran the command, not just when the frontend process started.
+    launch_start_ms = int(captured["env"]["VIBESYS_LAUNCH_START_MS"])  # pyright: ignore[reportIndexIssue]
+    assert abs(launch_start_ms - int(time.time() * 1000)) < 5_000
 
 
 def test_interactive_with_non_executable_bundled_runtime_errors(  # noqa: ANN201
@@ -191,6 +196,8 @@ def test_source_checkout_builds_and_runs_launcher_from_callers_directory(monkeyp
     assert captured["cmd"] == ["/usr/bin/node", str(launcher), "--input", "bundle", "--local"]
     assert captured["cwd"] is None
     assert captured["env"]["VIBESYS_PYTHON"] == sys.executable  # pyright: ignore[reportIndexIssue]
+    launch_start_ms = int(captured["env"]["VIBESYS_LAUNCH_START_MS"])  # pyright: ignore[reportIndexIssue]
+    assert abs(launch_start_ms - int(time.time() * 1000)) < 5_000
 
 
 def test_source_checkout_skips_build_when_fresh(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -620,7 +627,7 @@ def test_run_source_tui_prints_stale_and_rebuilt_messages(monkeypatch, tmp_path,
     monkeypatch.setattr(cli, "_ensure_source_tui_built", lambda _root: True)
     monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)  # noqa: ARG005
 
-    rc = cli._run_source_tui(tmp_path, [])  # noqa: SLF001
+    rc = cli._run_source_tui(tmp_path, [], launch_start_ms=0)  # noqa: SLF001
 
     assert rc == 0
     err = capsys.readouterr().err
@@ -642,7 +649,7 @@ def test_run_source_tui_skips_message_when_fresh(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "_stale_reason", _boom)
     monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)  # noqa: ARG005
 
-    rc = cli._run_source_tui(tmp_path, [])  # noqa: SLF001
+    rc = cli._run_source_tui(tmp_path, [], launch_start_ms=0)  # noqa: SLF001
 
     assert rc == 0
     assert capsys.readouterr().err == ""

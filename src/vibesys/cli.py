@@ -138,7 +138,7 @@ def _bundled_runtime_missing_message() -> str:
     )
 
 
-def _run_bundled_tui(bundle: BundledTui, args: list[str]) -> int:
+def _run_bundled_tui(bundle: BundledTui, args: list[str], *, launch_start_ms: int) -> int:
     if not bundle.runtime.is_file() or not os.access(bundle.runtime, os.X_OK):
         print(_bundled_runtime_missing_message(), file=sys.stderr)  # noqa: T201  # tracked: #288
         return 1
@@ -151,6 +151,12 @@ def _run_bundled_tui(bundle: BundledTui, args: list[str]) -> int:
         "BUN_CONFIG_SKIP_INSTALL_PACKAGES": "1",
         "VIBESYS_PYTHON": sys.executable,
         "VIBESYS_TUI_RUNTIME": str(bundle.runtime),
+        # Read by the frontend entrypoint (clients/tui/src/index.ts) to anchor
+        # its StartupTrace to when the user actually ran the command, not just
+        # when that process started. The launcher (launcher.ts) forwards its
+        # own environment to the frontend it spawns, so this reaches it
+        # unchanged.
+        "VIBESYS_LAUNCH_START_MS": str(launch_start_ms),
     }
     return subprocess.call(  # noqa: S603  # tracked: #288
         [str(bundle.runtime), str(bundle.launcher), *args],
@@ -351,7 +357,7 @@ def _ensure_source_tui_built(root: Path) -> bool:
     return _run_pnpm_install(pnpm, root) and _run_codegen_and_build(pnpm, root)
 
 
-def _run_source_tui(root: Path, args: list[str]) -> int:
+def _run_source_tui(root: Path, args: list[str], *, launch_start_ms: int) -> int:
     bun = _bun_executable()
     if bun is None:
         print(  # noqa: T201  # tracked: #288
@@ -387,6 +393,12 @@ def _run_source_tui(root: Path, args: list[str]) -> int:
         # Ensure the launcher's Bun frontend is discoverable even when Bun only
         # lives under ~/.bun/bin.
         "PATH": os.pathsep.join([str(bun.parent), os.environ.get("PATH", "")]),
+        # Read by the frontend entrypoint (clients/tui/src/index.ts) to anchor
+        # its StartupTrace to when the user actually ran the command, not just
+        # when that process started. The launcher (launcher.ts) forwards its
+        # own environment to the frontend it spawns, so this reaches it
+        # unchanged.
+        "VIBESYS_LAUNCH_START_MS": str(launch_start_ms),
     }
     return subprocess.call(  # noqa: S603  # tracked: #288
         [str(node), str(launcher), *args], env=env
@@ -395,6 +407,11 @@ def _run_source_tui(root: Path, args: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``vibesys`` console script."""
+    # Captured before any doctor checks, staleness checks, or rebuilds so the
+    # frontend's StartupTrace (clients/tui/src/index.ts,
+    # VIBESYS_LAUNCH_START_MS) reports wall time since the user actually ran
+    # the command, including a source-checkout rebuild.
+    launch_start_ms = int(time.time() * 1000)
     args = list(sys.argv[1:] if argv is None else argv)
 
     if _headless_requested(args):
@@ -402,11 +419,11 @@ def main(argv: list[str] | None = None) -> int:
 
     bundle = bundled_tui()
     if bundle is not None:
-        return _run_bundled_tui(bundle, args)
+        return _run_bundled_tui(bundle, args, launch_start_ms=launch_start_ms)
 
     root = source_checkout_root()
     if root is not None:
-        return _run_source_tui(root, args)
+        return _run_source_tui(root, args, launch_start_ms=launch_start_ms)
 
     print(  # noqa: T201  # tracked: #288
         "vibesys: interactive TUI is not bundled and no source checkout was found; "

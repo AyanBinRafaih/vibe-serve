@@ -9,6 +9,17 @@ import {resolveTheme} from './ui/theme.js';
 const socketPath = process.env['VIBESYS_CONTROL_SOCKET'];
 if (!socketPath) throw new Error('VIBESYS_CONTROL_SOCKET is required');
 
+// Set by `vibesys.cli` before it spawns the launcher, so the StartupTrace can
+// report wall time since the user actually ran the command, not just since
+// this frontend process started. Absent on any launch path that predates it
+// (e.g. `pnpm --dir clients/tui dev`), in which case the trace omits it.
+const launchStartMsRaw = process.env['VIBESYS_LAUNCH_START_MS'];
+const parsedLaunchStartMs = launchStartMsRaw === undefined ? undefined : Number(launchStartMsRaw);
+const launchStartMs =
+  parsedLaunchStartMs !== undefined && Number.isFinite(parsedLaunchStartMs)
+    ? parsedLaunchStartMs
+    : undefined;
+
 const client = await SupervisionClient.connect(socketPath);
 // VibeSys owns Ctrl+C so a nonempty OpenTUI selection can be copied before the
 // same chord falls back to exiting. Enabling OpenTUI's parallel exit handler
@@ -23,6 +34,7 @@ const controller = new SocketSessionController(
   line => {
     process.stderr.write(`${line}\n`);
   },
+  launchStartMs,
 );
 const app = createOpenTuiApp(renderer, controller);
 const startupSmokeMarker = process.env['VIBESYS_RELEASE_SMOKE_MARKER'];
