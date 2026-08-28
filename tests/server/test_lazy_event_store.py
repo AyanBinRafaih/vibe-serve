@@ -9,6 +9,7 @@ fully eager path would, at every cursor and every bounded range.
 import random
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 from pydantic import ValidationError
@@ -68,6 +69,14 @@ def _legacy_sequence_plan(count: int) -> list[int]:
     return plan
 
 
+class _CommonFields(TypedDict):
+    """The ``RunEvent`` fields every generated event shares, spread as kwargs."""
+
+    sequence: int
+    run_id: str
+    timestamp: datetime
+
+
 def _generated_events(
     seed: int, count: int, *, legacy_sequences: bool = False, legacy_invocations: bool = False
 ) -> list[RunEvent]:
@@ -77,7 +86,7 @@ def _generated_events(
     events: list[RunEvent] = []
     open_execution: str | None = None
     for index, sequence in enumerate(plan):
-        common = {
+        common: _CommonFields = {
             "sequence": sequence,
             "run_id": "persisted-run",
             "timestamp": _TIMESTAMP,
