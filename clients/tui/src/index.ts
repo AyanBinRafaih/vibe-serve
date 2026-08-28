@@ -1,6 +1,7 @@
 import {writeFile} from 'node:fs/promises';
 import {createCliRenderer} from '@opentui/core';
 import {SupervisionClient} from '@vibesys/backend-client';
+import {resolveStartupTrace} from './boot-trace.js';
 import {runTuiSession} from './runtime.js';
 import {SocketSessionController} from './session-controller.js';
 import {resolveStartupTheme} from './startup-theme.js';
@@ -11,17 +12,6 @@ const CONNECT_TIMEOUT_MS = 30_000;
 
 const socketPath = process.env['VIBESYS_CONTROL_SOCKET'];
 if (!socketPath) throw new Error('VIBESYS_CONTROL_SOCKET is required');
-
-// Set by `vibesys.cli` before it spawns the launcher, so the StartupTrace can
-// report wall time since the user actually ran the command, not just since
-// this frontend process started. Absent on any launch path that predates it
-// (e.g. `pnpm --dir clients/tui dev`), in which case the trace omits it.
-const launchStartMsRaw = process.env['VIBESYS_LAUNCH_START_MS'];
-const parsedLaunchStartMs = launchStartMsRaw === undefined ? undefined : Number(launchStartMsRaw);
-const launchStartMs =
-  parsedLaunchStartMs !== undefined && Number.isFinite(parsedLaunchStartMs)
-    ? parsedLaunchStartMs
-    : undefined;
 
 const client = await SupervisionClient.connect(socketPath, {
   connectTimeoutMs: CONNECT_TIMEOUT_MS,
@@ -38,13 +28,10 @@ const renderer = await createCliRenderer({exitOnCtrlC: false});
 const controller = new SocketSessionController(
   client,
   await resolveStartupTheme(themeRequest, {explicitTheme}),
-  // Boot measurements go to stderr: they are developer diagnostics, not
-  // session state. The renderer holds the alternate screen, so the line never
-  // lands in the operator's scrollback; `vs 2>trace.log` captures it.
-  line => {
+  // Quiet unless VIBESYS_BOOT_TRACE=1; see boot-trace.ts.
+  resolveStartupTrace(process.env, line => {
     process.stderr.write(`${line}\n`);
-  },
-  launchStartMs,
+  }),
 );
 const app = createOpenTuiApp(renderer, controller);
 const startupSmokeMarker = process.env['VIBESYS_RELEASE_SMOKE_MARKER'];

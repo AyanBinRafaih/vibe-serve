@@ -8,6 +8,7 @@ import {
   type SubscribeOptions,
   SupervisionError,
 } from '@vibesys/backend-client';
+import {resolveStartupTrace} from './boot-trace.js';
 import {SocketSessionController, type SupervisionTransport} from './session-controller.js';
 import {chatPaneVisible, experimentLogVisible} from './session-model.js';
 
@@ -867,35 +868,57 @@ describe('session controller', () => {
     expect(traced).toHaveLength(1);
   });
 
-  it('adds a since-launch suffix when a launch start time is given', async () => {
+  it('stays silent through the real sink unless the boot trace is switched on', async () => {
     const transport = new FakeTransport();
     transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
-    const traced: string[] = [];
-    const launchStartMs = Date.now() - 25;
+    const written: string[] = [];
     const controller = new SocketSessionController(
       transport,
       undefined,
-      line => traced.push(line),
-      launchStartMs,
+      resolveStartupTrace({VIBESYS_LAUNCH_START_MS: String(Date.now() - 25)}, line =>
+        written.push(line),
+      ),
     );
 
     await controller.start();
 
-    expect(traced).toHaveLength(1);
-    expect(traced[0]).toMatch(/^experiments loaded in \d+ms \(1 entries; \d+ms since launch\)$/);
+    expect(written).toEqual([]);
   });
 
-  it('omits the since-launch suffix when no launch start time is given', async () => {
+  it('writes one anchored line through the real sink when the boot trace is on', async () => {
     const transport = new FakeTransport();
     transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
-    const traced: string[] = [];
-    const controller = new SocketSessionController(transport, undefined, line => traced.push(line));
+    const written: string[] = [];
+    const controller = new SocketSessionController(
+      transport,
+      undefined,
+      resolveStartupTrace(
+        {VIBESYS_BOOT_TRACE: '1', VIBESYS_LAUNCH_START_MS: String(Date.now() - 25)},
+        line => written.push(line),
+      ),
+    );
 
     await controller.start();
 
-    expect(traced).toHaveLength(1);
-    expect(traced[0]).toMatch(/^experiments loaded in \d+ms \(1 entries\)$/);
-    expect(traced[0]).not.toContain('since launch');
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatch(/^experiments loaded in \d+ms \(1 entries\); \d+ms since launch$/);
+  });
+
+  it('omits the since-launch suffix when the launch anchor is absent', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const written: string[] = [];
+    const controller = new SocketSessionController(
+      transport,
+      undefined,
+      resolveStartupTrace({VIBESYS_BOOT_TRACE: '1'}, line => written.push(line)),
+    );
+
+    await controller.start();
+
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatch(/^experiments loaded in \d+ms \(1 entries\)$/);
+    expect(written[0]).not.toContain('since launch');
   });
 
   it('coalesces refetches when a burst of experiment changes lands', async () => {

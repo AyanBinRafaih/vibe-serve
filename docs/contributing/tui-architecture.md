@@ -56,6 +56,26 @@ the renderer starts and applies the answer before the first frame, falling back 
 if the backend does not answer in time. `--theme` skips the query and reaches the frontend as
 `VIBESYS_THEME`.
 
+### Boot trace
+
+Boot timings are always recorded and never narrated. The backend times its boot in spans
+(`src/vibesys/boot_trace.py`): the dispatch preamble in `main.py`, then run-context assembly in
+`context.py`. Every span lands in the run's `run-*.log` as
+`boot span <qualified.name>: <ms>ms`, with the preamble's spans ahead of assembly's and each
+enclosing span reporting its region's total after its children.
+
+Nothing reaches stderr unless you ask:
+
+```bash
+VIBESYS_BOOT_TRACE=1 vibesys --input ... 2>trace.log
+```
+
+The CLI passes the request to every process it spawns, so the same variable also switches on the
+frontend's own measurement of how long the landing view waits for experiments
+(`clients/tui/src/boot-trace.ts`), which spans the request, the backend gate, and the reply. Those
+client lines are anchored to `VIBESYS_LAUNCH_START_MS`, which the CLI always sets, so they report
+wall time since the user ran the command rather than since the frontend process started.
+
 ## Validation
 
 Run all package checks from the repository root:

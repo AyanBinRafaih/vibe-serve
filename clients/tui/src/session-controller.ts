@@ -8,6 +8,7 @@ import {
   SupervisionError,
 } from '@vibesys/backend-client';
 import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
+import type {StartupTrace} from './boot-trace.js';
 import {helpText, parseChatCommand, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
@@ -161,17 +162,6 @@ export interface SupervisionTransport {
 }
 
 /**
- * Sink for one-off boot measurements the client takes of itself.
- *
- * The experiment log is the landing view, and how long it sits on "Loading
- * experiments..." is a client-observable number the backend's own stage timings
- * cannot report: it spans the request, the backend gate, and the reply. It goes
- * to stderr rather than into the UI because it is a developer diagnostic, not
- * session state. The entrypoint picks the sink; the controller only reports.
- */
-export type StartupTrace = (line: string) => void;
-
-/**
  * How much history the boot subscribe asks for. A long-lived run holds tens of
  * thousands of events, and replaying all of them costs seconds of wire, parse,
  * and fold before the first frame. A thousand events covers what an operator
@@ -230,16 +220,12 @@ export class SocketSessionController implements SessionController {
   constructor(
     private readonly client: SupervisionTransport,
     themeName: ThemeName = DEFAULT_THEME_NAME,
-    private readonly trace: StartupTrace = () => {},
     /**
-     * Epoch-ms timestamp the launcher recorded before spawning the backend
-     * (`VIBESYS_LAUNCH_START_MS`, read by the entrypoint). Present in the
-     * real client, absent in tests and any launch path that predates it.
-     * When set, `#traceExperimentsLoaded` reports wall time since launch
-     * alongside its own request-to-response measurement, since the gap
-     * between the two is the dispatch preamble the request timer cannot see.
+     * Where boot measurements go. The controller only reports; whether
+     * anything is written, and how it is anchored, belongs to the sink
+     * (`boot-trace.ts`), which is why the default discards.
      */
-    private readonly launchStartMs?: number,
+    private readonly trace: StartupTrace = () => {},
   ) {
     this.#state = initialSessionState(themeName);
   }
@@ -731,11 +717,7 @@ export class SocketSessionController implements SessionController {
     if (this.#experimentsLoadTraced || this.#experimentsRequestedAt === null) return;
     this.#experimentsLoadTraced = true;
     const elapsed = Math.round(performance.now() - this.#experimentsRequestedAt);
-    const sinceLaunch =
-      this.launchStartMs === undefined
-        ? ''
-        : `; ${Math.round(Date.now() - this.launchStartMs)}ms since launch`;
-    this.trace(`experiments loaded in ${elapsed}ms (${entryCount} entries${sinceLaunch})`);
+    this.trace(`experiments loaded in ${elapsed}ms (${entryCount} entries)`);
   }
 
   /**

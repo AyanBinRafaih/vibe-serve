@@ -21,13 +21,13 @@ import math
 import shlex
 import subprocess
 import sys
-import time
 import tomllib
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
+from vibesys import boot_trace
 from vibesys.config import Config, load_config
 from vibesys.constants import (
     KNOWN_COMPUTE_BACKENDS,
@@ -37,8 +37,6 @@ from vibesys.constants import (
 from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.input_manifest import InputBundle, load_input_bundle, load_project_task
-from vibesys.preamble_timing import record_stage as _record_preamble_stage
-from vibesys.preamble_timing import start_clock as _start_preamble_clock
 from vibesys.profilers import CLI_PROFILER_CHOICES, ProfilerKind, coerce_profiler_kind
 from vibesys.repository import (
     REPOSITORY_SLUG,
@@ -2062,35 +2060,35 @@ def _validate_agent(args: argparse.Namespace) -> None:
 
 
 def _run_agent(args: argparse.Namespace) -> None:
-    stage = _preamble_stage_timer()
-    bundle: InputBundle = args.input_bundle
-    config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
-    stage("load_config_and_skills")
-    _prepare_experiment_repository(args, config)
-    stage("prepare_experiment_repository")
-    from vibesys.loops.agent.loop import run_agent_loop  # noqa: PLC0415  # tracked: #288
+    # Everything the run needs before the loop can start. The enclosing span
+    # is this preamble's total; ``context.py`` times assembly from there.
+    with boot_trace.span("agent_preamble"):
+        bundle: InputBundle = args.input_bundle
+        with boot_trace.span("load_config_and_skills"):
+            config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
+        with boot_trace.span("prepare_experiment_repository"):
+            _prepare_experiment_repository(args, config)
+        with boot_trace.span("import_run_agent_loop"):
+            from vibesys.loops.agent.loop import run_agent_loop  # noqa: PLC0415  # tracked: #288
+        with boot_trace.span("load_objective"):
+            objective = _with_operator_constraints(_load_objective(bundle), args.constraint)
 
-    stage("import_run_agent_loop")
+        existing = False
+        exp_name = args.exp_name
+        start_round = 1
 
-    objective = _with_operator_constraints(_load_objective(bundle), args.constraint)
-    stage("load_objective")
+        if args.resume is not None:
+            exp_name = args.resume
+            existing = True
+            start_round = None
+            print(f"Resuming VibeSys run {exp_name} in {bundle.root}/")  # noqa: T201  # tracked: #288
 
-    existing = False
-    exp_name = args.exp_name
-    start_round = 1
+        with boot_trace.span("load_objectives_toml"):
+            objectives = _load_objectives_toml(bundle.task_root)
+            pareto_relative_noise = _load_pareto_relative_noise_toml(bundle.task_root)
 
-    if args.resume is not None:
-        exp_name = args.resume
-        existing = True
-        start_round = None
-        print(f"Resuming VibeSys run {exp_name} in {bundle.root}/")  # noqa: T201  # tracked: #288
-
-    objectives = _load_objectives_toml(bundle.task_root)
-    pareto_relative_noise = _load_pareto_relative_noise_toml(bundle.task_root)
-    stage("load_objectives_toml")
-
-    run_environment = run_environment_spec_from_args(args)
-    stage("run_environment_spec")
+        with boot_trace.span("run_environment_spec"):
+            run_environment = run_environment_spec_from_args(args)
 
     success = run_agent_loop(
         config=config,
@@ -2561,26 +2559,6 @@ def _explicit_cli_dests(
     )
 
 
-def _preamble_stage_timer() -> Callable[[str], None]:
-    """Return a closure that logs elapsed time since the previous call.
-
-    Mirrors ``context._stage``, but for the dispatch preamble that runs
-    before ``create_run_context`` builds a run log: lines route through
-    ``vibesys.preamble_timing`` (printed to stderr immediately, then
-    replayed into the run log once :func:`vibesys.context.create_run_context`
-    assembles it) instead of a buffered run-log sink.
-    """
-    clock = time.perf_counter()
-
-    def _stage(name: str) -> None:
-        nonlocal clock
-        now = time.perf_counter()
-        _record_preamble_stage(f"main stage {name}: {(now - clock) * 1000:.0f}ms")
-        clock = now
-
-    return _stage
-
-
 def parse_cli_invocation(argv: list[str]) -> CliInvocation:
     """Parse and validate one invocation without printing or exiting."""
     argv = _prepare_stub_agent_smoke_defaults(argv)
@@ -2606,32 +2584,36 @@ def _dispatch(argv: list[str]) -> None:
         _run_migrate_run_environment(argv[1:])
         return
 
-    _start_preamble_clock()
-    stage = _preamble_stage_timer()
-    invocation = parse_cli_invocation(argv)
-    stage("parse_cli_invocation")
-    loop_kind, args = invocation.loop_kind, invocation.args
-    runner = _LOOP_COMMANDS[loop_kind].run
-    from vibesys.server.events import (  # noqa: PLC0415  # tracked: #288
-        EventStatus,
-        EventType,
-        RunStartedData,
-    )
-    from vibesys.server.registry import active_supervisor  # noqa: PLC0415  # tracked: #288
+    # Dispatch's own share of boot; the selected command's preamble
+    # (``_run_agent``) and then ``context.py`` continue the trace. These
+    # lines stay buffered until run-context assembly drains them.
+    with boot_trace.span("dispatch"):
+        with boot_trace.span("parse_cli_invocation"):
+            invocation = parse_cli_invocation(argv)
+        loop_kind, args = invocation.loop_kind, invocation.args
+        runner = _LOOP_COMMANDS[loop_kind].run
+        with boot_trace.span("supervisor_run_started_event"):
+            from vibesys.server.events import (  # noqa: PLC0415  # tracked: #288
+                EventStatus,
+                EventType,
+                RunStartedData,
+            )
+            from vibesys.server.registry import (  # noqa: PLC0415  # tracked: #288
+                active_supervisor,
+            )
 
-    supervisor = active_supervisor()
-    if supervisor is not None:
-        max_rounds = getattr(args, "max_rounds", getattr(args, "max_iterations", 1))
-        supervisor.record(
-            EventType.RUN_STARTED,
-            status=EventStatus.ACTIVE,
-            data=RunStartedData(
-                outer_loop=loop_kind,
-                input=str(args.input_bundle.root),
-                max_rounds=max_rounds,
-            ),
-        )
-    stage("supervisor_run_started_event")
+            supervisor = active_supervisor()
+            if supervisor is not None:
+                max_rounds = getattr(args, "max_rounds", getattr(args, "max_iterations", 1))
+                supervisor.record(
+                    EventType.RUN_STARTED,
+                    status=EventStatus.ACTIVE,
+                    data=RunStartedData(
+                        outer_loop=loop_kind,
+                        input=str(args.input_bundle.root),
+                        max_rounds=max_rounds,
+                    ),
+                )
     runner(args)
 
 

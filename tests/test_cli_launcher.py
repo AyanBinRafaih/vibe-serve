@@ -87,6 +87,7 @@ def test_headless_flag_runs_engine_subprocess(monkeypatch):  # noqa: ANN001, ANN
 def test_interactive_execs_launcher_with_python_env(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     bundle = _make_bundle(tmp_path)
     _force_interactive(monkeypatch)
+    monkeypatch.delenv("VIBESYS_BOOT_TRACE", raising=False)
     monkeypatch.setattr(cli, "bundled_tui", lambda: bundle)
 
     captured: dict[str, object] = {}
@@ -112,10 +113,32 @@ def test_interactive_execs_launcher_with_python_env(monkeypatch, tmp_path):  # n
     assert captured["env"]["VIBESYS_PYTHON"] == sys.executable  # pyright: ignore[reportIndexIssue]
     assert captured["env"]["VIBESYS_TUI_RUNTIME"] == str(bundle.runtime)  # pyright: ignore[reportIndexIssue]
     assert captured["env"]["BUN_CONFIG_SKIP_INSTALL_PACKAGES"] == "1"  # pyright: ignore[reportIndexIssue]
-    # Read by clients/tui/src/index.ts to anchor the StartupTrace to when the
-    # user ran the command, not just when the frontend process started.
+    # Read by clients/tui/src/boot-trace.ts to anchor the client's boot
+    # measurements to when the user ran the command, not just when the
+    # frontend process started. cli.main marks it through vibesys.boot_trace.
     launch_start_ms = int(captured["env"]["VIBESYS_LAUNCH_START_MS"])  # pyright: ignore[reportIndexIssue]
     assert abs(launch_start_ms - int(time.time() * 1000)) < 5_000
+    # Quiet by default: the frontend traces only when asked to.
+    assert "VIBESYS_BOOT_TRACE" not in captured["env"]  # pyright: ignore[reportOperatorIssue]
+
+
+def test_boot_trace_request_reaches_the_launcher(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
+    """``VIBESYS_BOOT_TRACE=1`` must reach the frontend, which traces itself."""
+    bundle = _make_bundle(tmp_path)
+    _force_interactive(monkeypatch)
+    monkeypatch.setenv("VIBESYS_BOOT_TRACE", "1")
+    monkeypatch.setattr(cli, "bundled_tui", lambda: bundle)
+
+    captured: dict[str, object] = {}
+
+    def _call(cmd, env=None):  # noqa: ANN001, ANN202, ARG001  # tracked: #288
+        captured["env"] = env
+        return 0
+
+    monkeypatch.setattr(cli.subprocess, "call", _call)
+
+    assert cli.main(["--input", "bundle", "--local"]) == 0
+    assert captured["env"]["VIBESYS_BOOT_TRACE"] == "1"  # pyright: ignore[reportIndexIssue]
 
 
 def test_interactive_with_non_executable_bundled_runtime_errors(  # noqa: ANN201
@@ -167,6 +190,7 @@ def test_source_checkout_root_finds_this_repo():  # noqa: ANN201  # tracked: #28
 
 def test_source_checkout_builds_and_runs_launcher_from_callers_directory(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     _force_interactive(monkeypatch)
+    monkeypatch.delenv("VIBESYS_BOOT_TRACE", raising=False)
     monkeypatch.setattr(cli, "bundled_tui", lambda: None)
     monkeypatch.setattr(cli, "source_checkout_root", lambda: tmp_path)
     monkeypatch.setattr(cli, "_bun_executable", lambda: Path("/usr/bin/bun"))
@@ -198,6 +222,7 @@ def test_source_checkout_builds_and_runs_launcher_from_callers_directory(monkeyp
     assert captured["env"]["VIBESYS_PYTHON"] == sys.executable  # pyright: ignore[reportIndexIssue]
     launch_start_ms = int(captured["env"]["VIBESYS_LAUNCH_START_MS"])  # pyright: ignore[reportIndexIssue]
     assert abs(launch_start_ms - int(time.time() * 1000)) < 5_000
+    assert "VIBESYS_BOOT_TRACE" not in captured["env"]  # pyright: ignore[reportOperatorIssue]
 
 
 def test_source_checkout_skips_build_when_fresh(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -627,7 +652,7 @@ def test_run_source_tui_prints_stale_and_rebuilt_messages(monkeypatch, tmp_path,
     monkeypatch.setattr(cli, "_ensure_source_tui_built", lambda _root: True)
     monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)  # noqa: ARG005
 
-    rc = cli._run_source_tui(tmp_path, [], launch_start_ms=0)  # noqa: SLF001
+    rc = cli._run_source_tui(tmp_path, [])  # noqa: SLF001
 
     assert rc == 0
     err = capsys.readouterr().err
@@ -649,7 +674,7 @@ def test_run_source_tui_skips_message_when_fresh(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "_stale_reason", _boom)
     monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)  # noqa: ARG005
 
-    rc = cli._run_source_tui(tmp_path, [], launch_start_ms=0)  # noqa: SLF001
+    rc = cli._run_source_tui(tmp_path, [])  # noqa: SLF001
 
     assert rc == 0
     assert capsys.readouterr().err == ""
