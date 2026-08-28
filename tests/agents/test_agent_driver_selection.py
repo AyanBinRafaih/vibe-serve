@@ -9,8 +9,9 @@ import pytest
 
 from vibesys.agents import build_agent_client
 from vibesys.agents.drivers.agentshim import AgentShimDriver
+from vibesys.agents.drivers.mock import MockDriver
 from vibesys.agents.drivers.omnigent import OmnigentDriver, OmnigentDriverError
-from vibesys.agents.factory import agent_driver_supports_mcp_servers
+from vibesys.agents.factory import agent_driver_supports_mcp_servers, supported_cli_providers
 from vibesys.agents.omnigent import supported_providers
 from vibesys.agents.omnigent.providers import OMNIGENT_PROVIDER_EXECUTORS
 from vibesys.config import Config
@@ -72,9 +73,32 @@ def test_omnigent_driver_can_be_selected() -> None:
     assert isinstance(client._driver, OmnigentDriver)  # noqa: SLF001
 
 
+def test_mock_driver_can_be_selected_as_test_infrastructure() -> None:
+    client = _build(_config(driver="mock", backend="cli"))
+
+    assert isinstance(client._driver, MockDriver)  # noqa: SLF001
+    # The mock drives no CLI, so the configured provider does not apply.
+    assert client.provider == "mock"
+    assert supported_cli_providers("mock") == ("mock",)
+
+
+def test_mock_driver_ignores_a_configured_cli_provider() -> None:
+    client = _build(_config(driver="mock", backend="cli", cli_provider="codex"))
+
+    assert isinstance(client._driver, MockDriver)  # noqa: SLF001
+    assert client.provider == "mock"
+
+
+def test_unknown_driver_names_the_selectable_drivers() -> None:
+    with pytest.raises(ValueError, match="mock") as exc:
+        supported_cli_providers("nonesuch")
+
+    assert "nonesuch" in str(exc.value)
+
+
 @pytest.mark.parametrize(
     ("driver", "supports_mcp"),
-    [(None, True), ("agentshim", True), ("omnigent", True)],
+    [(None, True), ("agentshim", True), ("omnigent", True), ("mock", True)],
 )
 def test_preflight_capabilities_match_constructed_driver(
     driver: str | None,

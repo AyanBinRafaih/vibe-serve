@@ -18,6 +18,14 @@ if TYPE_CHECKING:
 
 DEFAULT_AGENT_DRIVER = "agentshim"
 
+AGENT_DRIVERS: tuple[str, ...] = ("agentshim", "omnigent", "mock")
+"""Every driver this application configuration can select.
+
+``mock`` is test infrastructure: it satisfies the same driver contract while
+streaming a deterministic playbook, so integration tests exercise the real
+client, sink, supervisor, and transport path without an agent CLI.
+"""
+
 
 def resolve_agent_driver(config: Config) -> str:
     """Resolve the configured agent driver, defaulting to agentshim."""
@@ -44,6 +52,10 @@ def agent_driver_supports_mcp_servers(
         from vibesys.agents.drivers.omnigent import OMNIGENT_CAPABILITIES  # noqa: PLC0415
 
         return OMNIGENT_CAPABILITIES.mcp_servers
+    if driver_name == "mock":
+        from vibesys.agents.drivers.mock import MOCK_CAPABILITIES  # noqa: PLC0415
+
+        return MOCK_CAPABILITIES.mcp_servers
 
     from vibesys.agents.drivers.agentshim import AGENTSHIM_CAPABILITIES  # noqa: PLC0415
 
@@ -65,7 +77,13 @@ def supported_cli_providers(driver_name: str) -> tuple[str, ...]:
         from vibesys.agents.drivers.agentshim import supported_providers  # noqa: PLC0415
 
         return tuple(supported_providers())
-    raise ValueError(f"unknown agent driver {driver_name!r}; expected 'agentshim' or 'omnigent'")  # noqa: TRY003  # tracked: #288
+    if driver_name == "mock":
+        from vibesys.agents.drivers.mock import supported_providers  # noqa: PLC0415
+
+        return tuple(supported_providers())
+    raise ValueError(  # noqa: TRY003  # tracked: #288
+        f"unknown agent driver {driver_name!r}; expected one of: {', '.join(AGENT_DRIVERS)}"
+    )
 
 
 def build_agent_client(  # noqa: C901, PLR0912, PLR0913
@@ -131,7 +149,13 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
     timeout = agent_cfg.cli_timeout
     driver_log = AgentDiagnosticLog(run_log_file)
 
-    if driver_name == "omnigent":
+    if driver_name == "mock":
+        from vibesys.agents.drivers.mock import MockDriver  # noqa: PLC0415
+
+        # The mock runs no agent, so the provider name only labels the run.
+        provider = "mock"
+        driver = MockDriver()
+    elif driver_name == "omnigent":
         if use_docker:
             raise SystemExit(  # noqa: TRY003  # tracked: #288
                 "agent.driver='omnigent' is not supported with --docker"
