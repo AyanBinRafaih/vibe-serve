@@ -63,6 +63,42 @@ describe('session controller', () => {
     expect(transport.closed).toBe(true);
   });
 
+  it('issues every boot request concurrently', async () => {
+    const started: string[] = [];
+    const pending: Array<() => void> = [];
+    const transport: SupervisionTransport = {
+      request(input: RequestInput): Promise<ProtocolResponse> {
+        started.push(input.type ?? 'untyped');
+        return new Promise(resolve => {
+          pending.push(() =>
+            resolve({
+              protocol_version: 1,
+              request_id: 'request',
+              timestamp: '2026-01-01T00:00:00Z',
+              ok: true,
+            }),
+          );
+        });
+      },
+      subscribe(): Promise<EventSubscription> {
+        started.push('subscribe');
+        return new Promise(resolve => {
+          pending.push(() => resolve({close: () => Promise.resolve()}));
+        });
+      },
+      close: () => Promise.resolve(),
+    };
+    const controller = new SocketSessionController(transport);
+
+    const boot = controller.start();
+
+    // The event replay is the long pole; nothing waits behind it, and nothing
+    // waits behind the two independent queries either.
+    expect([...started].sort()).toEqual(['query.experiments', 'query.snapshot', 'subscribe']);
+    for (const resolve of pending) resolve();
+    await boot;
+  });
+
   it('applies a replay batch before reconciling its active execution checkpoint', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);

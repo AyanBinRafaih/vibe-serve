@@ -178,16 +178,36 @@ export class SocketSessionController implements SessionController {
     return this.#state;
   }
 
+  /**
+   * Boots the session: the snapshot, the experiment log, and the event
+   * subscription run concurrently.
+   *
+   * Nothing here orders them. Each applies its own result onto whatever state
+   * is current when it lands, and a snapshot older than the replayed event
+   * cursor is rejected by `reduceSnapshot`, so a late snapshot cannot undo
+   * events that already arrived. Sequencing them only made boot cost the sum
+   * of three round trips, the replay being by far the longest.
+   */
   async start(): Promise<void> {
+    await Promise.all([
+      this.#loadSnapshot(),
+      // The log is the landing view, so it is populated before the first frame
+      // rather than on demand.
+      this.#loadExperiments(),
+      this.#openEventStream(),
+    ]);
+  }
+
+  async #loadSnapshot(): Promise<void> {
     try {
       const response = await this.client.request({type: 'query.snapshot'});
       if (response.snapshot) this.#setState(applySnapshot(this.#state, response.snapshot));
     } catch (error) {
       this.#setState(reportCaughtError(this.#state, error, 'request'));
     }
-    // The log is the landing view, so it is populated before the first frame
-    // rather than on demand.
-    await this.#loadExperiments();
+  }
+
+  async #openEventStream(): Promise<void> {
     try {
       this.#eventSubscription = await this.client.subscribe(
         0,
