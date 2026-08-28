@@ -2,6 +2,8 @@ import type {Diagnostic, RunEvent, RunSnapshot} from '@vibesys/backend-client';
 import {
   type AgentPhase,
   applyRunMapEvent,
+  mergePhaseLists,
+  mergeRoundLists,
   type RoundSummary,
   roundNumberFromLabel,
 } from './run-map.js';
@@ -142,6 +144,14 @@ export interface CoreState {
   typedToolEvents: boolean;
   /** Per thread id: typed tool events seen, so legacy tool chunks are dropped. */
   chatTypedToolEvents: Record<string, boolean>;
+  /**
+   * Every event this state folded had `sequence > historyAfterSequence`.
+   *
+   * `0` means the state covers the whole history. A tail bootstrap starts it at
+   * the newest sequence the client skipped and lowers it to `0` as older chunks
+   * are folded in through `reduceEventPrefix`.
+   */
+  historyAfterSequence: number;
 }
 
 export function initialCoreState(): CoreState {
@@ -171,6 +181,7 @@ export function initialCoreState(): CoreState {
     experimentsRevision: 0,
     typedToolEvents: false,
     chatTypedToolEvents: {},
+    historyAfterSequence: 0,
   };
 }
 
@@ -180,9 +191,25 @@ export function chatTranscriptFor(state: CoreState, threadId: string): Transcrip
 }
 
 export function reduceSnapshot(state: CoreState, snapshot: RunSnapshot): CoreState {
-  if (snapshot.sequence < state.sequence) return state;
+  // The thread registry is a server projection of history already written, and
+  // under a tail bootstrap it names threads created before the replay window.
+  // Boot issues the snapshot query and the subscription concurrently, so the
+  // batch usually lands first and the liveness guard below would otherwise drop
+  // the registry entirely. Applying it to a stale snapshot is always safe.
+  const registered = (snapshot.chat_threads ?? []).reduce(
+    (current, thread) =>
+      upsertChatThread(current, {
+        id: thread.thread_id,
+        title: thread.title ?? '',
+        driver: thread.driver,
+        provider: thread.provider,
+        model: thread.model,
+      }),
+    state,
+  );
+  if (snapshot.sequence < registered.sequence) return registered;
   return {
-    ...state,
+    ...registered,
     status: snapshot.status,
     agentKind: snapshot.agent_kind ?? null,
     roundLabel: snapshot.round_label ?? null,
@@ -210,20 +237,178 @@ export function reconcileActiveExecutions(
  * batch touches is built in one working array and published once, instead of
  * being copied per event. Only the state this returns is observable, so the
  * intermediate states carry the batch's starting transcripts.
+ *
+ * `historyAfterSequence` records the floor the batch's stream declared. Omitting
+ * it leaves whatever floor the state already had.
  */
 export function reduceEventBatch(
   state: CoreState,
   events: readonly RunEvent[],
   activeExecutions?: ActiveExecutionCheckpoint,
   throughSequence?: number,
+  historyAfterSequence?: number,
 ): CoreState {
   const folder = new TranscriptFolder();
   let folded = state;
   for (const event of events) folded = foldEvent(folded, event, folder);
-  const reduced = folder.commit(folded);
+  const committed = folder.commit(folded);
+  const reduced =
+    historyAfterSequence === undefined ? committed : {...committed, historyAfterSequence};
   return activeExecutions === undefined
     ? reduced
     : reconcileActiveExecutions(reduced, activeExecutions, throughSequence);
+}
+
+/**
+ * Folds a chunk of events strictly older than everything `state` has folded,
+ * i.e. every `event.sequence <= state.historyAfterSequence`.
+ *
+ * The chunk folds into a fresh state rather than onto `state`: `foldEvent` drops
+ * events the cursor already covers, so folding backwards onto the live state
+ * would be a no-op, and a fresh fold keeps the work proportional to the chunk.
+ * The two states then merge with prefix semantics, the newer one winning
+ * wherever a field is last-write-wins. `historyAfterSequence` is the new floor.
+ */
+export function reduceEventPrefix(
+  state: CoreState,
+  events: readonly RunEvent[],
+  historyAfterSequence: number,
+): CoreState {
+  const older = reduceEventBatch(initialCoreState(), events);
+  const chatTranscripts = mergeChatTranscriptsPrefix(older.chatTranscripts, state.chatTranscripts);
+  return {
+    sequence: state.sequence,
+    // The newer events own run termination.
+    status: state.status,
+    terminal: state.terminal,
+    agentKind: state.agentKind ?? older.agentKind,
+    roundLabel: state.roundLabel ?? older.roundLabel,
+    outerLoop: state.outerLoop ?? older.outerLoop,
+    maxRounds: state.maxRounds ?? older.maxRounds,
+    rounds: mergeRoundLists(older.rounds, state.rounds),
+    phases: mergePhaseLists(older.phases, state.phases),
+    // Liveness comes from the backend checkpoint, never from replayed history.
+    activeExecutions: state.activeExecutions,
+    transcript: mergeTranscriptPrefix(older.transcript, state.transcript),
+    chatTranscripts,
+    chatTranscript: chatTranscripts[DEFAULT_CHAT_THREAD_ID] ?? [],
+    chatThreads: mergeChatThreadsPrefix(older.chatThreads, state.chatThreads),
+    todos: mergeTodosPrefix(older.todos, state.todos),
+    usage: state.usage ?? older.usage,
+    benchmarks: [...older.benchmarks, ...state.benchmarks],
+    diagnostics: state.diagnostics.reduce(upsertDiagnostic, older.diagnostics),
+    experimentsRevision: Math.max(older.experimentsRevision, state.experimentsRevision),
+    typedToolEvents: older.typedToolEvents || state.typedToolEvents,
+    chatTypedToolEvents: mergeTypedToolFlags(older.chatTypedToolEvents, state.chatTypedToolEvents),
+    historyAfterSequence,
+  };
+}
+
+/**
+ * Folds `newer` onto `older` so the result equals a full replay of the chunk's
+ * events followed by the newer events.
+ *
+ * A plain concatenation is wrong: the fold merges entries (streamed text
+ * concatenates, a tool result lands on its open call) and those merges straddle
+ * the chunk boundary. Re-running `foldTranscriptEntry` over `newer` is exact
+ * because `newer`'s entries are already maximally merged among themselves and
+ * the step is idempotent over an already merged entry, so re-folding reproduces
+ * what replay would have built.
+ *
+ * O(older + newer) with an O(1) step per entry. Re-folding only the entries near
+ * the boundary would be faster by a constant, but no bounded window is provably
+ * enough, so the whole of `newer` is re-folded.
+ *
+ * Known boundaries, neither worth machinery:
+ * - `capTranscript` evicts the oldest round once a transcript passes
+ *   MAX_TRANSCRIPT_ENTRIES, so a transcript that grew past the cap by replay and
+ *   one that grew past it by backfill are not required to agree.
+ * - Two typed `tool_result` events carrying the same `call_id`, which only a
+ *   malformed producer emits, diverge.
+ */
+function mergeTranscriptPrefix(
+  older: readonly TranscriptEntry[],
+  newer: readonly TranscriptEntry[],
+): TranscriptEntry[] {
+  const entries = [...older];
+  const index = new OpenToolCallIndex();
+  index.reindex(entries);
+  for (const entry of newer) foldTranscriptEntry(entries, entry, index);
+  return entries;
+}
+
+function mergeChatTranscriptsPrefix(
+  older: Record<string, TranscriptEntry[]>,
+  newer: Record<string, TranscriptEntry[]>,
+): Record<string, TranscriptEntry[]> {
+  const merged: Record<string, TranscriptEntry[]> = {};
+  for (const [threadId, entries] of Object.entries(older)) {
+    merged[threadId] = mergeTranscriptPrefix(entries, newer[threadId] ?? []);
+  }
+  for (const [threadId, entries] of Object.entries(newer)) {
+    if (merged[threadId] === undefined) merged[threadId] = [...entries];
+  }
+  return merged;
+}
+
+/**
+ * Keeps `older`'s replay order, then upserts `newer`'s threads on top.
+ *
+ * The implicit default thread heads both lists, so it stays first and is never
+ * duplicated. A newer record that only names a thread (a titled turn whose
+ * `chat_thread_created` fell in the chunk) must not erase the agent selection
+ * the chunk carried, hence `??` rather than a plain overwrite.
+ */
+function mergeChatThreadsPrefix(
+  older: readonly ChatThread[],
+  newer: readonly ChatThread[],
+): ChatThread[] {
+  const merged = [...older];
+  for (const thread of newer) {
+    const at = merged.findIndex(candidate => candidate.id === thread.id);
+    const existing = merged[at];
+    if (existing === undefined) {
+      merged.push(thread);
+      continue;
+    }
+    merged[at] = {
+      id: thread.id,
+      title: thread.title || existing.title,
+      driver: thread.driver ?? existing.driver,
+      provider: thread.provider ?? existing.provider,
+      model: thread.model ?? existing.model,
+    };
+  }
+  return merged;
+}
+
+function mergeTodosPrefix(
+  older: readonly ExecutionTodos[],
+  newer: readonly ExecutionTodos[],
+): ExecutionTodos[] {
+  const retained = older.filter(item => !newer.some(incoming => sameTodoTarget(item, incoming)));
+  return [...retained, ...newer].slice(-100);
+}
+
+/** The identity `updateTodos` replaces on: execution id, else role and round. */
+function sameTodoTarget(candidate: ExecutionTodos, incoming: ExecutionTodos): boolean {
+  if (incoming.executionId != null) return candidate.executionId === incoming.executionId;
+  return (
+    candidate.executionId == null &&
+    candidate.agentKind === incoming.agentKind &&
+    candidate.roundNumber === incoming.roundNumber
+  );
+}
+
+function mergeTypedToolFlags(
+  older: Record<string, boolean>,
+  newer: Record<string, boolean>,
+): Record<string, boolean> {
+  const merged = {...older};
+  for (const [threadId, seen] of Object.entries(newer)) {
+    merged[threadId] = merged[threadId] === true || seen;
+  }
+  return merged;
 }
 
 export function reduceEvent(state: CoreState, event: RunEvent): CoreState {
@@ -502,22 +687,25 @@ function appendChatTranscript(
 function applyDiagnosticEvent(state: CoreState, event: RunEvent): CoreState {
   const diagnostic = diagnosticFromEvent(event);
   if (diagnostic === null) return state;
-  const existingIndex = state.diagnostics.findIndex(existing =>
-    diagnostic.id !== null
-      ? existing.id === diagnostic.id
+  return {...state, diagnostics: upsertDiagnostic(state.diagnostics, diagnostic)};
+}
+
+/** Merges `incoming` into the diagnostic it identifies, else appends it. */
+function upsertDiagnostic(
+  diagnostics: readonly CoreDiagnostic[],
+  incoming: CoreDiagnostic,
+): CoreDiagnostic[] {
+  const existingIndex = diagnostics.findIndex(existing =>
+    incoming.id !== null
+      ? existing.id === incoming.id
       : existing.id === null &&
-        diagnostic.invocationId !== null &&
-        existing.invocationId === diagnostic.invocationId,
+        incoming.invocationId !== null &&
+        existing.invocationId === incoming.invocationId,
   );
-  if (existingIndex !== -1) {
-    return {
-      ...state,
-      diagnostics: state.diagnostics.map((existing, index) =>
-        index === existingIndex ? mergeDiagnostic(existing, diagnostic) : existing,
-      ),
-    };
-  }
-  return {...state, diagnostics: [...state.diagnostics, diagnostic]};
+  if (existingIndex === -1) return [...diagnostics, incoming];
+  return diagnostics.map((existing, index) =>
+    index === existingIndex ? mergeDiagnostic(existing, incoming) : existing,
+  );
 }
 
 function mergeDiagnostic(existing: CoreDiagnostic, incoming: CoreDiagnostic): CoreDiagnostic {
@@ -858,7 +1046,13 @@ function foldTranscriptEntry(
     last?.kind === 'tool' &&
     incoming.kind === 'tool' &&
     last.invocationId === incoming.invocationId &&
-    !incoming.startsTurn
+    !incoming.startsTurn &&
+    // Gluing onto the last tool entry is the legacy tool-chunk rule, where a
+    // response chunk has no way to name its call. A typed result names one, so
+    // if the search above found nothing the call is outside the replay window
+    // and the result stands alone. Without this, two results whose calls both
+    // predate the window would collapse into a single entry.
+    incoming.toolCallId === undefined
   ) {
     entries[entries.length - 1] = mergeToolResult(last, incoming);
     return;

@@ -1,6 +1,7 @@
 import {describe, expect, it} from 'bun:test';
 import type {RunEvent, RunSnapshot} from '@vibesys/backend-client';
 import {
+  DEFAULT_CHAT_THREAD_ID,
   initialCoreState,
   latestDiagnosticChange,
   reconcileActiveExecutions,
@@ -41,6 +42,109 @@ describe('core state projection', () => {
     } satisfies RunSnapshot;
 
     expect(reduceSnapshot(current, stale)).toBe(current);
+  });
+
+  it('registers the chat threads a snapshot projects', () => {
+    const state = reduceSnapshot(initialCoreState(), {
+      run_id: 'run',
+      status: 'running',
+      sequence: 1,
+      chat_threads: [
+        {
+          thread_id: 'thread-a',
+          title: 'Ring buffer sizing',
+          driver: 'agentshim',
+          provider: 'anthropic',
+          model: 'opus',
+        },
+      ],
+    } satisfies RunSnapshot);
+
+    expect(state.chatThreads).toEqual([
+      {id: DEFAULT_CHAT_THREAD_ID, title: '', driver: null, provider: null, model: null},
+      {
+        id: 'thread-a',
+        title: 'Ring buffer sizing',
+        driver: 'agentshim',
+        provider: 'anthropic',
+        model: 'opus',
+      },
+    ]);
+    expect(state.chatTranscripts['thread-a']).toEqual([]);
+  });
+
+  // Boot issues the snapshot query and the subscription concurrently, and under
+  // a tail bootstrap the replay batch usually lands first. The registry is a
+  // fact about history already written, so the liveness guard must not drop it.
+  it('registers projected chat threads even from a stale snapshot', () => {
+    const current = reduceEvent(initialCoreState(), outputEvent(5, 'current'));
+
+    const state = reduceSnapshot(current, {
+      run_id: 'run',
+      status: 'running',
+      sequence: 4,
+      chat_threads: [
+        {thread_id: 'thread-a', title: '', driver: 'agentshim', provider: 'codex', model: 'gpt-5'},
+      ],
+    } satisfies RunSnapshot);
+
+    expect(state.status).toBe(current.status);
+    expect(state.chatThreads.map(thread => thread.id)).toEqual([
+      DEFAULT_CHAT_THREAD_ID,
+      'thread-a',
+    ]);
+  });
+
+  it('leaves a stale snapshot that projects no chat threads identity-preserving', () => {
+    const current = reduceEvent(initialCoreState(), outputEvent(5, 'current'));
+    const stale = {run_id: 'run', status: 'running', sequence: 4} satisfies RunSnapshot;
+
+    expect(reduceSnapshot(current, stale)).toBe(current);
+  });
+
+  it('merges projected chat threads with replayed ones without duplicating', () => {
+    let current = reduceEvent(initialCoreState(), threadCreatedEvent(1, 'thread-a', 'anthropic'));
+    current = reduceEvent(current, chatTitledEvent(2, 'thread-a', 'Replayed title'));
+
+    const state = reduceSnapshot(current, {
+      run_id: 'run',
+      status: 'running',
+      sequence: 3,
+      chat_threads: [
+        {
+          thread_id: 'thread-a',
+          title: '',
+          driver: 'agentshim',
+          provider: 'anthropic',
+          model: 'opus',
+        },
+        {
+          thread_id: 'thread-b',
+          title: 'Projected',
+          driver: 'agentshim',
+          provider: 'codex',
+          model: 'gpt-5',
+        },
+      ],
+    } satisfies RunSnapshot);
+
+    expect(state.chatThreads).toEqual([
+      {id: DEFAULT_CHAT_THREAD_ID, title: '', driver: null, provider: null, model: null},
+      {
+        id: 'thread-a',
+        title: 'Replayed title',
+        driver: 'agentshim',
+        provider: 'anthropic',
+        model: 'opus',
+      },
+      {
+        id: 'thread-b',
+        title: 'Projected',
+        driver: 'agentshim',
+        provider: 'codex',
+        model: 'gpt-5',
+      },
+    ]);
   });
 
   it('ignores duplicate replay events', () => {
@@ -657,6 +761,16 @@ function threadCreatedEvent(sequence: number, threadId: string, provider: string
       model: 'opus',
       created_at: `2026-01-01T00:00:0${sequence}Z`,
     },
+  };
+}
+
+function chatTitledEvent(sequence: number, threadId: string, title: string): RunEvent {
+  return {
+    ...baseEvent(sequence, 'chat'),
+    agent_kind: 'chat',
+    round_label: 'experiment-chat',
+    chat_thread_id: threadId,
+    data: {kind: 'chat', answer: 'answer', thread_title: title},
   };
 }
 
