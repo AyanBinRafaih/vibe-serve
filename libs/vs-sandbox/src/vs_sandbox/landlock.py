@@ -88,6 +88,13 @@ _PR_SET_NO_NEW_PRIVS = 38
 _LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
 _LANDLOCK_RULE_PATH_BENEATH = 1
 
+# ``O_PATH`` is Linux-only, so it is absent from ``os`` when a type checker runs
+# on another host. Take the kernel's value rather than hardcoding one (it is
+# arch-dependent), and fall back to a value that is never used: every caller
+# sits below :func:`restrict`, which is unreachable off Linux because
+# :func:`abi_version` returns ``None`` there.
+_O_PATH = os.O_PATH if sys.platform == "linux" else 0
+
 
 class LandlockUnavailableError(RuntimeError):
     """Raised when Landlock cannot confine this process on this host."""
@@ -358,7 +365,7 @@ def _add_path_rule(
 ) -> None:
     """Add one ``PATH_BENEATH`` rule, skipping paths absent from this host."""
     try:
-        parent_fd = os.open(rule.path, os.O_PATH | os.O_CLOEXEC)
+        parent_fd = os.open(rule.path, _O_PATH | os.O_CLOEXEC)
     except OSError:
         return
     try:

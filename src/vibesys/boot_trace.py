@@ -44,7 +44,7 @@ import functools
 import os
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import ParamSpec, TypeVar
 
@@ -119,7 +119,7 @@ _TRACE = _BootTrace()
 
 
 @contextmanager
-def span(name: str) -> Iterator[None]:
+def span(name: str) -> Generator[None]:
     """Time this block and record ``boot span <qualified name>: <ms>ms``.
 
     Spans nest: *name* is qualified by whatever spans are still open, so an
