@@ -60,7 +60,7 @@ class _RecordingHooks:
 
 
 @pytest.fixture(autouse=True)
-def _context_dependencies(monkeypatch):  # pyright: ignore[reportUnusedFunction]  # noqa: ANN001, ANN202
+def context_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("vibesys.context.backends.get", lambda *_args, **_kwargs: _FakeBackend())
     monkeypatch.setattr("vibesys.context.build_agent_client", lambda *_args, **_kwargs: MagicMock())
     monkeypatch.setattr(

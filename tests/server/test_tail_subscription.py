@@ -12,13 +12,14 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, Unpack
 
 import pytest
 
 from vibesys.server.events import (
     ChatData,
     ChatThreadCreatedData,
+    EventData,
     EventStore,
     EventType,
     OutputData,
@@ -35,7 +36,16 @@ _TIMESTAMP = datetime(2026, 1, 1, tzinfo=UTC)
 _ROUND_EVERY = 25
 
 
-def _event(sequence: int, event_type: EventType, **fields: Any) -> RunEvent:  # noqa: ANN401  # tracked: #288
+class _EventFields(TypedDict, total=False):
+    """The RunEvent fields these tests vary; the helper fills the rest."""
+
+    data: EventData
+    chat_thread_id: str
+    round_label: str
+    text: str
+
+
+def _event(sequence: int, event_type: EventType, **fields: Unpack[_EventFields]) -> RunEvent:
     return RunEvent(
         sequence=sequence, run_id="persisted-run", timestamp=_TIMESTAMP, type=event_type, **fields
     )
