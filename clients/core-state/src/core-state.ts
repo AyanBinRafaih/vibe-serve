@@ -203,26 +203,40 @@ export function reconcileActiveExecutions(
   return {...state, activeExecutions: activeExecutionsFromCheckpoint(executions)};
 }
 
-/** Fold an ordered batch before applying its backend liveness checkpoint. */
+/**
+ * Fold an ordered batch before applying its backend liveness checkpoint.
+ *
+ * Equivalent to folding the batch one event at a time, but every transcript the
+ * batch touches is built in one working array and published once, instead of
+ * being copied per event. Only the state this returns is observable, so the
+ * intermediate states carry the batch's starting transcripts.
+ */
 export function reduceEventBatch(
   state: CoreState,
   events: readonly RunEvent[],
   activeExecutions?: ActiveExecutionCheckpoint,
   throughSequence?: number,
 ): CoreState {
-  const reduced = events.reduce(reduceEvent, state);
+  const folder = new TranscriptFolder();
+  let folded = state;
+  for (const event of events) folded = foldEvent(folded, event, folder);
+  const reduced = folder.commit(folded);
   return activeExecutions === undefined
     ? reduced
     : reconcileActiveExecutions(reduced, activeExecutions, throughSequence);
 }
 
 export function reduceEvent(state: CoreState, event: RunEvent): CoreState {
+  return foldEvent(state, event, null);
+}
+
+function foldEvent(state: CoreState, event: RunEvent, folder: TranscriptFolder | null): CoreState {
   const sequence = event.sequence ?? 0;
   if (sequence > 0 && sequence <= state.sequence) return state;
   let next: CoreState = {...state, sequence: Math.max(state.sequence, sequence)};
   next = applyDiagnosticEvent(next, event);
   next = applyAgentExecutionEvent(next, event);
-  if (event.agent_kind === 'chat') return applyChatEvent(next, event);
+  if (event.agent_kind === 'chat') return applyChatEvent(next, event, folder);
   if (event.agent_kind) next.agentKind = event.agent_kind;
   if (event.round_label) next.roundLabel = event.round_label;
   const runMap = applyRunMapEvent(next, event);
@@ -258,7 +272,10 @@ export function reduceEvent(state: CoreState, event: RunEvent): CoreState {
     data?.kind === 'agent_output_chunk' && data.channel === 'tool' && next.typedToolEvents;
   if (!legacyToolChunk) {
     const entry = eventToTranscriptEntry(event);
-    if (entry !== null) next.transcript = appendTranscript(next.transcript, entry);
+    if (entry !== null) {
+      if (folder === null) next.transcript = appendTranscript(next.transcript, entry);
+      else folder.buffer(RUN_TRANSCRIPT, next.transcript).append(entry);
+    }
   }
 
   if (event.type === 'run_started') {
@@ -393,7 +410,11 @@ function updateTodos(previous: ExecutionTodos[], event: RunEvent): ExecutionTodo
   ].slice(-100);
 }
 
-function applyChatEvent(state: CoreState, event: RunEvent): CoreState {
+function applyChatEvent(
+  state: CoreState,
+  event: RunEvent,
+  folder: TranscriptFolder | null,
+): CoreState {
   const data = event.data;
   const threadId = event.chat_thread_id ?? DEFAULT_CHAT_THREAD_ID;
   if (data?.kind === 'chat_thread_created') {
@@ -420,7 +441,7 @@ function applyChatEvent(state: CoreState, event: RunEvent): CoreState {
   }
   const entry = eventToTranscriptEntry(event);
   if (entry === null || (entry.kind !== 'assistant' && entry.kind !== 'result')) return next;
-  return appendChatTranscript(next, threadId, entry);
+  return appendChatTranscript(next, threadId, entry, folder);
 }
 
 /** Registers a replayed thread, or refreshes the record it already has. */
@@ -463,7 +484,12 @@ function appendChatTranscript(
   state: CoreState,
   threadId: string,
   entry: TranscriptEntry,
+  folder: TranscriptFolder | null,
 ): CoreState {
+  if (folder !== null) {
+    folder.buffer(threadId, state.chatTranscripts[threadId] ?? []).append(entry);
+    return state;
+  }
   const transcript = appendTranscript(state.chatTranscripts[threadId] ?? [], entry);
   const chatTranscripts = {...state.chatTranscripts, [threadId]: transcript};
   return {
@@ -790,26 +816,52 @@ function labelFor(event: RunEvent, fallback: string): string {
   return event.round_label ? `${phase} · ${event.round_label}` : phase;
 }
 
+/**
+ * Appends one entry to a copy of `previous`, leaving `previous` untouched.
+ *
+ * Used by the single-event path, where the caller owns an immutable array. A
+ * batch folds through `TranscriptBuffer` instead, which applies the same step
+ * to one working array.
+ */
 function appendTranscript(
-  previous: TranscriptEntry[],
+  previous: readonly TranscriptEntry[],
   incoming: TranscriptEntry,
 ): TranscriptEntry[] {
+  const next = [...previous];
+  foldTranscriptEntry(next, incoming, null);
+  return next;
+}
+
+/**
+ * The transcript fold step, applied in place to `entries`.
+ *
+ * `index` accelerates the open-tool-call lookup; passing null falls back to
+ * scanning, which is what the single-event path does. Both must agree, so the
+ * index reproduces `findToolCall`'s search order exactly.
+ */
+function foldTranscriptEntry(
+  entries: TranscriptEntry[],
+  incoming: TranscriptEntry,
+  index: OpenToolCallIndex | null,
+): void {
   if (incoming.kind === 'tool' && !incoming.startsTurn && incoming.toolName !== undefined) {
-    const target = findToolCall(previous, incoming);
-    if (target !== -1) {
-      return previous.map((entry, index) =>
-        index === target ? mergeToolResult(entry, incoming) : entry,
-      );
+    const target =
+      index === null ? findToolCall(entries, incoming) : index.match(entries, incoming);
+    const call = entries[target];
+    if (call !== undefined) {
+      entries[target] = mergeToolResult(call, incoming);
+      return;
     }
   }
-  const last = previous.at(-1);
+  const last = entries.at(-1);
   if (
     last?.kind === 'tool' &&
     incoming.kind === 'tool' &&
     last.invocationId === incoming.invocationId &&
     !incoming.startsTurn
   ) {
-    return [...previous.slice(0, -1), mergeToolResult(last, incoming)];
+    entries[entries.length - 1] = mergeToolResult(last, incoming);
+    return;
   }
   if (
     last !== undefined &&
@@ -817,24 +869,47 @@ function appendTranscript(
     last.turnId === incoming.turnId &&
     (incoming.kind === 'assistant' || incoming.kind === 'prompt' || incoming.kind === 'analysis')
   ) {
-    return [...previous.slice(0, -1), {...last, content: last.content + incoming.content}];
+    entries[entries.length - 1] = {...last, content: last.content + incoming.content};
+    return;
   }
-  return capTranscript([...previous, incoming]);
+  entries.push(incoming);
+  index?.record(incoming, entries.length - 1);
+  capTranscript(entries, index);
 }
 
 const MAX_TRANSCRIPT_ENTRIES = 20_000;
 
-function capTranscript(entries: TranscriptEntry[]): TranscriptEntry[] {
-  if (entries.length <= MAX_TRANSCRIPT_ENTRIES) return entries;
+/** Evicts the oldest round in place once the transcript passes its cap. */
+function capTranscript(entries: TranscriptEntry[], index: OpenToolCallIndex | null): void {
+  if (entries.length <= MAX_TRANSCRIPT_ENTRIES) return;
   const oldestRound = entries.find(entry => entry.roundNumber !== undefined)?.roundNumber;
-  if (oldestRound === undefined) return entries.slice(-MAX_TRANSCRIPT_ENTRIES);
-  const kept = entries.filter(
-    entry => entry.roundNumber === undefined || entry.roundNumber > oldestRound,
-  );
-  return kept.length === entries.length ? entries.slice(-MAX_TRANSCRIPT_ENTRIES) : kept;
+  const kept =
+    oldestRound === undefined
+      ? entries.length
+      : retainInPlace(
+          entries,
+          entry => entry.roundNumber === undefined || entry.roundNumber > oldestRound,
+        );
+  if (kept === entries.length) entries.splice(0, entries.length - MAX_TRANSCRIPT_ENTRIES);
+  else entries.length = kept;
+  index?.reindex(entries);
 }
 
-function findToolCall(previous: TranscriptEntry[], result: TranscriptEntry): number {
+/** Compacts the kept entries to the front and returns how many survived. */
+function retainInPlace(
+  entries: TranscriptEntry[],
+  keep: (entry: TranscriptEntry) => boolean,
+): number {
+  let write = 0;
+  for (const entry of entries) {
+    if (!keep(entry)) continue;
+    entries[write] = entry;
+    write += 1;
+  }
+  return write;
+}
+
+function findToolCall(previous: readonly TranscriptEntry[], result: TranscriptEntry): number {
   const indices = Array.from(previous.keys());
   if (result.toolCallId !== undefined) indices.reverse();
   for (const index of indices) {
@@ -853,6 +928,154 @@ function findToolCall(previous: TranscriptEntry[], result: TranscriptEntry): num
     } else if (candidate.toolName === result.toolName) return index;
   }
   return -1;
+}
+
+/** A tool call still waiting for its result: what `findToolCall` accepts. */
+function isOpenToolCall(entry: TranscriptEntry): boolean {
+  return (
+    entry.kind === 'tool' &&
+    (entry.toolCall !== undefined || entry.toolArguments !== undefined) &&
+    entry.toolResponse === undefined &&
+    entry.toolResult === undefined
+  );
+}
+
+// NUL appears in no invocation id, tool name, call id, or thread id, so it
+// separates the halves of a key without any real value colliding.
+const TOOL_KEY_SEPARATOR = '\u0000';
+
+function toolKey(invocationId: string | undefined, discriminator: string): string {
+  return `${invocationId ?? ''}${TOOL_KEY_SEPARATOR}${discriminator}`;
+}
+
+/**
+ * Locates the tool call a result merges into without scanning the transcript.
+ *
+ * `findToolCall` scans by call id from the end (latest open call wins) and by
+ * tool name from the start (earliest open call wins), so this keeps one bucket
+ * per key holding candidate positions in ascending order and reads the matching
+ * end. Positions of calls that have since been answered are dropped lazily: a
+ * call never reopens, so a stale position can only ever be discarded.
+ */
+class OpenToolCallIndex {
+  readonly #byCallId = new Map<string, number[]>();
+  readonly #byName = new Map<string, number[]>();
+
+  /** Records `entry` at position `at` if it is a call awaiting a result. */
+  record(entry: TranscriptEntry, at: number): void {
+    if (!isOpenToolCall(entry)) return;
+    if (entry.toolCallId !== undefined) {
+      bucket(this.#byCallId, toolKey(entry.invocationId, entry.toolCallId)).push(at);
+    }
+    if (entry.toolName !== undefined) {
+      bucket(this.#byName, toolKey(entry.invocationId, entry.toolName)).push(at);
+    }
+  }
+
+  /** Rebuilds every bucket after positions shift, i.e. after cap eviction. */
+  reindex(entries: readonly TranscriptEntry[]): void {
+    this.#byCallId.clear();
+    this.#byName.clear();
+    for (let at = 0; at < entries.length; at += 1) {
+      const entry = entries[at];
+      if (entry !== undefined) this.record(entry, at);
+    }
+  }
+
+  /** The position `findToolCall` would return for `result`, or -1. */
+  match(entries: readonly TranscriptEntry[], result: TranscriptEntry): number {
+    if (result.toolCallId !== undefined) {
+      const key = toolKey(result.invocationId, result.toolCallId);
+      return this.#take(this.#byCallId, key, entries, 'last');
+    }
+    if (result.toolName === undefined) return -1;
+    return this.#take(
+      this.#byName,
+      toolKey(result.invocationId, result.toolName),
+      entries,
+      'first',
+    );
+  }
+
+  #take(
+    buckets: Map<string, number[]>,
+    key: string,
+    entries: readonly TranscriptEntry[],
+    end: 'first' | 'last',
+  ): number {
+    const positions = buckets.get(key);
+    if (positions === undefined) return -1;
+    while (positions.length > 0) {
+      const at = (end === 'last' ? positions.at(-1) : positions[0]) as number;
+      const candidate = entries[at];
+      if (candidate !== undefined && isOpenToolCall(candidate)) return at;
+      if (end === 'last') positions.pop();
+      else positions.shift();
+    }
+    buckets.delete(key);
+    return -1;
+  }
+}
+
+function bucket(buckets: Map<string, number[]>, key: string): number[] {
+  const existing = buckets.get(key);
+  if (existing !== undefined) return existing;
+  const created: number[] = [];
+  buckets.set(key, created);
+  return created;
+}
+
+/**
+ * One transcript folded in place across a batch.
+ *
+ * The array is mutable only while the batch is folding; `entries` is handed to
+ * the committed `CoreState` once, after which nothing writes to it again.
+ */
+class TranscriptBuffer {
+  readonly entries: TranscriptEntry[];
+  readonly #index = new OpenToolCallIndex();
+
+  constructor(initial: readonly TranscriptEntry[]) {
+    this.entries = [...initial];
+    this.#index.reindex(this.entries);
+  }
+
+  append(incoming: TranscriptEntry): void {
+    foldTranscriptEntry(this.entries, incoming, this.#index);
+  }
+}
+
+/** Key for the run transcript, kept out of the chat thread id space. */
+const RUN_TRANSCRIPT = `${TOOL_KEY_SEPARATOR}run`;
+
+/** The transcripts one `reduceEventBatch` call touched, folded once each. */
+class TranscriptFolder {
+  readonly #buffers = new Map<string, TranscriptBuffer>();
+
+  buffer(key: string, initial: readonly TranscriptEntry[]): TranscriptBuffer {
+    const existing = this.#buffers.get(key);
+    if (existing !== undefined) return existing;
+    const created = new TranscriptBuffer(initial);
+    this.#buffers.set(key, created);
+    return created;
+  }
+
+  /** Publishes every folded transcript onto the batch's final state. */
+  commit(state: CoreState): CoreState {
+    if (this.#buffers.size === 0) return state;
+    const run = this.#buffers.get(RUN_TRANSCRIPT);
+    let next = run === undefined ? state : {...state, transcript: run.entries};
+    const threads = [...this.#buffers].filter(([key]) => key !== RUN_TRANSCRIPT);
+    if (threads.length === 0) return next;
+    const chatTranscripts = {...next.chatTranscripts};
+    for (const [threadId, buffer] of threads) chatTranscripts[threadId] = buffer.entries;
+    next = {
+      ...next,
+      chatTranscripts,
+      chatTranscript: chatTranscripts[DEFAULT_CHAT_THREAD_ID] ?? next.chatTranscript,
+    };
+    return next;
+  }
 }
 
 function mergeToolResult(call: TranscriptEntry, result: TranscriptEntry): TranscriptEntry {

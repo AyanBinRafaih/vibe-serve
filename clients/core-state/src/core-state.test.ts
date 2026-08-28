@@ -515,6 +515,113 @@ describe('core state projection', () => {
   });
 });
 
+// A batch folds its transcripts in one working array instead of copying them
+// per event. That is only sound while it stays indistinguishable from folding
+// the same events one at a time, which is what these pin.
+describe('batched transcript folding', () => {
+  it('folds a batch exactly like folding its events one at a time', () => {
+    const events = mixedTranscriptEvents();
+
+    expect(reduceEventBatch(initialCoreState(), events)).toEqual(
+      events.reduce(reduceEvent, initialCoreState()),
+    );
+  });
+
+  it('correlates interleaved tool results by call id within one batch', () => {
+    const events = [
+      toolEvent(1, 'tool_call', 'call-a', 'first'),
+      toolEvent(2, 'tool_call', 'call-b', 'second'),
+      toolEvent(3, 'tool_result', 'call-b', 'second result'),
+      toolEvent(4, 'tool_result', 'call-a', 'first result'),
+    ];
+
+    const state = reduceEventBatch(initialCoreState(), events);
+
+    expect(state.transcript).toHaveLength(2);
+    expect(state.transcript[0]?.toolResult?.content).toBe('first result');
+    expect(state.transcript[1]?.toolResult?.content).toBe('second result');
+  });
+
+  it('merges a result without a call id into the oldest open call of that tool', () => {
+    const events = [
+      toolEvent(1, 'tool_call', 'call-a', 'first'),
+      toolEvent(2, 'tool_call', 'call-b', 'second'),
+      {
+        ...baseEvent(3, 'tool_result'),
+        invocation_id: 'turn',
+        data: {kind: 'tool_result', tool: 'Bash', content: 'anonymous result', is_error: false},
+      } satisfies RunEvent,
+    ];
+
+    const state = reduceEventBatch(initialCoreState(), events);
+
+    expect(state.transcript).toHaveLength(2);
+    expect(state.transcript[0]?.content).toContain('anonymous result');
+    expect(state.transcript[1]?.toolResult).toBeUndefined();
+    expect(state).toEqual(events.reduce(reduceEvent, initialCoreState()));
+  });
+
+  it('evicts the oldest round whole when a batch passes the transcript cap', () => {
+    const events = [
+      ...Array.from({length: 10_000}, (_, index) => roundOutputEvent(index + 1, 1)),
+      roundToolEvent(10_001, 'tool_call', 'call-late', 'survivor'),
+      ...Array.from({length: 10_000}, (_, index) => roundOutputEvent(10_002 + index, 2)),
+      roundToolEvent(20_002, 'tool_result', 'call-late', 'late result'),
+    ];
+
+    const state = reduceEventBatch(initialCoreState(), events);
+
+    // Round 1 goes as a block; the surviving round-2 tool call still merges its
+    // result, so the open-call index survived the eviction.
+    expect(state.transcript).toHaveLength(10_001);
+    expect(state.transcript.every(entry => entry.roundNumber === 2)).toBe(true);
+    expect(state.transcript[0]?.toolResult?.content).toBe('late result');
+  });
+});
+
+/** One stream touching every transcript merge rule, plus both chat threads. */
+function mixedTranscriptEvents(): RunEvent[] {
+  return [
+    outputEvent(1, 'hello '),
+    outputEvent(2, 'world'),
+    outputEvent(3, 'separate', 'turn-2'),
+    toolEvent(4, 'tool_call', 'call-a', 'first'),
+    toolEvent(5, 'tool_call', 'call-b', 'second'),
+    toolEvent(6, 'tool_result', 'call-b', 'second result'),
+    outputEvent(7, 'between', 'turn-3'),
+    toolEvent(8, 'tool_result', 'call-a', 'first result'),
+    chatAnswerEvent(9, 'default answer'),
+    threadCreatedEvent(10, 'thread-x', 'anthropic'),
+    chatAnswerEvent(11, 'thread answer', 'thread-x'),
+    chatAnswerEvent(12, 'default again'),
+    todoEvent(13, 'exec-1', 'Write the fold'),
+    roundOutputEvent(14, 2),
+    roundToolEvent(15, 'tool_call', 'call-c', 'third'),
+    roundToolEvent(16, 'tool_result', 'call-c', 'third result'),
+  ];
+}
+
+function roundOutputEvent(sequence: number, round: number): RunEvent {
+  return {
+    ...baseEvent(sequence, 'agent_output_chunk'),
+    round_label: `round-${round}-implementer`,
+    invocation_id: `turn-${sequence}`,
+    data: {kind: 'agent_output_chunk', channel: 'assistant', content: `entry ${sequence}`},
+  };
+}
+
+function roundToolEvent(
+  sequence: number,
+  kind: 'tool_call' | 'tool_result',
+  callId: string,
+  content: string,
+): RunEvent {
+  return {
+    ...toolEvent(sequence, kind, callId, content),
+    round_label: 'round-2-implementer',
+  };
+}
+
 function baseEvent(sequence: number, type: RunEvent['type']): RunEvent {
   return {
     sequence,
