@@ -258,6 +258,7 @@ def test_chat_thread_create_defaults_its_driver_to_the_runs(tmp_path):  # noqa: 
     # The client sends provider and model only; the driver stays the run's.
     created = service.execute(ChatThreadCreateQuery(provider="claude", model="opus"))
 
+    assert created.chat_thread is not None
     assert calls == [(created.chat_thread.thread_id, None, "claude", "opus")]
     assert created.chat_thread.driver == "agentshim"
 
