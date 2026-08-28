@@ -66,12 +66,14 @@ export type RequestId10 = string;
 export type Timestamp10 = string;
 export type Type10 = "query.events";
 export type AfterSequence = number;
+export type BeforeSequence = number | null;
 export type TimeoutMs = number;
 export type ProtocolVersion11 = 1;
 export type RequestId11 = string;
 export type Timestamp11 = string;
 export type Type11 = "subscribe";
 export type AfterSequence1 = number;
+export type Tail = number | null;
 export type ProtocolVersion12 = 1;
 export type RequestId12 = string;
 export type Timestamp12 = string;
@@ -134,6 +136,7 @@ export type Driver2 = string | null;
 export type Provider3 = string | null;
 export type Model3 = string | null;
 export type ActiveExecutions = ActiveAgentExecution[];
+export type ChatThreads = ChatThreadInfo[];
 export type ProtocolVersion14 = 1;
 export type Sequence1 = number;
 export type RunId1 = string;
@@ -351,6 +354,7 @@ export type Type14 = "event_batch";
 export type Events1 = RunEvent[];
 export type ThroughSequence = number;
 export type ActiveExecutions1 = ActiveAgentExecution[];
+export type HistoryAfterSequence = number;
 export type Type15 = "protocol_error";
 export type RequestId14 = string | null;
 export type Code2 = string;
@@ -453,6 +457,7 @@ export interface EventsQuery {
   timestamp?: Timestamp10;
   type?: Type10;
   after_sequence?: AfterSequence;
+  before_sequence?: BeforeSequence;
   timeout_ms?: TimeoutMs;
 }
 export interface SubscribeRequest {
@@ -461,6 +466,7 @@ export interface SubscribeRequest {
   timestamp?: Timestamp11;
   type?: Type11;
   after_sequence?: AfterSequence1;
+  tail?: Tail;
 }
 export interface Response {
   protocol_version?: ProtocolVersion12;
@@ -481,6 +487,9 @@ export interface Response {
 }
 /**
  * Structured, provider-neutral description of an operator diagnostic.
+ *
+ * Frozen for the same reason as ``RunEvent``: diagnostics ride along on
+ * replayed events, which readers share rather than copy.
  */
 export interface Diagnostic {
   id?: Id;
@@ -550,6 +559,7 @@ export interface RunSnapshot {
   agent_kind?: AgentKind;
   round_label?: RoundLabel;
   active_executions?: ActiveExecutions;
+  chat_threads?: ChatThreads;
 }
 /**
  * Authoritative activity checkpoint for one running agent execution.
@@ -579,6 +589,10 @@ export interface AgentExecutionActivityData {
 }
 /**
  * One reproducible human, control, or invocation event.
+ *
+ * Frozen: a recorded event is a durable fact. Readers that need a variant
+ * build one with ``model_copy(update=...)`` rather than mutating a shared
+ * object, which lets ``EventStore`` replay history without copying it.
  */
 export interface RunEvent {
   protocol_version?: ProtocolVersion14;
@@ -874,6 +888,7 @@ export interface EventBatchMessage {
   events: Events1;
   through_sequence?: ThroughSequence;
   active_executions?: ActiveExecutions1;
+  history_after_sequence?: HistoryAfterSequence;
 }
 export interface ProtocolErrorMessage {
   type?: Type15;

@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import json
 import threading
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError, model_validator
 
 from vibesys.server.diagnostics import Diagnostic
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from typing import BinaryIO
 
 
 class EventType(StrEnum):  # noqa: D101  # tracked: #288
@@ -380,6 +385,50 @@ class RunEvent(BaseModel):
         return result
 
 
+_EAGER_TAIL_RECORDS = 1024
+"""How many trailing records ``EventStore`` validates at construction.
+
+The final record decides malformed-tail truncation, so it must be parsed
+eagerly. Widening that to a window also keeps the common attach-then-read-the
+-tail path free of any lazy parse, at a bounded cost on an empty run.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class EventHeader:
+    """Scalar identity of one stored record, recovered without full validation.
+
+    ``sequence`` is the repaired cursor value ``read`` will report, not
+    necessarily the integer on disk. ``execution_id`` already folds in the
+    legacy ``invocation_id`` field the same way :class:`RunEvent` does.
+    """
+
+    sequence: int
+    type: EventType
+    execution_id: str | None
+    chat_thread_id: str | None
+
+
+_UNLOCATED = -1
+"""Offset of a record that is only in memory, never read back from disk."""
+
+
+@dataclass(slots=True)
+class _StoredRecord:
+    """One record's location on disk plus its parse, once something forces it.
+
+    ``offset`` is ``_UNLOCATED`` for a record this process appended, and for
+    every record on the eager fallback path: those already carry ``event``, so
+    nothing ever asks the file for them again.
+    """
+
+    header: EventHeader
+    offset: int
+    length: int
+    raw_sequence: int
+    event: RunEvent | None = None
+
+
 class EventStore:
     """Serialize event access so readers never observe partial JSONL writes.
 
@@ -388,6 +437,14 @@ class EventStore:
     history with ``model_copy(update=...)`` instead of mutating what they read.
     Copying every event per read cost ~1.9s on a 72k-event history, paid again
     on each new subscription's full replay.
+
+    Construction only scans the log with ``json.loads`` (measured ~2.6x cheaper
+    than full validation) to learn each record's byte range and header fields,
+    then validates the tail. Older records are validated when a read reaches
+    them and cached from then on. Any doubt during the scan discards the index
+    and falls back to validating the whole file, so a corrupt history still
+    raises from ``__init__``: the worst case is a slow attach, never wrong
+    state.
     """
 
     def __init__(self, path: Path, run_id: str):  # noqa: ANN204, D107  # tracked: #288
@@ -395,9 +452,14 @@ class EventStore:
         self.run_id = run_id
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
-        self._events, self._malformed_tail_offset = self._read_unlocked()
-        self._events = _repair_legacy_sequences(self._events)
-        self._sequences = [event.sequence for event in self._events]
+        self._parsed_records = 0
+        scanned = self._scan_unlocked()
+        if scanned is None:
+            events, self._malformed_tail_offset = self._read_unlocked()
+            self._records = _records_from_events(_repair_legacy_sequences(events))
+        else:
+            self._records, self._malformed_tail_offset = scanned
+        self._sequences = [record.header.sequence for record in self._records]
         self._next_sequence = self._sequences[-1] + 1 if self._sequences else 1
 
     def append(self, event: RunEvent) -> RunEvent:  # noqa: D102  # tracked: #288
@@ -412,7 +474,15 @@ class EventStore:
             with self.path.open("a", encoding="utf-8") as stream:
                 stream.write(event.model_dump_json() + "\n")
             self._next_sequence += 1
-            self._events.append(event)
+            self._records.append(
+                _StoredRecord(
+                    header=_header_from_event(event, event.sequence),
+                    offset=_UNLOCATED,
+                    length=0,
+                    raw_sequence=event.sequence,
+                    event=event,
+                )
+            )
             self._sequences.append(event.sequence)
             self._changed.notify_all()
             return event
@@ -422,9 +492,47 @@ class EventStore:
         with self._lock:
             return self._next_sequence - 1
 
-    def read(self, after_sequence: int = 0) -> list[RunEvent]:  # noqa: D102  # tracked: #288
+    @property
+    def parsed_record_count(self) -> int:
+        """How many stored records have been validated into models so far.
+
+        Accounting for callers that must assert an attach stayed lazy without
+        resorting to timing.
+        """
         with self._lock:
-            return self._events_after_unlocked(after_sequence)
+            return self._parsed_records
+
+    def event_headers(self) -> list[EventHeader]:
+        """Return every stored record's header, in replay order, unparsed.
+
+        This is the whole log's shape at scan cost. Consumers that only need
+        event types and identities (a lifecycle index) read it instead of
+        forcing the history into models.
+        """
+        with self._lock:
+            return [record.header for record in self._records]
+
+    def read(  # noqa: D102  # tracked: #288
+        self, after_sequence: int = 0, before_sequence: int | None = None
+    ) -> list[RunEvent]:
+        with self._lock:
+            return self._events_after_unlocked(after_sequence, before_sequence)
+
+    def read_sequences(self, sequences: Iterable[int]) -> list[RunEvent]:
+        """Return the records at the given cursor values, in the order asked.
+
+        Unknown sequences are skipped. Only the named records are validated,
+        which is what lets a consumer inspect a handful of rare payloads
+        without paying for the history around them.
+        """
+        with self._lock:
+            records: list[_StoredRecord] = []
+            for sequence in sequences:
+                index = bisect_left(self._sequences, sequence)
+                if index < len(self._sequences) and self._sequences[index] == sequence:
+                    records.append(self._records[index])
+            self._force_parse_unlocked(records)
+            return [record.event for record in records if record.event is not None]
 
     def wait(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:
         """Block until replayable events exist after a client's cursor."""
@@ -435,11 +543,124 @@ class EventStore:
             self._changed.wait(timeout)
             return self._events_after_unlocked(after_sequence)
 
-    def _events_after_unlocked(self, after_sequence: int) -> list[RunEvent]:
+    def _events_after_unlocked(
+        self, after_sequence: int, before_sequence: int | None = None
+    ) -> list[RunEvent]:
         start = bisect_right(self._sequences, after_sequence)
-        # A slice is a new list, so callers own the sequence; the frozen events
-        # inside it stay shared with the store.
-        return self._events[start:]
+        stop = (
+            len(self._records)
+            if before_sequence is None
+            else bisect_left(self._sequences, before_sequence)
+        )
+        if stop <= start:
+            return []
+        # A bounded read must only force the records it returns; that is what
+        # keeps a backfill query off the whole log.
+        window = self._records[start:stop]
+        self._force_parse_unlocked(window)
+        # A new list, so callers own the sequence; the frozen events inside it
+        # stay shared with the store.
+        return [record.event for record in window if record.event is not None]
+
+    def _force_parse_unlocked(self, records: list[_StoredRecord]) -> None:
+        """Validate any of these records not yet in memory, in log order.
+
+        Records adjacent on disk are fetched in one read, so a dense range
+        costs one seek while a sparse targeted read costs one seek per record.
+        """
+        pending = [record for record in records if record.event is None]
+        if not pending:
+            return
+        with self.path.open("rb") as stream:
+            run: list[_StoredRecord] = []
+            for record in pending:
+                if run and record.offset != run[-1].offset + run[-1].length:
+                    self._parse_run_unlocked(stream, run)
+                    run = []
+                run.append(record)
+            self._parse_run_unlocked(stream, run)
+
+    def _parse_run_unlocked(self, stream: BinaryIO, run: list[_StoredRecord]) -> None:
+        base = run[0].offset
+        stream.seek(base)
+        blob = stream.read(run[-1].offset + run[-1].length - base)
+        for record in run:
+            begin = record.offset - base
+            self._parse_record(record, blob[begin : begin + record.length])
+
+    def _parse_record(self, record: _StoredRecord, raw: bytes) -> None:
+        self._parsed_records += 1
+        event = RunEvent.model_validate_json(raw)
+        if record.header.sequence != record.raw_sequence:
+            # Only a legacy out-of-order or duplicate sequence needs the copy;
+            # every other record is handed out exactly as it was written.
+            event = event.model_copy(update={"sequence": record.header.sequence})
+        record.event = event
+
+    def _scan_unlocked(self) -> tuple[list[_StoredRecord], int | None] | None:
+        """Index the log by byte range and header, or return None on any doubt.
+
+        ``json.loads`` is a real parser, so the offsets and header fields it
+        yields are exact. Returning None sends construction to the fully eager
+        path, which is the only place a corrupt history is diagnosed.
+        """
+        if not self.path.exists():
+            return [], None
+        raw = self.path.read_bytes()
+        lines = raw.splitlines(keepends=True)
+        records: list[_StoredRecord] = []
+        malformed_tail_offset: int | None = None
+        offset = 0
+        last_sequence = 0
+        for index, line in enumerate(lines):
+            record_offset = offset
+            offset += len(line)
+            header_fields = _scan_header_fields(line)
+            if header_fields is None:
+                if index != len(lines) - 1:
+                    return None
+                # Preserve access to earlier audit history if a process was
+                # interrupted during its final append.
+                malformed_tail_offset = record_offset
+                break
+            raw_sequence, event_type, execution_id, chat_thread_id = header_fields
+            sequence = raw_sequence if raw_sequence > last_sequence else last_sequence + 1
+            last_sequence = sequence
+            records.append(
+                _StoredRecord(
+                    header=EventHeader(
+                        sequence=sequence,
+                        type=event_type,
+                        execution_id=execution_id,
+                        chat_thread_id=chat_thread_id,
+                    ),
+                    offset=record_offset,
+                    length=len(line),
+                    raw_sequence=raw_sequence,
+                )
+            )
+        tail_offset = self._parse_eager_tail(raw, records, malformed_tail_offset)
+        return records, tail_offset
+
+    def _parse_eager_tail(
+        self, raw: bytes, records: list[_StoredRecord], malformed_tail_offset: int | None
+    ) -> int | None:
+        """Validate the trailing window, reproducing today's tail semantics.
+
+        A final record that scans as JSON but fails validation is still an
+        interrupted append; anything earlier is still a hard failure.
+        """
+        for position in range(max(0, len(records) - _EAGER_TAIL_RECORDS), len(records)):
+            record = records[position]
+            try:
+                self._parse_record(record, raw[record.offset : record.offset + record.length])
+            except ValidationError:
+                if position != len(records) - 1 or malformed_tail_offset is not None:
+                    raise
+                offset = record.offset
+                del records[position]
+                return offset
+        return malformed_tail_offset
 
     def _read_unlocked(self) -> tuple[list[RunEvent], int | None]:
         if not self.path.exists():
@@ -451,6 +672,7 @@ class EventStore:
             record_offset = offset
             offset += len(line)
             try:
+                self._parsed_records += 1
                 event = RunEvent.model_validate_json(line)
                 events.append(event)
             except ValidationError:
@@ -460,6 +682,65 @@ class EventStore:
                     return events, record_offset
                 raise
         return events, None
+
+
+def _scan_header_fields(line: bytes) -> tuple[int, EventType, str | None, str | None] | None:
+    """Recover one record's header fields cheaply, or None if anything is off.
+
+    Every rejection here (non-object record, absent or non-integer
+    ``sequence``, unknown ``type``, non-string identity) is a case where
+    :class:`RunEvent` validation could disagree with the scan, so the caller
+    must reparse the history the strict way rather than guess.
+    """
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    sequence = record.get("sequence")
+    # ``type is not int`` also rejects bool, which pydantic would coerce.
+    if type(sequence) is not int or sequence < 0:
+        return None
+    try:
+        event_type = EventType(record.get("type"))
+    except ValueError:
+        return None
+    execution_id = record.get("execution_id")
+    if execution_id is None:
+        # RunEvent exposes legacy invocation identity through execution_id.
+        execution_id = record.get("invocation_id")
+    chat_thread_id = record.get("chat_thread_id")
+    if not _is_optional_str(execution_id) or not _is_optional_str(chat_thread_id):
+        return None
+    return sequence, event_type, execution_id, chat_thread_id
+
+
+def _is_optional_str(value: Any) -> bool:  # noqa: ANN401  # scanning untyped JSON
+    return value is None or isinstance(value, str)
+
+
+def _header_from_event(event: RunEvent, sequence: int) -> EventHeader:
+    return EventHeader(
+        sequence=sequence,
+        type=event.type,
+        execution_id=event.execution_id,
+        chat_thread_id=event.chat_thread_id,
+    )
+
+
+def _records_from_events(events: list[RunEvent]) -> list[_StoredRecord]:
+    """Wrap already-validated events as stored records with no disk location."""
+    return [
+        _StoredRecord(
+            header=_header_from_event(event, event.sequence),
+            offset=_UNLOCATED,
+            length=0,
+            raw_sequence=event.sequence,
+            event=event,
+        )
+        for event in events
+    ]
 
 
 def _repair_legacy_sequences(events: list[RunEvent]) -> list[RunEvent]:

@@ -26,6 +26,19 @@ from vibesys.server.service import SupervisionService  # noqa: TC001  # tracked:
 _REQUEST_ADAPTER = TypeAdapter(ProtocolRequest)
 
 
+def _history_floor(request: SubscribeRequest, latest_sequence: int) -> tuple[int, int]:
+    """Return the replay floor, and the floor to report on every batch.
+
+    Without ``tail`` the reported floor stays 0: the client asked for
+    everything from its own cursor onward, so nothing was withheld and old
+    clients see the field's default.
+    """
+    if request.tail is None:
+        return request.after_sequence, 0
+    floor = max(request.after_sequence, latest_sequence - request.tail)
+    return floor, floor
+
+
 class _RequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         service: SupervisionService = self.server.service  # type: ignore[attr-defined]
@@ -66,14 +79,16 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 latest_sequence=snapshot.sequence,
             )
         )
+        history_after, reported_floor = _history_floor(request, snapshot.sequence)
         through_sequence, replay, active_executions = service.subscription_checkpoint(
-            request.after_sequence
+            history_after, bootstrap_spine=request.tail is not None
         )
         self._write_message(
             EventBatchMessage(
                 events=replay,
                 through_sequence=through_sequence,
                 active_executions=active_executions,
+                history_after_sequence=reported_floor,
             )
         )
         cursor = through_sequence
@@ -94,6 +109,7 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                     events=events,
                     through_sequence=through_sequence,
                     active_executions=active_executions,
+                    history_after_sequence=reported_floor,
                 )
             )
             cursor = through_sequence

@@ -869,7 +869,7 @@
     },
     "Diagnostic": {
       "additionalProperties": false,
-      "description": "Structured, provider-neutral description of an operator diagnostic.",
+      "description": "Structured, provider-neutral description of an operator diagnostic.\n\nFrozen for the same reason as ``RunEvent``: diagnostics ride along on\nreplayed events, which readers share rather than copy.",
       "properties": {
         "id": {
           "title": "Id",
@@ -1014,6 +1014,12 @@
           },
           "title": "Active Executions",
           "type": "array"
+        },
+        "history_after_sequence": {
+          "default": 0,
+          "minimum": 0,
+          "title": "History After Sequence",
+          "type": "integer"
         }
       },
       "required": [
@@ -1119,6 +1125,19 @@
           "minimum": 0,
           "title": "After Sequence",
           "type": "integer"
+        },
+        "before_sequence": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Before Sequence"
         },
         "timeout_ms": {
           "default": 0,
@@ -2031,7 +2050,7 @@
     },
     "RunEvent": {
       "additionalProperties": false,
-      "description": "One reproducible human, control, or invocation event.",
+      "description": "One reproducible human, control, or invocation event.\n\nFrozen: a recorded event is a durable fact. Readers that need a variant\nbuild one with ``model_copy(update=...)`` rather than mutating a shared\nobject, which lets ``EventStore`` replay history without copying it.",
       "properties": {
         "protocol_version": {
           "const": 1,
@@ -2345,6 +2364,13 @@
           },
           "title": "Active Executions",
           "type": "array"
+        },
+        "chat_threads": {
+          "items": {
+            "$ref": "#/$defs/ChatThreadInfo"
+          },
+          "title": "Chat Threads",
+          "type": "array"
         }
       },
       "required": [
@@ -2533,6 +2559,19 @@
           "minimum": 0,
           "title": "After Sequence",
           "type": "integer"
+        },
+        "tail": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tail"
         }
       },
       "title": "SubscribeRequest",
