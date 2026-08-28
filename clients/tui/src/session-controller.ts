@@ -4,6 +4,7 @@ import {
   type RequestInput,
   type RunEvent,
   type ServerMessage,
+  type SubscribeOptions,
   SupervisionError,
 } from '@vibesys/backend-client';
 import {helpText, parseChatCommand, parseCommand} from './commands.js';
@@ -12,6 +13,7 @@ import {
   activeChatThreadSettings,
   applyEvent,
   applyEventBatch,
+  applyEventPrefix,
   applySnapshot,
   chatDocked,
   chatMenuCustomModel,
@@ -141,6 +143,8 @@ export interface SessionController {
   moveThemeSelection(delta: number): void;
   applySelectedTheme(): void;
   closeThemePicker(): void;
+  /** Loads the chunk of history just older than what is folded. Resolves false when history is already complete. */
+  loadOlderHistory(): Promise<boolean>;
   subscribe(listener: (state: SessionState) => void): () => void;
 }
 
@@ -150,9 +154,20 @@ export interface SupervisionTransport {
     afterSequence: number,
     onMessage: (message: ServerMessage) => void,
     onDisconnect: (error: Error) => void,
+    options?: SubscribeOptions,
   ): Promise<EventSubscription>;
   close(): Promise<void>;
 }
+
+/**
+ * How much history the boot subscribe asks for. A long-lived run holds tens of
+ * thousands of events, and replaying all of them costs seconds of wire, parse,
+ * and fold before the first frame. A thousand events covers what an operator
+ * opens the client to look at; the rest loads when they scroll back for it, in
+ * chunks of the same size so one backfill is one round trip of the same shape.
+ */
+const BOOTSTRAP_TAIL = 1_000;
+const BACKFILL_CHUNK = 1_000;
 
 export class SocketSessionController implements SessionController {
   #state: SessionState;
@@ -165,6 +180,23 @@ export class SocketSessionController implements SessionController {
   #experimentFetch: Promise<void> | null = null;
   #experimentRefreshPending = false;
   #paneFetch: Promise<void> | null = null;
+  /** Single-flight guard for on-demand history backfill. */
+  #historyFetch: Promise<boolean> | null = null;
+  /**
+   * Sequences already folded from below the history floor.
+   *
+   * A tail subscription's batch is not only the tail: the server also replays
+   * the run-level spine from before the floor (`run_started`, `round_finished`,
+   * `chat_thread_created`, the terminal events, …) so the ordinary reducer can
+   * derive what a suffix cannot carry. A backfill chunk covering that range
+   * therefore re-delivers those same events, and `reduceEventPrefix` folds into
+   * a fresh state with no `sequence <= state.sequence` guard to catch them. The
+   * set is O(rounds), and filtering every chunk through it is what keeps one
+   * `round_finished` from becoming two.
+   */
+  readonly #foldedBelowFloor = new Set<number>();
+  /** Lowest history floor seen so far; see `#lowerHistoryFloor`. */
+  #historyFloor = Number.POSITIVE_INFINITY;
   #streamProtocolError = false;
 
   constructor(
@@ -207,26 +239,87 @@ export class SocketSessionController implements SessionController {
     }
   }
 
+  /**
+   * Subscribes to the tail of the stream, falling back to the whole history.
+   *
+   * A server that predates `tail` forbids the unknown field and rejects the
+   * subscription, so the rejection is the capability probe: there is nothing
+   * else to ask. Any other failure degrades the same way, because a full
+   * replay is only slow, never wrong. A run shorter than the tail needs no
+   * special case, since the server clamps the floor to 0 and the batch comes
+   * back with `history_after_sequence` 0, which is today's behavior exactly.
+   */
   async #openEventStream(): Promise<void> {
+    const onMessage = (message: ServerMessage): void => this.#onMessage(message);
+    const onDisconnect = (error: Error): void => {
+      // A terminal event already carries the actual outcome. The socket
+      // closing afterward is lifecycle cleanup, not a second failure that
+      // should replace the useful diagnostic in the banner.
+      if (!this.#state.core.terminal && !this.#streamProtocolError) {
+        this.#setState(
+          reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
+        );
+      }
+    };
     try {
-      this.#eventSubscription = await this.client.subscribe(
-        0,
-        message => this.#onMessage(message),
-        error => {
-          // A terminal event already carries the actual outcome. The socket
-          // closing afterward is lifecycle cleanup, not a second failure that
-          // should replace the useful diagnostic in the banner.
-          if (!this.#state.core.terminal && !this.#streamProtocolError) {
-            this.#setState(
-              reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
-            );
-          }
-        },
-      );
+      this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect, {
+        tail: BOOTSTRAP_TAIL,
+      });
+      return;
+    } catch {
+      // Reported only if the full replay fails too: one boot must not put two
+      // banners up, and the first failure is expected against an old server.
+    }
+    try {
+      this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect);
     } catch (error) {
       this.#setState(
         reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
       );
+    }
+  }
+
+  /**
+   * Loads the chunk of history just older than what is folded. Resolves false
+   * when history is already complete.
+   *
+   * Single-flight: a reader holding the scroll gesture at the top asks
+   * repeatedly, and each answer moves the floor, so overlapping requests would
+   * fetch the same range twice and fold it twice.
+   */
+  loadOlderHistory(): Promise<boolean> {
+    if (this.#state.core.historyAfterSequence === 0) return Promise.resolve(false);
+    if (this.#historyFetch !== null) return this.#historyFetch;
+    const fetch = this.#requestOlderHistory().finally(() => {
+      this.#historyFetch = null;
+    });
+    this.#historyFetch = fetch;
+    return fetch;
+  }
+
+  async #requestOlderHistory(): Promise<boolean> {
+    const floor = this.#state.core.historyAfterSequence;
+    const nextFloor = Math.max(0, floor - BACKFILL_CHUNK);
+    try {
+      const response = await this.client.request({
+        type: 'query.events',
+        after_sequence: nextFloor,
+        // Every folded event has `sequence > floor`, so the range has to
+        // include the floor itself and stops one above it.
+        before_sequence: floor + 1,
+      });
+      // Spine events replayed with the tail fall inside this range; folding
+      // them a second time would duplicate their transcript entries.
+      const events = (response.events ?? []).filter(
+        event => event.sequence === undefined || !this.#foldedBelowFloor.has(event.sequence),
+      );
+      this.#setState(applyEventPrefix(this.#state, events, this.#lowerHistoryFloor(nextFloor)));
+      return true;
+    } catch (error) {
+      // The floor stays where it was, so the same range is retried the next
+      // time the reader asks for it.
+      this.#setState(reportCaughtError(this.#state, error, 'request'));
+      return false;
     }
   }
 
@@ -786,14 +879,17 @@ export class SocketSessionController implements SessionController {
       this.#refreshPaneFor([message.event]);
     }
     if (message.type === 'event_batch') {
+      const floor = this.#lowerHistoryFloor(message.history_after_sequence ?? 0);
       this.#setState(
         applyEventBatch(
           this.#state,
           message.events,
           message.active_executions,
           message.through_sequence,
+          floor,
         ),
       );
+      this.#recordSpine(message.events, message.history_after_sequence ?? 0);
       this.#refreshExperimentsFor(message.events);
       this.#refreshPaneFor(message.events);
     }
@@ -805,6 +901,30 @@ export class SocketSessionController implements SessionController {
           diagnostic: message.diagnostic ?? null,
         }),
       );
+    }
+  }
+
+  /**
+   * The floor only ever descends.
+   *
+   * A subscription reports the floor it bootstrapped with on every batch it
+   * sends, including live ones. Once a backfill has lowered the floor, taking
+   * a later batch's value literally would raise it again and send the client
+   * back for history it already holds.
+   */
+  #lowerHistoryFloor(floor: number): number {
+    this.#historyFloor = Math.min(this.#historyFloor, floor);
+    return this.#historyFloor;
+  }
+
+  /** Remembers the events a batch delivered from below its own history floor. */
+  #recordSpine(events: readonly RunEvent[], historyAfterSequence: number): void {
+    if (historyAfterSequence === 0) return;
+    for (const {sequence} of events) {
+      // An unsequenced event cannot be recognized in a later chunk anyway.
+      if (sequence !== undefined && sequence <= historyAfterSequence) {
+        this.#foldedBelowFloor.add(sequence);
+      }
     }
   }
 

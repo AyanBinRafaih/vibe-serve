@@ -5,6 +5,7 @@ import {
   type RequestInput,
   type RunEvent,
   type ServerMessage,
+  type SubscribeOptions,
   SupervisionError,
 } from '@vibesys/backend-client';
 import {SocketSessionController, type SupervisionTransport} from './session-controller.js';
@@ -1361,6 +1362,170 @@ describe('session controller', () => {
     expect(controller.state.themeName).toBe('dark');
     expect(transport.requests).toEqual([]);
   });
+
+  it('boots against the tail of the stream rather than the whole history', async () => {
+    const transport = new HistoryTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+
+    expect(transport.subscribeTails).toEqual([1_000]);
+  });
+
+  it('falls back once to a full subscription when the tail is rejected', async () => {
+    const history = [
+      event(1, 'agent_output_chunk', 'one\n'),
+      event(2, 'agent_output_chunk', 'two\n'),
+    ];
+    const transport = new HistoryTransport(history);
+    transport.rejectTail = true;
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+
+    // The rejection is the capability probe, so there is exactly one retry and
+    // it carries no tail.
+    expect(transport.subscribeTails).toEqual([1_000, undefined]);
+
+    transport.emitBatch(history, 0);
+
+    expect(controller.state.core.transcript.map(item => item.content).join('')).toBe('one\ntwo\n');
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    // A boot that recovered is not a boot that failed.
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.eventStreamAvailable).toBe(true);
+  });
+
+  it('reports the transport error when the full subscription fails too', async () => {
+    const transport = new HistoryTransport();
+    transport.rejectTail = true;
+    transport.subscribeError = new Error('Supervision server is disconnected');
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+
+    expect(transport.subscribeTails).toEqual([1_000, undefined]);
+    expect(controller.state.eventStreamAvailable).toBe(false);
+    expect(controller.state.errorBanner).toMatchObject({scope: 'transport'});
+  });
+
+  it('loads older history on demand while the fold is only a suffix', async () => {
+    const history = longHistory(2_000);
+    const transport = new HistoryTransport(history);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emitBatch(history.slice(1_500), 1_500);
+
+    expect(controller.state.core.historyAfterSequence).toBe(1_500);
+    expect(controller.state.core.transcript).toHaveLength(500);
+
+    await expect(controller.loadOlderHistory()).resolves.toBe(true);
+
+    expect(eventsQueries(transport)).toEqual([
+      {type: 'query.events', after_sequence: 500, before_sequence: 1_501},
+    ]);
+    expect(controller.state.core.historyAfterSequence).toBe(500);
+    expect(controller.state.core.transcript).toHaveLength(1_500);
+  });
+
+  it('stops asking once the history floor reaches the start of the run', async () => {
+    const history = longHistory(2_000);
+    const transport = new HistoryTransport(history);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(history.slice(1_500), 1_500);
+
+    await controller.loadOlderHistory();
+    await expect(controller.loadOlderHistory()).resolves.toBe(true);
+
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    expect(controller.state.core.transcript).toHaveLength(2_000);
+    const issued = eventsQueries(transport).length;
+
+    await expect(controller.loadOlderHistory()).resolves.toBe(false);
+
+    expect(eventsQueries(transport)).toHaveLength(issued);
+
+    // Every batch of the subscription repeats the floor it bootstrapped with,
+    // which must not undo the backfill and send the client back for history it
+    // already holds.
+    transport.emitBatch([event(2_001, 'agent_output_chunk', 'live\n')], 1_500);
+
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    await expect(controller.loadOlderHistory()).resolves.toBe(false);
+    expect(eventsQueries(transport)).toHaveLength(issued);
+  });
+
+  it('leaves the history floor where it was when a backfill fails', async () => {
+    const history = longHistory(2_000);
+    const transport = new HistoryTransport(history);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(history.slice(1_500), 1_500);
+    transport.eventsError = new Error('The event store is unavailable');
+
+    await expect(controller.loadOlderHistory()).resolves.toBe(false);
+
+    expect(controller.state.core.historyAfterSequence).toBe(1_500);
+    expect(controller.state.errorBanner).toMatchObject({scope: 'request'});
+    expect(controller.state.errorBanner?.message).toContain('The event store is unavailable');
+
+    // The unchanged floor is what makes the same range retryable.
+    transport.eventsError = null;
+    await expect(controller.loadOlderHistory()).resolves.toBe(true);
+    expect(controller.state.core.historyAfterSequence).toBe(500);
+  });
+
+  it('backfills once under concurrent requests', async () => {
+    const history = longHistory(2_000);
+    const transport = new HistoryTransport(history);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(history.slice(1_500), 1_500);
+    transport.deferEvents = true;
+
+    const first = controller.loadOlderHistory();
+    const second = controller.loadOlderHistory();
+
+    expect(eventsQueries(transport)).toHaveLength(1);
+
+    transport.releaseEvents();
+
+    await expect(first).resolves.toBe(true);
+    await expect(second).resolves.toBe(true);
+    expect(controller.state.core.historyAfterSequence).toBe(500);
+  });
+
+  it('folds a spine event re-delivered by a backfill exactly once', async () => {
+    // A tail subscription replays the run-level spine from below the floor, so
+    // the backfill covering that range delivers those events a second time.
+    const firstRound = roundFinished(2, 1);
+    const secondRound = roundFinished(4, 2);
+    const tail = event(5, 'agent_output_chunk', 'five\n');
+    const history = [
+      event(1, 'agent_output_chunk', 'one\n'),
+      firstRound,
+      event(3, 'agent_output_chunk', 'three\n'),
+      secondRound,
+      tail,
+    ];
+    const replayedTransport = new HistoryTransport(history);
+    const replayed = new SocketSessionController(replayedTransport);
+    await replayed.start();
+    replayedTransport.emitBatch(history, 0);
+
+    const tailedTransport = new HistoryTransport(history);
+    const tailed = new SocketSessionController(tailedTransport);
+    await tailed.start();
+    // The spine (both `round_finished` events) below the floor, then the tail.
+    tailedTransport.emitBatch([firstRound, secondRound, tail], 4);
+    await tailed.loadOlderHistory();
+
+    expect(tailed.state.core.historyAfterSequence).toBe(0);
+    expect(tailed.state.core.transcript).toEqual(replayed.state.core.transcript);
+    expect(tailed.state.core.rounds).toEqual(replayed.state.core.rounds);
+  });
 });
 
 class FakeTransport implements SupervisionTransport {
@@ -1622,6 +1787,105 @@ class ThreadTransport implements SupervisionTransport {
   close(): Promise<void> {
     return Promise.resolve();
   }
+}
+
+/**
+ * A tail-capable backend holding one run's whole history. The subscription
+ * delivers whatever a test emits, and `query.events` answers out of the same
+ * history, so a backfill returns exactly the range the controller asked for.
+ */
+class HistoryTransport implements SupervisionTransport {
+  readonly requests: RequestInput[] = [];
+  /** The `tail` each subscribe carried, in order; `undefined` for a plain one. */
+  readonly subscribeTails: Array<number | undefined> = [];
+  /** Rejects a subscribe carrying `tail`, the way a server without the field does. */
+  rejectTail = false;
+  /** Fails every subscribe, tail or not. */
+  subscribeError: Error | null = null;
+  /** Fails `query.events` instead of answering it. */
+  eventsError: Error | null = null;
+  /** Holds `query.events` answers until the test releases them. */
+  deferEvents = false;
+  readonly #pendingEvents: Array<() => void> = [];
+  #message: ((message: ServerMessage) => void) | null = null;
+
+  constructor(private readonly history: readonly RunEvent[] = []) {}
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    this.requests.push(input);
+    const base = {
+      protocol_version: 1 as const,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true as const,
+    };
+    if (input.type !== 'query.events') return Promise.resolve(base);
+    if (this.eventsError !== null) return Promise.reject(this.eventsError);
+    const after = input.after_sequence ?? 0;
+    const before = input.before_sequence ?? Number.MAX_SAFE_INTEGER;
+    const response = {
+      ...base,
+      events: this.history.filter(
+        item => (item.sequence ?? 0) > after && (item.sequence ?? 0) < before,
+      ),
+    };
+    if (!this.deferEvents) return Promise.resolve(response);
+    return new Promise(resolve => this.#pendingEvents.push(() => resolve(response)));
+  }
+
+  subscribe(
+    _afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    _onDisconnect: (error: Error) => void,
+    options?: SubscribeOptions,
+  ): Promise<EventSubscription> {
+    this.subscribeTails.push(options?.tail);
+    if (this.subscribeError !== null) return Promise.reject(this.subscribeError);
+    if (this.rejectTail && options?.tail !== undefined) {
+      return Promise.reject(new SupervisionError('Extra inputs are not permitted: tail'));
+    }
+    this.#message = onMessage;
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  /** One bootstrap batch: the spine below the floor, then the tail. */
+  emitBatch(events: readonly RunEvent[], historyAfterSequence: number): void {
+    this.#message?.({
+      type: 'event_batch',
+      events: [...events],
+      history_after_sequence: historyAfterSequence,
+    });
+  }
+
+  releaseEvents(): void {
+    const pending = this.#pendingEvents.shift();
+    if (!pending) throw new Error('No pending query.events request');
+    pending();
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+function eventsQueries(transport: HistoryTransport): RequestInput[] {
+  return transport.requests.filter(request => request.type === 'query.events');
+}
+
+function longHistory(length: number): RunEvent[] {
+  return Array.from({length}, (_, index) =>
+    event(index + 1, 'agent_output_chunk', `event ${index + 1}\n`),
+  );
+}
+
+function roundFinished(sequence: number, round: number): RunEvent {
+  return {
+    sequence,
+    timestamp: '2026-01-01T00:00:00Z',
+    type: 'round_finished',
+    round_label: `round-${round}`,
+    data: {kind: 'round_finished', attempts: 1, judge_verdict: 'pass'},
+  };
 }
 
 function perfRequests(transport: FakeTransport): number {

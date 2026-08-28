@@ -1632,6 +1632,37 @@ describe('OpenTUI presentation', () => {
     expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBeDefined();
   });
 
+  it('asks the controller for history once the window reaches what is loaded', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const state = hugeTranscriptState(2_400);
+    const controller = new FakeController({
+      ...state,
+      // The client folded a suffix of the run: everything at or below sequence
+      // 3000 is still on the server.
+      core: {...state.core, historyAfterSequence: 3_000},
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 2399'));
+
+    // Each press materializes another block of what is already loaded, and asks
+    // for nothing while there is more of it left.
+    for (let press = 0; press < 11; press += 1) {
+      testRenderer.mockInput.pressKey('HOME');
+      await testRenderer.waitForFrame(() => true);
+    }
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBeDefined();
+    expect(controller.historyLoads).toBe(0);
+
+    testRenderer.mockInput.pressKey('HOME');
+    await testRenderer.waitForFrame(() => true);
+
+    // The window starts at the oldest entry the client holds, so the next block
+    // has to come from the backend.
+    expect(controller.historyLoads).toBe(1);
+  });
+
   it('appends live entries incrementally on a windowed transcript', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const state = hugeTranscriptState(20_000);
@@ -3829,6 +3860,8 @@ class FakeController implements SessionController {
     ],
   };
   liveCalls = 0;
+  /** How many times the reveal path asked for history the client does not hold. */
+  historyLoads = 0;
 
   /**
    * Tests that exercise the transcript start past the landing view. The
@@ -3931,6 +3964,11 @@ class FakeController implements SessionController {
   }
   closeThemePicker(): void {
     this.publish(closeThemePicker(this.state));
+  }
+  /** Records the reveal path asking the backend for history it does not hold. */
+  loadOlderHistory(): Promise<boolean> {
+    this.historyLoads += 1;
+    return Promise.resolve(this.state.core.historyAfterSequence > 0);
   }
   submitChat(value: string): Promise<void> {
     const text = value.trim();

@@ -17,6 +17,15 @@ export interface SupervisionClientOptions {
   requestTimeoutMs?: number;
 }
 
+export interface SubscribeOptions {
+  /**
+   * Replay at most this many of the newest events instead of the whole history.
+   * A server that predates the field forbids it and rejects the subscription,
+   * which is exactly how a caller probes for the capability.
+   */
+  tail?: number;
+}
+
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -110,6 +119,7 @@ export class SupervisionClient {
     afterSequence: number,
     onMessage: (message: ServerMessage) => void,
     onDisconnect: (error: Error) => void,
+    options: SubscribeOptions = {},
   ): Promise<EventSubscription> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.#path);
@@ -141,6 +151,10 @@ export class SupervisionClient {
             timestamp: new Date().toISOString(),
             type: 'subscribe',
             after_sequence: afterSequence,
+            // Omitted rather than sent as null: an old server forbids unknown
+            // fields, so a default subscribe must stay byte-for-byte what it
+            // has always been.
+            ...(options.tail === undefined ? {} : {tail: options.tail}),
           })}\n`,
         );
       });

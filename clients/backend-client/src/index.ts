@@ -1,5 +1,6 @@
 export {
   type EventSubscription,
+  type SubscribeOptions,
   SupervisionClient,
   type SupervisionClientOptions,
   SupervisionError,

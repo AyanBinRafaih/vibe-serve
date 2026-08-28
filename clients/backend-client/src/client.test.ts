@@ -219,6 +219,36 @@ describe('SupervisionClient', () => {
     );
   });
 
+  it('carries a subscribe tail only when one is asked for', async () => {
+    const frames: Array<Record<string, unknown>> = [];
+    await withServer(
+      socket =>
+        respondToLines(socket, request => {
+          if (request['type'] !== 'subscribe') return;
+          frames.push(request);
+          socket.write(
+            `${JSON.stringify({
+              type: 'subscribed',
+              request_id: request['request_id'],
+              run_id: 'run-1',
+              latest_sequence: 0,
+            })}\n`,
+          );
+        }),
+      async client => {
+        const tailed = await client.subscribe(0, () => undefined, noopDisconnect, {tail: 1000});
+        const full = await client.subscribe(0, () => undefined, noopDisconnect);
+
+        expect(frames[0]).toMatchObject({after_sequence: 0, tail: 1000});
+        // An old server forbids unknown fields, so the plain call must not
+        // carry the key at all, not even as null.
+        expect(frames[1]).not.toHaveProperty('tail');
+        await tailed.close();
+        await full.close();
+      },
+    );
+  });
+
   it('reports an event-stream disconnect only once', async () => {
     await withServer(
       socket =>
@@ -332,6 +362,9 @@ async function withServer(
     await close(server);
   }
 }
+
+/** A subscription the test closes itself, so a disconnect is not a failure. */
+function noopDisconnect(): void {}
 
 function respondToLines(socket: Socket, respond: (request: Record<string, unknown>) => void): void {
   let buffer = '';

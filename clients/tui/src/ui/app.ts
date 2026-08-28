@@ -149,7 +149,16 @@ export function createOpenTuiApp(
   const revealOlderEntries = (): void => {
     const heightBefore = viewport.scrollHeight;
     const top = viewport.scrollTop;
-    if (!conversation.revealOlderEntries()) return;
+    if (!conversation.revealOlderEntries()) {
+      // The window already starts at the oldest entry the client holds, so the
+      // next block has to come from the backend. No scroll compensation here:
+      // the backfill lands as a state update, and the view follows its window
+      // anchor across the prepended entries, so the rendered cards, and with
+      // them the scroll height, are unchanged. The reader stays put, and the
+      // next gesture reveals the new entries through the branch below.
+      void controller.loadOlderHistory();
+      return;
+    }
     const grew = viewport.scrollHeight - heightBefore;
     if (grew > 0) viewport.scrollTo(top + grew);
   };

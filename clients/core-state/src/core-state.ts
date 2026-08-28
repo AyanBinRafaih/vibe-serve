@@ -295,7 +295,11 @@ export function reduceEventPrefix(
     chatThreads: mergeChatThreadsPrefix(older.chatThreads, state.chatThreads),
     todos: mergeTodosPrefix(older.todos, state.todos),
     usage: state.usage ?? older.usage,
-    benchmarks: [...older.benchmarks, ...state.benchmarks],
+    // Sorted rather than concatenated for the same reason the transcript is
+    // merged: a tail batch can carry events from below its own floor.
+    benchmarks: [...older.benchmarks, ...state.benchmarks].sort(
+      (left, right) => left.sequence - right.sequence,
+    ),
     diagnostics: state.diagnostics.reduce(upsertDiagnostic, older.diagnostics),
     experimentsRevision: Math.max(older.experimentsRevision, state.experimentsRevision),
     typedToolEvents: older.typedToolEvents || state.typedToolEvents,
@@ -305,19 +309,24 @@ export function reduceEventPrefix(
 }
 
 /**
- * Folds `newer` onto `older` so the result equals a full replay of the chunk's
- * events followed by the newer events.
+ * Folds two transcripts into the one a full replay of both their event streams
+ * would have built.
  *
- * A plain concatenation is wrong: the fold merges entries (streamed text
- * concatenates, a tool result lands on its open call) and those merges straddle
- * the chunk boundary. Re-running `foldTranscriptEntry` over `newer` is exact
- * because `newer`'s entries are already maximally merged among themselves and
- * the step is idempotent over an already merged entry, so re-folding reproduces
- * what replay would have built.
+ * A plain concatenation is wrong twice over. The fold merges entries (streamed
+ * text concatenates, a tool result lands on its open call) and those merges
+ * straddle the chunk boundary. And `newer` is not entirely newer: a tail
+ * subscription's batch also carries the run-level spine from below its floor,
+ * so a backfilled chunk interleaves with what the state already holds rather
+ * than sitting wholly before it.
+ *
+ * So the two sequence-ordered lists are merged in sequence order and each entry
+ * re-folded through `foldTranscriptEntry`. That is exact: entries are already
+ * maximally merged within each list and the step is idempotent over an
+ * already merged entry, so re-folding in replay order reproduces replay.
  *
  * O(older + newer) with an O(1) step per entry. Re-folding only the entries near
  * the boundary would be faster by a constant, but no bounded window is provably
- * enough, so the whole of `newer` is re-folded.
+ * enough, so every entry is re-folded.
  *
  * Known boundaries, neither worth machinery:
  * - `capTranscript` evicts the oldest round once a transcript passes
@@ -330,11 +339,36 @@ function mergeTranscriptPrefix(
   older: readonly TranscriptEntry[],
   newer: readonly TranscriptEntry[],
 ): TranscriptEntry[] {
-  const entries = [...older];
+  const entries: TranscriptEntry[] = [];
   const index = new OpenToolCallIndex();
-  index.reindex(entries);
-  for (const entry of newer) foldTranscriptEntry(entries, entry, index);
+  let left = 0;
+  let right = 0;
+  while (left < older.length || right < newer.length) {
+    const source =
+      left >= older.length
+        ? newer
+        : right >= newer.length
+          ? older
+          : entryOrder(newer[right]) < entryOrder(older[left])
+            ? newer
+            : older;
+    const entry = source === older ? older[left++] : newer[right++];
+    if (entry !== undefined) foldTranscriptEntry(entries, entry, index);
+  }
   return entries;
+}
+
+/**
+ * Replay position of an entry, from the sequence its id was built from.
+ *
+ * An entry recorded from an event with no sequence has a non-numeric id. It
+ * cannot be placed against the other list, so it sorts last within its own,
+ * which keeps it after the entries it followed there.
+ */
+function entryOrder(entry: TranscriptEntry | undefined): number {
+  if (entry === undefined) return Number.POSITIVE_INFINITY;
+  const sequence = Number(entry.id);
+  return Number.isFinite(sequence) ? sequence : Number.POSITIVE_INFINITY;
 }
 
 function mergeChatTranscriptsPrefix(

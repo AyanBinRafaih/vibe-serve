@@ -198,11 +198,21 @@ export class ConversationView {
   #windowed(entries: ConversationEntry[]): ConversationEntry[] {
     if (entries.length <= CONVERSATION_WINDOW_THRESHOLD) {
       this.#windowStart = 0;
-      this.#windowAnchor = null;
+      // Anchored even while everything is rendered, so a backfill that pushes
+      // the transcript past the threshold keeps the same first entry instead of
+      // windowing the reader onto the tail.
+      this.#windowAnchor = entries[0] ?? null;
       return entries;
     }
     if (this.#windowAnchor === null || entries[this.#windowStart] !== this.#windowAnchor) {
-      this.#windowStart = entries.length - CONVERSATION_WINDOW;
+      // History loaded on demand is prepended, which shifts every index without
+      // changing what the reader is looking at. Follow the anchor to where it
+      // moved rather than snapping back to the tail, which would throw the
+      // reader out of the history they scrolled into. Identity is checked first
+      // because it is the common case; the search runs only when it fails.
+      const anchorId = this.#windowAnchor?.id;
+      const moved = anchorId === undefined ? -1 : entries.findIndex(entry => entry.id === anchorId);
+      this.#windowStart = moved === -1 ? entries.length - CONVERSATION_WINDOW : moved;
     }
     if (this.#selectedId !== null) {
       // A cursor above the window has to stay reachable and revealable.
