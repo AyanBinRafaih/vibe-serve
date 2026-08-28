@@ -1662,26 +1662,52 @@ def _build_tui_defaults_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_tui_defaults(  # noqa: PLR0913  # tracked: #288
+    *,
+    config_path: Path | None = None,
+    stub_agent: bool = False,
+    input_path: Path | None = None,
+    runs_dir: Path | None = None,
+    experiment_name: str | None = None,
+    theme: TuiTheme | None = None,
+    directory_only: bool = False,
+) -> InteractiveSetupDefaults:
+    """Resolve launcher-facing defaults from configuration.
+
+    ``directory_only`` keeps the resolution local: it skips the repository
+    owner suggestion, the one field that may shell out to ``gh``. Raises
+    ``ValueError`` or ``FileNotFoundError`` when the configuration cannot be
+    loaded; callers decide how to report that.
+    """
+    config = _load_config_or_stub_default(config_path, stub_agent=stub_agent)
+    resolved_input = input_path.expanduser().resolve() if input_path is not None else None
+    resolved_runs_dir = (runs_dir or Path.cwd() / "exp_env").expanduser().resolve()
+    resolved_name = experiment_name or generate_experiment_name(resolved_input)
+    return InteractiveSetupDefaults(
+        runs_dir=str(resolved_runs_dir),
+        input_path=str(resolved_input) if resolved_input is not None else "",
+        experiment_name=resolved_name,
+        repository_owner=None if directory_only else _suggest_repository_owner(config),
+        repository_name=repository_name_from_experiment(resolved_name),
+        visibility=config.repository.visibility,
+        theme=theme or config.tui.theme,
+    )
+
+
 def _run_tui_defaults(argv: list[str]) -> None:
     args = _build_tui_defaults_parser().parse_args(argv)
     try:
-        config = _load_config_or_stub_default(args.config, stub_agent=args.stub_agent)
+        defaults = _resolve_tui_defaults(
+            config_path=args.config,
+            stub_agent=args.stub_agent,
+            input_path=args.input,
+            runs_dir=args.runs_dir,
+            experiment_name=args.exp_name,
+            theme=args.theme,
+            directory_only=args.directory_only,
+        )
     except (ValueError, FileNotFoundError) as exc:
         _configuration_error(str(exc), code="config_load_failed", stage="config_loading")
-
-    input_path = args.input.expanduser().resolve() if args.input is not None else None
-    runs_dir = (args.runs_dir or Path.cwd() / "exp_env").expanduser().resolve()
-    experiment_name = args.exp_name or generate_experiment_name(input_path)
-    repository_owner = None if args.directory_only else _suggest_repository_owner(config)
-    defaults = InteractiveSetupDefaults(
-        runs_dir=str(runs_dir),
-        input_path=str(input_path) if input_path is not None else "",
-        experiment_name=experiment_name,
-        repository_owner=repository_owner,
-        repository_name=repository_name_from_experiment(experiment_name),
-        visibility=config.repository.visibility,
-        theme=args.theme or config.tui.theme,
-    )
     print(defaults.model_dump_json())  # noqa: T201  # tracked: #288
 
 
@@ -2609,15 +2635,43 @@ def _dispatch(argv: list[str]) -> None:
     runner(args)
 
 
+def _option_from_argv(argv: list[str], option: str) -> str | None:
+    """Read one option's value without parsing the full run configuration."""
+    prefix = f"{option}="
+    for index, token in enumerate(argv):
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+        if token == option and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
 def _control_socket_from_argv(argv: list[str]) -> Path | None:
     """Read the transport bootstrap flag without parsing run configuration."""
-    for index, token in enumerate(argv):
-        if token.startswith("--control-socket="):
-            value = token.partition("=")[2]
-            return Path(value) if value else None
-        if token == "--control-socket" and index + 1 < len(argv):  # noqa: S105  # tracked: #288
-            return Path(argv[index + 1])
-    return None
+    value = _option_from_argv(argv, "--control-socket")
+    return Path(value) if value else None
+
+
+def _tui_defaults_from_argv(argv: list[str]) -> Callable[[], InteractiveSetupDefaults]:
+    """Build the defaults provider a supervision server answers clients with.
+
+    The server is constructed before the run's configuration is parsed, so the
+    provider closes over the launch argv and resolves on demand. Resolution is
+    directory-only: clients need the configured theme, not a GitHub lookup.
+    """
+    config = _option_from_argv(argv, "--config")
+    theme = _option_from_argv(argv, "--theme")
+    stub_agent = "--stub-agent" in argv
+
+    def provide() -> InteractiveSetupDefaults:
+        return _resolve_tui_defaults(
+            config_path=Path(config) if config is not None else None,
+            stub_agent=stub_agent,
+            theme=TuiTheme(theme) if theme is not None else None,
+            directory_only=True,
+        )
+
+    return provide
 
 
 def _render_configuration_error(error: ConfigurationError) -> NoReturn:
@@ -2635,7 +2689,11 @@ def main() -> None:  # tracked: #288
         from vibesys.server.runtime import run_server  # noqa: PLC0415  # tracked: #288
 
         try:
-            run_server(lambda: _dispatch(argv), socket_path=control_socket)
+            run_server(
+                lambda: _dispatch(argv),
+                socket_path=control_socket,
+                tui_defaults=_tui_defaults_from_argv(argv),
+            )
         except ConfigurationError as exc:
             raise SystemExit(exc.diagnostic.exit_code) from None
         return

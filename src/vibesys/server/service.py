@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Literal
 
 from vibesys.loops.agent.hypotheses import reproject_run_evidence
@@ -32,21 +33,35 @@ from vibesys.server.protocol import (
     RunSnapshot,
     SnapshotQuery,
     SteerCommand,
+    TuiDefaultsQuery,
 )
 from vibesys.server.supervisor import RunSupervisor  # noqa: TC001  # tracked: #288
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from vibesys.loops.agent.model import AgentRunState
+    from vibesys.repository import InteractiveSetupDefaults
 
 
 class SupervisionService:
     """Authoritative message API consumed by every presentation client."""
 
-    def __init__(self, supervisor: RunSupervisor):  # noqa: ANN204, D107  # tracked: #288
+    def __init__(  # noqa: D107  # tracked: #288
+        self,
+        supervisor: RunSupervisor,
+        *,
+        tui_defaults: Callable[[], InteractiveSetupDefaults] | None = None,
+    ) -> None:
         self.supervisor = supervisor
         self.inspector = RunInspector(supervisor)
+        # The server outlives configuration parsing, so defaults are resolved
+        # on the first request and then reused.
+        self._tui_defaults_provider = tui_defaults
+        self._tui_defaults: InteractiveSetupDefaults | None = None
+        self._tui_defaults_lock = threading.Lock()
 
-    def execute(self, request: ProtocolRequest) -> Response:  # noqa: D102, PLR0911  # tracked: #288
+    def execute(self, request: ProtocolRequest) -> Response:  # noqa: C901, D102, PLR0911  # tracked: #288
         if isinstance(request, (PauseCommand, ResumeCommand, SteerCommand)):
             return self._execute_command(request)
         if isinstance(request, ChatQuery):
@@ -55,6 +70,8 @@ class SupervisionService:
             return self._execute_chat_thread_create(request)
         if isinstance(request, ChatOptionsQuery):
             return Response(request_id=request.request_id, chat_options=self.chat_options())
+        if isinstance(request, TuiDefaultsQuery):
+            return Response(request_id=request.request_id, tui_defaults=self.tui_defaults())
         if isinstance(request, HistoryQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/history")
             return Response(request_id=request.request_id, events=self.history_events())
@@ -127,6 +144,15 @@ class SupervisionService:
         """Enumerate the run's chat agent selections, or None before attach."""
         settings = self.supervisor.chat_run_settings
         return None if settings is None else build_chat_options(settings)
+
+    def tui_defaults(self) -> InteractiveSetupDefaults | None:
+        """Resolve the run's TUI defaults once, or None without a provider."""
+        if self._tui_defaults_provider is None:
+            return None
+        with self._tui_defaults_lock:
+            if self._tui_defaults is None:
+                self._tui_defaults = self._tui_defaults_provider()
+            return self._tui_defaults
 
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         return self.supervisor.snapshot()

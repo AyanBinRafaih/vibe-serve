@@ -15,6 +15,8 @@ export interface EventSubscription {
 export interface SupervisionClientOptions {
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
+  /** Delay between connection attempts while the socket does not exist yet. */
+  connectRetryIntervalMs?: number;
 }
 
 export interface SubscribeOptions {
@@ -28,6 +30,9 @@ export interface SubscribeOptions {
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_CONNECT_RETRY_INTERVAL_MS = 25;
+/** Errors a not-yet-listening server produces; anything else is fatal. */
+const RETRYABLE_CONNECT_CODES = new Set(['ENOENT', 'ECONNREFUSED']);
 
 /** A failed supervision response, including its optional structured diagnostic. */
 export class SupervisionError extends Error {
@@ -67,21 +72,60 @@ export class SupervisionClient {
     socket.on('close', () => this.#rejectAll(new Error('Supervision server disconnected')));
   }
 
-  static connect(path: string, options: SupervisionClientOptions = {}): Promise<SupervisionClient> {
+  /**
+   * Connect to the supervision socket, retrying until it accepts.
+   *
+   * The launcher starts the backend and this client concurrently, so the
+   * socket routinely does not exist for the first few hundred milliseconds.
+   * Only the errors a starting server produces are retried; every other
+   * failure, and the overall deadline, still surfaces to the caller.
+   */
+  static async connect(
+    path: string,
+    options: SupervisionClientOptions = {},
+  ): Promise<SupervisionClient> {
+    const timeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    const retryIntervalMs = options.connectRetryIntervalMs ?? DEFAULT_CONNECT_RETRY_INTERVAL_MS;
+    const deadline = Date.now() + timeoutMs;
+    let lastError: Error | undefined;
+    while (true) {
+      try {
+        return await SupervisionClient.#connectOnce(path, options, deadline);
+      } catch (error) {
+        if (!isRetryableConnectError(error)) throw error;
+        lastError = error;
+      }
+      if (Date.now() + retryIntervalMs >= deadline) {
+        throw new Error(
+          `Timed out connecting to supervision server after ${timeoutMs}ms: ${lastError?.message}`,
+        );
+      }
+      await delay(retryIntervalMs);
+    }
+  }
+
+  static #connectOnce(
+    path: string,
+    options: SupervisionClientOptions,
+    deadline: number,
+  ): Promise<SupervisionClient> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(path);
       const onError = (error: Error): void => {
         clearTimeout(timeout);
         reject(error);
       };
-      const timeout = setTimeout(() => {
-        socket.destroy();
-        reject(
-          new Error(
-            `Timed out connecting to supervision server after ${options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS}ms`,
-          ),
-        );
-      }, options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS);
+      const timeout = setTimeout(
+        () => {
+          socket.destroy();
+          reject(
+            new Error(
+              `Timed out connecting to supervision server after ${options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS}ms`,
+            ),
+          );
+        },
+        Math.max(0, deadline - Date.now()),
+      );
       socket.once('connect', () => {
         clearTimeout(timeout);
         socket.off('error', onError);
@@ -334,6 +378,16 @@ export class SupervisionClient {
     clearTimeout(pending.timeout);
     pending.reject(error);
   }
+}
+
+function isRetryableConnectError(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return code !== undefined && RETRYABLE_CONNECT_CODES.has(code);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function responseError(response: ProtocolResponse): SupervisionError {

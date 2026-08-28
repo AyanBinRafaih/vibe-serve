@@ -8,6 +8,7 @@ export type Request =
   | ChatQuery
   | ChatThreadCreateQuery
   | ChatOptionsQuery
+  | TuiDefaultsQuery
   | HistoryQuery
   | PerformanceQuery
   | ExperimentQuery
@@ -52,31 +53,35 @@ export type Type6 = "query.chat_options";
 export type ProtocolVersion7 = 1;
 export type RequestId7 = string;
 export type Timestamp7 = string;
-export type Type7 = "query.history";
+export type Type7 = "query.tui_defaults";
 export type ProtocolVersion8 = 1;
 export type RequestId8 = string;
 export type Timestamp8 = string;
-export type Type8 = "query.performance";
+export type Type8 = "query.history";
 export type ProtocolVersion9 = 1;
 export type RequestId9 = string;
 export type Timestamp9 = string;
-export type Type9 = "query.experiments";
+export type Type9 = "query.performance";
 export type ProtocolVersion10 = 1;
 export type RequestId10 = string;
 export type Timestamp10 = string;
-export type Type10 = "query.events";
-export type AfterSequence = number;
-export type BeforeSequence = number | null;
-export type TimeoutMs = number;
+export type Type10 = "query.experiments";
 export type ProtocolVersion11 = 1;
 export type RequestId11 = string;
 export type Timestamp11 = string;
-export type Type11 = "subscribe";
-export type AfterSequence1 = number;
-export type Tail = number | null;
+export type Type11 = "query.events";
+export type AfterSequence = number;
+export type BeforeSequence = number | null;
+export type TimeoutMs = number;
 export type ProtocolVersion12 = 1;
 export type RequestId12 = string;
 export type Timestamp12 = string;
+export type Type12 = "subscribe";
+export type AfterSequence1 = number;
+export type Tail = number | null;
+export type ProtocolVersion13 = 1;
+export type RequestId13 = string;
+export type Timestamp13 = string;
 export type Ok = boolean;
 export type Error = string | null;
 export type Id = string;
@@ -115,7 +120,28 @@ export type Source = "run" | "role" | "suggested";
 export type Default = boolean;
 export type Models = ChatModelOption[];
 export type Providers = ChatProviderOptions[];
-export type ProtocolVersion13 = 1;
+export type RunsDir = string;
+export type InputPath = string;
+export type ExperimentName = string;
+export type RepositoryOwner = string | null;
+export type RepositoryName = string;
+/**
+ * Supported GitHub repository visibility values.
+ */
+export type RepositoryVisibility = "private" | "public" | "internal";
+/**
+ * Selectable TUI themes, as light/dark pairs.
+ */
+export type TuiTheme =
+  | "dark"
+  | "light"
+  | "solarized-dark"
+  | "solarized-light"
+  | "catppuccin-mocha"
+  | "catppuccin-latte"
+  | "high-contrast-dark"
+  | "high-contrast-light";
+export type ProtocolVersion14 = 1;
 export type RunId = string;
 export type Sequence = number;
 export type Status1 = string;
@@ -137,10 +163,10 @@ export type Provider3 = string | null;
 export type Model3 = string | null;
 export type ActiveExecutions = ActiveAgentExecution[];
 export type ChatThreads = ChatThreadInfo[];
-export type ProtocolVersion14 = 1;
+export type ProtocolVersion15 = 1;
 export type Sequence1 = number;
 export type RunId1 = string;
-export type Timestamp13 = string;
+export type Timestamp14 = string;
 export type EventType =
   | "server_started"
   | "server_ready"
@@ -345,18 +371,18 @@ export type Active = boolean;
 export type Experiments = HypothesisEntry[];
 export type ExperimentsReady = boolean | null;
 export type ServerMessage = SubscribedMessage | EventMessage | EventBatchMessage | ProtocolErrorMessage;
-export type Type12 = "subscribed";
-export type RequestId13 = string;
+export type Type13 = "subscribed";
+export type RequestId14 = string;
 export type RunId2 = string;
 export type LatestSequence = number;
-export type Type13 = "event";
-export type Type14 = "event_batch";
+export type Type14 = "event";
+export type Type15 = "event_batch";
 export type Events1 = RunEvent[];
 export type ThroughSequence = number;
 export type ActiveExecutions1 = ActiveAgentExecution[];
 export type HistoryAfterSequence = number;
-export type Type15 = "protocol_error";
-export type RequestId14 = string | null;
+export type Type16 = "protocol_error";
+export type RequestId15 = string | null;
 export type Code2 = string;
 export type Message1 = string;
 
@@ -430,48 +456,61 @@ export interface ChatOptionsQuery {
   timestamp?: Timestamp6;
   type?: Type6;
 }
-export interface HistoryQuery {
+/**
+ * Request the launch-directory configuration defaults a TUI applies.
+ *
+ * A terminal client resolves its theme from the run's configuration. Asking
+ * over the control channel keeps TOML parsing in the backend and saves the
+ * launcher an extra Python process on the boot path.
+ */
+export interface TuiDefaultsQuery {
   protocol_version?: ProtocolVersion7;
   request_id?: RequestId7;
   timestamp?: Timestamp7;
   type?: Type7;
 }
-export interface PerformanceQuery {
+export interface HistoryQuery {
   protocol_version?: ProtocolVersion8;
   request_id?: RequestId8;
   timestamp?: Timestamp8;
   type?: Type8;
 }
-/**
- * Request the hypothesis-level experiment log for the attached run.
- */
-export interface ExperimentQuery {
+export interface PerformanceQuery {
   protocol_version?: ProtocolVersion9;
   request_id?: RequestId9;
   timestamp?: Timestamp9;
   type?: Type9;
 }
-export interface EventsQuery {
+/**
+ * Request the hypothesis-level experiment log for the attached run.
+ */
+export interface ExperimentQuery {
   protocol_version?: ProtocolVersion10;
   request_id?: RequestId10;
   timestamp?: Timestamp10;
   type?: Type10;
+}
+export interface EventsQuery {
+  protocol_version?: ProtocolVersion11;
+  request_id?: RequestId11;
+  timestamp?: Timestamp11;
+  type?: Type11;
   after_sequence?: AfterSequence;
   before_sequence?: BeforeSequence;
   timeout_ms?: TimeoutMs;
 }
 export interface SubscribeRequest {
-  protocol_version?: ProtocolVersion11;
-  request_id?: RequestId11;
-  timestamp?: Timestamp11;
-  type?: Type11;
+  protocol_version?: ProtocolVersion12;
+  request_id?: RequestId12;
+  timestamp?: Timestamp12;
+  type?: Type12;
   after_sequence?: AfterSequence1;
   tail?: Tail;
 }
 export interface Response {
-  protocol_version?: ProtocolVersion12;
-  request_id: RequestId12;
-  timestamp?: Timestamp12;
+  protocol_version?: ProtocolVersion13;
+  request_id: RequestId13;
+  timestamp?: Timestamp13;
   ok?: Ok;
   error?: Error;
   diagnostic?: Diagnostic | null;
@@ -479,6 +518,7 @@ export interface Response {
   chat?: ChatResult | null;
   chat_thread?: ChatThreadInfo | null;
   chat_options?: ChatOptions | null;
+  tui_defaults?: InteractiveSetupDefaults | null;
   snapshot?: RunSnapshot | null;
   events?: Events;
   performance?: Performance;
@@ -551,8 +591,20 @@ export interface ChatModelOption {
   source: Source;
   default?: Default;
 }
+/**
+ * JSON contract passed from Python configuration to the pre-launch TUI.
+ */
+export interface InteractiveSetupDefaults {
+  runs_dir: RunsDir;
+  input_path: InputPath;
+  experiment_name: ExperimentName;
+  repository_owner: RepositoryOwner;
+  repository_name: RepositoryName;
+  visibility: RepositoryVisibility;
+  theme: TuiTheme;
+}
 export interface RunSnapshot {
-  protocol_version?: ProtocolVersion13;
+  protocol_version?: ProtocolVersion14;
   run_id: RunId;
   sequence: Sequence;
   status: Status1;
@@ -595,10 +647,10 @@ export interface AgentExecutionActivityData {
  * object, which lets ``EventStore`` replay history without copying it.
  */
 export interface RunEvent {
-  protocol_version?: ProtocolVersion14;
+  protocol_version?: ProtocolVersion15;
   sequence?: Sequence1;
   run_id?: RunId1;
-  timestamp: Timestamp13;
+  timestamp: Timestamp14;
   type: EventType;
   text?: Text2;
   diagnostic?: Diagnostic | null;
@@ -874,25 +926,25 @@ export interface HypothesisRound {
   candidate_disposition?: CandidateDisposition;
 }
 export interface SubscribedMessage {
-  type?: Type12;
-  request_id: RequestId13;
+  type?: Type13;
+  request_id: RequestId14;
   run_id: RunId2;
   latest_sequence: LatestSequence;
 }
 export interface EventMessage {
-  type?: Type13;
+  type?: Type14;
   event: RunEvent;
 }
 export interface EventBatchMessage {
-  type?: Type14;
+  type?: Type15;
   events: Events1;
   through_sequence?: ThroughSequence;
   active_executions?: ActiveExecutions1;
   history_after_sequence?: HistoryAfterSequence;
 }
 export interface ProtocolErrorMessage {
-  type?: Type15;
-  request_id?: RequestId14;
+  type?: Type16;
+  request_id?: RequestId15;
   code: Code2;
   message: Message1;
   diagnostic?: Diagnostic | null;

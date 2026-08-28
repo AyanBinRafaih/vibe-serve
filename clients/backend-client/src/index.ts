@@ -18,4 +18,5 @@ export type {
   RunEvent,
   RunSnapshot,
   ServerMessage,
+  TuiDefaults,
 } from './protocol.js';

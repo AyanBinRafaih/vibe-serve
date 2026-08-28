@@ -3,8 +3,11 @@ import {createCliRenderer} from '@opentui/core';
 import {SupervisionClient} from '@vibesys/backend-client';
 import {runTuiSession} from './runtime.js';
 import {SocketSessionController} from './session-controller.js';
+import {resolveStartupTheme} from './startup-theme.js';
 import {createOpenTuiApp} from './ui/app.js';
-import {resolveTheme} from './ui/theme.js';
+
+/** The launcher starts the backend and this process concurrently. */
+const CONNECT_TIMEOUT_MS = 30_000;
 
 const socketPath = process.env['VIBESYS_CONTROL_SOCKET'];
 if (!socketPath) throw new Error('VIBESYS_CONTROL_SOCKET is required');
@@ -20,14 +23,21 @@ const launchStartMs =
     ? parsedLaunchStartMs
     : undefined;
 
-const client = await SupervisionClient.connect(socketPath);
+const client = await SupervisionClient.connect(socketPath, {
+  connectTimeoutMs: CONNECT_TIMEOUT_MS,
+});
+const explicitTheme = process.env['VIBESYS_THEME'];
+// In flight while the renderer starts, so the configured theme costs no
+// extra wall clock before the first frame.
+const themeRequest =
+  explicitTheme === undefined ? client.request({type: 'query.tui_defaults'}) : undefined;
 // VibeSys owns Ctrl+C so a nonempty OpenTUI selection can be copied before the
 // same chord falls back to exiting. Enabling OpenTUI's parallel exit handler
 // would make those two outcomes race.
 const renderer = await createCliRenderer({exitOnCtrlC: false});
 const controller = new SocketSessionController(
   client,
-  resolveTheme(process.env['VIBESYS_THEME']).name,
+  await resolveStartupTheme(themeRequest, {explicitTheme}),
   // Boot measurements go to stderr: they are developer diagnostics, not
   // session state. The renderer holds the alternate screen, so the line never
   // lands in the operator's scrollback; `vs 2>trace.log` captures it.

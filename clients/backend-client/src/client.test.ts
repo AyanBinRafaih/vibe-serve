@@ -344,6 +344,43 @@ describe('SupervisionClient', () => {
       },
     );
   });
+  it('keeps retrying until a socket that does not exist yet accepts', async () => {
+    socketPath = join('/tmp', `vs-${randomUUID().slice(0, 8)}.sock`);
+    const server = createServer(socket =>
+      respondToLines(socket, request =>
+        socket.write(`${JSON.stringify(successResponse(request['request_id'] as string))}\n`),
+      ),
+    );
+    const path = socketPath;
+    const connecting = SupervisionClient.connect(path, {connectTimeoutMs: 5_000});
+    setTimeout(() => void listen(server, path), 150);
+
+    const client = await connecting;
+    try {
+      await expect(client.request({type: 'query.snapshot'})).resolves.toMatchObject({ok: true});
+    } finally {
+      await client.close();
+      await close(server);
+    }
+  });
+
+  it('reports the last connection failure when the backend never listens', async () => {
+    socketPath = join('/tmp', `vs-${randomUUID().slice(0, 8)}.sock`);
+
+    await expect(
+      SupervisionClient.connect(socketPath, {connectTimeoutMs: 120, connectRetryIntervalMs: 20}),
+    ).rejects.toThrow(/Timed out connecting to supervision server after 120ms: .*ENOENT/);
+  });
+
+  it('stops retrying once the deadline passes', async () => {
+    socketPath = join('/tmp', `vs-${randomUUID().slice(0, 8)}.sock`);
+    const start = Date.now();
+
+    await expect(
+      SupervisionClient.connect(socketPath, {connectTimeoutMs: 100, connectRetryIntervalMs: 10}),
+    ).rejects.toThrow();
+    expect(Date.now() - start).toBeLessThan(2_000);
+  });
 });
 
 async function withServer(
