@@ -488,8 +488,15 @@ class RunSupervisor:
 
     def read_history_events(self) -> list[RunEvent]:
         """Return the same durable event history used for subscription replay."""
-        store = self._store
-        return _canonical_execution_events(store.read()) if store else []
+        with self._condition:
+            store = self._store
+            if store is None:
+                return []
+            return _canonical_execution_events(
+                store.read(),
+                canonical_lifecycle_ids=self._canonical_execution_ids,
+                invocation_lifecycle_ids=self._legacy_invocation_ids,
+            )
 
     def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         store = self._store

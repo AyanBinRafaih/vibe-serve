@@ -7,8 +7,9 @@ from itertools import pairwise
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from vibesys.server.events import EventStore, EventType, RunEvent, make_event
+from vibesys.server.events import EventStore, EventType, RunEvent, ToolCallData, make_event
 
 
 def _persisted_event(sequence: int, text: str = "") -> RunEvent:
@@ -187,17 +188,43 @@ class TestEventStore:
         batches = [reader.result() for reader in readers]
         assert [[event.sequence for event in batch] for batch in batches] == [[1], [1]]
         assert all(batch[0] == appended for batch in batches)
-        assert batches[0][0] is not batches[1][0]
+        # Readers share the stored event rather than each getting a copy: it is
+        # frozen, so sharing is what keeps replay from copying whole histories.
+        assert batches[0][0] is batches[1][0]
+        assert batches[0] is not batches[1]
 
     def test_cached_events_are_isolated_from_reader_mutation(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
         appended = store.append(make_event(EventType.OUTPUT, "durable"))
 
         first_read = store.read()
-        first_read[0].text = "mutated"
+        with pytest.raises(ValidationError):
+            first_read[0].text = "mutated"
 
         assert appended.text == "durable"
         assert store.read()[0].text == "durable"
+
+    def test_reader_projections_do_not_disturb_stored_history(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        """The read path builds variants by copy, which the store never sees."""
+        store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
+        store.append(make_event(EventType.OUTPUT, "durable"))
+
+        projected = store.read()[0].model_copy(update={"text": "projected"})
+
+        assert projected.text == "projected"
+        assert store.read()[0].text == "durable"
+
+    def test_appended_events_are_immutable(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
+        appended = store.append(
+            make_event(EventType.TOOL_CALL, data=ToolCallData(tool="Bash", call_id="c1"))
+        )
+
+        with pytest.raises(ValidationError):
+            appended.sequence = 99
+        assert isinstance(appended.data, ToolCallData)
+        with pytest.raises(ValidationError):
+            appended.data.tool = "Write"
 
     def test_append_does_not_publish_cache_state_when_file_close_fails(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"

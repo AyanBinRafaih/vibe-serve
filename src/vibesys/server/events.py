@@ -65,7 +65,18 @@ AgentOutputChannel = Literal["assistant", "analysis", "tool", "diagnostic", "pro
 """Presentation channel for streamed agent output."""
 
 
-class ChatData(BaseModel):  # noqa: D101  # tracked: #288
+class EventPayload(BaseModel):
+    """Immutable base for every structured event payload.
+
+    Payloads are frozen so ``EventStore`` can hand the same stored object to
+    every reader instead of copying the whole history on each replay. Producers
+    build new payloads; ``model_copy(update=...)`` still works on frozen models.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+
+class ChatData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["chat"] = "chat"
     answer: str
     # The authoritative thread title, set by the server on the turn that
@@ -73,7 +84,7 @@ class ChatData(BaseModel):  # noqa: D101  # tracked: #288
     thread_title: str | None = None
 
 
-class ChatThreadCreatedData(BaseModel):
+class ChatThreadCreatedData(EventPayload):
     """Identity and resolved agent settings for one experiment-chat thread.
 
     Replayed by clients to rebuild the thread list; the default thread is
@@ -89,13 +100,13 @@ class ChatThreadCreatedData(BaseModel):
     created_at: datetime
 
 
-class InvocationStartedData(BaseModel):  # noqa: D101  # tracked: #288
+class InvocationStartedData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["invocation_started"] = "invocation_started"
     system_prompt: str
     user_prompt: str
 
 
-class InvocationFinishedData(BaseModel):  # noqa: D101  # tracked: #288
+class InvocationFinishedData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["invocation_finished"] = "invocation_finished"
     result: Any = None
     error: str | None = None
@@ -104,7 +115,7 @@ class InvocationFinishedData(BaseModel):  # noqa: D101  # tracked: #288
 ExecutionActivityMode = Literal["thinking", "responding", "tool", "waiting"]
 
 
-class AgentExecutionActivityData(BaseModel):
+class AgentExecutionActivityData(EventPayload):
     """Complete current activity for an active agent execution."""
 
     kind: Literal["agent_execution_activity_changed"] = "agent_execution_activity_changed"
@@ -113,7 +124,7 @@ class AgentExecutionActivityData(BaseModel):
     tool: str | None = None
 
 
-class AgentExecutionStartedData(BaseModel):
+class AgentExecutionStartedData(EventPayload):
     """Semantic context for one prompt-to-result agent execution."""
 
     kind: Literal["agent_execution_started"] = "agent_execution_started"
@@ -127,7 +138,7 @@ class AgentExecutionStartedData(BaseModel):
     model: str | None = None
 
 
-class AgentExecutionFinishedData(BaseModel):
+class AgentExecutionFinishedData(EventPayload):
     """Terminal result for one agent execution."""
 
     kind: Literal["agent_execution_finished"] = "agent_execution_finished"
@@ -135,37 +146,37 @@ class AgentExecutionFinishedData(BaseModel):
     error: str | None = None
 
 
-class OutputData(BaseModel):  # noqa: D101  # tracked: #288
+class OutputData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["output"] = "output"
     stream: OutputStream
     source: str = "backend"
     content: str
 
 
-class ServerReadyData(BaseModel):  # noqa: D101  # tracked: #288
+class ServerReadyData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["server_ready"] = "server_ready"
     socket_protocol: Literal["jsonl"] = "jsonl"
 
 
-class RunStartedData(BaseModel):  # noqa: D101  # tracked: #288
+class RunStartedData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["run_started"] = "run_started"
     outer_loop: str
     input: str
     max_rounds: int
 
 
-class RunInterruptedData(BaseModel):  # noqa: D101  # tracked: #288
+class RunInterruptedData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["run_interrupted"] = "run_interrupted"
     reason: str
     signal: str | None = None
 
 
-class ExperimentsChangedData(BaseModel):  # noqa: D101  # tracked: #288
+class ExperimentsChangedData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["experiments_changed"] = "experiments_changed"
     reason: Literal["project_attached", "active_hypothesis_changed", "round_persisted"]
 
 
-class ConfigurationFailedData(BaseModel):  # noqa: D101  # tracked: #288
+class ConfigurationFailedData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["configuration_failed"] = "configuration_failed"
     code: str
     stage: str
@@ -174,13 +185,13 @@ class ConfigurationFailedData(BaseModel):  # noqa: D101  # tracked: #288
     exit_code: int
 
 
-class PhaseData(BaseModel):  # noqa: D101  # tracked: #288
+class PhaseData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["phase"] = "phase"
     phase: str
     attempt: int | None = None
 
 
-class AgentStatusData(BaseModel):
+class AgentStatusData(EventPayload):
     """Structured progress readings for one agent invocation.
 
     Carried on presentation events so renderers can format their own status
@@ -195,14 +206,14 @@ class AgentStatusData(BaseModel):
     context_window: int | None = None
 
 
-class AgentOutputChunkData(BaseModel):  # noqa: D101  # tracked: #288
+class AgentOutputChunkData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["agent_output_chunk"] = "agent_output_chunk"
     channel: AgentOutputChannel
     content: str
     status: AgentStatusData | None = None
 
 
-class ToolCallData(BaseModel):  # noqa: D101  # tracked: #288
+class ToolCallData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["tool_call"] = "tool_call"
     tool: str
     call_id: str | None = None
@@ -210,7 +221,7 @@ class ToolCallData(BaseModel):  # noqa: D101  # tracked: #288
     status: AgentStatusData | None = None
 
 
-class CommandResultPayload(BaseModel):
+class CommandResultPayload(EventPayload):
     """Structured result of a command-style tool execution."""
 
     kind: Literal["command"] = "command"
@@ -221,7 +232,7 @@ class CommandResultPayload(BaseModel):
     """Wall-clock execution time in seconds."""
 
 
-class JsonResultPayload(BaseModel):
+class JsonResultPayload(EventPayload):
     """A tool result that is a JSON object or array, already parsed."""
 
     kind: Literal["json"] = "json"
@@ -235,7 +246,7 @@ ToolResultPayload = Annotated[
 """Typed structure a producer preserved alongside the raw result text."""
 
 
-class ToolResultData(BaseModel):  # noqa: D101  # tracked: #288
+class ToolResultData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["tool_result"] = "tool_result"
     tool: str
     call_id: str | None = None
@@ -246,7 +257,7 @@ class ToolResultData(BaseModel):  # noqa: D101  # tracked: #288
     payload: ToolResultPayload | None = None
 
 
-class TodoItemData(BaseModel):  # noqa: D101  # tracked: #288
+class TodoItemData(EventPayload):  # noqa: D101  # tracked: #288
     content: str
     # Expected values are "pending" / "in_progress" / "completed", but the
     # field stays open: todo payloads originate from agent tool calls, and an
@@ -254,19 +265,19 @@ class TodoItemData(BaseModel):  # noqa: D101  # tracked: #288
     status: str
 
 
-class TodoUpdateData(BaseModel):  # noqa: D101  # tracked: #288
+class TodoUpdateData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["todo_update"] = "todo_update"
     todos: list[TodoItemData] = Field(default_factory=list)
 
 
-class UsageUpdateData(BaseModel):  # noqa: D101  # tracked: #288
+class UsageUpdateData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["usage_update"] = "usage_update"
     input_tokens: int
     context_window: int | None = None
     model: str | None = None
 
 
-class SubprocessOutputData(BaseModel):  # noqa: D101  # tracked: #288
+class SubprocessOutputData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["subprocess_output"] = "subprocess_output"
     process_id: str
     process_kind: str
@@ -274,21 +285,21 @@ class SubprocessOutputData(BaseModel):  # noqa: D101  # tracked: #288
     content: str
 
 
-class JudgeResultData(BaseModel):  # noqa: D101  # tracked: #288
+class JudgeResultData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["judge_result"] = "judge_result"
     verdict: Literal["pass", "fail"]
     feedback: str
     attempt: int
 
 
-class BenchmarkResultData(BaseModel):  # noqa: D101  # tracked: #288
+class BenchmarkResultData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["benchmark_result"] = "benchmark_result"
     metric: str
     value: FiniteFloat
     unit: str
 
 
-class RoundFinishedData(BaseModel):  # noqa: D101  # tracked: #288
+class RoundFinishedData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["round_finished"] = "round_finished"
     attempts: int
     judge_verdict: Literal["pass", "fail", "skipped"]
@@ -325,9 +336,14 @@ EventData = Annotated[
 
 
 class RunEvent(BaseModel):
-    """One reproducible human, control, or invocation event."""
+    """One reproducible human, control, or invocation event.
 
-    model_config = ConfigDict(extra="forbid")
+    Frozen: a recorded event is a durable fact. Readers that need a variant
+    build one with ``model_copy(update=...)`` rather than mutating a shared
+    object, which lets ``EventStore`` replay history without copying it.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     protocol_version: Literal[1] = 1
     sequence: int = Field(default=0, ge=0)
@@ -365,7 +381,14 @@ class RunEvent(BaseModel):
 
 
 class EventStore:
-    """Serialize event access so readers never observe partial JSONL writes."""
+    """Serialize event access so readers never observe partial JSONL writes.
+
+    Read contract: reads return the stored ``RunEvent`` objects themselves, in
+    a fresh list. ``RunEvent`` and its payloads are frozen, so readers project
+    history with ``model_copy(update=...)`` instead of mutating what they read.
+    Copying every event per read cost ~1.9s on a 72k-event history, paid again
+    on each new subscription's full replay.
+    """
 
     def __init__(self, path: Path, run_id: str):  # noqa: ANN204, D107  # tracked: #288
         self.path = path
@@ -389,7 +412,7 @@ class EventStore:
             with self.path.open("a", encoding="utf-8") as stream:
                 stream.write(event.model_dump_json() + "\n")
             self._next_sequence += 1
-            self._events.append(event.model_copy(deep=True))
+            self._events.append(event)
             self._sequences.append(event.sequence)
             self._changed.notify_all()
             return event
@@ -414,8 +437,9 @@ class EventStore:
 
     def _events_after_unlocked(self, after_sequence: int) -> list[RunEvent]:
         start = bisect_right(self._sequences, after_sequence)
-        events = self._events[start:]
-        return [event.model_copy(deep=True) for event in events]
+        # A slice is a new list, so callers own the sequence; the frozen events
+        # inside it stay shared with the store.
+        return self._events[start:]
 
     def _read_unlocked(self) -> tuple[list[RunEvent], int | None]:
         if not self.path.exists():
@@ -444,7 +468,7 @@ def _repair_legacy_sequences(events: list[RunEvent]) -> list[RunEvent]:
     last_sequence = 0
     for event in events:
         repaired_event = (
-            event.model_copy(update={"sequence": last_sequence + 1}, deep=True)
+            event.model_copy(update={"sequence": last_sequence + 1})
             if event.sequence <= last_sequence
             else event
         )
