@@ -5,9 +5,18 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
+from typing import TypedDict
 from unittest.mock import patch
 
 from vibesys import cli
+
+
+class _LaunchCall(TypedDict, total=False):
+    """What the launcher handed to ``subprocess.call``, as captured by a fake."""
+
+    cmd: list[str]
+    cwd: Path | None
+    env: dict[str, str] | None
 
 
 def _make_source_checkout(
@@ -62,7 +71,7 @@ def test_headless_requested_when_not_a_tty(monkeypatch):  # noqa: ANN001, ANN201
 
 
 def test_headless_flag_runs_engine_subprocess(monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
-    captured: dict[str, object] = {}
+    captured: _LaunchCall = {}
 
     def _call(cmd, env=None):  # noqa: ANN001, ANN202, ARG001  # tracked: #288
         captured["cmd"] = cmd
@@ -90,7 +99,7 @@ def test_interactive_execs_launcher_with_python_env(monkeypatch, tmp_path):  # n
     monkeypatch.delenv("VIBESYS_BOOT_TRACE", raising=False)
     monkeypatch.setattr(cli, "bundled_tui", lambda: bundle)
 
-    captured: dict[str, object] = {}
+    captured: _LaunchCall = {}
 
     def _call(cmd, env=None):  # noqa: ANN001, ANN202  # tracked: #288
         captured["cmd"] = cmd
@@ -110,16 +119,18 @@ def test_interactive_execs_launcher_with_python_env(monkeypatch, tmp_path):  # n
         "bundle",
         "--local",
     ]
-    assert captured["env"]["VIBESYS_PYTHON"] == sys.executable  # pyright: ignore[reportIndexIssue]
-    assert captured["env"]["VIBESYS_TUI_RUNTIME"] == str(bundle.runtime)  # pyright: ignore[reportIndexIssue]
-    assert captured["env"]["BUN_CONFIG_SKIP_INSTALL_PACKAGES"] == "1"  # pyright: ignore[reportIndexIssue]
+    env = captured["env"]
+    assert env is not None
+    assert env["VIBESYS_PYTHON"] == sys.executable
+    assert env["VIBESYS_TUI_RUNTIME"] == str(bundle.runtime)
+    assert env["BUN_CONFIG_SKIP_INSTALL_PACKAGES"] == "1"
     # Read by clients/tui/src/boot-trace.ts to anchor the client's boot
     # measurements to when the user ran the command, not just when the
     # frontend process started. cli.main marks it through vibesys.boot_trace.
-    launch_start_ms = int(captured["env"]["VIBESYS_LAUNCH_START_MS"])  # pyright: ignore[reportIndexIssue]
+    launch_start_ms = int(env["VIBESYS_LAUNCH_START_MS"])
     assert abs(launch_start_ms - int(time.time() * 1000)) < 5_000
     # Quiet by default: the frontend traces only when asked to.
-    assert "VIBESYS_BOOT_TRACE" not in captured["env"]  # pyright: ignore[reportOperatorIssue]
+    assert "VIBESYS_BOOT_TRACE" not in env
 
 
 def test_boot_trace_request_reaches_the_launcher(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
@@ -129,7 +140,7 @@ def test_boot_trace_request_reaches_the_launcher(monkeypatch, tmp_path):  # noqa
     monkeypatch.setenv("VIBESYS_BOOT_TRACE", "1")
     monkeypatch.setattr(cli, "bundled_tui", lambda: bundle)
 
-    captured: dict[str, object] = {}
+    captured: _LaunchCall = {}
 
     def _call(cmd, env=None):  # noqa: ANN001, ANN202, ARG001  # tracked: #288
         captured["env"] = env
@@ -138,7 +149,9 @@ def test_boot_trace_request_reaches_the_launcher(monkeypatch, tmp_path):  # noqa
     monkeypatch.setattr(cli.subprocess, "call", _call)
 
     assert cli.main(["--input", "bundle", "--local"]) == 0
-    assert captured["env"]["VIBESYS_BOOT_TRACE"] == "1"  # pyright: ignore[reportIndexIssue]
+    env = captured["env"]
+    assert env is not None
+    assert env["VIBESYS_BOOT_TRACE"] == "1"
 
 
 def test_interactive_with_non_executable_bundled_runtime_errors(  # noqa: ANN201
@@ -162,7 +175,7 @@ def test_no_bundle_no_checkout_falls_back_to_headless(monkeypatch, capsys):  # n
     _force_interactive(monkeypatch)
     monkeypatch.setattr(cli, "bundled_tui", lambda: None)
     monkeypatch.setattr(cli, "source_checkout_root", lambda: None)
-    captured: dict[str, object] = {}
+    captured: _LaunchCall = {}
 
     def _call(cmd, env=None):  # noqa: ANN001, ANN202, ARG001  # tracked: #288
         captured["cmd"] = cmd
@@ -202,7 +215,7 @@ def test_source_checkout_builds_and_runs_launcher_from_callers_directory(monkeyp
         cli, "_ensure_source_tui_built", lambda _root: build_calls.append(True) or True
     )
 
-    captured: dict[str, object] = {}
+    captured: _LaunchCall = {}
 
     def _call(cmd, cwd=None, env=None):  # noqa: ANN001, ANN202  # tracked: #288
         captured["cmd"] = cmd
@@ -219,10 +232,12 @@ def test_source_checkout_builds_and_runs_launcher_from_callers_directory(monkeyp
     launcher = tmp_path / "clients" / "tui" / "dist" / "launcher.js"
     assert captured["cmd"] == ["/usr/bin/node", str(launcher), "--input", "bundle", "--local"]
     assert captured["cwd"] is None
-    assert captured["env"]["VIBESYS_PYTHON"] == sys.executable  # pyright: ignore[reportIndexIssue]
-    launch_start_ms = int(captured["env"]["VIBESYS_LAUNCH_START_MS"])  # pyright: ignore[reportIndexIssue]
+    env = captured["env"]
+    assert env is not None
+    assert env["VIBESYS_PYTHON"] == sys.executable
+    launch_start_ms = int(env["VIBESYS_LAUNCH_START_MS"])
     assert abs(launch_start_ms - int(time.time() * 1000)) < 5_000
-    assert "VIBESYS_BOOT_TRACE" not in captured["env"]  # pyright: ignore[reportOperatorIssue]
+    assert "VIBESYS_BOOT_TRACE" not in env
 
 
 def test_source_checkout_skips_build_when_fresh(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288

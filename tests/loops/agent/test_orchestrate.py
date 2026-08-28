@@ -2,15 +2,20 @@
 
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack, cast
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 from vibesys.agents import AgentClient
+from vibesys.config import Config, as_config
+from vibesys.constants import ComputeBackend
 from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationError
+from vibesys.input_manifest import BenchmarkResult, WorkspaceSource
 from vibesys.loops.agent import issue_board
 from vibesys.loops.agent.loop import (
     FrameworkBenchmarkOutcome,
@@ -33,8 +38,8 @@ from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.evolve.population import Objective
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.prompts import PROMPTS_DIR
-from vibesys.run import GitTracker
-from vibesys.sandbox.run_environment import make_run_environment_spec
+from vibesys.run import GitTracker, RepositoryVisibility
+from vibesys.sandbox.run_environment import RunEnvironmentSpec, make_run_environment_spec
 from vibesys.schemas import (
     CandidateDisposition,
     HypothesisOutcome,
@@ -51,6 +56,9 @@ from vibesys.schemas import (
 )
 from vs_loop_state.agent import RoundRecord
 from vs_project import Project, serialize_round
+
+if TYPE_CHECKING:
+    from vibesys.run.protocol import LoopContext
 
 # ---------------------------------------------------------------------------
 # Fixtures & helpers
@@ -253,21 +261,72 @@ def _make_orchestrate_runner(  # noqa: ANN202, PLR0913  # tracked: #288
     return runner
 
 
-def _invoke_orchestrate(tmp_path, ref_file, runner, **kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
+class _AgentLoopArguments(TypedDict, total=False):
+    """The keyword surface of :func:`run_agent_loop`, mirrored for the harness."""
+
+    config: Config
+    exp_name: str
+    input_path: str
+    accuracy_command: str
+    benchmark_command: str
+    objective: str
+    runs_dir: Path | None
+    task_name: str | None
+    task_root: Path | None
+    objectives: list[Objective] | None
+    pareto_relative_noise: float
+    workspace_sources: tuple[WorkspaceSource, ...]
+    evaluator_path: Path | None
+    evaluator_package_root: Path | None
+    benchmark_result: BenchmarkResult | None
+    benchmark_result_protocol: Literal[2] | None
+    accuracy_timeout_seconds: int | None
+    benchmark_timeout_seconds: int | None
+    max_rounds: int
+    max_retries_per_round: int
+    judge_every: int
+    official_eval_every: int
+    memory_layout: str
+    start_round: int | None
+    existing: bool
+    operator_constraints: tuple[str, ...]
+    trusted_input_baseline: str | None
+    debug: bool
+    profiler_kind: ProfilerKind
+    skills_dirs: list[str] | None
+    run_environment: RunEnvironmentSpec | None
+    agent_backend: str | None
+    cli_provider: str | None
+    backend: ComputeBackend
+    modality: str | None
+    inner_loop: str
+    domain: DomainName | None
+    interface: str
+    remote_repo: str | None
+    repo_visibility: RepositoryVisibility
+
+
+def _invoke_orchestrate(
+    tmp_path: Path,
+    ref_file: str,
+    runner: MagicMock,
+    *,
+    _accuracy_gate_results: Sequence[str | None] | None = None,
+    **kwargs: Unpack[_AgentLoopArguments],
+) -> bool:
     """Shared plumbing: patch context globals, run the loop, return result."""
-    accuracy_gate_results = kwargs.pop("_accuracy_gate_results", None)
-    defaults = dict(  # noqa: C408  # tracked: #288
-        config={"model": {"name": "claude-sonnet-4-6"}},
-        exp_name="test-orch",
-        runs_dir=tmp_path / "exp_env",
-        input_path=str(Path(ref_file).parent),
-        accuracy_command="uv run python accuracy_checker/checker.py",
-        benchmark_command="uv run python benchmark/benchmark.py",
-        objective="Maximize tok/s throughput.",
-        max_rounds=5,
-        max_retries_per_round=2,
-        domain=DomainName.LLM_SERVING,
-    )
+    defaults: _AgentLoopArguments = {
+        "config": as_config({"model": {"name": "claude-sonnet-4-6"}}),
+        "exp_name": "test-orch",
+        "runs_dir": tmp_path / "exp_env",
+        "input_path": str(Path(ref_file).parent),
+        "accuracy_command": "uv run python accuracy_checker/checker.py",
+        "benchmark_command": "uv run python benchmark/benchmark.py",
+        "objective": "Maximize tok/s throughput.",
+        "max_rounds": 5,
+        "max_retries_per_round": 2,
+        "domain": DomainName.LLM_SERVING,
+    }
     defaults.update(kwargs)
     with (
         patch("vibesys.context.build_model", return_value="mock-model"),
@@ -276,11 +335,11 @@ def _invoke_orchestrate(tmp_path, ref_file, runner, **kwargs):  # noqa: ANN001, 
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
         patch(
             "vibesys.loops.agent.loop._run_framework_accuracy_gate",
-            side_effect=accuracy_gate_results,
+            side_effect=_accuracy_gate_results,
             return_value=None,
         ),
     ):
-        return run_agent_loop(**defaults)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        return run_agent_loop(**defaults)
 
 
 def _created_project(tmp_path: Path) -> Path:
@@ -330,17 +389,19 @@ def test_project_configuration_captures_effective_agent_behavior(tmp_path: Path)
         pytest.raises(RuntimeError, match="captured project configuration"),
     ):
         run_agent_loop(
-            config={  # pyright: ignore[reportArgumentType]  # tracked: #297
-                "model": {"name": "gpt-default"},
-                "thinking": {"level": "high"},
-                "agent": {
-                    "backend": "cli",
-                    "cli_provider": "codex",
-                    "cli_timeout": 900,
-                    "outer": {"model": "gpt-outer", "reasoning_effort": "xhigh"},
-                    "inner": {"model": "gpt-inner", "reasoning_effort": "medium"},
-                },
-            },
+            config=as_config(
+                {
+                    "model": {"name": "gpt-default"},
+                    "thinking": {"level": "high"},
+                    "agent": {
+                        "backend": "cli",
+                        "cli_provider": "codex",
+                        "cli_timeout": 900,
+                        "outer": {"model": "gpt-outer", "reasoning_effort": "xhigh"},
+                        "inner": {"model": "gpt-inner", "reasoning_effort": "medium"},
+                    },
+                }
+            ),
             exp_name="queue",
             input_path=str(tmp_path),
             accuracy_command="check",
@@ -519,7 +580,10 @@ def test_read_only_role_preserves_allowed_roadmap_and_reverts_other_writes(tmp_p
     )
 
     result = _invoke_read_only_role(
-        ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        # Deliberately a partial double: role isolation touches only these five
+        # members, and SimpleNamespace fails loudly on anything else, which is
+        # the property this test pins.
+        cast("LoopContext", ctx),
         role="orchestrator",
         checkpoint_label="round-2-plan-input",
         allowed_workspace_paths=("roadmap/index.md",),
@@ -564,7 +628,8 @@ def test_read_only_role_preserves_allowed_directory_and_reverts_candidate_edits(
     )
 
     result = _invoke_read_only_role(
-        ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        # Partial double, same rationale as the orchestrator case above.
+        cast("LoopContext", ctx),
         role="profiler",
         checkpoint_label="round-2-profiler-input",
         allowed_workspace_paths=("progress/profiles/round-0002",),
@@ -1481,7 +1546,8 @@ def test_framework_local_validation_fails_and_restores_mutation(tmp_path):  # no
         progress_path=progress,
     )
 
-    assert "mutated the workspace" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert feedback is not None
+    assert "mutated the workspace" in feedback
     ctx.git.checkout_tree.assert_called_once_with("b" * 40, clean=True)
     artifact = progress / "validation" / "round-0003-attempt-01.json"
     assert '"passed": false' in artifact.read_text()
@@ -1529,8 +1595,9 @@ def test_framework_accuracy_gate_rejects_checker_failure(tmp_path):  # noqa: ANN
         progress_path=tmp_path / "progress.md",
     )
 
-    assert "Framework accuracy gate failed" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
-    assert "bad history" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert feedback is not None
+    assert "Framework accuracy gate failed" in feedback
+    assert "bad history" in feedback
 
 
 def test_framework_accuracy_gate_uses_manifest_timeout(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1620,7 +1687,8 @@ def test_framework_accuracy_gate_rejects_evaluator_changes_without_execution(tmp
         progress_path=tmp_path / "progress.md",
     )
 
-    assert "Evaluator-owned files were modified" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert feedback is not None
+    assert "Evaluator-owned files were modified" in feedback
     ctx.judge_backend.execute.assert_not_called()
 
 
@@ -1641,7 +1709,8 @@ def test_framework_accuracy_gate_rejects_changes_during_execution(tmp_path):  # 
         progress_path=tmp_path / "progress.md",
     )
 
-    assert "changed during accuracy execution" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert feedback is not None
+    assert "changed during accuracy execution" in feedback
 
 
 def test_framework_gates_reuse_accuracy_pass_after_later_gate_failure(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1801,7 +1870,8 @@ def test_framework_benchmark_rejects_ambiguous_metric(tmp_path):  # noqa: ANN001
     )
 
     assert outcome.metric_value is None
-    assert "expected exactly one 'ops' field" in outcome.feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert outcome.feedback is not None
+    assert "expected exactly one 'ops' field" in outcome.feedback
 
 
 # ---------------------------------------------------------------------------

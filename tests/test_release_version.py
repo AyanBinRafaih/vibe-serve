@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING
 
 import pytest
 from packaging.version import Version
-from scripts.check_release_version import (  # pyright: ignore[reportMissingImports]
+from scripts.check_release_version import (
     ReleaseVersionError,
     check_release_version,
 )
-from wheel_targets import TARGETS  # pyright: ignore[reportMissingImports]
+from wheel_targets import TARGETS
 
 if TYPE_CHECKING:
     from pathlib import Path

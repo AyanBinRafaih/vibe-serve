@@ -418,7 +418,8 @@ class RunSupervisor:
         *,
         scope: DiagnosticScope,
         operation: str,
-        data: EventData | Callable[[Diagnostic], EventData] | None = None,
+        data: EventData | None = None,
+        data_factory: Callable[[Diagnostic], EventData] | None = None,
         text: str | None = None,
         severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
         status: EventStatus = EventStatus.FAILED,
@@ -430,6 +431,8 @@ class RunSupervisor:
         This API handles nonterminal invocation and phase boundaries. Pass an
         existing diagnostic when related events must share an identity.
         Terminal failures remain owned by ``finish`` and ``run_server``.
+        Pass ``data_factory`` instead of ``data`` when the payload needs the
+        canonical diagnostic; it takes precedence over ``data``.
         """
         if event_type not in _NONTERMINAL_FAILURE_EVENTS:
             raise ValueError(f"Cannot record {event_type.value} without owning run termination")  # noqa: TRY003  # contract violation, not a user-facing error
@@ -439,6 +442,7 @@ class RunSupervisor:
             scope=scope,
             operation=operation,
             data=data,
+            data_factory=data_factory,
             text=text,
             severity=severity,
             status=status,
@@ -453,7 +457,8 @@ class RunSupervisor:
         *,
         scope: DiagnosticScope,
         operation: str,
-        data: EventData | Callable[[Diagnostic], EventData] | None = None,
+        data: EventData | None = None,
+        data_factory: Callable[[Diagnostic], EventData] | None = None,
         text: str | None = None,
         severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
         status: EventStatus = EventStatus.FAILED,
@@ -466,7 +471,7 @@ class RunSupervisor:
         diagnostic = diagnostic or self._diagnostic_for(error, scope, operation=operation)
         if diagnostic.severity is not severity:
             diagnostic = diagnostic.model_copy(update={"severity": severity})
-        event_data = data(diagnostic) if callable(data) else data
+        event_data = data_factory(diagnostic) if data_factory is not None else data
         return self.record(
             event_type,
             diagnostic.summary if text is None else text,
@@ -483,7 +488,8 @@ class RunSupervisor:
         event_type: EventType,
         scope: DiagnosticScope,
         operation: str,
-        data: EventData | Callable[[Diagnostic], EventData] | None = None,
+        data: EventData | None = None,
+        data_factory: Callable[[Diagnostic], EventData] | None = None,
         text: str | None = None,
         severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
         **fields: Any,  # noqa: ANN401  # tracked: #288
@@ -506,6 +512,7 @@ class RunSupervisor:
                 scope=scope,
                 operation=operation,
                 data=data,
+                data_factory=data_factory,
                 text=text,
                 severity=severity,
                 **fields,
@@ -1158,7 +1165,7 @@ class RunSupervisor:
                     scope=DiagnosticScope.INVOCATION,
                     operation="Agent execution",
                     status=terminal_status,
-                    data=lambda diagnostic: AgentExecutionFinishedData(
+                    data_factory=lambda diagnostic: AgentExecutionFinishedData(
                         result=json_value(result), error=diagnostic.summary
                     ),
                     agent_kind=active.agent_kind,

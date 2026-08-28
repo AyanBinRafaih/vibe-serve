@@ -20,8 +20,8 @@ from enum import StrEnum
 from pathlib import Path  # noqa: TC003  # tracked: #288
 from typing import Literal, Protocol, cast
 
-from openevolve.config import DatabaseConfig  # pyright: ignore[reportMissingTypeStubs]
-from openevolve.database import Program, ProgramDatabase  # pyright: ignore[reportMissingTypeStubs]
+from openevolve.config import DatabaseConfig
+from openevolve.database import Program, ProgramDatabase
 from pydantic import BaseModel, ConfigDict, Field
 
 from vibesys.loops.evolve.population import Individual, Objective, Population
@@ -227,7 +227,7 @@ class OpenEvolveSearchPolicy:
     _STATE_FILE = "adapter.json"
     _CURRENT_FILE = "CURRENT"
     _SELECTION_FILE = "selection.json"
-    _STATE_SCHEMA_VERSION = 1
+    _STATE_SCHEMA_VERSION: Literal[1] = 1
 
     @property
     def requires_code(self) -> bool:  # noqa: D102  # tracked: #288

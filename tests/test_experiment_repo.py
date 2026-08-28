@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path  # noqa: TC003  # tracked: #288
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from vibesys.repository import RepositoryVisibility
 from vibesys.run.experiment_repo import ExperimentRepository
 from vibesys.run.git_tracker import GitTracker
+from vs_github import GitHubCLI
 
 _IDENTITY = {
     "GIT_AUTHOR_NAME": "test",
@@ -189,19 +191,26 @@ def test_push_rejects_non_run_branch(tmp_path: Path) -> None:
         publisher.push()
 
 
-class _RecordingGitHub:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, Path]] = []
+@dataclass(frozen=True)
+class _RecordingGitHub(GitHubCLI):
+    calls: list[tuple[str, str, Path]] = field(default_factory=list)
 
-    def create_repository(self, slug: str, *, visibility: str, source: Path) -> None:
-        self.calls.append((slug, visibility, source))
+    def create_repository(
+        self,
+        repository: str,
+        *,
+        visibility: str,
+        source: Path,
+        remote_name: str = "origin",  # noqa: ARG002  # tracked: #288
+    ) -> None:
+        self.calls.append((repository, visibility, source))
 
 
 def test_create_remote_delegates_creation_and_attachment(tmp_path: Path) -> None:
     _project(tmp_path)
     github = _RecordingGitHub()
     messages: list[str] = []
-    publisher = ExperimentRepository(tmp_path, messages.append, github=github)  # type: ignore[arg-type]
+    publisher = ExperimentRepository(tmp_path, messages.append, github=github)
 
     publisher.create_remote(
         "vibesys-playground/example",

@@ -159,7 +159,7 @@ class RoundTransaction:
             raise RoundTransactionError(
                 f"Round {self.round_number} transaction has already completed"
             )
-        result = self._coordinator._complete(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        result = self._coordinator._complete(  # noqa: SLF001
             self.round_number
         )
         self._closed = True

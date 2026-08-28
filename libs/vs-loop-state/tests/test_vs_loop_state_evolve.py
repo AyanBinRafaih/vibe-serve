@@ -1,5 +1,7 @@
 """Model-only tests for strict evolve-loop persisted state."""
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -115,8 +117,9 @@ def test_individual_record_rejects_non_finite_metrics(metric: float) -> None:
 
 
 def test_individual_record_rejects_coercion_unknown_fields_and_invalid_ids() -> None:
+    string_id: dict[str, Any] = {"id": "1", "generation": 0, "parent_id": None}
     with pytest.raises(ValidationError):
-        IndividualRecord(id="1", generation=0, parent_id=None)  # type: ignore[arg-type]
+        IndividualRecord(**string_id)
     with pytest.raises(ValidationError):
         IndividualRecord.model_validate(
             {"id": 1, "generation": 0, "parent_id": None, "unknown": True}

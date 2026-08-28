@@ -378,8 +378,7 @@ class AgentShimSession:
     def _refresh_container(self) -> None:
         if self._docker_sandboxes is None:
             return
-        executor = getattr(self._agent, "executor", None)
-        executor.container_id = self._docker_sandboxes[self._spec.role]._container_id  # pyright: ignore[reportOptionalMemberAccess]  # noqa: SLF001  # tracked: #288
+        self._agent.executor.container_id = self._docker_sandboxes[self._spec.role]._container_id  # noqa: SLF001  # tracked: #288
 
     def _repair_workspace_ownership(self) -> None:
         if self._docker_sandboxes is None:

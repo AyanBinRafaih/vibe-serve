@@ -50,7 +50,13 @@ from vs_project import RunEnvironmentRecord, RunResourceRequest
 from vs_sandbox import ProjectPathPolicy
 
 _SHELL_COMMAND_ARG_COUNT = 3
-_RECORDED_ENVIRONMENT_NAMES = frozenset({"local", "docker", "modal", "skypilot"})
+_RunEnvironmentName = Literal["local", "docker", "modal", "skypilot"]
+_RECORDED_ENVIRONMENT_NAMES: tuple[_RunEnvironmentName, ...] = (
+    "local",
+    "docker",
+    "modal",
+    "skypilot",
+)
 _ENVIRONMENTS_TEMPLATE_DIR = PROMPTS_DIR / "environments"
 
 if TYPE_CHECKING:
@@ -217,6 +223,27 @@ class _NoopWorkspaceRecovery:
         return CandidateRuntime(view.prompt_notes, view.deployment_namespace)
 
 
+def _start_sandbox(sandbox: SandboxBackendProtocol) -> None:
+    """Start the container of a sandbox kind that owns one.
+
+    ``SandboxBackendProtocol`` is the command-execution contract and says
+    nothing about container lifetime, so the lookup stays dynamic. Every
+    Docker- and Modal-kind sandbox this module builds implements ``start``.
+    """
+    start = getattr(sandbox, "start", None)
+    if not callable(start):
+        message = f"{type(sandbox).__name__} has no container to start"
+        raise TypeError(message)
+    start()
+
+
+def _stop_sandbox(sandbox: SandboxBackendProtocol) -> None:
+    """Stop the sandbox's container, if it owns one."""
+    stop = getattr(sandbox, "stop", None)
+    if callable(stop):
+        stop()
+
+
 @dataclass
 class _DefaultRunEnvironmentSession:
     sandbox: SandboxBackendProtocol
@@ -234,8 +261,8 @@ class _DefaultRunEnvironmentSession:
         if self._closed:
             return
         self._closed = True
-        if self.stop_on_close and hasattr(self.sandbox, "stop"):
-            self.sandbox.stop()  # pyright: ignore[reportAttributeAccessIssue]
+        if self.stop_on_close:
+            _stop_sandbox(self.sandbox)
 
 
 class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
@@ -317,8 +344,8 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
         log: Callable[[str], None] = request.log or (lambda _: None)
         label = getattr(request.backend, "image", self.config.image or "<backend-default>")
         log(f"[docker] starting container with image {label}")
-        # DOCKER-kind sandboxes always implement start().
-        sandbox.start()  # pyright: ignore[reportAttributeAccessIssue]
+        # DOCKER-kind sandboxes always manage a container lifetime.
+        _start_sandbox(sandbox)
 
         return _DefaultRunEnvironmentSession(
             sandbox=sandbox,
@@ -426,8 +453,7 @@ class _SkyPilotRunEnvironmentSession:
             return
         self._closed = True
         try:
-            if hasattr(self.sandbox, "stop"):
-                self.sandbox.stop()  # pyright: ignore[reportAttributeAccessIssue]
+            _stop_sandbox(self.sandbox)
         finally:
             self.bridge.close()
 
@@ -435,6 +461,7 @@ class _SkyPilotRunEnvironmentSession:
 class SkyPilotEnvironment(DockerEnvironment):
     """CPU-only Docker editor with host-mediated SkyPilot evaluation."""
 
+    config: SkyPilotEnvironmentConfig
     materialize_local_model_weights = False
     default_profiler_kind = ProfilerKind.NONE
     supported_profiler_kinds: frozenset[ProfilerKind] | None = frozenset(
@@ -548,7 +575,7 @@ class SkyPilotEnvironment(DockerEnvironment):
                 setup_fns=_symlink_setup_fns(docker_symlinks),
                 attach_accelerator=False,
             )
-            sandbox.start()  # pyright: ignore[reportAttributeAccessIssue]
+            _start_sandbox(sandbox)
         except Exception:
             bridge.close()
             raise
@@ -694,8 +721,8 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
             "[modal] starting local Docker editor; GPU work will dispatch "
             "to Modal via the candidate's declared `modal run` entrypoint"
         )
-        # DOCKER-kind sandboxes always implement start().
-        sandbox.start()  # pyright: ignore[reportAttributeAccessIssue]
+        # DOCKER-kind sandboxes always manage a container lifetime.
+        _start_sandbox(sandbox)
 
         setup_timeout_seconds = 1200
         evaluator_prefix = (
@@ -866,16 +893,23 @@ def run_environment_record(spec: RunEnvironmentSpec) -> RunEnvironmentRecord:
     declared by the input bundle and re-derived on every launch, so recording
     it would make a legitimate task edit look like a resume mismatch.
     """
-    if spec.name not in _RECORDED_ENVIRONMENT_NAMES:
-        raise ValueError(f"unknown run environment: {spec.name!r}")  # noqa: TRY003  # tracked: #288
     return RunEnvironmentRecord(
-        name=spec.name,  # pyright: ignore[reportArgumentType]
+        name=_recorded_environment_name(spec.name),
         image=_recorded_option(spec, "image"),
         gpu=_recorded_option(spec, "gpu"),
         model_volume=_recorded_option(spec, "model_volume"),
         app=_recorded_option(spec, "app"),
         resources=spec.resources,
     )
+
+
+def _recorded_environment_name(name: str) -> _RunEnvironmentName:
+    """Validate a spec name against the environments the run record can hold."""
+    for recorded in _RECORDED_ENVIRONMENT_NAMES:
+        if name == recorded:
+            return recorded
+    message = f"unknown run environment: {name!r}"
+    raise ValueError(message)
 
 
 def _recorded_option(spec: RunEnvironmentSpec, key: str) -> str | None:
@@ -1492,8 +1526,9 @@ def _symlink_setup_fns(symlinks: list[tuple[str, str]]) -> list[SetupFn]:
     def install_symlinks(sb: BaseSandbox) -> None:
         for cmd in symlink_cmds:
             sb.execute(cmd)
-        if hasattr(sb, "save_symlink_commands"):
-            sb.save_symlink_commands(symlink_cmds)  # pyright: ignore[reportAttributeAccessIssue]
+        save_symlink_commands = getattr(sb, "save_symlink_commands", None)
+        if callable(save_symlink_commands):
+            save_symlink_commands(symlink_cmds)
 
     return [install_symlinks]
 

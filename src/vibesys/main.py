@@ -1347,8 +1347,14 @@ def _set_resume_cli_value(
                 stage="resume_resolution",
             )
     elif destination == "profiler":
+        if value is not None and not isinstance(value, str):
+            _configuration_error(
+                f"Run metadata records unknown profiler {value!r}",
+                code="project_resume_configuration_invalid",
+                stage="resume_resolution",
+            )
         try:
-            value = coerce_profiler_kind(value or ProfilerKind.AUTO.value)  # type: ignore[arg-type]
+            value = coerce_profiler_kind(value or ProfilerKind.AUTO.value)
         except ValueError:
             _configuration_error(
                 f"Run metadata records unknown profiler {value!r}",

@@ -9,6 +9,7 @@ carries serving prose; ``generic`` injects nothing of its own).
 from __future__ import annotations
 
 from pathlib import Path  # noqa: TC003  # tracked: #288
+from typing import cast
 
 import pytest
 
@@ -79,8 +80,10 @@ def test_resolve_path_is_not_supported(tmp_path: Path):  # noqa: ANN201  # track
     f = tmp_path / "mine"
     f.mkdir()
     (f / "implementer.md").write_text("hello\n")
+    # The runtime guard is the subject here, so the declared type is violated
+    # deliberately: a path string must not resolve as a domain.
     with pytest.raises(TypeError, match="DomainName"):
-        resolve_domain(str(f))  # pyright: ignore[reportArgumentType]  # tracked: #297
+        resolve_domain(cast("DomainName", str(f)))
 
 
 def test_registered_domains_carry_environment_hooks():  # noqa: ANN201  # tracked: #288
@@ -98,8 +101,10 @@ def test_domains_declare_torch_profiler_compatibility():  # noqa: ANN201  # trac
 
 
 def test_resolve_unknown_raises():  # noqa: ANN201  # tracked: #288
+    # The runtime guard is the subject here, so the declared type is violated
+    # deliberately: an unregistered name must not resolve.
     with pytest.raises(TypeError) as exc:
-        resolve_domain("does-not-exist-xyz")  # pyright: ignore[reportArgumentType]  # tracked: #297
+        resolve_domain(cast("DomainName", "does-not-exist-xyz"))
     assert "DomainName" in str(exc.value)
 
 

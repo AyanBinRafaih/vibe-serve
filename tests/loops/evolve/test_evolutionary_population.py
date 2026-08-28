@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter
+from typing import Any
 
 import pytest
 
@@ -35,6 +36,12 @@ def _passed(id_: int, perf: float | None, parent_id: int | None = None, gen: int
         passed=True,
         summary=f"individual {id_}",
     )
+
+
+def _selected_id(selected: Individual | None) -> int:
+    """Unwrap a selection that the test requires to be non-None."""
+    assert selected is not None
+    return selected.id
 
 
 def _failed(id_: int, parent_id: int | None = None, gen: int = 1) -> Individual:
@@ -66,7 +73,7 @@ def test_passed_filter_excludes_no_commit_and_failed():  # noqa: ANN201  # track
 
 def test_best_picks_highest_perf_metric():  # noqa: ANN201  # tracked: #288
     pop = Population([_passed(1, 10.0), _passed(2, 12.0), _passed(3, 11.0)])
-    assert pop.best().id == 2  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert _selected_id(pop.best()) == 2
 
 
 def test_best_returns_none_with_no_passed_individuals():  # noqa: ANN201  # tracked: #288
@@ -76,7 +83,7 @@ def test_best_returns_none_with_no_passed_individuals():  # noqa: ANN201  # trac
 
 def test_best_breaks_ties_by_id():  # noqa: ANN201  # tracked: #288
     pop = Population([_passed(1, 10.0), _passed(2, 10.0)])
-    assert pop.best().id == 2  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert _selected_id(pop.best()) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +102,14 @@ def test_select_parent_only_failed_returns_none():  # noqa: ANN201  # tracked: #
 
 def test_select_parent_single_passed_returns_it():  # noqa: ANN201  # tracked: #288
     pop = Population([_failed(1), _passed(2, 10.0)])
-    assert pop.select_parent(rng=random.Random(0)).id == 2  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297  # noqa: S311  # tracked: #288
+    assert _selected_id(pop.select_parent(rng=random.Random(0))) == 2  # noqa: S311  # tracked: #288
 
 
 def test_select_parent_low_temperature_concentrates_on_best():  # noqa: ANN201  # tracked: #288
     """A near-zero temperature should pick the best almost every time."""
     pop = Population([_passed(1, 1.0), _passed(2, 5.0), _passed(3, 10.0)])
     rng = random.Random(123)  # noqa: S311  # tracked: #288
-    counts = Counter(pop.select_parent(rng=rng, temperature=0.01).id for _ in range(200))  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    counts = Counter(_selected_id(pop.select_parent(rng=rng, temperature=0.01)) for _ in range(200))
     # The best (id=3) should dominate.
     assert counts[3] > 180
 
@@ -111,7 +118,9 @@ def test_select_parent_high_temperature_spreads():  # noqa: ANN201  # tracked: #
     """High temperature flattens the distribution toward uniform."""
     pop = Population([_passed(1, 1.0), _passed(2, 5.0), _passed(3, 10.0)])
     rng = random.Random(123)  # noqa: S311  # tracked: #288
-    counts = Counter(pop.select_parent(rng=rng, temperature=100.0).id for _ in range(600))  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    counts = Counter(
+        _selected_id(pop.select_parent(rng=rng, temperature=100.0)) for _ in range(600)
+    )
     # All three should be picked a meaningful number of times.
     assert all(counts[i] > 100 for i in (1, 2, 3))
 
@@ -119,7 +128,7 @@ def test_select_parent_high_temperature_spreads():  # noqa: ANN201  # tracked: #
 def test_select_parent_uniform_when_all_perfs_equal():  # noqa: ANN201  # tracked: #288
     pop = Population([_passed(1, 7.0), _passed(2, 7.0), _passed(3, 7.0)])
     rng = random.Random(42)  # noqa: S311  # tracked: #288
-    counts = Counter(pop.select_parent(rng=rng).id for _ in range(300))  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    counts = Counter(_selected_id(pop.select_parent(rng=rng)) for _ in range(300))
     assert all(counts[i] > 50 for i in (1, 2, 3))
 
 
@@ -200,8 +209,10 @@ def _multi(id_: int, metrics: dict[str, float], parent_id: int | None = None) ->
 
 
 def test_objective_rejects_unknown_direction():  # noqa: ANN201  # tracked: #288
+    # Deliberately outside the declared Literal: the guard is a runtime contract.
+    unknown_direction: Any = "bigger"
     with pytest.raises(ValueError):  # noqa: PT011  # tracked: #288
-        Objective(name="foo", direction="bigger")  # pyright: ignore[reportArgumentType]
+        Objective(name="foo", direction=unknown_direction)
 
 
 def test_objective_signed_max_passes_through():  # noqa: ANN201  # tracked: #288
@@ -302,7 +313,7 @@ def test_select_parent_pareto_mode_draws_from_frontier_with_full_bias():  # noqa
     objs = [Objective("tput", "max"), Objective("lat", "min")]
     rng = random.Random(0)  # noqa: S311  # tracked: #288
     counts = Counter(
-        pop.select_parent(rng=rng, objectives=objs, frontier_bias=1.0).id  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+        _selected_id(pop.select_parent(rng=rng, objectives=objs, frontier_bias=1.0))
         for _ in range(200)
     )
     assert counts[3] == 0  # never the dominated one
@@ -322,12 +333,14 @@ def test_select_parent_pareto_mode_falls_back_to_scalar_when_bias_zero():  # noq
     objs = [Objective("tput", "max"), Objective("lat", "min")]
     rng = random.Random(0)  # noqa: S311  # tracked: #288
     counts = Counter(
-        pop.select_parent(
-            rng=rng,
-            objectives=objs,
-            frontier_bias=0.0,
-            temperature=0.01,
-        ).id  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+        _selected_id(
+            pop.select_parent(
+                rng=rng,
+                objectives=objs,
+                frontier_bias=0.0,
+                temperature=0.01,
+            )
+        )
         for _ in range(100)
     )
     assert counts[1] > 90

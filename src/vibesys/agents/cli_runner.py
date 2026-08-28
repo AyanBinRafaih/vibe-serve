@@ -394,8 +394,7 @@ class CliAgentRunner:
             if self._docker_sandboxes is not None:
                 # Dynamic poke: only the docker path constructs agents with a
                 # DockerCommandExecutor, which carries container_id.
-                executor = getattr(agent, "executor", None)
-                executor.container_id = self._docker_sandboxes[kind]._container_id  # pyright: ignore[reportOptionalMemberAccess]  # noqa: SLF001  # tracked: #288
+                agent.executor.container_id = self._docker_sandboxes[kind]._container_id  # noqa: SLF001  # tracked: #288
         elif self._docker_sandboxes is not None:
             from vibesys.agents.docker_executor import (  # noqa: PLC0415  # tracked: #288
                 DockerCommandExecutor,

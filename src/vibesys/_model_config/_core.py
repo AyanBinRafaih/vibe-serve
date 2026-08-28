@@ -85,7 +85,7 @@ class ModelConfig:
         if not self.model or not self.model.strip():
             raise ValueError("model must be a non-empty string")  # noqa: TRY003  # tracked: #288
         if self.thinking_budget is not None and (
-            not isinstance(self.thinking_budget, int) or self.thinking_budget <= 0  # pyright: ignore[reportUnnecessaryIsInstance]
+            not isinstance(self.thinking_budget, int) or self.thinking_budget <= 0
         ):
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"thinking_budget must be a positive int, got {self.thinking_budget!r}"

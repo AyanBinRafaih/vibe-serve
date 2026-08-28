@@ -1,5 +1,4 @@
 # Package-boundary tests intentionally inspect private on-disk details.
-# pyright: reportPrivateUsage=false
 # ruff: noqa: SLF001
 
 from __future__ import annotations
@@ -168,7 +167,7 @@ def test_manifests_are_strict_versioned_contracts() -> None:
                 "initial_input_fingerprint": "a" * 64,
             }
         )
-    forbidden_value = ""
+    forbidden_field = {"provider_token": ""}
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         RunManifest(
             schema_version=RUN_SCHEMA_VERSION,
@@ -181,7 +180,7 @@ def test_manifests_are_strict_versioned_contracts() -> None:
             branch="vibesys/run-1",
             vibesys_version="0.2.0",
             configuration=_configuration(),
-            provider_token=forbidden_value,  # type: ignore[call-arg]
+            **forbidden_field,
         )
 
 
@@ -251,9 +250,10 @@ def test_run_configuration_allows_optional_behavior_overrides_to_be_absent() -> 
 
 def test_run_configuration_is_frozen() -> None:
     configuration = _configuration()
+    frozen_field = "inner_loop"
 
     with pytest.raises(ValidationError, match="frozen"):
-        configuration.inner_loop = "single-agent"
+        setattr(configuration, frozen_field, "single-agent")
 
 
 @pytest.mark.parametrize(

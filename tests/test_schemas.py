@@ -36,12 +36,13 @@ def _profiler_summary(
 
 
 def test_skill_resource_selection_forbids_unknown_fields():  # noqa: ANN201  # tracked: #288
+    unknown_field = {"unexpected": True}
     with pytest.raises(ValidationError, match="unexpected"):
         SkillResourceSelection(
             skill="portable",
             resource_paths=[],
             purpose="Useful for this task.",
-            unexpected=True,  # pyright: ignore[reportCallIssue]  # tracked: #297
+            **unknown_field,
         )
 
 
@@ -51,7 +52,7 @@ def test_skill_resource_selection_rejects_whitespace_required_fields(field):  # 
     values[field] = "   "
 
     with pytest.raises(ValidationError, match="non-whitespace"):
-        SkillResourceSelection(**values)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        SkillResourceSelection(**values)
 
 
 def test_agent_skill_selection_fields_are_zero_to_many_by_default():  # noqa: ANN201  # tracked: #288

@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import pytest
 
@@ -21,6 +21,7 @@ from vibesys.server.events import CommandResultPayload
 from vs_sandbox import ProjectPathPolicy
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -30,6 +31,19 @@ class _Observer:
 
     def on_event(self, event: AgentEvent) -> None:
         self.events.append(event)
+
+
+class _GenerateOverride(Protocol):
+    def __call__(
+        self,
+        prompt: str,
+        /,
+        *,
+        cwd: str | None,
+        timeout: int | None,
+        silent: bool,
+    ) -> str:
+        """Replace one fake agent's generate behavior."""
 
 
 class _FakeAgent:
@@ -57,6 +71,8 @@ class _FakeAgent:
         self.output_schema_paths: list[str | None] = []
         self.reasoning_effort: str | None = None
         self.error: BaseException | None = None
+        self.generate_override: _GenerateOverride | None = None
+        self.uninstall_override: Callable[[Path, list[Any]], None] | None = None
         self.tool_result_events: list[dict[str, Any]] = []
         self._last_session = SimpleNamespace(
             final_usage={"input_tokens": 12, "output_tokens": 3},
@@ -74,6 +90,9 @@ class _FakeAgent:
         self.install_calls.append((workspace, servers))
 
     def uninstall_mcp_servers(self, workspace: Path, servers: list[Any]) -> None:
+        if self.uninstall_override is not None:
+            self.uninstall_override(workspace, servers)
+            return
         self.uninstall_calls.append((workspace, servers))
 
     def generate(
@@ -84,6 +103,8 @@ class _FakeAgent:
         timeout: int | None,
         silent: bool,
     ) -> str:
+        if self.generate_override is not None:
+            return self.generate_override(prompt, cwd=cwd, timeout=timeout, silent=silent)
         assert silent
         assert self.event_handler is not None
         self.generate_calls.append((prompt, cwd, timeout))
@@ -262,8 +283,8 @@ def test_independent_sessions_overlap_and_chat_cleanup_does_not_interrupt_optimi
         fake_agent[1].event_handler.on_thinking("chat event")
         return "chat result"
 
-    fake_agent[0].generate = generate_optimizer
-    fake_agent[1].generate = generate_chat
+    fake_agent[0].generate_override = generate_optimizer
+    fake_agent[1].generate_override = generate_chat
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         optimizer_turn = pool.submit(
@@ -317,7 +338,7 @@ def test_mcp_cleanup_preserves_original_turn_error(
     def fail_cleanup(_workspace: Path, _servers: list[Any]) -> None:
         raise OSError("cleanup failed")  # noqa: TRY003  # tracked: #288
 
-    fake_agent[0].uninstall_mcp_servers = fail_cleanup
+    fake_agent[0].uninstall_override = fail_cleanup
 
     with pytest.raises(ValueError, match="turn failed"):
         session.run_turn(AgentTurnRequest(message="review"))

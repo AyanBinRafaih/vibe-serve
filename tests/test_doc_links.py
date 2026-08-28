@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from scripts.check_doc_links import (  # pyright: ignore[reportMissingImports]
+from scripts.check_doc_links import (
     anchors_of,
     check,
     extract_links,

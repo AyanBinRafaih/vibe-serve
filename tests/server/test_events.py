@@ -87,7 +87,7 @@ class TestNewEventDataRoundTrip:
 
     def test_json_payload_rejects_scalar_value(self):  # noqa: ANN201  # tracked: #288
         with pytest.raises(ValidationError):
-            JsonResultPayload(value=42)  # pyright: ignore[reportArgumentType]
+            JsonResultPayload.model_validate({"value": 42})
 
     def test_tool_result_without_payload_field_still_validates(self):  # noqa: ANN201  # tracked: #288
         # Old event logs predate the payload field and must keep replaying.

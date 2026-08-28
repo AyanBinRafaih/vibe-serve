@@ -170,15 +170,18 @@ def test_recovery_rolls_prepared_state_and_candidate_forward(tmp_path: Path) -> 
     assert restarted.recover() is RoundRecoveryOutcome.NO_TRANSACTION
 
 
-def test_recovery_restores_an_already_committed_state_file(tmp_path: Path) -> None:
+def test_recovery_restores_an_already_committed_state_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     project, tracker, coordinator = _project(tmp_path)
     transition = _transition(project, active=None, rounds=(1,))
     transaction = coordinator.begin(1, state_transition=transition)
 
     original_clear = coordinator._clear_journal  # noqa: SLF001
-    coordinator._clear_journal = lambda: None  # noqa: SLF001
+    monkeypatch.setattr(coordinator, "_clear_journal", lambda: None)
     transaction.complete()
-    coordinator._clear_journal = original_clear  # noqa: SLF001
+    monkeypatch.setattr(coordinator, "_clear_journal", original_clear)
     _state_slot(project).save(_AgentState(active_hypothesis_id="corrupt"))
     committed_head = tracker.current_sha()
 

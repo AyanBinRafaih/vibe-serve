@@ -86,7 +86,7 @@ def _write_sidecar(root: Path, content: str) -> Path:
 
 def test_trainium_loads_nki_skills_from_sidecar_metadata(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     _, skills, backend = load_config_and_skills(
-        _args(tmp_path, ComputeBackend.TRAINIUM),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        _args(tmp_path, ComputeBackend.TRAINIUM),
         domain=DomainName.LLM_SERVING,
     )
     assert backend is ComputeBackend.TRAINIUM
@@ -97,7 +97,7 @@ def test_trainium_loads_nki_skills_from_sidecar_metadata(tmp_path):  # noqa: ANN
 
 def test_cuda_filters_out_trainium_scoped_nki_skills(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     _, skills, _ = load_config_and_skills(
-        _args(tmp_path, ComputeBackend.CUDA),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        _args(tmp_path, ComputeBackend.CUDA),
         domain=DomainName.LLM_SERVING,
     )
     names = _skill_names(skills)
@@ -107,14 +107,14 @@ def test_cuda_filters_out_trainium_scoped_nki_skills(tmp_path):  # noqa: ANN001,
 
 @pytest.mark.parametrize("domain", [DomainName.GENERIC, DomainName.MICROSERVICES])
 def test_non_serving_domains_filter_out_serving_systems(tmp_path, domain):  # noqa: ANN001, ANN201  # tracked: #288
-    _, skills, _ = load_config_and_skills(_args(tmp_path, ComputeBackend.CUDA), domain=domain)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    _, skills, _ = load_config_and_skills(_args(tmp_path, ComputeBackend.CUDA), domain=domain)
 
     assert "serving-systems" not in _skill_names(skills)
 
 
 def test_no_skills_disables_even_compatible_skills(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     _, skills, _ = load_config_and_skills(
-        _args(tmp_path, ComputeBackend.TRAINIUM, no_skills=True),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        _args(tmp_path, ComputeBackend.TRAINIUM, no_skills=True),
         domain=DomainName.LLM_SERVING,
     )
     assert skills is None
@@ -123,7 +123,7 @@ def test_no_skills_disables_even_compatible_skills(tmp_path):  # noqa: ANN001, A
 def test_omitted_skills_dir_uses_presets(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     # With no --skills-dir the preset roots (resources/skills) are the base.
     _, skills, _ = load_config_and_skills(
-        _args(tmp_path, ComputeBackend.CUDA, default_presets=False),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        _args(tmp_path, ComputeBackend.CUDA, default_presets=False),
         domain=DomainName.LLM_SERVING,
     )
     assert "serving-systems" in _skill_names(skills)
@@ -134,7 +134,7 @@ def test_extra_skills_stack_on_presets(tmp_path):  # noqa: ANN001, ANN201  # tra
     _write_skill(custom_root, "custom-skill")
 
     _, skills, _ = load_config_and_skills(
-        _args(tmp_path, ComputeBackend.CUDA, extra_skills=[custom_root]),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        _args(tmp_path, ComputeBackend.CUDA, extra_skills=[custom_root]),
         domain=DomainName.LLM_SERVING,
     )
     names = _skill_names(skills)
@@ -147,7 +147,7 @@ def test_skills_dir_replaces_presets(tmp_path):  # noqa: ANN001, ANN201  # track
     _write_skill(custom_root, "custom-skill")
 
     _, skills, _ = load_config_and_skills(
-        _args(tmp_path, ComputeBackend.CUDA, skills_dir=[custom_root]),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        _args(tmp_path, ComputeBackend.CUDA, skills_dir=[custom_root]),
         domain=DomainName.LLM_SERVING,
     )
     names = _skill_names(skills)

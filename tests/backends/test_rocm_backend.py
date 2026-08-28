@@ -15,13 +15,15 @@ from vibesys.main import _add_common_args
 from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, RocmComputeBackendFragment
 from vibesys.prompts.renderer import _FRAGMENT_IMPLS, ComputeBackendFragment
+from vs_sandbox import DockerSandbox
 
 
 def _make_backend(tmp_path, devices=("/dev/kfd", "/dev/dri/renderD128")) -> RocmBackend:  # noqa: ANN001  # tracked: #288
     impl = backends.get(ComputeBackend.ROCM, log_dir=tmp_path / "logs")
+    assert isinstance(impl, RocmBackend)
     # Pin a deterministic device set so tests don't depend on host hardware.
     impl._devices = list(devices)  # noqa: SLF001  # tracked: #288
-    return impl  # pyright: ignore[reportReturnType]  # tracked: #297
+    return impl
 
 
 class TestRocmRegistry:
@@ -56,6 +58,7 @@ class TestRocmSandbox:
             host_workspace=str(workspace),
             log_path=None,
         )
+        assert isinstance(sb, DockerSandbox)
         assert sb._devices == ["/dev/kfd", "/dev/dri/renderD128"]  # noqa: SLF001  # tracked: #288
         assert sb._gpus is None  # noqa: SLF001  # tracked: #288
 
@@ -71,6 +74,7 @@ class TestRocmSandbox:
             attach_accelerator=False,
         )
 
+        assert isinstance(sb, DockerSandbox)
         assert sb._devices == []  # noqa: SLF001  # tracked: #288
 
     def test_docker_adds_device_groups(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -84,6 +88,7 @@ class TestRocmSandbox:
             host_workspace=str(workspace),
             log_path=None,
         )
+        assert isinstance(sb, DockerSandbox)
         assert sb._group_add == ["video", "render"]  # noqa: SLF001  # tracked: #288
 
     def test_modal_raises(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -107,6 +112,7 @@ class TestRocmSandbox:
             host_workspace=str(workspace),
             log_path=None,
         )
+        assert isinstance(sb, DockerSandbox)
         assert "rocm" in sb._env["UV_EXTRA_INDEX_URL"]  # noqa: SLF001  # tracked: #288
 
     def test_default_image_is_pinned(self):  # noqa: ANN201  # tracked: #288
@@ -125,6 +131,7 @@ class TestRocmSandbox:
             host_workspace=str(workspace),
             log_path=None,
         )
+        assert isinstance(sb, DockerSandbox)
         assert sb._env.get("HIP_VISIBLE_DEVICES") == "2"  # noqa: SLF001  # tracked: #288
 
     def test_caller_env_overrides_backend_env(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
@@ -138,6 +145,7 @@ class TestRocmSandbox:
             log_path=None,
             extra_env={"HIP_VISIBLE_DEVICES": "0"},
         )
+        assert isinstance(sb, DockerSandbox)
         assert sb._env.get("HIP_VISIBLE_DEVICES") == "0"  # noqa: SLF001  # tracked: #288
 
 

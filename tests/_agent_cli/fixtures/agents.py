@@ -96,11 +96,21 @@ class ErrorAgent(CodingAgent):
         """
         self.error_message = error_message
 
-    def generate(self, prompt: str, **kwargs) -> str:  # type: ignore[override]  # noqa: ANN003, ARG002  # tracked: #288
+    def generate(
+        self,
+        prompt: str,  # noqa: ARG002  # tracked: #288
+        cwd: str | None = None,  # noqa: ARG002  # tracked: #288
+        timeout: int | None = None,  # noqa: ARG002  # tracked: #288
+        silent: bool = False,  # noqa: ARG002, FBT001, FBT002  # tracked: #288
+        **kwargs: Any,  # noqa: ANN401, ARG002  # tracked: #288
+    ) -> str:
         """Raise a RuntimeError.
 
         Args:
             prompt: The prompt (ignored).
+            cwd: Optional working directory (ignored).
+            timeout: Timeout value (ignored).
+            silent: Whether output is suppressed (ignored).
             **kwargs: Additional arguments (ignored).
 
         Raises:
@@ -123,12 +133,21 @@ class TimeoutAgent(CodingAgent):
         """
         self.sleep_duration = sleep_duration
 
-    def generate(self, prompt: str, timeout: int = 300, **kwargs) -> str:  # type: ignore[override]  # noqa: ANN003, ARG002  # tracked: #288
+    def generate(
+        self,
+        prompt: str,  # noqa: ARG002  # tracked: #288
+        cwd: str | None = None,  # noqa: ARG002  # tracked: #288
+        timeout: int | None = 300,  # noqa: ARG002  # tracked: #288
+        silent: bool = False,  # noqa: ARG002, FBT001, FBT002  # tracked: #288
+        **kwargs: Any,  # noqa: ANN401, ARG002  # tracked: #288
+    ) -> str:
         """Sleep longer than the timeout.
 
         Args:
             prompt: The prompt (ignored).
-            timeout: The timeout value (used to sleep longer).
+            cwd: Optional working directory (ignored).
+            timeout: The timeout value (ignored; the sleep outlasts it).
+            silent: Whether output is suppressed (ignored).
             **kwargs: Additional arguments (ignored).
 
         Returns:
@@ -155,17 +174,35 @@ class TrackingAgent(CodingAgent):
         self.generation_count = 0
         self.response = response
 
-    def generate(self, prompt: str, **kwargs) -> str:  # type: ignore[override]  # noqa: ANN003  # tracked: #288
+    def generate(
+        self,
+        prompt: str,
+        cwd: str | None = None,
+        timeout: int | None = None,
+        silent: bool = False,  # noqa: FBT001, FBT002  # tracked: #288
+        **kwargs: Any,  # noqa: ANN401  # tracked: #288
+    ) -> str:
         """Track the call and return a response.
 
         Args:
             prompt: The prompt to track.
+            cwd: Optional working directory (tracked).
+            timeout: Timeout value (tracked).
+            silent: Whether output is suppressed (tracked).
             **kwargs: Additional arguments to track.
 
         Returns:
             str: The configured response.
         """
-        self.calls.append({"prompt": prompt, "kwargs": kwargs})
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "cwd": cwd,
+                "timeout": timeout,
+                "silent": silent,
+                "kwargs": kwargs,
+            }
+        )
         self.generation_count += 1
 
         if "fix" in prompt.lower():
@@ -213,17 +250,35 @@ class ConfigurableAgent(CodingAgent):
         """
         self.default_response = response
 
-    def generate(self, prompt: str, **kwargs) -> str:  # type: ignore[override]  # noqa: ANN003  # tracked: #288
+    def generate(
+        self,
+        prompt: str,
+        cwd: str | None = None,
+        timeout: int | None = None,
+        silent: bool = False,  # noqa: FBT001, FBT002  # tracked: #288
+        **kwargs: Any,  # noqa: ANN401  # tracked: #288
+    ) -> str:
         """Return a configured response based on the prompt.
 
         Args:
             prompt: The prompt to analyze.
+            cwd: Optional working directory (recorded).
+            timeout: Timeout value (recorded).
+            silent: Whether output is suppressed (recorded).
             **kwargs: Additional arguments.
 
         Returns:
             str: A response matching the prompt, or the default.
         """
-        self.calls.append({"prompt": prompt, "kwargs": kwargs})
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "cwd": cwd,
+                "timeout": timeout,
+                "silent": silent,
+                "kwargs": kwargs,
+            }
+        )
 
         # Check for matching keywords
         prompt_lower = prompt.lower()
@@ -254,20 +309,28 @@ class ScriptGeneratingAgent(CodingAgent):
             responses: Custom script contents (if None, uses defaults).
         """
         self.generate_valid_scripts = generate_valid_scripts
-        self.calls: list[tuple[str, str | None, int]] = []
+        self.calls: list[tuple[str, str | None, int | None]] = []
         self.responses = responses or [
             "#!/bin/bash\necho deploy",
             "#!/bin/bash\necho health",
         ]
         self.call_count = 0
 
-    def generate(self, prompt: str, cwd: str | None = None, timeout: int = 300, **kwargs) -> str:  # type: ignore[override]  # noqa: ANN003, ARG002  # tracked: #288
+    def generate(
+        self,
+        prompt: str,
+        cwd: str | None = None,
+        timeout: int | None = 300,
+        silent: bool = False,  # noqa: ARG002, FBT001, FBT002  # tracked: #288
+        **kwargs: Any,  # noqa: ANN401, ARG002  # tracked: #288
+    ) -> str:
         """Generate scripts based on the prompt.
 
         Args:
             prompt: The prompt requesting script generation.
             cwd: Working directory for script creation.
             timeout: Timeout for generation.
+            silent: Whether output is suppressed (ignored).
             **kwargs: Additional arguments.
 
         Returns:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 from vibesys.loops.agent.model import (
     AgentRunState,
@@ -13,7 +13,7 @@ from vibesys.loops.agent.model import (
     HypothesisStrategy,
 )
 from vibesys.loops.agent.state import AgentRunStateStore
-from vibesys.schemas import OrchestratorPlan
+from vibesys.schemas import HypothesisOutcome, OrchestratorPlan
 from vibesys.server import RunSupervisor
 from vibesys.server.experiments import build_experiment_log
 from vibesys.server.protocol import ExperimentQuery, PerformanceQuery
@@ -25,8 +25,78 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _round(number: int, **overrides: object) -> RoundRecord:
-    fields: dict[str, object] = {
+class _RoundFields(TypedDict, total=False):
+    """Keyword fields of ``RoundRecord``, so helper overrides stay checked."""
+
+    round_number: int
+    commit: str | None
+    perf_metric: float | None
+    perf_unit: str | None
+    passed: bool
+    profile_skipped: bool
+    reviewed: bool
+    hypothesis_id: str | None
+    hypothesis_declared_outcome: str | None
+    judge_verdict: Literal["pass", "fail", "deferred"] | None
+    hypothesis_outcome: str | None
+    hypothesis_claim: str | None
+    hypothesis_task: str | None
+    hypothesis_parent_round: int | None
+    hypothesis_parent_commit: str | None
+    metrics: dict[str, float]
+    evaluation_artifact: str | None
+    official_evaluation: bool
+    official_evaluation_reason: str | None
+    candidate_disposition: str
+    candidate_metrics: dict[str, float]
+    candidate_evaluation_artifact: str | None
+    candidate_operating_point: str
+    candidate_retention_reason: str
+    candidate_retained: bool | None
+    perf_direction: Literal["max", "min"] | None
+    perf_baseline_round: int | None
+    perf_baseline_commit: str | None
+    perf_baseline_metric: float | None
+    perf_delta_pct: float | None
+
+
+class _HypothesisFields(TypedDict, total=False):
+    """Keyword fields of ``Hypothesis``, so helper overrides stay checked."""
+
+    hypothesis_id: str
+    plan: OrchestratorPlan
+    started_round: int
+    parent_round: int | None
+    parent_commit: str | None
+    rounds: list[RoundRecord]
+    feedback: str | None
+    next_step: str | None
+    continuation_rounds: int
+    revert_applied: bool
+    revert_commit: str | None
+    gate_revalidation_pending: bool
+    gate_approved_perf_metric: float | None
+    gate_approved_perf_unit: str | None
+    gate_approved_metrics: dict[str, float]
+    gate_approved_evaluation_artifact: str | None
+    gate_approved_candidate_disposition: str
+    gate_approved_candidate_metrics: dict[str, float]
+    gate_approved_candidate_evaluation_artifact: str | None
+    gate_approved_candidate_operating_point: str
+    gate_approved_candidate_retention_reason: str
+    gate_candidate_commit: str | None
+    gate_accuracy_passed: bool
+    declared_outcome: HypothesisOutcome | None
+    review: HypothesisReview
+    resolution: HypothesisResolution | None
+    measurement: HypothesisMeasurement | None
+    candidate_retained: bool | None
+    strategy: HypothesisStrategy
+    strategy_reason: str | None
+
+
+def _round(number: int, **overrides: Unpack[_RoundFields]) -> RoundRecord:
+    fields: _RoundFields = {
         "round_number": number,
         "commit": f"c{number}",
         "perf_metric": None,
@@ -34,11 +104,13 @@ def _round(number: int, **overrides: object) -> RoundRecord:
         "passed": False,
     }
     fields.update(overrides)
-    return RoundRecord(**fields)  # type: ignore[arg-type]
+    return RoundRecord(**fields)
 
 
-def _hypothesis(identifier: str, started_round: int, **overrides: object) -> Hypothesis:
-    fields: dict[str, object] = {
+def _hypothesis(
+    identifier: str, started_round: int, /, **overrides: Unpack[_HypothesisFields]
+) -> Hypothesis:
+    fields: _HypothesisFields = {
         "hypothesis_id": identifier,
         "plan": OrchestratorPlan(
             hypothesis_id=identifier,
@@ -50,7 +122,7 @@ def _hypothesis(identifier: str, started_round: int, **overrides: object) -> Hyp
         "started_round": started_round,
     }
     fields.update(overrides)
-    return Hypothesis(**fields)  # type: ignore[arg-type]
+    return Hypothesis(**fields)
 
 
 def test_projection_uses_nested_rounds_and_one_official_measurement_tuple() -> None:

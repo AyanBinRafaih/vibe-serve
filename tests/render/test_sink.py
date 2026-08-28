@@ -1,6 +1,7 @@
 """Tests for the process-global OutputSink emission point."""
 
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from vibesys.agents.callbacks import AgentLogger
@@ -21,7 +22,7 @@ from vibesys.server.registry import REGISTRY
 from vibesys.server.supervisor import RunSupervisor
 
 
-def _collect(sink: OutputSink) -> tuple[list[RunEvent], object]:
+def _collect(sink: OutputSink) -> tuple[list[RunEvent], Callable[[], None]]:
     seen: list[RunEvent] = []
     unsubscribe = sink.subscribe(seen.append)
     return seen, unsubscribe
@@ -43,7 +44,7 @@ class TestSubscription:
         sink = OutputSink()
         seen, unsubscribe = _collect(sink)
         sink.agent_output("one")
-        unsubscribe()  # pyright: ignore[reportCallIssue]  # tracked: #297
+        unsubscribe()
         sink.agent_output("two")
         assert [e.data.content for e in seen if isinstance(e.data, AgentOutputChunkData)] == ["one"]
 

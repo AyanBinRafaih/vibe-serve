@@ -1,6 +1,7 @@
 import io
 import re
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 from vibesys.agents.callbacks import AgentLogger
@@ -46,7 +47,9 @@ class TestOnLlmNewToken:
 
     def test_none_token_no_output(self, capsys):  # noqa: ANN001, ANN201  # tracked: #288
         logger = AgentLogger()
-        logger.on_llm_new_token(None)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        # LangChain can stream a None token, which the declared type rejects.
+        none_token: dict[str, Any] = {"token": None}
+        logger.on_llm_new_token(**none_token)  # tracked: #297
         assert logger._streaming is False  # noqa: SLF001  # tracked: #288
         assert capsys.readouterr().out == ""
 
@@ -409,7 +412,7 @@ class TestOnChatModelStart:
             "kwargs": {"model": "claude-sonnet-4-6"},
         }
         messages = [[self._make_system_message(), self._make_human_message()]]
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        logger.on_chat_model_start(serialized, messages)
         log_text = log.getvalue()
         assert "claude-sonnet-4-6" in log_text
 
@@ -422,7 +425,7 @@ class TestOnChatModelStart:
         }
         system_prompt = "You are an expert ML engineer."
         messages = [[self._make_system_message(system_prompt), self._make_human_message()]]
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        logger.on_chat_model_start(serialized, messages)
         log_text = log.getvalue()
         assert system_prompt in log_text
 
@@ -440,7 +443,7 @@ class TestOnChatModelStart:
                 self._make_human_message("follow up"),
             ]
         ]
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        logger.on_chat_model_start(serialized, messages)
         log_text = log.getvalue()
         assert "1 system" in log_text
         assert "2 human" in log_text
@@ -452,8 +455,8 @@ class TestOnChatModelStart:
         logger = AgentLogger(log_file=log)
         serialized = {"id": ["langchain"], "kwargs": {}}
         messages = [[self._make_human_message()]]
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        logger.on_chat_model_start(serialized, messages)
+        logger.on_chat_model_start(serialized, messages)
         log_text = log.getvalue()
         assert "LLM call #1" in log_text
         assert "LLM call #2" in log_text
@@ -470,7 +473,7 @@ class TestOnChatModelStart:
                 self._make_human_message("second question"),
             ]
         ]
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        logger.on_chat_model_start(serialized, messages)
         log_text = log.getvalue()
         assert "second question" in log_text
 
@@ -479,7 +482,7 @@ class TestOnChatModelStart:
         logger = AgentLogger()
         serialized = {"id": ["langchain"], "kwargs": {"model": "test-model"}}
         messages = [[self._make_human_message()]]
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        logger.on_chat_model_start(serialized, messages)
         stdout = capsys.readouterr().out
         assert "test-model" not in stdout
         assert "LLM call" not in stdout
@@ -490,14 +493,14 @@ class TestOnChatModelStart:
         serialized = {"id": ["langchain"], "kwargs": {}}
         system_prompt = "You are an expert ML engineer."
         messages = [[self._make_system_message(system_prompt), self._make_human_message()]]
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        logger.on_chat_model_start(serialized, messages)
         first_log = log.getvalue()
         assert system_prompt in first_log
 
         # Second call should NOT repeat system prompt
         log.truncate(0)
         log.seek(0)
-        logger.on_chat_model_start(serialized, messages)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        logger.on_chat_model_start(serialized, messages)
         second_log = log.getvalue()
         assert system_prompt not in second_log
 

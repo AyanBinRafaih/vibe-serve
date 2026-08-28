@@ -37,7 +37,8 @@ def mock_modal(monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
     fake_objects = MagicMock()
     monkeypatch.setattr(modal.App, "lookup", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(modal.Image, "from_registry", MagicMock(return_value=MagicMock()))
-    monkeypatch.setattr(modal.Sandbox, "create", MagicMock(return_value=fake_sandbox))
+    create_sandbox = MagicMock(return_value=fake_sandbox)
+    monkeypatch.setattr(modal.Sandbox, "create", create_sandbox)
     monkeypatch.setattr(modal.Volume, "from_name", MagicMock(return_value=fake_volume))
     monkeypatch.setattr(modal.Volume, "objects", fake_objects)
     yield {
@@ -45,6 +46,7 @@ def mock_modal(monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
         "proc": fake_proc,
         "volume": fake_volume,
         "objects": fake_objects,
+        "create": create_sandbox,
     }
 
     leaked = list(_live_sandboxes)
@@ -92,19 +94,15 @@ class TestVpath:
 
 
 class TestStart:
-    def test_start_creates_sandbox_with_gpu_and_timeout(self, sandbox, mock_modal):  # noqa: ANN001, ANN201, ARG002  # tracked: #288
-        import modal  # noqa: PLC0415  # tracked: #288
-
+    def test_start_creates_sandbox_with_gpu_and_timeout(self, sandbox, mock_modal):  # noqa: ANN001, ANN201  # tracked: #288
         sandbox.start()
-        modal.Sandbox.create.assert_called_once()
-        kwargs = modal.Sandbox.create.call_args.kwargs
+        mock_modal["create"].assert_called_once()
+        kwargs = mock_modal["create"].call_args.kwargs
         assert kwargs["gpu"] == "H100"
         assert kwargs["workdir"] == "/workspace"
         assert "/workspace" in kwargs["volumes"]
 
-    def test_start_mounts_model_volume_when_name_given(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201, ARG002  # tracked: #288
-        import modal  # noqa: PLC0415  # tracked: #288
-
+    def test_start_mounts_model_volume_when_name_given(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201  # tracked: #288
         from vs_sandbox.modal_sandbox import ModalSandbox  # noqa: PLC0415  # tracked: #288
 
         with ModalSandbox(
@@ -112,7 +110,7 @@ class TestStart:
             image="nvcr.io/nvidia/pytorch:25.04-py3",
             model_volume_name="vibesys-models",
         ):
-            kwargs = modal.Sandbox.create.call_args.kwargs
+            kwargs = mock_modal["create"].call_args.kwargs
             assert "/model" in kwargs["volumes"]
 
     def test_start_uploads_bind_mounts_into_workspace_volume(  # noqa: ANN201  # tracked: #288
@@ -469,10 +467,8 @@ class TestSandboxFallbackRestart:
             assert resp.exit_code == -1
             assert "already shut down" in resp.output.lower()
 
-    def test_extra_readonly_volumes_are_mounted(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201, ARG002  # tracked: #288
+    def test_extra_readonly_volumes_are_mounted(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201  # tracked: #288
         """Auxiliary volumes like /draft_model should be added to volumes dict."""
-        import modal  # noqa: PLC0415  # tracked: #288
-
         from vs_sandbox.modal_sandbox import ModalSandbox  # noqa: PLC0415  # tracked: #288
 
         with ModalSandbox(
@@ -480,7 +476,7 @@ class TestSandboxFallbackRestart:
             image="nvcr.io/nvidia/pytorch:25.04-py3",
             extra_readonly_volumes={"/draft_model": "vibesys-model-eagle3"},
         ):
-            kwargs = modal.Sandbox.create.call_args.kwargs
+            kwargs = mock_modal["create"].call_args.kwargs
             assert "/draft_model" in kwargs["volumes"]
 
 

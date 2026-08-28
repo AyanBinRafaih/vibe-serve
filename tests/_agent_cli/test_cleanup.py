@@ -1,6 +1,7 @@
 """CLI wrapper tests at the command-executor boundary."""
 
 import subprocess
+from typing import Any
 
 import pytest
 from agentshim.executor import CommandRequest, CommandResult, CommandStreamSink
@@ -70,6 +71,11 @@ class DummyAgent(CLICodingAgent[CLIGenerationSession]):
         timeout: int | None = None,
         silent: bool = False,  # noqa: FBT001, FBT002  # tracked: #288
     ) -> CLIGenerationSession:
+        # agentshim declares ``timeout: int`` with a 300s default, but forwards
+        # ``None`` unchanged as "no timeout" -- which is what the base agent's
+        # ``int | None`` contract means. Pass the value through untouched, the
+        # way the real provider sessions do.
+        optional_timeout: dict[str, Any] = {"timeout": timeout}
         return CLIGenerationSession(
             binary_name=self.binary_name,
             env=self.env,
@@ -77,7 +83,7 @@ class DummyAgent(CLICodingAgent[CLIGenerationSession]):
             cmd=cmd,
             logger=self.logger,
             cwd=cwd,
-            timeout=timeout,  # pyright: ignore[reportArgumentType]  # tracked: #297
+            **optional_timeout,
             silent=silent,
             event_handler=self.event_handler,
             executor=self.executor,

@@ -4,7 +4,7 @@ import io
 import json
 import subprocess
 
-from agentshim.executor import CallbackCommandStreamSink, CommandRequest
+from agentshim.executor import CallbackCommandStreamSink, CommandHandle, CommandRequest
 
 from vibesys.agents.docker_executor import (
     DockerCommandExecutor,
@@ -59,7 +59,10 @@ class _HungProcess(_FakeProcess):
     def wait(self, timeout: int | None = None) -> int:
         self.wait_timeout = timeout
         if self.returncode is None:
-            raise subprocess.TimeoutExpired(["docker", "exec"], timeout)  # pyright: ignore[reportArgumentType]  # tracked: #297
+            # A still-running fake is only ever waited on with a bounded
+            # timeout; an unbounded wait here would hang the real executor.
+            assert timeout is not None
+            raise subprocess.TimeoutExpired(["docker", "exec"], timeout)
         return self.returncode
 
 
@@ -74,7 +77,7 @@ def test_docker_executor_runs_command_request_and_streams_to_sink(monkeypatch): 
     monkeypatch.setattr("vibesys.agents.docker_executor.subprocess.Popen", fake_popen)
     stdout: list[str] = []
     stderr: list[str] = []
-    started: list[DockerCommandHandle] = []
+    started: list[CommandHandle] = []
 
     result = DockerCommandExecutor("container-123").run(
         CommandRequest(
@@ -87,7 +90,7 @@ def test_docker_executor_runs_command_request_and_streams_to_sink(monkeypatch): 
         CallbackCommandStreamSink(
             on_stdout=stdout.append,
             on_stderr=stderr.append,
-            on_started=started.append,  # pyright: ignore[reportArgumentType]  # tracked: #297
+            on_started=started.append,
         ),
     )
 
@@ -107,6 +110,7 @@ def test_docker_executor_runs_command_request_and_streams_to_sink(monkeypatch): 
     assert process.wait_timeout == 17
     assert stdout == ["out\n"]
     assert stderr == ["err\n"]
+    assert isinstance(started[0], DockerCommandHandle)
     assert started[0].process is process
     assert result.returncode == 0
     assert result.stdout == "out\n"

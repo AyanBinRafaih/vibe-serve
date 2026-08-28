@@ -14,7 +14,7 @@ import shlex
 from collections.abc import Mapping, Sequence  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass, replace
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from vibesys.agents.base import ResponseFallback
 from vibesys.agents.factory import resolve_agent_driver
@@ -1948,13 +1948,7 @@ def _read_protocol_benchmark(
             if hello is not None and outcome.metric_name in hello.metrics
             else None
         )
-        outcome = replace(
-            outcome,
-            metric_direction=cast(
-                "Literal['max', 'min'] | None",
-                configured or declared,
-            ),
-        )
+        outcome = replace(outcome, metric_direction=configured or declared)
     return outcome
 
 
