@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from importlib.resources import files
@@ -42,6 +43,18 @@ _MIN_NODE_MAJOR = 20
 
 #: Files and directories whose changes trigger a source-TUI rebuild, relative to
 #: the repository root. Mirrors the staleness check the old ``./vs`` script used.
+#:
+#: Principle: watch only inputs to the *shipped bundle* (``clients/tui/dist``),
+#: not everything that happens to live nearby. On the Python side that means
+#: the modules that actually shape ``ProtocolDocument`` in
+#: ``vibesys.server.schema`` -- ``events.py``, ``protocol.py``, and
+#: ``diagnostics.py`` -- not all of ``src/vibesys/server``. (Running
+#: ``python -m vibesys.server.schema`` also imports the rest of
+#: ``vibesys.server``'s package ``__init__.py``, and transitively much of
+#: ``vibesys``, purely because Python must execute a package's ``__init__``
+#: before importing one of its submodules; none of those extra modules feed
+#: the Pydantic models that get serialized into the schema, so changes to them
+#: cannot change the generated output and are deliberately excluded here.)
 _REBUILD_WATCH_FILES: tuple[str, ...] = (
     "clients/backend-client/package.json",
     "clients/backend-client/tsconfig.json",
@@ -56,12 +69,18 @@ _REBUILD_WATCH_FILES: tuple[str, ...] = (
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
     "biome.json",
+    # Inputs to `generate:protocol` (python -m vibesys.server.schema), which
+    # feeds clients/backend-client's generated types and, downstream, the TUI
+    # bundle. See the principle above for why this is the full set, no more.
+    "src/vibesys/server/schema.py",
+    "src/vibesys/server/events.py",
+    "src/vibesys/server/protocol.py",
+    "src/vibesys/server/diagnostics.py",
 )
 _REBUILD_WATCH_DIRS: tuple[str, ...] = (
     "clients/backend-client/src",
     "clients/core-state/src",
     "clients/tui/src",
-    "src/vibesys/server",
 )
 
 
@@ -206,39 +225,92 @@ def _pnpm_argv() -> list[str] | None:
     return None
 
 
-def _needs_rebuild(root: Path) -> bool:
+def _stale_reason(root: Path) -> str | None:
+    """Return why the source TUI bundle needs a rebuild, or ``None`` if fresh.
+
+    The result is a path relative to ``root`` (or a short description for the
+    missing-output case), meant for a user-facing message. It names the first
+    offending input found while scanning ``_REBUILD_WATCH_FILES`` then
+    ``_REBUILD_WATCH_DIRS`` in order, not necessarily the most-recently-changed
+    one.
+    """
     dist = root / "clients" / "tui" / "dist"
     entry = dist / "index.js"
     launcher = dist / "launcher.js"
     if not entry.is_file() or not launcher.is_file():
-        return True
+        return "clients/tui/dist/index.js (missing)"
     reference = entry.stat().st_mtime
     for rel in _REBUILD_WATCH_FILES:
         path = root / rel
         if path.is_file() and path.stat().st_mtime > reference:
-            return True
+            return rel
     for rel in _REBUILD_WATCH_DIRS:
         base = root / rel
         if not base.is_dir():
             continue
         for path in base.rglob("*"):
             if path.is_file() and path.stat().st_mtime > reference:
-                return True
-    return False
+                return str(path.relative_to(root))
+    return None
 
 
-def _ensure_source_tui_built(root: Path) -> bool:
-    pnpm = _pnpm_argv()
-    if pnpm is None:
-        print(  # noqa: T201  # tracked: #288
-            "vibesys: pnpm is required to build the interactive client. Install pnpm "
-            "or enable Corepack, or run headless with --headless.",
-            file=sys.stderr,
-        )
-        return False
-    print("vibesys: building the interactive client...", file=sys.stderr)  # noqa: T201  # tracked: #288
-    steps = (
+def _needs_rebuild(root: Path) -> bool:
+    return _stale_reason(root) is not None
+
+
+#: Marker written under `node_modules` after a successful `pnpm install`, so
+#: later launches can skip reinstalling when nothing changed. Relative to the
+#: repository root, matching `_REBUILD_WATCH_FILES`/`_REBUILD_WATCH_DIRS`.
+_INSTALL_STAMP_REL = "node_modules/.vibesys-install-stamp"
+
+
+def _needs_install(root: Path) -> bool:
+    """Whether `pnpm install --frozen-lockfile` must run before codegen/build.
+
+    Skipped when `node_modules` already exists and the lockfile is no newer
+    than the stamp file written after the last successful install.
+    """
+    if not (root / "node_modules").is_dir():
+        return True
+    stamp = root / _INSTALL_STAMP_REL
+    if not stamp.is_file():
+        return True
+    lockfile = root / "pnpm-lock.yaml"
+    return lockfile.is_file() and lockfile.stat().st_mtime > stamp.stat().st_mtime
+
+
+def _write_install_stamp(root: Path) -> None:
+    stamp = root / _INSTALL_STAMP_REL
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+
+
+def _run_pnpm_install(pnpm: list[str], root: Path) -> bool:
+    print(  # noqa: T201  # tracked: #288
+        "vibesys: installing JS dependencies (pnpm install --frozen-lockfile)...",
+        file=sys.stderr,
+    )
+    started = time.monotonic()
+    result = subprocess.run(  # noqa: S603  # tracked: #288
         [*pnpm, "install", "--frozen-lockfile"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.stderr.write("vibesys: failed to install JS dependencies:\n")
+        sys.stderr.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return False
+    _write_install_stamp(root)
+    elapsed = time.monotonic() - started
+    print(f"vibesys: dependencies installed ({elapsed:.1f}s)", file=sys.stderr)  # noqa: T201  # tracked: #288
+    return True
+
+
+def _run_codegen_and_build(pnpm: list[str], root: Path) -> bool:
+    steps = (
         [*pnpm, "--dir", "clients/backend-client", "generate:protocol"],
         [*pnpm, "build:clients"],
     )
@@ -252,6 +324,31 @@ def _ensure_source_tui_built(root: Path) -> bool:
             sys.stderr.write(result.stderr)
             return False
     return True
+
+
+def _ensure_source_tui_built(root: Path) -> bool:
+    pnpm = _pnpm_argv()
+    if pnpm is None:
+        print(  # noqa: T201  # tracked: #288
+            "vibesys: pnpm is required to build the interactive client. Install pnpm "
+            "or enable Corepack, or run headless with --headless.",
+            file=sys.stderr,
+        )
+        return False
+
+    if _needs_install(root) and not _run_pnpm_install(pnpm, root):
+        return False
+    if _run_codegen_and_build(pnpm, root):
+        return True
+
+    # The build failed even though the install-skip heuristic considered
+    # dependencies fresh (e.g. a partially removed node_modules). Fall back to
+    # a full install and retry once before giving up.
+    print(  # noqa: T201  # tracked: #288
+        "vibesys: build failed; retrying after a full dependency install...",
+        file=sys.stderr,
+    )
+    return _run_pnpm_install(pnpm, root) and _run_codegen_and_build(pnpm, root)
 
 
 def _run_source_tui(root: Path, args: list[str]) -> int:
@@ -271,8 +368,17 @@ def _run_source_tui(root: Path, args: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    if _needs_rebuild(root) and not _ensure_source_tui_built(root):
-        return 1
+    if _needs_rebuild(root):
+        reason = _stale_reason(root) or "clients/tui/dist/index.js (missing)"
+        print(  # noqa: T201  # tracked: #288
+            f"vibesys: TUI bundle is stale (changed: {reason}); rebuilding (~30-60s)...",
+            file=sys.stderr,
+        )
+        started = time.monotonic()
+        if not _ensure_source_tui_built(root):
+            return 1
+        elapsed = time.monotonic() - started
+        print(f"vibesys: TUI bundle rebuilt ({elapsed:.1f}s)", file=sys.stderr)  # noqa: T201  # tracked: #288
 
     launcher = root / "clients" / "tui" / "dist" / "launcher.js"
     env = {
