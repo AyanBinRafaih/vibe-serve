@@ -41,6 +41,7 @@ from vibesys.domains.environment import (
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.input_manifest import WorkspaceSource
 from vibesys.llm_client import build_model
+from vibesys.preamble_timing import drain_log_lines as drain_preamble_log_lines
 from vibesys.profilers import (
     ACTIVE_PROFILER_KINDS,
     ProfilerKind,
@@ -409,7 +410,10 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
 ) -> "_RunContext":
     stage_clock = time.perf_counter()
     context_start = stage_clock
-    buffered_logs: list[str] = []
+    # Preamble lines (recorded by ``_dispatch``/``run_agent_loop`` before this
+    # function ran) come first, so the run log reads in the order the work
+    # actually happened once the buffer below flushes into ``RunLogger``.
+    buffered_logs: list[str] = drain_preamble_log_lines()
     stage_sink: Callable[[str], None] = buffered_logs.append
 
     def _stage(name: str) -> None:

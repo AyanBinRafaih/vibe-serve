@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vibesys import preamble_timing
 from vibesys.context import (
     _EXPERIMENT_CHAT_SYSTEM_PROMPT,
     _ExperimentChatDependencies,
@@ -299,6 +300,59 @@ def test_context_assembly_logs_stage_timings(tmp_path):  # noqa: ANN001, ANN201
     ):
         assert f"context stage {stage}: " in log_text, f"missing stage timing for {stage!r}"
     assert "experiments gate open after " in log_text
+
+
+def test_dispatch_preamble_timing_lines_reach_run_log(tmp_path):  # noqa: ANN001, ANN201
+    """Preamble timing lines recorded before ``create_run_context`` land in the run log.
+
+    ``_dispatch`` and ``run_agent_loop`` (main.py / loops/agent/loop.py) do
+    substantial work before a ``RunLogger`` exists and record their own
+    ``main stage`` lines through ``vibesys.preamble_timing`` as they go.
+    ``_assemble_run_context`` must drain that collector into the same
+    pre-logger buffer as its own ``context stage`` lines, so both land in
+    the persistent run log in the order the work actually happened.
+    """
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+
+    preamble_timing.start_clock()
+    preamble_timing.record_stage("main stage parse_cli_invocation: 5ms")
+    preamble_timing.record_stage("main stage load_config_and_skills: 3ms")
+    preamble_timing.record_total()
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            log_text = ctx.run_log_path.read_text()
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+    assert "main stage parse_cli_invocation: 5ms" in log_text
+    assert "main stage load_config_and_skills: 3ms" in log_text
+    assert "dispatch preamble total: " in log_text
+    # The preamble happened before assembly in real dispatch; the run log
+    # should preserve that order.
+    preamble_index = log_text.index("dispatch preamble total: ")
+    context_index = log_text.index("context stage config_and_inputs: ")
+    assert preamble_index < context_index
+
+
+def test_context_assembly_without_recorded_preamble_omits_preamble_lines(tmp_path):  # noqa: ANN001, ANN201
+    """No ``vibesys.preamble_timing`` calls (e.g. a test-built context) means no stray lines."""
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            log_text = ctx.run_log_path.read_text()
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+    assert "main stage " not in log_text
+    assert "dispatch preamble total: " not in log_text
 
 
 def test_retained_experiment_chat_uses_one_dedicated_client_across_run_teardown(

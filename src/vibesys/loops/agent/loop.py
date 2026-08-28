@@ -46,6 +46,7 @@ from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.evolve.population import Objective  # noqa: TC001  # tracked: #288
 from vibesys.loops.gates import run_accuracy_gate
 from vibesys.loops.profiler import mcp_spec as profiler_mcp_spec
+from vibesys.preamble_timing import record_total as _record_preamble_total
 from vibesys.profilers import (
     ProfilerKind,
     profiler_definition,
@@ -2418,6 +2419,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
             f"{name}:{direction}" for name, direction in legacy_metric_directions.items()
         ),
     )
+    _record_preamble_total()
     ctx = create_run_context(
         config=normalized_config,
         exp_name=exp_name,
