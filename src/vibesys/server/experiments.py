@@ -44,12 +44,15 @@ def _entry(hypothesis: Hypothesis, *, active_id: str | None) -> HypothesisEntry:
             hypothesis.resolution.value if hypothesis.resolution is not None else None
         ),
         judge_verdict=_judge_verdict(hypothesis),
-        # These three values are intentionally copied as one tuple. Choosing a
-        # newer per-round metric here would pair it with a different causal
-        # delta and make the UI lie about the measurement.
+        # The measurement fields are intentionally copied as one tuple.
+        # Choosing a newer per-round metric here would pair it with a
+        # different causal delta and make the UI lie about the measurement.
         perf_metric=measurement.value if measurement is not None else None,
         perf_unit=_text(measurement.unit) if measurement is not None else None,
         perf_delta_pct=measurement.delta_pct if measurement is not None else None,
+        perf_metric_name=_text(measurement.metric) if measurement is not None else None,
+        perf_direction=measurement.direction if measurement is not None else None,
+        perf_baseline_value=measurement.baseline_value if measurement is not None else None,
         kept=hypothesis.candidate_retained,
         strategy_disposition=hypothesis.strategy.value,
         strategy_reason=hypothesis.strategy_reason,

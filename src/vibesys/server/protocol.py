@@ -271,6 +271,15 @@ class HypothesisEntry(ProtocolModel):
     # Causal delta paired with ``perf_metric`` by the hypothesis state. None
     # means no official comparison is available.
     perf_delta_pct: FiniteFloat | None = None
+    # Identity of the measured metric, so clients can label the bare number.
+    # Legacy rounds recorded only a unit, so this may repeat ``perf_unit``.
+    perf_metric_name: str | None = None
+    # Which way improvement points for the metric. None when the run recorded
+    # no objective direction; clients must not guess one.
+    perf_direction: Literal["max", "min"] | None = None
+    # The other side of ``perf_delta_pct``, from the same official
+    # measurement, so the comparison stays interpretable in absolute terms.
+    perf_baseline_value: FiniteFloat | None = None
     # Integration, not truth: the framework's explicit retention decision.
     # None means legacy or not yet assessed, never "official evaluation ran".
     kept: bool | None = None

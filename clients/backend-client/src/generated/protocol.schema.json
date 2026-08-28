@@ -1359,6 +1359,46 @@
           "default": null,
           "title": "Perf Delta Pct"
         },
+        "perf_metric_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Metric Name"
+        },
+        "perf_direction": {
+          "anyOf": [
+            {
+              "enum": [
+                "max",
+                "min"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Direction"
+        },
+        "perf_baseline_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Baseline Value"
+        },
         "kept": {
           "anyOf": [
             {
