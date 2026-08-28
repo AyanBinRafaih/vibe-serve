@@ -247,6 +247,11 @@ class RunSupervisor:
             self._store = durable
             self.log_dir = log_dir
             started_fresh = store is None
+            if store is not None:
+                # Subscribers block on the store they last read. Wake them so
+                # they pick up the run's durable store now rather than after
+                # their poll timeout.
+                store.notify_change()
         if started_fresh:
             self.record(EventType.SERVER_STARTED, status=EventStatus.ACTIVE)
         with self._condition:
@@ -555,6 +560,25 @@ class RunSupervisor:
                 canonical_lifecycle_ids=self._canonical_execution_ids,
                 invocation_lifecycle_ids=self._legacy_invocation_ids,
             )
+
+    def wait_for_change(self, after_sequence: int, timeout: float | None = None) -> bool:
+        """Block until the stream advances past the cursor, parsing no events.
+
+        A subscriber that will take its own checkpoint afterwards only needs
+        the change signal, so it must not force the intervening window into
+        models on the way to discarding it.
+        """
+        store = self._store
+        if store is None:
+            return False
+        return store.wait_for_change(after_sequence, timeout)
+
+    @property
+    def latest_sequence(self) -> int:
+        """The newest durable sequence, without building a whole snapshot."""
+        with self._condition:
+            store = self._store
+            return store.last_sequence if store else 0
 
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         with self._condition:

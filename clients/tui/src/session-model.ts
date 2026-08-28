@@ -22,6 +22,7 @@ import {
   reduceEvent,
   reduceEventBatch,
   reduceEventPrefix,
+  reduceEventRebootstrap,
   reduceSnapshot,
   type TodoItem,
   type TranscriptEntry,
@@ -1331,13 +1332,39 @@ export function applyEventBatch(
   throughSequence?: number,
   historyAfterSequence?: number,
 ): SessionState {
-  const core = reduceEventBatch(
-    state.core,
-    events,
-    activeExecutions,
-    throughSequence,
-    historyAfterSequence,
+  return applyReducedCore(
+    state,
+    reduceEventBatch(state.core, events, activeExecutions, throughSequence, historyAfterSequence),
   );
+}
+
+/**
+ * Fold a batch that re-bootstraps the stream at a raised history floor, which
+ * happens when the run's durable event log is attached after the client
+ * subscribed. The batch supersedes the pre-attach state instead of extending
+ * it; see `reduceEventRebootstrap`.
+ */
+export function applyEventRebootstrap(
+  state: SessionState,
+  events: readonly RunEvent[],
+  activeExecutions: ActiveExecutionCheckpoint | undefined,
+  throughSequence: number | undefined,
+  historyAfterSequence: number,
+): SessionState {
+  return applyReducedCore(
+    state,
+    reduceEventRebootstrap(
+      state.core,
+      events,
+      activeExecutions,
+      throughSequence,
+      historyAfterSequence,
+    ),
+  );
+}
+
+/** The UI transition shared by both ways of folding a backend checkpoint. */
+function applyReducedCore(state: SessionState, core: CoreState): SessionState {
   if (core === state.core) return state;
   let next: SessionState = deriveActiveChat({
     ...state,

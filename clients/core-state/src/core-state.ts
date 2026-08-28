@@ -260,6 +260,31 @@ export function reduceEventBatch(
 }
 
 /**
+ * Folds a batch that re-bootstraps the stream at a raised history floor.
+ *
+ * The server re-bootstraps when the run's durable event log is attached after
+ * the client subscribed: the subscription started against the server's own
+ * short bootstrap log, and the batch that follows replays the run log's tail
+ * plus its spine. Those sequences number a different log, so folding the batch
+ * onto the existing state would silently drop every spine event at or below
+ * the stale cursor, `run_started` among them.
+ *
+ * The batch therefore rebuilds the core state rather than extending it. Only
+ * the chat-thread registry survives, because a concurrent snapshot query
+ * supplies threads that no replayed tail carries.
+ */
+export function reduceEventRebootstrap(
+  state: CoreState,
+  events: readonly RunEvent[],
+  activeExecutions: ActiveExecutionCheckpoint | undefined,
+  throughSequence: number | undefined,
+  historyAfterSequence: number,
+): CoreState {
+  const base: CoreState = {...initialCoreState(), chatThreads: state.chatThreads};
+  return reduceEventBatch(base, events, activeExecutions, throughSequence, historyAfterSequence);
+}
+
+/**
  * Folds a chunk of events strictly older than everything `state` has folded,
  * i.e. every `event.sequence <= state.historyAfterSequence`.
  *

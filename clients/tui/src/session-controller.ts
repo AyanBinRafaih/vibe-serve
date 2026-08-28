@@ -7,6 +7,7 @@ import {
   type SubscribeOptions,
   SupervisionError,
 } from '@vibesys/backend-client';
+import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
 import {helpText, parseChatCommand, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
@@ -14,11 +15,12 @@ import {
   applyEvent,
   applyEventBatch,
   applyEventPrefix,
+  applyEventRebootstrap,
   applySnapshot,
+  type ChatThreadSettings,
   chatDocked,
   chatMenuCustomModel,
   chatPaneVisible,
-  type ChatThreadSettings,
   clearAgentSelection,
   clearEntrySelection,
   closeChatMenu,
@@ -58,6 +60,7 @@ import {
   type SessionState,
   selectAgent,
   selectExperimentActivity,
+  selectedChatMenuRow,
   selectNextAgent,
   selectNextEntry,
   selectNextRound,
@@ -65,7 +68,6 @@ import {
   selectPreviousAgent,
   selectPreviousRound,
   selectRound,
-  selectedChatMenuRow,
   setChatDockFits,
   setChatMenuCustomModel,
   setChatModelMenuOptions,
@@ -80,7 +82,6 @@ import {
   toggleTodos,
   updateChatConversation,
 } from './session-model.js';
-import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
 import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
 
 export interface SessionController {
@@ -216,6 +217,14 @@ export class SocketSessionController implements SessionController {
   readonly #foldedBelowFloor = new Set<number>();
   /** Lowest history floor seen so far; see `#lowerHistoryFloor`. */
   #historyFloor = Number.POSITIVE_INFINITY;
+  /**
+   * Highest floor the stream itself has declared, which is not the same as the
+   * floor in state: backfill lowers the latter and the stream never sees it.
+   * A later batch declaring more than this is a re-bootstrap; see
+   * `#raiseHistoryFloor`. Null until the first batch, whose floor is the
+   * bootstrap's own and therefore raises nothing.
+   */
+  #declaredFloor: number | null = null;
   #streamProtocolError = false;
 
   constructor(
@@ -923,9 +932,15 @@ export class SocketSessionController implements SessionController {
       this.#refreshPaneFor([message.event]);
     }
     if (message.type === 'event_batch') {
-      const floor = this.#lowerHistoryFloor(message.history_after_sequence ?? 0);
+      const declared = message.history_after_sequence ?? 0;
+      const rebootstrap = this.#declaredFloor !== null && declared > this.#declaredFloor;
+      this.#declaredFloor = declared;
+      const floor = rebootstrap
+        ? this.#raiseHistoryFloor(declared)
+        : this.#lowerHistoryFloor(declared);
+      const apply = rebootstrap ? applyEventRebootstrap : applyEventBatch;
       this.#setState(
-        applyEventBatch(
+        apply(
           this.#state,
           message.events,
           message.active_executions,
@@ -933,7 +948,7 @@ export class SocketSessionController implements SessionController {
           floor,
         ),
       );
-      this.#recordSpine(message.events, message.history_after_sequence ?? 0);
+      this.#recordSpine(message.events, declared);
       this.#refreshExperimentsFor(message.events);
       this.#refreshPaneFor(message.events);
     }
@@ -959,6 +974,21 @@ export class SocketSessionController implements SessionController {
   #lowerHistoryFloor(floor: number): number {
     this.#historyFloor = Math.min(this.#historyFloor, floor);
     return this.#historyFloor;
+  }
+
+  /**
+   * Adopts a floor the stream raised, which only a re-bootstrap does.
+   *
+   * The run's durable event log is attached after the client subscribes, so a
+   * subscription that bootstrapped against the server's own short log is
+   * re-bootstrapped at a tail of the run log. Everything below that tail is
+   * unread history, whatever the client held before, and the spine set
+   * described a log this one replaces.
+   */
+  #raiseHistoryFloor(floor: number): number {
+    this.#historyFloor = floor;
+    this.#foldedBelowFloor.clear();
+    return floor;
   }
 
   /** Remembers the events a batch delivered from below its own history floor. */

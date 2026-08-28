@@ -7,6 +7,7 @@ import {
   reconcileActiveExecutions,
   reduceEvent,
   reduceEventBatch,
+  reduceEventRebootstrap,
   reduceSnapshot,
 } from './core-state.js';
 
@@ -616,6 +617,58 @@ describe('core state projection', () => {
 
     expect(state.experimentsRevision).toBe(12);
     expect('experimentLog' in state).toBe(false);
+  });
+});
+
+// The run's durable event log is attached after a client subscribes, so a
+// subscription bootstrapped against the server's own short log is later
+// re-bootstrapped at a tail of the run log. The two batches number different
+// logs, which is why the second supersedes the state the first built.
+describe('a re-bootstrapped stream', () => {
+  const runLog: RunEvent[] = [
+    {
+      ...baseEvent(1, 'run_started'),
+      data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+    },
+    outputEvent(2, 'two'),
+    outputEvent(3, 'three'),
+  ];
+
+  it('folds events the superseded cursor would have dropped', () => {
+    const superseded = reduceEventBatch(initialCoreState(), [outputEvent(2, 'pre-attach')]);
+
+    const state = reduceEventRebootstrap(superseded, runLog, [], 3, 1);
+
+    expect(state.maxRounds).toBe(3);
+    expect(state.outerLoop).toBe('agent');
+    // One turn, so the two chunks concatenate; the superseded 'pre-attach'
+    // chunk is gone rather than concatenated onto them.
+    expect(state.transcript.map(entry => entry.content)).toEqual(['twothree']);
+    expect(state.historyAfterSequence).toBe(1);
+  });
+
+  it('keeps the chat threads a concurrent snapshot registered', () => {
+    const superseded = reduceSnapshot(initialCoreState(), {
+      run_id: 'run',
+      status: 'running',
+      sequence: 1,
+      chat_threads: [
+        {
+          thread_id: 'thread-a',
+          title: 'Ring buffer sizing',
+          driver: 'agentshim',
+          provider: 'anthropic',
+          model: 'opus',
+        },
+      ],
+    } satisfies RunSnapshot);
+
+    const state = reduceEventRebootstrap(superseded, runLog, [], 3, 1);
+
+    expect(state.chatThreads.map(thread => thread.id)).toEqual([
+      DEFAULT_CHAT_THREAD_ID,
+      'thread-a',
+    ]);
   });
 });
 

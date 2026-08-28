@@ -207,6 +207,15 @@ class SupervisionService:
         """Block for new events after the cursor, bounded by ``before_sequence``."""
         return self.supervisor.wait_for_events(after_sequence, timeout, before_sequence)
 
+    def wait_for_change(self, after_sequence: int, timeout: float | None = None) -> bool:
+        """Block until the stream advances past the cursor, parsing no events."""
+        return self.supervisor.wait_for_change(after_sequence, timeout)
+
+    @property
+    def latest_sequence(self) -> int:
+        """The newest sequence in the run's log, without a snapshot's copies."""
+        return self.supervisor.latest_sequence
+
 
 def _metric_directions(
     encoded: tuple[str, ...],

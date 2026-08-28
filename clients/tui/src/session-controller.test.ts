@@ -1596,6 +1596,96 @@ describe('session controller', () => {
   });
 });
 
+/**
+ * The run's durable event log is attached after the client subscribes, so the
+ * subscription's first batch comes from the server's own short log and the
+ * stream then re-bootstraps at a tail of the run log. The two batches number
+ * different logs, and the second declares a floor above the first.
+ */
+describe('a stream that re-bootstraps at a raised floor', () => {
+  /** The run log, whose last event is the pre-attach one carried into it. */
+  const runLog: RunEvent[] = [
+    {
+      ...event(1, 'run_started'),
+      data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+    },
+    event(2, 'agent_output_chunk', 'two\n'),
+    roundFinished(3, 1),
+    event(4, 'agent_output_chunk', 'four\n'),
+    event(5, 'agent_output_chunk', 'five\n'),
+    event(6, 'agent_output_chunk', 'server started\n'),
+  ];
+  /** What the stream sends once the run log is attached: spine, then tail. */
+  const rebootstrap = [runLog[0], runLog[2], runLog[4], runLog[5]] as RunEvent[];
+  const preAttach = [event(1, 'agent_output_chunk', 'server started\n')];
+
+  async function rebootstrapped(transport: HistoryTransport): Promise<SocketSessionController> {
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(preAttach, 0);
+    transport.emitBatch(rebootstrap, 4);
+    return controller;
+  }
+
+  it('keeps the raised floor so the skipped history is still backfillable', async () => {
+    const transport = new HistoryTransport(runLog);
+
+    const controller = await rebootstrapped(transport);
+
+    expect(controller.state.core.historyAfterSequence).toBe(4);
+    await expect(controller.loadOlderHistory()).resolves.toBe(true);
+    expect(eventsQueries(transport)).toEqual([
+      {type: 'query.events', after_sequence: 0, before_sequence: 5},
+    ]);
+  });
+
+  it('folds the spine the pre-attach cursor would otherwise have swallowed', async () => {
+    const controller = await rebootstrapped(new HistoryTransport(runLog));
+
+    // `run_started` and `round_finished` sit at or below the cursor the
+    // superseded log left behind, in a sequence space that no longer applies.
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.outerLoop).toBe('agent');
+    expect(controller.state.core.rounds.map(round => round.number)).toEqual([1]);
+  });
+
+  it('reaches the state a full replay of the run log would have built', async () => {
+    const replayedTransport = new HistoryTransport(runLog);
+    const replayed = new SocketSessionController(replayedTransport);
+    await replayed.start();
+    replayedTransport.emitBatch(runLog, 0);
+
+    const controller = await rebootstrapped(new HistoryTransport(runLog));
+    await controller.loadOlderHistory();
+
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    expect(controller.state.core.transcript).toEqual(replayed.state.core.transcript);
+    expect(controller.state.core.rounds).toEqual(replayed.state.core.rounds);
+    expect(controller.state.core.sequence).toBe(replayed.state.core.sequence);
+  });
+
+  it('refreshes experiments from a change buried in the re-bootstrap batch', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emit({type: 'event_batch', events: preAttach, history_after_sequence: 0});
+    const before = transport.requests.length;
+
+    transport.emit({
+      type: 'event_batch',
+      events: [...rebootstrap, event(7, 'experiments_changed')],
+      history_after_sequence: 4,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(controller.state.core.historyAfterSequence).toBe(4);
+    expect(transport.requests.slice(before).map(request => request.type)).toEqual([
+      'query.experiments',
+    ]);
+  });
+});
+
 class FakeTransport implements SupervisionTransport {
   closed = false;
   /** Mutable so a test can change what a refetch returns mid-run. */

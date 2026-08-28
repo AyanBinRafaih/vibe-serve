@@ -543,6 +543,29 @@ class EventStore:
             self._changed.wait(timeout)
             return self._events_after_unlocked(after_sequence)
 
+    def wait_for_change(self, after_sequence: int, timeout: float | None = None) -> bool:
+        """Block until a record exists past the cursor; report it, parse nothing.
+
+        A subscriber that only needs to know the stream moved must not pay to
+        validate the window it moved by. On a resumed run that window is the
+        entire durable history.
+        """
+        with self._changed:
+            if self._next_sequence - 1 > after_sequence:
+                return True
+            self._changed.wait(timeout)
+            return self._next_sequence - 1 > after_sequence
+
+    def notify_change(self) -> None:
+        """Wake every waiter without appending, for a store being retired.
+
+        A waiter blocked on a store the run has replaced would otherwise sleep
+        out its timeout before noticing that the store it should read is a
+        different object.
+        """
+        with self._changed:
+            self._changed.notify_all()
+
     def _events_after_unlocked(
         self, after_sequence: int, before_sequence: int | None = None
     ) -> list[RunEvent]:
