@@ -228,6 +228,24 @@ class PerformanceRound(ProtocolModel):  # noqa: D101  # tracked: #288
     profile_skipped: bool = False
 
 
+class PerformanceContext(ProtocolModel):
+    """What the performance plot measures and how to read it.
+
+    Copied from recorded run state and the run manifest, never recomputed.
+    Every field is optional so the section can describe the objective before
+    the first measurement and omit facts a run never recorded; a run whose
+    prose is known before its metric still gets a description-only context.
+    """
+
+    objective_metric: str | None = None
+    objective_unit: str | None = None
+    objective_direction: Literal["max", "min"] | None = None
+    objective_baseline_value: FiniteFloat | None = None
+    objective_baseline_round: int | None = None
+    objective_baseline_commit: str | None = None
+    objective_description: str | None = None
+
+
 class HypothesisRound(ProtocolModel):
     """One round belonging to a hypothesis, for the experiment-log drill-down."""
 
@@ -300,6 +318,9 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     snapshot: RunSnapshot | None = None
     events: list[RunEvent] = Field(default_factory=list)
     performance: list[PerformanceRound] = Field(default_factory=list)
+    # None means the run has not recorded what its metric is, which is
+    # distinct from a run whose plot is merely empty so far.
+    performance_context: PerformanceContext | None = None
     experiments: list[HypothesisEntry] = Field(default_factory=list)
     # False means canonical project/run state is not attached yet. Keeping the
     # readiness marker separate preserves the protocol-v1 list contract while

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from vibesys.loops.agent.hypotheses import reproject_run_evidence
 from vibesys.loops.agent.state import AgentRunStateStore
@@ -11,6 +11,11 @@ from vibesys.server.chat_options import build_chat_options
 from vibesys.server.events import EventType, RunEvent
 from vibesys.server.experiments import build_experiment_log
 from vibesys.server.inspector import RunInspector
+from vibesys.server.performance import (
+    build_performance_context,
+    metric_directions,
+    summarize_objective,
+)
 from vibesys.server.protocol import (
     ActiveAgentExecution,
     ChatOptions,
@@ -25,6 +30,7 @@ from vibesys.server.protocol import (
     HistoryQuery,
     HypothesisEntry,
     PauseCommand,
+    PerformanceContext,
     PerformanceQuery,
     PerformanceRound,
     ProtocolRequest,
@@ -36,6 +42,7 @@ from vibesys.server.protocol import (
     TuiDefaultsQuery,
 )
 from vibesys.server.supervisor import RunSupervisor  # noqa: TC001  # tracked: #288
+from vs_project import ProjectStateError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -77,7 +84,11 @@ class SupervisionService:
             return Response(request_id=request.request_id, events=self.history_events())
         if isinstance(request, PerformanceQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/perf")
-            return Response(request_id=request.request_id, performance=self.performance_rounds())
+            return Response(
+                request_id=request.request_id,
+                performance=self.performance_rounds(),
+                performance_context=self.performance_context(),
+            )
         if isinstance(request, ExperimentQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/experiments")
             ready = self.supervisor.project_run is not None
@@ -191,6 +202,35 @@ class SupervisionService:
             )
         return rounds
 
+    def performance_context(self) -> PerformanceContext | None:
+        """Describe what the performance plot measures, for presentation clients."""
+        project_run = self.supervisor.project_run
+        if project_run is None:
+            return None
+        manifest = project_run.project.state.load_run(project_run.run_id)
+        if manifest.configuration.outer_loop != "agent":
+            return None
+        return build_performance_context(
+            self._agent_run_state(),
+            objectives=manifest.configuration.objectives,
+            objective_description=self._objective_description(),
+        )
+
+    def _objective_description(self) -> str | None:
+        """Read the bounded summary of the run's recorded objective prose."""
+        project_run = self.supervisor.project_run
+        if project_run is None:
+            return None
+        try:
+            runtime = project_run.project.state.portable_namespace(project_run.run_id, "runtime")
+            document = runtime.external_directory() / "effective-objective.md"
+            if not document.is_file():
+                return None
+            text = document.read_text(encoding="utf-8")
+        except (OSError, ProjectStateError):
+            return None
+        return summarize_objective(text)
+
     def experiments(self) -> list[HypothesisEntry]:
         """Project the run's authoritative hypothesis aggregate for clients."""
         state = self._agent_run_state()
@@ -218,10 +258,10 @@ class SupervisionService:
             return store.migrate_legacy(
                 rounds=project_run.project.state.load_rounds(project_run.run_id),
                 local_namespace=local,
-                legacy_directions=_metric_directions(manifest.configuration.objectives),
+                legacy_directions=metric_directions(manifest.configuration.objectives),
             )
         return reproject_run_evidence(
-            state, legacy_directions=_metric_directions(manifest.configuration.objectives)
+            state, legacy_directions=metric_directions(manifest.configuration.objectives)
         )
 
     def wait_for_events(
@@ -241,18 +281,3 @@ class SupervisionService:
     def latest_sequence(self) -> int:
         """The newest sequence in the run's log, without a snapshot's copies."""
         return self.supervisor.latest_sequence
-
-
-def _metric_directions(
-    encoded: tuple[str, ...],
-) -> dict[str, Literal["max", "min"]]:
-    """Decode objective directions stored with an agent run."""
-    directions: dict[str, Literal["max", "min"]] = {}
-    for value in encoded:
-        name, separator, direction = value.rpartition(":")
-        if separator and name:
-            if direction == "max":
-                directions[name] = "max"
-            elif direction == "min":
-                directions[name] = "min"
-    return directions
