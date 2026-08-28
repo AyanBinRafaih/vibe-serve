@@ -184,7 +184,11 @@ class RunSupervisor:
         # The run's own agent selection, attached by the run context. Chat
         # options are derived from it, so a client enumerates nothing.
         self._chat_run_settings: ChatRunSettings | None = None
+        # Default-chat and thread-chat borrowers are counted separately: the
+        # default handler can outlive the run context (retained terminal chat),
+        # so thread teardown must not wait on it.
         self._active_chat_calls = 0
+        self._active_chat_thread_calls = 0
         self._retain_terminal_chat = False
         self._terminal_chat_resource: TerminalChatResource | None = None
         self._retired_terminal_chat_resource: TerminalChatResource | None = None
@@ -752,7 +756,7 @@ class RunSupervisor:
             # no CHAT event is recorded for a thread that cannot answer.
             return handler
         with self._condition:
-            self._active_chat_calls += 1
+            self._active_chat_thread_calls += 1
         try:
             answer = handler(text)
             thread_title = self._title_thread_if_needed(thread_id, text)
@@ -767,7 +771,7 @@ class RunSupervisor:
             )
             return answer
         finally:
-            self._release_chat_call()
+            self._release_chat_thread_call()
 
     def _title_thread_if_needed(self, thread_id: str, question: str) -> str | None:
         """Derive and store an untitled thread's title from its first message."""
@@ -867,11 +871,17 @@ class RunSupervisor:
             return sorted(self._chat_thread_specs.values(), key=lambda spec: spec.created_at)
 
     def clear_chat_threads_and_drain(self) -> None:
-        """Stop routing thread chat and wait for in-flight calls to release."""
+        """Stop routing thread chat and wait for in-flight thread calls to release."""
         with self._condition:
             self._chat_thread_factory = None
             self._chat_thread_handlers.clear()
-            self._wait_for_chat_drain_locked(timeout=_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS)
+            self._wait_for_thread_chat_drain_locked(timeout=_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS)
+
+    def _release_chat_thread_call(self) -> None:
+        """Release one thread-handler lease."""
+        with self._condition:
+            self._active_chat_thread_calls -= 1
+            self._condition.notify_all()
 
     def _release_chat_call(self) -> None:
         """Release one handler lease and close a retired resource when safe."""
@@ -951,8 +961,16 @@ class RunSupervisor:
             resource.close()
 
     def _wait_for_chat_drain_locked(self, *, timeout: float | None) -> bool:
+        """Wait until the default chat handler has no borrowers."""
+        return self._wait_locked(lambda: self._active_chat_calls > 0, timeout=timeout)
+
+    def _wait_for_thread_chat_drain_locked(self, *, timeout: float | None) -> bool:
+        """Wait until no thread handler is borrowed."""
+        return self._wait_locked(lambda: self._active_chat_thread_calls > 0, timeout=timeout)
+
+    def _wait_locked(self, busy: Callable[[], bool], *, timeout: float | None) -> bool:
         deadline = time.monotonic() + timeout if timeout is not None else None
-        while self._active_chat_calls > 0:
+        while busy():
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 return False

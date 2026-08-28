@@ -1965,8 +1965,12 @@ class _RunContext:
     def _close_chat_surfaces(self) -> BaseException | None:
         """Tear down the default chat and every created thread's resources."""
         chat_error: BaseException | None = None
-        experiment_chat, self._experiment_chat = self._experiment_chat, None
-        chat_threads, self._chat_thread_services = list(self._chat_thread_services), []
+        # Teardown must survive a partially constructed context: __init__ can
+        # raise between attribute assignments, and tests build minimal contexts
+        # through __new__. Read defensively rather than assuming full init.
+        experiment_chat, self._experiment_chat = getattr(self, "_experiment_chat", None), None
+        chat_threads = list(getattr(self, "_chat_thread_services", ()))
+        self._chat_thread_services = []
         if self.supervisor is not None:
             try:
                 # Threads never outlive the run context, even when a retained
