@@ -4,9 +4,9 @@ import {resolveStartupTheme} from './startup-theme.js';
 
 describe('resolveStartupTheme', () => {
   it('applies the theme the backend resolved from configuration', async () => {
-    await expect(resolveStartupTheme(Promise.resolve(defaultsResponse('solarized-light')))).resolves.toBe(
-      'solarized-light',
-    );
+    await expect(
+      resolveStartupTheme(Promise.resolve(defaultsResponse('solarized-light'))),
+    ).resolves.toBe('solarized-light');
   });
 
   it('prefers an explicit launcher theme without asking the backend', async () => {
@@ -16,9 +16,9 @@ describe('resolveStartupTheme', () => {
       return defaultsResponse('light');
     })();
 
-    await expect(
-      resolveStartupTheme(pending, {explicitTheme: 'catppuccin-latte'}),
-    ).resolves.toBe('catppuccin-latte');
+    await expect(resolveStartupTheme(pending, {explicitTheme: 'catppuccin-latte'})).resolves.toBe(
+      'catppuccin-latte',
+    );
     await pending;
     // The launcher only starts the request when no theme was given, but an
     // explicit one wins even if a response is already in flight.

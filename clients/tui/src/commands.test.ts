@@ -5,8 +5,8 @@ import {
   helpText,
   parseChatCommand,
   parseCommand,
-  slashCommandRange,
   SLASH_COMMANDS,
+  slashCommandRange,
   suggestChatSlashCommands,
   suggestSlashCommands,
 } from './commands.js';

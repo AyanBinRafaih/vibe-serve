@@ -2,9 +2,9 @@ import {
   BoxRenderable,
   type CliRenderer,
   MarkdownRenderable,
+  type SyntaxStyle,
   // The terminal mouse event, not the DOM global of the same name.
   type MouseEvent as TerminalMouseEvent,
-  type SyntaxStyle,
   TextRenderable,
 } from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
