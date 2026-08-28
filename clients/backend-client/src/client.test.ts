@@ -219,6 +219,36 @@ describe('SupervisionClient', () => {
     );
   });
 
+  it('carries a subscribe tail only when one is asked for', async () => {
+    const frames: Array<Record<string, unknown>> = [];
+    await withServer(
+      socket =>
+        respondToLines(socket, request => {
+          if (request['type'] !== 'subscribe') return;
+          frames.push(request);
+          socket.write(
+            `${JSON.stringify({
+              type: 'subscribed',
+              request_id: request['request_id'],
+              run_id: 'run-1',
+              latest_sequence: 0,
+            })}\n`,
+          );
+        }),
+      async client => {
+        const tailed = await client.subscribe(0, () => undefined, noopDisconnect, {tail: 1000});
+        const full = await client.subscribe(0, () => undefined, noopDisconnect);
+
+        expect(frames[0]).toMatchObject({after_sequence: 0, tail: 1000});
+        // An old server forbids unknown fields, so the plain call must not
+        // carry the key at all, not even as null.
+        expect(frames[1]).not.toHaveProperty('tail');
+        await tailed.close();
+        await full.close();
+      },
+    );
+  });
+
   it('reports an event-stream disconnect only once', async () => {
     await withServer(
       socket =>
@@ -314,6 +344,43 @@ describe('SupervisionClient', () => {
       },
     );
   });
+  it('keeps retrying until a socket that does not exist yet accepts', async () => {
+    socketPath = join('/tmp', `vs-${randomUUID().slice(0, 8)}.sock`);
+    const server = createServer(socket =>
+      respondToLines(socket, request =>
+        socket.write(`${JSON.stringify(successResponse(request['request_id'] as string))}\n`),
+      ),
+    );
+    const path = socketPath;
+    const connecting = SupervisionClient.connect(path, {connectTimeoutMs: 5_000});
+    setTimeout(() => void listen(server, path), 150);
+
+    const client = await connecting;
+    try {
+      await expect(client.request({type: 'query.snapshot'})).resolves.toMatchObject({ok: true});
+    } finally {
+      await client.close();
+      await close(server);
+    }
+  });
+
+  it('reports the last connection failure when the backend never listens', async () => {
+    socketPath = join('/tmp', `vs-${randomUUID().slice(0, 8)}.sock`);
+
+    await expect(
+      SupervisionClient.connect(socketPath, {connectTimeoutMs: 120, connectRetryIntervalMs: 20}),
+    ).rejects.toThrow(/Timed out connecting to supervision server after 120ms: .*ENOENT/);
+  });
+
+  it('stops retrying once the deadline passes', async () => {
+    socketPath = join('/tmp', `vs-${randomUUID().slice(0, 8)}.sock`);
+    const start = Date.now();
+
+    await expect(
+      SupervisionClient.connect(socketPath, {connectTimeoutMs: 100, connectRetryIntervalMs: 10}),
+    ).rejects.toThrow();
+    expect(Date.now() - start).toBeLessThan(2_000);
+  });
 });
 
 async function withServer(
@@ -332,6 +399,9 @@ async function withServer(
     await close(server);
   }
 }
+
+/** A subscription the test closes itself, so a disconnect is not a failure. */
+function noopDisconnect(): void {}
 
 function respondToLines(socket: Socket, respond: (request: Record<string, unknown>) => void): void {
   let buffer = '';

@@ -46,7 +46,98 @@ describe('launcher', () => {
     });
   });
 
-  it('starts a headless backend, waits for readiness, and runs the frontend', async () => {
+  it('starts the frontend while the backend is still coming up', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
+    const backendTerminated = join(tempDir, 'backend-terminated');
+    const defaultsInvoked = join(tempDir, 'defaults-invoked');
+    const socketSeen = join(tempDir, 'socket-seen');
+    const backend = await writeExecutable(
+      'slow-backend.mjs',
+      `
+import {writeFileSync} from 'node:fs';
+import {createServer} from 'node:net';
+
+if (process.argv.includes('tui-defaults')) {
+  writeFileSync(${JSON.stringify(defaultsInvoked)}, 'invoked');
+  console.log(JSON.stringify({theme: 'dark'}));
+  process.exit(0);
+}
+const socketPath = process.argv[process.argv.indexOf('--control-socket') + 1];
+const server = createServer(socket => socket.end());
+setTimeout(() => server.listen(socketPath), 300);
+process.on('SIGTERM', () => {
+  writeFileSync(process.env.VIBESYS_FAKE_BACKEND_TERM_FILE, 'terminated');
+  process.exit(0);
+});
+`,
+    );
+    const frontend = await writeExecutable(
+      'probe-frontend.mjs',
+      `
+import {existsSync, writeFileSync} from 'node:fs';
+writeFileSync(
+  ${JSON.stringify(socketSeen)},
+  existsSync(process.env.VIBESYS_CONTROL_SOCKET) ? 'listening' : 'starting',
+);
+process.exit(0);
+`,
+    );
+
+    process.env['VIBESYS_PYTHON'] = backend;
+    process.env['VIBESYS_TUI_RUNTIME'] = process.execPath;
+    process.env['VIBESYS_TUI_ENTRYPOINT'] = frontend;
+    process.env['VIBESYS_FAKE_BACKEND_TERM_FILE'] = backendTerminated;
+
+    await expect(launch(['--stub-agent', '--runs-dir', '/tmp/vibesys-test-runs'])).resolves.toBe(0);
+    // The frontend owns the wait for the socket, so the launcher spawns it
+    // before the backend listens and never interposes a defaults process.
+    expect(await readFile(socketSeen, 'utf8')).toBe('starting');
+    await expect(access(defaultsInvoked)).rejects.toThrow();
+  }, 15_000);
+
+  it('reports the backend log when the backend dies before it listens', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
+    const frontendTerminated = join(tempDir, 'frontend-terminated');
+    const backend = await writeExecutable(
+      'doomed-backend.mjs',
+      `
+console.error('vibesys: configuration is unreadable');
+process.exit(3);
+`,
+    );
+    const frontend = await writeExecutable(
+      'waiting-frontend.mjs',
+      `
+import {writeFileSync} from 'node:fs';
+process.on('SIGTERM', () => {
+  writeFileSync(${JSON.stringify(frontendTerminated)}, 'terminated');
+  process.exit(143);
+});
+setInterval(() => undefined, 1000);
+`,
+    );
+
+    process.env['VIBESYS_PYTHON'] = backend;
+    process.env['VIBESYS_TUI_RUNTIME'] = process.execPath;
+    process.env['VIBESYS_TUI_ENTRYPOINT'] = frontend;
+
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(' '));
+    };
+    try {
+      await expect(launch(['--stub-agent'])).resolves.toBe(3);
+    } finally {
+      console.error = originalError;
+    }
+
+    await access(frontendTerminated);
+    expect(errors.join('\n')).toContain('backend exited with status 3');
+    expect(errors.join('\n')).toContain('configuration is unreadable');
+  }, 15_000);
+
+  it('starts a headless backend and runs the frontend', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
     const backendTerminated = join(tempDir, 'backend-terminated');
     const backend = await writeExecutable(
@@ -115,20 +206,10 @@ if (process.argv.includes('tui-defaults')) {
   process.exit(0);
 }
 const socketPath = process.argv[process.argv.indexOf('--control-socket') + 1];
-const server = createServer(socket => {
-  socket.once('data', data => {
-    const request = JSON.parse(data.toString().split('\\n')[0]);
-    socket.end(JSON.stringify({
-      protocol_version: 1,
-      request_id: request.request_id,
-      timestamp: new Date().toISOString(),
-      ok: true,
-      events: [],
-    }) + '\\n');
-    setTimeout(() => process.exit(2), 1000);
-  });
-});
+const server = createServer(socket => socket.end());
 server.listen(socketPath);
+// The run fails on its own once the client has had time to attach.
+setTimeout(() => process.exit(2), 1000);
 process.on('SIGTERM', () => {
   writeFileSync(process.env.VIBESYS_FAKE_BACKEND_TERM_FILE, 'terminated');
   server.close(() => process.exit(0));
@@ -243,12 +324,12 @@ process.exit(0);
     expect(implicitArgs).not.toContain('--input');
     expect(implicitArgs).not.toContain('--repo');
     expect(implicitArgs).not.toContain('--exp-name');
-    const defaultsArgs = JSON.parse(await readFile(defaultsInvoked, 'utf8')) as string[];
-    expect(defaultsArgs).toContain('--directory-only');
+    // Without --theme the frontend asks over the control channel, so no
+    // defaults process runs and the environment carries no theme.
+    await expect(access(defaultsInvoked)).rejects.toThrow();
     expect(await realpath(await readFile(backendCwd, 'utf8'))).toBe(await realpath(tempDir));
-    expect(await readFile(frontendTheme, 'utf8')).toBe('solarized-light');
+    expect(await readFile(frontendTheme, 'utf8')).toBe('');
 
-    await rm(defaultsInvoked);
     await expect(
       launch([
         '--input',
@@ -288,15 +369,17 @@ process.exit(0);
 import {writeFileSync} from 'node:fs';
 import {createConnection} from 'node:net';
 writeFileSync(${JSON.stringify(frontendMarker)}, 'started');
-const socket = createConnection(process.env.VIBESYS_CONTROL_SOCKET);
+// The launcher no longer waits for the socket, so the client retries like
+// the real backend client does.
+const socket = await connectWithRetry(process.env.VIBESYS_CONTROL_SOCKET);
 let buffer = '';
-socket.once('connect', () => socket.write(JSON.stringify({
+socket.write(JSON.stringify({
   protocol_version: 1,
   request_id: 'launcher-empty-runs-dir',
   timestamp: '1970-01-01T00:00:00Z',
   type: 'subscribe',
   after_sequence: 0,
-}) + '\\n'));
+}) + '\\n');
 socket.setEncoding('utf8');
 socket.on('data', chunk => {
   buffer += chunk;
@@ -319,6 +402,22 @@ socket.on('data', chunk => {
   }
 });
 socket.once('close', () => process.exit(0));
+
+async function connectWithRetry(path) {
+  const deadline = Date.now() + 30000;
+  while (true) {
+    try {
+      return await new Promise((resolve, reject) => {
+        const socket = createConnection(path);
+        socket.once('connect', () => resolve(socket));
+        socket.once('error', reject);
+      });
+    } catch (error) {
+      if (Date.now() > deadline) throw error;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+}
 `,
     );
     const python = join(dirname(fileURLToPath(import.meta.url)), '../../../.venv/bin/python');

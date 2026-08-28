@@ -12,21 +12,14 @@ import {parseChatCommand} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
   activeChatThreadSettings,
-  chatMenuCustomModel,
   type ChatThreadSettings,
+  chatMenuCustomModel,
   clearAgentSelection,
   clearEntrySelection,
   closeChatMenu,
   closeOverlays,
   closePane,
   closeThemePicker,
-  moveChatMenuSelection,
-  openChatModelMenu,
-  openChatResumeMenu,
-  selectedChatMenuRow,
-  setChatMenuCustomModel,
-  setChatModelMenuOptions,
-  switchChatThread,
   cyclePaneFocus,
   dismissErrorBanner,
   enterExperimentDrilldown,
@@ -37,10 +30,13 @@ import {
   initialSessionState,
   leaveExperimentDrilldown,
   leaveHypothesisDetail,
+  moveChatMenuSelection,
   moveExperimentSelection,
   moveHypothesisRoundSelection,
   moveThemeSelection,
   normalizeFocus,
+  openChatModelMenu,
+  openChatResumeMenu,
   openExperimentLog,
   openHypothesisDetail,
   openPane,
@@ -51,14 +47,18 @@ import {
   type SessionState,
   selectAgent,
   selectExperimentActivity,
+  selectedChatMenuRow,
   selectNextEntry,
   selectNextRound,
   selectNextTodo,
   selectPreviousRound,
   setChatDockFits,
+  setChatMenuCustomModel,
+  setChatModelMenuOptions,
   setExperiments,
   setPaneContent,
   setTheme,
+  switchChatThread,
   togglePaneZoom,
 } from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
@@ -1608,6 +1608,87 @@ describe('OpenTUI presentation', () => {
     await testRenderer.waitForFrame(value => value.includes('updated tail'));
     expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBe(firstCard);
     expect(testRenderer.renderer.root.findDescendantById('event-entry-999')).not.toBe(lastCard);
+  });
+
+  it('paints only the tail of a huge transcript, then reveals history on scroll', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const controller = new FakeController(hugeTranscriptState(20_000));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 19999'));
+    // Only a bounded tail gets cards: the newest entry is on screen, the run's
+    // older history is not built at all.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBeDefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBeUndefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19799')).toBeUndefined();
+
+    testRenderer.mockInput.pressKey('HOME');
+    await testRenderer.waitForFrame(() => true);
+
+    // Scrolling back materializes the next block, so the capped history stays
+    // reachable rather than being discarded.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19799')).toBeDefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBeDefined();
+  });
+
+  it('asks the controller for history once the window reaches what is loaded', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const state = hugeTranscriptState(2_400);
+    const controller = new FakeController({
+      ...state,
+      // The client folded a suffix of the run: everything at or below sequence
+      // 3000 is still on the server.
+      core: {...state.core, historyAfterSequence: 3_000},
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 2399'));
+
+    // Each press materializes another block of what is already loaded, and asks
+    // for nothing while there is more of it left.
+    for (let press = 0; press < 11; press += 1) {
+      testRenderer.mockInput.pressKey('HOME');
+      await testRenderer.waitForFrame(() => true);
+    }
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBeDefined();
+    expect(controller.historyLoads).toBe(0);
+
+    testRenderer.mockInput.pressKey('HOME');
+    await testRenderer.waitForFrame(() => true);
+
+    // The window starts at the oldest entry the client holds, so the next block
+    // has to come from the backend.
+    expect(controller.historyLoads).toBe(1);
+  });
+
+  it('appends live entries incrementally on a windowed transcript', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const state = hugeTranscriptState(20_000);
+    const controller = new FakeController(state);
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 19999'));
+    const tailCard = testRenderer.renderer.root.findDescendantById('event-entry-19999');
+
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        transcript: [
+          ...state.core.transcript,
+          {id: 'entry-20000', kind: 'status' as const, content: 'event 20000'},
+        ],
+      },
+    });
+    await testRenderer.waitForFrame(value => value.includes('event 20000'));
+
+    // The window anchor held, so the append stayed a prefix extension and the
+    // cards already on screen were not rebuilt.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBe(tailCard);
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-20000')).toBeDefined();
   });
 
   it('selects an agent with Tab and filters the transcript', async () => {
@@ -3716,6 +3797,22 @@ function spanColors(
   return undefined;
 }
 
+/** A run long enough that building every card would block the first frame. */
+function hugeTranscriptState(entries: number): SessionState {
+  const initial = initialSessionState();
+  return {
+    ...initial,
+    core: {
+      ...initial.core,
+      transcript: Array.from({length: entries}, (_, index) => ({
+        id: `entry-${index}`,
+        kind: 'status' as const,
+        content: `event ${index}`,
+      })),
+    },
+  };
+}
+
 function registerCleanup(
   renderer: Awaited<ReturnType<typeof createTestRenderer>>['renderer'],
   app: OpenTuiApp,
@@ -3763,6 +3860,8 @@ class FakeController implements SessionController {
     ],
   };
   liveCalls = 0;
+  /** How many times the reveal path asked for history the client does not hold. */
+  historyLoads = 0;
 
   /**
    * Tests that exercise the transcript start past the landing view. The
@@ -3865,6 +3964,11 @@ class FakeController implements SessionController {
   }
   closeThemePicker(): void {
     this.publish(closeThemePicker(this.state));
+  }
+  /** Records the reveal path asking the backend for history it does not hold. */
+  loadOlderHistory(): Promise<boolean> {
+    this.historyLoads += 1;
+    return Promise.resolve(this.state.core.historyAfterSequence > 0);
   }
   submitChat(value: string): Promise<void> {
     const text = value.trim();

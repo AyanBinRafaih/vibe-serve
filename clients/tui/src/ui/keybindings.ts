@@ -16,6 +16,8 @@ export interface KeybindingActions {
   toggleSelectedTool(): boolean;
   /** Brings the entry the cursor moved to into view. */
   revealSelectedEntry(): void;
+  /** Materializes the next block of conversation history above the window. */
+  revealOlderEntries(): void;
   selectNextAgent(): void;
   selectPreviousAgent(): void;
   selectNextRound(): void;
@@ -289,12 +291,21 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    if (key.name === 'pageup') viewport.scrollBy(-1, 'viewport');
-    else if (key.name === 'pagedown') viewport.scrollBy(1, 'viewport');
-    else if (key.ctrl && key.name === 'up') viewport.scrollBy(-1);
-    else if (key.ctrl && key.name === 'down') viewport.scrollBy(1);
-    else if (key.name === 'home') viewport.scrollTo(0);
-    else if (key.name === 'end') viewport.scrollTo(viewport.scrollHeight);
+    if (key.name === 'pageup') {
+      actions.revealOlderEntries();
+      viewport.scrollBy(-1, 'viewport');
+    } else if (key.name === 'pagedown') viewport.scrollBy(1, 'viewport');
+    else if (key.ctrl && key.name === 'up') {
+      actions.revealOlderEntries();
+      viewport.scrollBy(-1);
+    } else if (key.ctrl && key.name === 'down') viewport.scrollBy(1);
+    else if (key.name === 'home') {
+      // Home reaches the top of what is rendered. On a windowed transcript that
+      // is one further block of history per press, rather than one press
+      // building every card a 20k-entry run has.
+      actions.revealOlderEntries();
+      viewport.scrollTo(0);
+    } else if (key.name === 'end') viewport.scrollTo(viewport.scrollHeight);
     else return;
     key.preventDefault();
   };

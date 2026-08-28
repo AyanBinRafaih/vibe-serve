@@ -42,6 +42,40 @@ Experiment entries currently come from `query.experiments`. The event stream sup
 `experiments_changed` invalidation, not the entries themselves. Query progress and results therefore
 remain outside core state until the backend event contract becomes complete enough to project them.
 
+## Launch sequence
+
+`vs` spawns the headless backend and the frontend concurrently. The launcher does not wait for the
+control socket: the backend client retries `ENOENT` and `ECONNREFUSED` until its connect deadline,
+so the frontend pays its own startup while the backend is still coming up. The launcher still
+watches for the socket appearing, which is what distinguishes a backend that died before it ever
+listened (report its log tail) from a run that failed later (the frontend already shows the
+diagnostic).
+
+Configuration stays in the backend. Without `--theme`, the frontend asks `query.tui_defaults` while
+the renderer starts and applies the answer before the first frame, falling back to the default theme
+if the backend does not answer in time. `--theme` skips the query and reaches the frontend as
+`VIBESYS_THEME`.
+
+### Boot trace
+
+Boot timings are always recorded and never narrated. The backend times its boot in spans
+(`src/vibesys/boot_trace.py`): the dispatch preamble in `main.py`, then run-context assembly in
+`context.py`. Every span lands in the run's `run-*.log` as
+`boot span <qualified.name>: <ms>ms`, with the preamble's spans ahead of assembly's and each
+enclosing span reporting its region's total after its children.
+
+Nothing reaches stderr unless you ask:
+
+```bash
+VIBESYS_BOOT_TRACE=1 vibesys --input ... 2>trace.log
+```
+
+The CLI passes the request to every process it spawns, so the same variable also switches on the
+frontend's own measurement of how long the landing view waits for experiments
+(`clients/tui/src/boot-trace.ts`), which spans the request, the backend gate, and the reply. Those
+client lines are anchored to `VIBESYS_LAUNCH_START_MS`, which the CLI always sets, so they report
+wall time since the user ran the command rather than since the frontend process started.
+
 ## Validation
 
 Run all package checks from the repository root:

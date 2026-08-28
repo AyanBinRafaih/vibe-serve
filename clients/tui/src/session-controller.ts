@@ -4,19 +4,24 @@ import {
   type RequestInput,
   type RunEvent,
   type ServerMessage,
+  type SubscribeOptions,
   SupervisionError,
 } from '@vibesys/backend-client';
+import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
+import type {StartupTrace} from './boot-trace.js';
 import {helpText, parseChatCommand, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
   activeChatThreadSettings,
   applyEvent,
   applyEventBatch,
+  applyEventPrefix,
+  applyEventRebootstrap,
   applySnapshot,
+  type ChatThreadSettings,
   chatDocked,
   chatMenuCustomModel,
   chatPaneVisible,
-  type ChatThreadSettings,
   clearAgentSelection,
   clearEntrySelection,
   closeChatMenu,
@@ -56,6 +61,7 @@ import {
   type SessionState,
   selectAgent,
   selectExperimentActivity,
+  selectedChatMenuRow,
   selectNextAgent,
   selectNextEntry,
   selectNextRound,
@@ -63,7 +69,6 @@ import {
   selectPreviousAgent,
   selectPreviousRound,
   selectRound,
-  selectedChatMenuRow,
   setChatDockFits,
   setChatMenuCustomModel,
   setChatModelMenuOptions,
@@ -78,7 +83,6 @@ import {
   toggleTodos,
   updateChatConversation,
 } from './session-model.js';
-import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
 import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
 
 export interface SessionController {
@@ -141,6 +145,8 @@ export interface SessionController {
   moveThemeSelection(delta: number): void;
   applySelectedTheme(): void;
   closeThemePicker(): void;
+  /** Loads the chunk of history just older than what is folded. Resolves false when history is already complete. */
+  loadOlderHistory(): Promise<boolean>;
   subscribe(listener: (state: SessionState) => void): () => void;
 }
 
@@ -150,9 +156,20 @@ export interface SupervisionTransport {
     afterSequence: number,
     onMessage: (message: ServerMessage) => void,
     onDisconnect: (error: Error) => void,
+    options?: SubscribeOptions,
   ): Promise<EventSubscription>;
   close(): Promise<void>;
 }
+
+/**
+ * How much history the boot subscribe asks for. A long-lived run holds tens of
+ * thousands of events, and replaying all of them costs seconds of wire, parse,
+ * and fold before the first frame. A thousand events covers what an operator
+ * opens the client to look at; the rest loads when they scroll back for it, in
+ * chunks of the same size so one backfill is one round trip of the same shape.
+ */
+const BOOTSTRAP_TAIL = 1_000;
+const BACKFILL_CHUNK = 1_000;
 
 export class SocketSessionController implements SessionController {
   #state: SessionState;
@@ -164,12 +181,51 @@ export class SocketSessionController implements SessionController {
   /** Single-flight guard for semantic experiment-log invalidations. */
   #experimentFetch: Promise<void> | null = null;
   #experimentRefreshPending = false;
+  /**
+   * When the client first asked for experiments, and whether the answer has
+   * been timed yet. The first request can be answered `experiments_ready:
+   * false`, so the elapsed time spans every retry until entries actually land,
+   * which is exactly how long the landing view shows "Loading experiments...".
+   */
+  #experimentsRequestedAt: number | null = null;
+  #experimentsLoadTraced = false;
   #paneFetch: Promise<void> | null = null;
+  /** Single-flight guard for on-demand history backfill. */
+  #historyFetch: Promise<boolean> | null = null;
+  /**
+   * Sequences already folded from below the history floor.
+   *
+   * A tail subscription's batch is not only the tail: the server also replays
+   * the run-level spine from before the floor (`run_started`, `round_finished`,
+   * `chat_thread_created`, the terminal events, …) so the ordinary reducer can
+   * derive what a suffix cannot carry. A backfill chunk covering that range
+   * therefore re-delivers those same events, and `reduceEventPrefix` folds into
+   * a fresh state with no `sequence <= state.sequence` guard to catch them. The
+   * set is O(rounds), and filtering every chunk through it is what keeps one
+   * `round_finished` from becoming two.
+   */
+  readonly #foldedBelowFloor = new Set<number>();
+  /** Lowest history floor seen so far; see `#lowerHistoryFloor`. */
+  #historyFloor = Number.POSITIVE_INFINITY;
+  /**
+   * Highest floor the stream itself has declared, which is not the same as the
+   * floor in state: backfill lowers the latter and the stream never sees it.
+   * A later batch declaring more than this is a re-bootstrap; see
+   * `#raiseHistoryFloor`. Null until the first batch, whose floor is the
+   * bootstrap's own and therefore raises nothing.
+   */
+  #declaredFloor: number | null = null;
   #streamProtocolError = false;
 
   constructor(
     private readonly client: SupervisionTransport,
     themeName: ThemeName = DEFAULT_THEME_NAME,
+    /**
+     * Where boot measurements go. The controller only reports; whether
+     * anything is written, and how it is anchored, belongs to the sink
+     * (`boot-trace.ts`), which is why the default discards.
+     */
+    private readonly trace: StartupTrace = () => {},
   ) {
     this.#state = initialSessionState(themeName);
   }
@@ -178,35 +234,116 @@ export class SocketSessionController implements SessionController {
     return this.#state;
   }
 
+  /**
+   * Boots the session: the snapshot, the experiment log, and the event
+   * subscription run concurrently.
+   *
+   * Nothing here orders them. Each applies its own result onto whatever state
+   * is current when it lands, and a snapshot older than the replayed event
+   * cursor is rejected by `reduceSnapshot`, so a late snapshot cannot undo
+   * events that already arrived. Sequencing them only made boot cost the sum
+   * of three round trips, the replay being by far the longest.
+   */
   async start(): Promise<void> {
+    await Promise.all([
+      this.#loadSnapshot(),
+      // The log is the landing view, so it is populated before the first frame
+      // rather than on demand.
+      this.#loadExperiments(),
+      this.#openEventStream(),
+    ]);
+  }
+
+  async #loadSnapshot(): Promise<void> {
     try {
       const response = await this.client.request({type: 'query.snapshot'});
       if (response.snapshot) this.#setState(applySnapshot(this.#state, response.snapshot));
     } catch (error) {
       this.#setState(reportCaughtError(this.#state, error, 'request'));
     }
-    // The log is the landing view, so it is populated before the first frame
-    // rather than on demand.
-    await this.#loadExperiments();
+  }
+
+  /**
+   * Subscribes to the tail of the stream, falling back to the whole history.
+   *
+   * A server that predates `tail` forbids the unknown field and rejects the
+   * subscription, so the rejection is the capability probe: there is nothing
+   * else to ask. Any other failure degrades the same way, because a full
+   * replay is only slow, never wrong. A run shorter than the tail needs no
+   * special case, since the server clamps the floor to 0 and the batch comes
+   * back with `history_after_sequence` 0, which is today's behavior exactly.
+   */
+  async #openEventStream(): Promise<void> {
+    const onMessage = (message: ServerMessage): void => this.#onMessage(message);
+    const onDisconnect = (error: Error): void => {
+      // A terminal event already carries the actual outcome. The socket
+      // closing afterward is lifecycle cleanup, not a second failure that
+      // should replace the useful diagnostic in the banner.
+      if (!this.#state.core.terminal && !this.#streamProtocolError) {
+        this.#setState(
+          reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
+        );
+      }
+    };
     try {
-      this.#eventSubscription = await this.client.subscribe(
-        0,
-        message => this.#onMessage(message),
-        error => {
-          // A terminal event already carries the actual outcome. The socket
-          // closing afterward is lifecycle cleanup, not a second failure that
-          // should replace the useful diagnostic in the banner.
-          if (!this.#state.core.terminal && !this.#streamProtocolError) {
-            this.#setState(
-              reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
-            );
-          }
-        },
-      );
+      this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect, {
+        tail: BOOTSTRAP_TAIL,
+      });
+      return;
+    } catch {
+      // Reported only if the full replay fails too: one boot must not put two
+      // banners up, and the first failure is expected against an old server.
+    }
+    try {
+      this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect);
     } catch (error) {
       this.#setState(
         reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
       );
+    }
+  }
+
+  /**
+   * Loads the chunk of history just older than what is folded. Resolves false
+   * when history is already complete.
+   *
+   * Single-flight: a reader holding the scroll gesture at the top asks
+   * repeatedly, and each answer moves the floor, so overlapping requests would
+   * fetch the same range twice and fold it twice.
+   */
+  loadOlderHistory(): Promise<boolean> {
+    if (this.#state.core.historyAfterSequence === 0) return Promise.resolve(false);
+    if (this.#historyFetch !== null) return this.#historyFetch;
+    const fetch = this.#requestOlderHistory().finally(() => {
+      this.#historyFetch = null;
+    });
+    this.#historyFetch = fetch;
+    return fetch;
+  }
+
+  async #requestOlderHistory(): Promise<boolean> {
+    const floor = this.#state.core.historyAfterSequence;
+    const nextFloor = Math.max(0, floor - BACKFILL_CHUNK);
+    try {
+      const response = await this.client.request({
+        type: 'query.events',
+        after_sequence: nextFloor,
+        // Every folded event has `sequence > floor`, so the range has to
+        // include the floor itself and stops one above it.
+        before_sequence: floor + 1,
+      });
+      // Spine events replayed with the tail fall inside this range; folding
+      // them a second time would duplicate their transcript entries.
+      const events = (response.events ?? []).filter(
+        event => event.sequence === undefined || !this.#foldedBelowFloor.has(event.sequence),
+      );
+      this.#setState(applyEventPrefix(this.#state, events, this.#lowerHistoryFloor(nextFloor)));
+      return true;
+    } catch (error) {
+      // The floor stays where it was, so the same range is retried the next
+      // time the reader asks for it.
+      this.#setState(reportCaughtError(this.#state, error, 'request'));
+      return false;
     }
   }
 
@@ -549,6 +686,7 @@ export class SocketSessionController implements SessionController {
   }
 
   async #loadExperiments(): Promise<void> {
+    this.#experimentsRequestedAt ??= performance.now();
     if (this.#experimentFetch !== null) return this.#experimentFetch;
     const fetch = this.#requestExperiments().finally(() => {
       this.#experimentFetch = null;
@@ -565,11 +703,21 @@ export class SocketSessionController implements SessionController {
     try {
       const response = await this.client.request({type: 'query.experiments'});
       if (response.experiments_ready === false) return;
-      this.#setState(setExperiments(this.#state, response.experiments ?? []));
+      const entries = response.experiments ?? [];
+      this.#setState(setExperiments(this.#state, entries));
+      this.#traceExperimentsLoaded(entries.length);
     } catch (error) {
       const message = errorMessage(error);
       this.#setState(reportCaughtError(failExperiments(this.#state, message), error, 'request'));
     }
+  }
+
+  /** Reports the first delivery only: later refreshes are not a boot cost. */
+  #traceExperimentsLoaded(entryCount: number): void {
+    if (this.#experimentsLoadTraced || this.#experimentsRequestedAt === null) return;
+    this.#experimentsLoadTraced = true;
+    const elapsed = Math.round(performance.now() - this.#experimentsRequestedAt);
+    this.trace(`experiments loaded in ${elapsed}ms (${entryCount} entries)`);
   }
 
   /**
@@ -766,14 +914,23 @@ export class SocketSessionController implements SessionController {
       this.#refreshPaneFor([message.event]);
     }
     if (message.type === 'event_batch') {
+      const declared = message.history_after_sequence ?? 0;
+      const rebootstrap = this.#declaredFloor !== null && declared > this.#declaredFloor;
+      this.#declaredFloor = declared;
+      const floor = rebootstrap
+        ? this.#raiseHistoryFloor(declared)
+        : this.#lowerHistoryFloor(declared);
+      const apply = rebootstrap ? applyEventRebootstrap : applyEventBatch;
       this.#setState(
-        applyEventBatch(
+        apply(
           this.#state,
           message.events,
           message.active_executions,
           message.through_sequence,
+          floor,
         ),
       );
+      this.#recordSpine(message.events, declared);
       this.#refreshExperimentsFor(message.events);
       this.#refreshPaneFor(message.events);
     }
@@ -785,6 +942,45 @@ export class SocketSessionController implements SessionController {
           diagnostic: message.diagnostic ?? null,
         }),
       );
+    }
+  }
+
+  /**
+   * The floor only ever descends.
+   *
+   * A subscription reports the floor it bootstrapped with on every batch it
+   * sends, including live ones. Once a backfill has lowered the floor, taking
+   * a later batch's value literally would raise it again and send the client
+   * back for history it already holds.
+   */
+  #lowerHistoryFloor(floor: number): number {
+    this.#historyFloor = Math.min(this.#historyFloor, floor);
+    return this.#historyFloor;
+  }
+
+  /**
+   * Adopts a floor the stream raised, which only a re-bootstrap does.
+   *
+   * The run's durable event log is attached after the client subscribes, so a
+   * subscription that bootstrapped against the server's own short log is
+   * re-bootstrapped at a tail of the run log. Everything below that tail is
+   * unread history, whatever the client held before, and the spine set
+   * described a log this one replaces.
+   */
+  #raiseHistoryFloor(floor: number): number {
+    this.#historyFloor = floor;
+    this.#foldedBelowFloor.clear();
+    return floor;
+  }
+
+  /** Remembers the events a batch delivered from below its own history floor. */
+  #recordSpine(events: readonly RunEvent[], historyAfterSequence: number): void {
+    if (historyAfterSequence === 0) return;
+    for (const {sequence} of events) {
+      // An unsequenced event cannot be recognized in a later chunk anyway.
+      if (sequence !== undefined && sequence <= historyAfterSequence) {
+        this.#foldedBelowFloor.add(sequence);
+      }
     }
   }
 

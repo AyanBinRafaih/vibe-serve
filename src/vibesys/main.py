@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
+from vibesys import boot_trace
 from vibesys.config import Config, load_config
 from vibesys.constants import (
     KNOWN_COMPUTE_BACKENDS,
@@ -1659,26 +1660,52 @@ def _build_tui_defaults_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_tui_defaults(  # noqa: PLR0913  # tracked: #288
+    *,
+    config_path: Path | None = None,
+    stub_agent: bool = False,
+    input_path: Path | None = None,
+    runs_dir: Path | None = None,
+    experiment_name: str | None = None,
+    theme: TuiTheme | None = None,
+    directory_only: bool = False,
+) -> InteractiveSetupDefaults:
+    """Resolve launcher-facing defaults from configuration.
+
+    ``directory_only`` keeps the resolution local: it skips the repository
+    owner suggestion, the one field that may shell out to ``gh``. Raises
+    ``ValueError`` or ``FileNotFoundError`` when the configuration cannot be
+    loaded; callers decide how to report that.
+    """
+    config = _load_config_or_stub_default(config_path, stub_agent=stub_agent)
+    resolved_input = input_path.expanduser().resolve() if input_path is not None else None
+    resolved_runs_dir = (runs_dir or Path.cwd() / "exp_env").expanduser().resolve()
+    resolved_name = experiment_name or generate_experiment_name(resolved_input)
+    return InteractiveSetupDefaults(
+        runs_dir=str(resolved_runs_dir),
+        input_path=str(resolved_input) if resolved_input is not None else "",
+        experiment_name=resolved_name,
+        repository_owner=None if directory_only else _suggest_repository_owner(config),
+        repository_name=repository_name_from_experiment(resolved_name),
+        visibility=config.repository.visibility,
+        theme=theme or config.tui.theme,
+    )
+
+
 def _run_tui_defaults(argv: list[str]) -> None:
     args = _build_tui_defaults_parser().parse_args(argv)
     try:
-        config = _load_config_or_stub_default(args.config, stub_agent=args.stub_agent)
+        defaults = _resolve_tui_defaults(
+            config_path=args.config,
+            stub_agent=args.stub_agent,
+            input_path=args.input,
+            runs_dir=args.runs_dir,
+            experiment_name=args.exp_name,
+            theme=args.theme,
+            directory_only=args.directory_only,
+        )
     except (ValueError, FileNotFoundError) as exc:
         _configuration_error(str(exc), code="config_load_failed", stage="config_loading")
-
-    input_path = args.input.expanduser().resolve() if args.input is not None else None
-    runs_dir = (args.runs_dir or Path.cwd() / "exp_env").expanduser().resolve()
-    experiment_name = args.exp_name or generate_experiment_name(input_path)
-    repository_owner = None if args.directory_only else _suggest_repository_owner(config)
-    defaults = InteractiveSetupDefaults(
-        runs_dir=str(runs_dir),
-        input_path=str(input_path) if input_path is not None else "",
-        experiment_name=experiment_name,
-        repository_owner=repository_owner,
-        repository_name=repository_name_from_experiment(experiment_name),
-        visibility=config.repository.visibility,
-        theme=args.theme or config.tui.theme,
-    )
     print(defaults.model_dump_json())  # noqa: T201  # tracked: #288
 
 
@@ -2033,22 +2060,35 @@ def _validate_agent(args: argparse.Namespace) -> None:
 
 
 def _run_agent(args: argparse.Namespace) -> None:
-    bundle: InputBundle = args.input_bundle
-    config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
-    _prepare_experiment_repository(args, config)
-    from vibesys.loops.agent.loop import run_agent_loop  # noqa: PLC0415  # tracked: #288
+    # Everything the run needs before the loop can start. The enclosing span
+    # is this preamble's total; ``context.py`` times assembly from there.
+    with boot_trace.span("agent_preamble"):
+        bundle: InputBundle = args.input_bundle
+        with boot_trace.span("load_config_and_skills"):
+            config, skills, backend = load_config_and_skills(args, domain=bundle.domain)
+        with boot_trace.span("prepare_experiment_repository"):
+            _prepare_experiment_repository(args, config)
+        with boot_trace.span("import_run_agent_loop"):
+            from vibesys.loops.agent.loop import run_agent_loop  # noqa: PLC0415  # tracked: #288
+        with boot_trace.span("load_objective"):
+            objective = _with_operator_constraints(_load_objective(bundle), args.constraint)
 
-    objective = _with_operator_constraints(_load_objective(bundle), args.constraint)
+        existing = False
+        exp_name = args.exp_name
+        start_round = 1
 
-    existing = False
-    exp_name = args.exp_name
-    start_round = 1
+        if args.resume is not None:
+            exp_name = args.resume
+            existing = True
+            start_round = None
+            print(f"Resuming VibeSys run {exp_name} in {bundle.root}/")  # noqa: T201  # tracked: #288
 
-    if args.resume is not None:
-        exp_name = args.resume
-        existing = True
-        start_round = None
-        print(f"Resuming VibeSys run {exp_name} in {bundle.root}/")  # noqa: T201  # tracked: #288
+        with boot_trace.span("load_objectives_toml"):
+            objectives = _load_objectives_toml(bundle.task_root)
+            pareto_relative_noise = _load_pareto_relative_noise_toml(bundle.task_root)
+
+        with boot_trace.span("run_environment_spec"):
+            run_environment = run_environment_spec_from_args(args)
 
     success = run_agent_loop(
         config=config,
@@ -2067,8 +2107,8 @@ def _run_agent(args: argparse.Namespace) -> None:
         accuracy_timeout_seconds=bundle.manifest.accuracy.timeout_seconds,
         benchmark_timeout_seconds=bundle.manifest.benchmark.timeout_seconds,
         objective=objective,
-        objectives=_load_objectives_toml(bundle.task_root),
-        pareto_relative_noise=_load_pareto_relative_noise_toml(bundle.task_root),
+        objectives=objectives,
+        pareto_relative_noise=pareto_relative_noise,
         max_rounds=args.max_rounds,
         max_retries_per_round=args.max_retries_per_round,
         judge_every=args.judge_every,
@@ -2082,7 +2122,7 @@ def _run_agent(args: argparse.Namespace) -> None:
         debug=args.debug,
         profiler_kind=args.profiler,
         skills_dirs=skills,
-        run_environment=run_environment_spec_from_args(args),
+        run_environment=run_environment,
         agent_backend="stub" if args.stub_agent else args.agent_backend,
         cli_provider=args.cli_provider,
         backend=backend,
@@ -2544,40 +2584,76 @@ def _dispatch(argv: list[str]) -> None:
         _run_migrate_run_environment(argv[1:])
         return
 
-    invocation = parse_cli_invocation(argv)
-    loop_kind, args = invocation.loop_kind, invocation.args
-    runner = _LOOP_COMMANDS[loop_kind].run
-    from vibesys.server.events import (  # noqa: PLC0415  # tracked: #288
-        EventStatus,
-        EventType,
-        RunStartedData,
-    )
-    from vibesys.server.registry import active_supervisor  # noqa: PLC0415  # tracked: #288
+    # Dispatch's own share of boot; the selected command's preamble
+    # (``_run_agent``) and then ``context.py`` continue the trace. These
+    # lines stay buffered until run-context assembly drains them.
+    with boot_trace.span("dispatch"):
+        with boot_trace.span("parse_cli_invocation"):
+            invocation = parse_cli_invocation(argv)
+        loop_kind, args = invocation.loop_kind, invocation.args
+        runner = _LOOP_COMMANDS[loop_kind].run
+        with boot_trace.span("supervisor_run_started_event"):
+            from vibesys.server.events import (  # noqa: PLC0415  # tracked: #288
+                EventStatus,
+                EventType,
+                RunStartedData,
+            )
+            from vibesys.server.registry import (  # noqa: PLC0415  # tracked: #288
+                active_supervisor,
+            )
 
-    supervisor = active_supervisor()
-    if supervisor is not None:
-        max_rounds = getattr(args, "max_rounds", getattr(args, "max_iterations", 1))
-        supervisor.record(
-            EventType.RUN_STARTED,
-            status=EventStatus.ACTIVE,
-            data=RunStartedData(
-                outer_loop=loop_kind,
-                input=str(args.input_bundle.root),
-                max_rounds=max_rounds,
-            ),
-        )
+            supervisor = active_supervisor()
+            if supervisor is not None:
+                max_rounds = getattr(args, "max_rounds", getattr(args, "max_iterations", 1))
+                supervisor.record(
+                    EventType.RUN_STARTED,
+                    status=EventStatus.ACTIVE,
+                    data=RunStartedData(
+                        outer_loop=loop_kind,
+                        input=str(args.input_bundle.root),
+                        max_rounds=max_rounds,
+                    ),
+                )
     runner(args)
+
+
+def _option_from_argv(argv: list[str], option: str) -> str | None:
+    """Read one option's value without parsing the full run configuration."""
+    prefix = f"{option}="
+    for index, token in enumerate(argv):
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+        if token == option and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
 
 
 def _control_socket_from_argv(argv: list[str]) -> Path | None:
     """Read the transport bootstrap flag without parsing run configuration."""
-    for index, token in enumerate(argv):
-        if token.startswith("--control-socket="):
-            value = token.partition("=")[2]
-            return Path(value) if value else None
-        if token == "--control-socket" and index + 1 < len(argv):  # noqa: S105  # tracked: #288
-            return Path(argv[index + 1])
-    return None
+    value = _option_from_argv(argv, "--control-socket")
+    return Path(value) if value else None
+
+
+def _tui_defaults_from_argv(argv: list[str]) -> Callable[[], InteractiveSetupDefaults]:
+    """Build the defaults provider a supervision server answers clients with.
+
+    The server is constructed before the run's configuration is parsed, so the
+    provider closes over the launch argv and resolves on demand. Resolution is
+    directory-only: clients need the configured theme, not a GitHub lookup.
+    """
+    config = _option_from_argv(argv, "--config")
+    theme = _option_from_argv(argv, "--theme")
+    stub_agent = "--stub-agent" in argv
+
+    def provide() -> InteractiveSetupDefaults:
+        return _resolve_tui_defaults(
+            config_path=Path(config) if config is not None else None,
+            stub_agent=stub_agent,
+            theme=TuiTheme(theme) if theme is not None else None,
+            directory_only=True,
+        )
+
+    return provide
 
 
 def _render_configuration_error(error: ConfigurationError) -> NoReturn:
@@ -2595,7 +2671,11 @@ def main() -> None:  # tracked: #288
         from vibesys.server.runtime import run_server  # noqa: PLC0415  # tracked: #288
 
         try:
-            run_server(lambda: _dispatch(argv), socket_path=control_socket)
+            run_server(
+                lambda: _dispatch(argv),
+                socket_path=control_socket,
+                tui_defaults=_tui_defaults_from_argv(argv),
+            )
         except ConfigurationError as exc:
             raise SystemExit(exc.diagnostic.exit_code) from None
         return

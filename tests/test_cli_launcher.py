@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,6 +87,7 @@ def test_headless_flag_runs_engine_subprocess(monkeypatch):  # noqa: ANN001, ANN
 def test_interactive_execs_launcher_with_python_env(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     bundle = _make_bundle(tmp_path)
     _force_interactive(monkeypatch)
+    monkeypatch.delenv("VIBESYS_BOOT_TRACE", raising=False)
     monkeypatch.setattr(cli, "bundled_tui", lambda: bundle)
 
     captured: dict[str, object] = {}
@@ -111,6 +113,32 @@ def test_interactive_execs_launcher_with_python_env(monkeypatch, tmp_path):  # n
     assert captured["env"]["VIBESYS_PYTHON"] == sys.executable  # pyright: ignore[reportIndexIssue]
     assert captured["env"]["VIBESYS_TUI_RUNTIME"] == str(bundle.runtime)  # pyright: ignore[reportIndexIssue]
     assert captured["env"]["BUN_CONFIG_SKIP_INSTALL_PACKAGES"] == "1"  # pyright: ignore[reportIndexIssue]
+    # Read by clients/tui/src/boot-trace.ts to anchor the client's boot
+    # measurements to when the user ran the command, not just when the
+    # frontend process started. cli.main marks it through vibesys.boot_trace.
+    launch_start_ms = int(captured["env"]["VIBESYS_LAUNCH_START_MS"])  # pyright: ignore[reportIndexIssue]
+    assert abs(launch_start_ms - int(time.time() * 1000)) < 5_000
+    # Quiet by default: the frontend traces only when asked to.
+    assert "VIBESYS_BOOT_TRACE" not in captured["env"]  # pyright: ignore[reportOperatorIssue]
+
+
+def test_boot_trace_request_reaches_the_launcher(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
+    """``VIBESYS_BOOT_TRACE=1`` must reach the frontend, which traces itself."""
+    bundle = _make_bundle(tmp_path)
+    _force_interactive(monkeypatch)
+    monkeypatch.setenv("VIBESYS_BOOT_TRACE", "1")
+    monkeypatch.setattr(cli, "bundled_tui", lambda: bundle)
+
+    captured: dict[str, object] = {}
+
+    def _call(cmd, env=None):  # noqa: ANN001, ANN202, ARG001  # tracked: #288
+        captured["env"] = env
+        return 0
+
+    monkeypatch.setattr(cli.subprocess, "call", _call)
+
+    assert cli.main(["--input", "bundle", "--local"]) == 0
+    assert captured["env"]["VIBESYS_BOOT_TRACE"] == "1"  # pyright: ignore[reportIndexIssue]
 
 
 def test_interactive_with_non_executable_bundled_runtime_errors(  # noqa: ANN201
@@ -162,6 +190,7 @@ def test_source_checkout_root_finds_this_repo():  # noqa: ANN201  # tracked: #28
 
 def test_source_checkout_builds_and_runs_launcher_from_callers_directory(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     _force_interactive(monkeypatch)
+    monkeypatch.delenv("VIBESYS_BOOT_TRACE", raising=False)
     monkeypatch.setattr(cli, "bundled_tui", lambda: None)
     monkeypatch.setattr(cli, "source_checkout_root", lambda: tmp_path)
     monkeypatch.setattr(cli, "_bun_executable", lambda: Path("/usr/bin/bun"))
@@ -191,6 +220,9 @@ def test_source_checkout_builds_and_runs_launcher_from_callers_directory(monkeyp
     assert captured["cmd"] == ["/usr/bin/node", str(launcher), "--input", "bundle", "--local"]
     assert captured["cwd"] is None
     assert captured["env"]["VIBESYS_PYTHON"] == sys.executable  # pyright: ignore[reportIndexIssue]
+    launch_start_ms = int(captured["env"]["VIBESYS_LAUNCH_START_MS"])  # pyright: ignore[reportIndexIssue]
+    assert abs(launch_start_ms - int(time.time() * 1000)) < 5_000
+    assert "VIBESYS_BOOT_TRACE" not in captured["env"]  # pyright: ignore[reportOperatorIssue]
 
 
 def test_source_checkout_skips_build_when_fresh(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -356,7 +388,9 @@ def test_ensure_built_runs_pnpm_steps(monkeypatch, tmp_path):  # noqa: ANN001, A
     assert [c[1] for c in calls] == ["install", "--dir", "build:clients"]
 
 
-def test_ensure_built_reports_failure(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201  # tracked: #288
+def test_ensure_built_reports_install_failure(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201
+    # tmp_path has no node_modules, so this exercises the install step (not
+    # the codegen/build steps).
     from types import SimpleNamespace  # noqa: PLC0415  # tracked: #288
 
     monkeypatch.setattr(cli, "_pnpm_argv", lambda: ["/usr/bin/pnpm"])
@@ -367,8 +401,114 @@ def test_ensure_built_reports_failure(monkeypatch, tmp_path, capsys):  # noqa: A
     monkeypatch.setattr(cli.subprocess, "run", _run)
     assert cli._ensure_source_tui_built(tmp_path) is False  # noqa: SLF001  # tracked: #288
     err = capsys.readouterr().err
-    assert "failed to build" in err
+    assert "failed to install" in err
     assert "boom-err" in err
+
+
+def test_ensure_built_skips_install_when_fresh(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
+    from types import SimpleNamespace  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.setattr(cli, "_pnpm_argv", lambda: ["/usr/bin/pnpm"])
+    monkeypatch.setattr(cli, "_needs_install", lambda _root: False)
+    calls: list[list[str]] = []
+
+    def _run(cmd, cwd=None, capture_output=False, text=False, check=False):  # noqa: ANN001, ANN202, ARG001, FBT002  # tracked: #288
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _run)
+    assert cli._ensure_source_tui_built(tmp_path) is True  # noqa: SLF001  # tracked: #288
+    # No "install" call: codegen/build run directly.
+    assert [c[1] for c in calls] == ["--dir", "build:clients"]
+
+
+def test_ensure_built_retries_with_install_after_build_failure(monkeypatch, tmp_path):  # noqa: ANN001, ANN201
+    from types import SimpleNamespace  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.setattr(cli, "_pnpm_argv", lambda: ["/usr/bin/pnpm"])
+    monkeypatch.setattr(cli, "_needs_install", lambda _root: False)
+    monkeypatch.setattr(cli, "_write_install_stamp", lambda _root: None)
+    calls: list[list[str]] = []
+    state = {"failed_once": False}
+
+    def _run(cmd, cwd=None, capture_output=False, text=False, check=False):  # noqa: ANN001, ANN202, ARG001, FBT002  # tracked: #288
+        calls.append(cmd)
+        if cmd[-1] == "generate:protocol" and not state["failed_once"]:
+            state["failed_once"] = True
+            return SimpleNamespace(returncode=1, stdout="", stderr="stale-deps")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _run)
+    assert cli._ensure_source_tui_built(tmp_path) is True  # noqa: SLF001  # tracked: #288
+    # generate:protocol failed once -> forced install -> generate:protocol and
+    # build:clients both retried and succeeded.
+    assert [c[1] for c in calls] == ["--dir", "install", "--dir", "build:clients"]
+
+
+def test_ensure_built_reports_build_failure_after_retry(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201
+    from types import SimpleNamespace  # noqa: PLC0415  # tracked: #288
+
+    monkeypatch.setattr(cli, "_pnpm_argv", lambda: ["/usr/bin/pnpm"])
+    monkeypatch.setattr(cli, "_needs_install", lambda _root: False)
+    monkeypatch.setattr(cli, "_write_install_stamp", lambda _root: None)
+
+    def _run(cmd, cwd=None, capture_output=False, text=False, check=False):  # noqa: ANN001, ANN202, ARG001, FBT002  # tracked: #288
+        if cmd[-1] == "generate:protocol":
+            return SimpleNamespace(returncode=1, stdout="proto-out", stderr="proto-err")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _run)
+    assert cli._ensure_source_tui_built(tmp_path) is False  # noqa: SLF001  # tracked: #288
+    err = capsys.readouterr().err
+    assert "retrying after a full dependency install" in err
+    assert "failed to build" in err
+    assert "proto-err" in err
+
+
+def test_run_pnpm_install_prints_messages_and_writes_stamp(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201
+    from types import SimpleNamespace  # noqa: PLC0415  # tracked: #288
+
+    def _run(cmd, cwd=None, capture_output=False, text=False, check=False):  # noqa: ANN001, ANN202, ARG001, FBT002  # tracked: #288
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _run)
+
+    assert cli._run_pnpm_install(["/usr/bin/pnpm"], tmp_path) is True  # noqa: SLF001  # tracked: #288
+    err = capsys.readouterr().err
+    assert "installing JS dependencies" in err
+    assert "dependencies installed (" in err
+    assert (tmp_path / cli._INSTALL_STAMP_REL).is_file()  # noqa: SLF001  # tracked: #288
+
+
+def test_needs_install_when_node_modules_missing(tmp_path):  # noqa: ANN001, ANN201
+    assert cli._needs_install(tmp_path) is True  # noqa: SLF001  # tracked: #288
+
+
+def test_needs_install_when_stamp_missing(tmp_path):  # noqa: ANN001, ANN201
+    (tmp_path / "node_modules").mkdir()
+    assert cli._needs_install(tmp_path) is True  # noqa: SLF001  # tracked: #288
+
+
+def test_needs_install_skips_when_stamp_is_fresh(tmp_path):  # noqa: ANN001, ANN201
+    (tmp_path / "node_modules").mkdir()
+    lockfile = tmp_path / "pnpm-lock.yaml"
+    lockfile.write_text("lockfileVersion: 9\n")
+    _set_mtime(lockfile, 1000)
+    cli._write_install_stamp(tmp_path)  # noqa: SLF001  # tracked: #288
+    _set_mtime(tmp_path / cli._INSTALL_STAMP_REL, 2000)  # noqa: SLF001  # tracked: #288
+
+    assert cli._needs_install(tmp_path) is False  # noqa: SLF001  # tracked: #288
+
+
+def test_needs_install_when_lockfile_newer_than_stamp(tmp_path):  # noqa: ANN001, ANN201
+    (tmp_path / "node_modules").mkdir()
+    cli._write_install_stamp(tmp_path)  # noqa: SLF001  # tracked: #288
+    _set_mtime(tmp_path / cli._INSTALL_STAMP_REL, 1000)  # noqa: SLF001  # tracked: #288
+    lockfile = tmp_path / "pnpm-lock.yaml"
+    lockfile.write_text("lockfileVersion: 9\n")
+    _set_mtime(lockfile, 2000)
+
+    assert cli._needs_install(tmp_path) is True  # noqa: SLF001  # tracked: #288
 
 
 def test_bundled_tui_missing_launcher_errors(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201  # tracked: #288
@@ -443,6 +583,101 @@ def test_needs_rebuild_on_core_state_source_change(tmp_path):  # noqa: ANN001, A
     _set_mtime(core_source, 3000)
 
     assert cli._needs_rebuild(root) is True  # noqa: SLF001
+
+
+def test_needs_rebuild_ignores_unrelated_backend_file(tmp_path):  # noqa: ANN001, ANN201
+    # src/vibesys/server no longer feeds `generate:protocol` in its entirety;
+    # a change to an unrelated module in that package must not trigger a
+    # rebuild.
+    root = _make_checkout(tmp_path)
+    dist = root / "clients" / "tui" / "dist"
+    unrelated = root / "src" / "vibesys" / "server" / "inspector.py"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("# inspector\n")
+    _set_mtime(root / "clients" / "tui" / "src" / "app.ts", 1000)
+    _set_mtime(dist / "index.js", 2000)
+    _set_mtime(dist / "launcher.js", 2000)
+    _set_mtime(unrelated, 3000)
+
+    assert cli._needs_rebuild(root) is False  # noqa: SLF001
+
+
+def test_needs_rebuild_on_protocol_codegen_file(tmp_path):  # noqa: ANN001, ANN201
+    # protocol.py directly shapes the generated JSON schema, so it must still
+    # trigger a rebuild even though src/vibesys/server is no longer watched
+    # wholesale.
+    root = _make_checkout(tmp_path)
+    dist = root / "clients" / "tui" / "dist"
+    protocol = root / "src" / "vibesys" / "server" / "protocol.py"
+    protocol.parent.mkdir(parents=True)
+    protocol.write_text("# protocol\n")
+    _set_mtime(root / "clients" / "tui" / "src" / "app.ts", 1000)
+    _set_mtime(dist / "index.js", 2000)
+    _set_mtime(dist / "launcher.js", 2000)
+    _set_mtime(protocol, 3000)
+
+    assert cli._needs_rebuild(root) is True  # noqa: SLF001
+
+
+def test_stale_reason_reports_first_offending_path(tmp_path):  # noqa: ANN001, ANN201
+    root = _make_checkout(tmp_path)
+    dist = root / "clients" / "tui" / "dist"
+    protocol = root / "src" / "vibesys" / "server" / "protocol.py"
+    protocol.parent.mkdir(parents=True)
+    protocol.write_text("# protocol\n")
+    _set_mtime(root / "clients" / "tui" / "src" / "app.ts", 1000)
+    _set_mtime(dist / "index.js", 2000)
+    _set_mtime(dist / "launcher.js", 2000)
+    _set_mtime(protocol, 3000)
+
+    assert cli._stale_reason(root) == "src/vibesys/server/protocol.py"  # noqa: SLF001
+
+
+def test_stale_reason_none_when_fresh(tmp_path):  # noqa: ANN001, ANN201
+    root = _make_checkout(tmp_path)
+    dist = root / "clients" / "tui" / "dist"
+    _set_mtime(root / "clients" / "tui" / "src" / "app.ts", 1000)
+    _set_mtime(dist / "index.js", 2000)
+    _set_mtime(dist / "launcher.js", 2000)
+
+    assert cli._stale_reason(root) is None  # noqa: SLF001
+
+
+def test_run_source_tui_prints_stale_and_rebuilt_messages(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201
+    monkeypatch.setattr(cli, "_bun_executable", lambda: Path("/usr/bin/bun"))
+    monkeypatch.setattr(cli, "_node_executable", lambda: Path("/usr/bin/node"))
+    monkeypatch.setattr(cli, "_node_major", lambda _node: 20)
+    monkeypatch.setattr(cli, "_needs_rebuild", lambda _root: True)
+    monkeypatch.setattr(cli, "_stale_reason", lambda _root: "src/vibesys/server/protocol.py")
+    monkeypatch.setattr(cli, "_ensure_source_tui_built", lambda _root: True)
+    monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)  # noqa: ARG005
+
+    rc = cli._run_source_tui(tmp_path, [])  # noqa: SLF001
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "TUI bundle is stale (changed: src/vibesys/server/protocol.py); rebuilding" in err
+    assert "TUI bundle rebuilt (" in err
+
+
+def test_run_source_tui_skips_message_when_fresh(monkeypatch, tmp_path, capsys):  # noqa: ANN001, ANN201
+    monkeypatch.setattr(cli, "_bun_executable", lambda: Path("/usr/bin/bun"))
+    monkeypatch.setattr(cli, "_node_executable", lambda: Path("/usr/bin/node"))
+    monkeypatch.setattr(cli, "_node_major", lambda _node: 20)
+    monkeypatch.setattr(cli, "_needs_rebuild", lambda _root: False)
+
+    message = "must not compute a stale reason for a fresh checkout"
+
+    def _boom(_root):  # noqa: ANN001, ANN202
+        raise AssertionError(message)
+
+    monkeypatch.setattr(cli, "_stale_reason", _boom)
+    monkeypatch.setattr(cli.subprocess, "call", lambda *a, **k: 0)  # noqa: ARG005
+
+    rc = cli._run_source_tui(tmp_path, [])  # noqa: SLF001
+
+    assert rc == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_source_checkout_build_failure_returns_one(monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288

@@ -192,7 +192,7 @@ def _invoke_loop(tmp_path, ref_file, runner, **kwargs):  # noqa: ANN001, ANN003,
     defaults.update(kwargs)
     with (
         patch("vibesys.context.build_model", return_value="mock-model"),
-        patch("vibesys.backends.cuda.LocalShellBackend"),
+        patch("vibesys.backends.cuda.make_local_shell_sandbox"),
         patch("vibesys.context.build_agent_client", return_value=runner),
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
         patch(
@@ -1271,7 +1271,7 @@ def test_evaluate_in_subcontext_builds_worktree_and_evaluates(tmp_path, ref_file
     runner = _make_runner(mutator_writes=True)
     with (
         patch("vibesys.context.build_model", return_value="mock-model"),
-        patch("vibesys.backends.cuda.LocalShellBackend"),
+        patch("vibesys.backends.cuda.make_local_shell_sandbox"),
         patch("vibesys.context.build_agent_client", return_value=runner),
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
         patch("vibesys.loops.evolve.loop._run_framework_accuracy_gate", return_value=None),

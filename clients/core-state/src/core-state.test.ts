@@ -1,11 +1,13 @@
 import {describe, expect, it} from 'bun:test';
 import type {RunEvent, RunSnapshot} from '@vibesys/backend-client';
 import {
+  DEFAULT_CHAT_THREAD_ID,
   initialCoreState,
   latestDiagnosticChange,
   reconcileActiveExecutions,
   reduceEvent,
   reduceEventBatch,
+  reduceEventRebootstrap,
   reduceSnapshot,
 } from './core-state.js';
 
@@ -41,6 +43,109 @@ describe('core state projection', () => {
     } satisfies RunSnapshot;
 
     expect(reduceSnapshot(current, stale)).toBe(current);
+  });
+
+  it('registers the chat threads a snapshot projects', () => {
+    const state = reduceSnapshot(initialCoreState(), {
+      run_id: 'run',
+      status: 'running',
+      sequence: 1,
+      chat_threads: [
+        {
+          thread_id: 'thread-a',
+          title: 'Ring buffer sizing',
+          driver: 'agentshim',
+          provider: 'anthropic',
+          model: 'opus',
+        },
+      ],
+    } satisfies RunSnapshot);
+
+    expect(state.chatThreads).toEqual([
+      {id: DEFAULT_CHAT_THREAD_ID, title: '', driver: null, provider: null, model: null},
+      {
+        id: 'thread-a',
+        title: 'Ring buffer sizing',
+        driver: 'agentshim',
+        provider: 'anthropic',
+        model: 'opus',
+      },
+    ]);
+    expect(state.chatTranscripts['thread-a']).toEqual([]);
+  });
+
+  // Boot issues the snapshot query and the subscription concurrently, and under
+  // a tail bootstrap the replay batch usually lands first. The registry is a
+  // fact about history already written, so the liveness guard must not drop it.
+  it('registers projected chat threads even from a stale snapshot', () => {
+    const current = reduceEvent(initialCoreState(), outputEvent(5, 'current'));
+
+    const state = reduceSnapshot(current, {
+      run_id: 'run',
+      status: 'running',
+      sequence: 4,
+      chat_threads: [
+        {thread_id: 'thread-a', title: '', driver: 'agentshim', provider: 'codex', model: 'gpt-5'},
+      ],
+    } satisfies RunSnapshot);
+
+    expect(state.status).toBe(current.status);
+    expect(state.chatThreads.map(thread => thread.id)).toEqual([
+      DEFAULT_CHAT_THREAD_ID,
+      'thread-a',
+    ]);
+  });
+
+  it('leaves a stale snapshot that projects no chat threads identity-preserving', () => {
+    const current = reduceEvent(initialCoreState(), outputEvent(5, 'current'));
+    const stale = {run_id: 'run', status: 'running', sequence: 4} satisfies RunSnapshot;
+
+    expect(reduceSnapshot(current, stale)).toBe(current);
+  });
+
+  it('merges projected chat threads with replayed ones without duplicating', () => {
+    let current = reduceEvent(initialCoreState(), threadCreatedEvent(1, 'thread-a', 'anthropic'));
+    current = reduceEvent(current, chatTitledEvent(2, 'thread-a', 'Replayed title'));
+
+    const state = reduceSnapshot(current, {
+      run_id: 'run',
+      status: 'running',
+      sequence: 3,
+      chat_threads: [
+        {
+          thread_id: 'thread-a',
+          title: '',
+          driver: 'agentshim',
+          provider: 'anthropic',
+          model: 'opus',
+        },
+        {
+          thread_id: 'thread-b',
+          title: 'Projected',
+          driver: 'agentshim',
+          provider: 'codex',
+          model: 'gpt-5',
+        },
+      ],
+    } satisfies RunSnapshot);
+
+    expect(state.chatThreads).toEqual([
+      {id: DEFAULT_CHAT_THREAD_ID, title: '', driver: null, provider: null, model: null},
+      {
+        id: 'thread-a',
+        title: 'Replayed title',
+        driver: 'agentshim',
+        provider: 'anthropic',
+        model: 'opus',
+      },
+      {
+        id: 'thread-b',
+        title: 'Projected',
+        driver: 'agentshim',
+        provider: 'codex',
+        model: 'gpt-5',
+      },
+    ]);
   });
 
   it('ignores duplicate replay events', () => {
@@ -515,6 +620,165 @@ describe('core state projection', () => {
   });
 });
 
+// The run's durable event log is attached after a client subscribes, so a
+// subscription bootstrapped against the server's own short log is later
+// re-bootstrapped at a tail of the run log. The two batches number different
+// logs, which is why the second supersedes the state the first built.
+describe('a re-bootstrapped stream', () => {
+  const runLog: RunEvent[] = [
+    {
+      ...baseEvent(1, 'run_started'),
+      data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+    },
+    outputEvent(2, 'two'),
+    outputEvent(3, 'three'),
+  ];
+
+  it('folds events the superseded cursor would have dropped', () => {
+    const superseded = reduceEventBatch(initialCoreState(), [outputEvent(2, 'pre-attach')]);
+
+    const state = reduceEventRebootstrap(superseded, runLog, [], 3, 1);
+
+    expect(state.maxRounds).toBe(3);
+    expect(state.outerLoop).toBe('agent');
+    // One turn, so the two chunks concatenate; the superseded 'pre-attach'
+    // chunk is gone rather than concatenated onto them.
+    expect(state.transcript.map(entry => entry.content)).toEqual(['twothree']);
+    expect(state.historyAfterSequence).toBe(1);
+  });
+
+  it('keeps the chat threads a concurrent snapshot registered', () => {
+    const superseded = reduceSnapshot(initialCoreState(), {
+      run_id: 'run',
+      status: 'running',
+      sequence: 1,
+      chat_threads: [
+        {
+          thread_id: 'thread-a',
+          title: 'Ring buffer sizing',
+          driver: 'agentshim',
+          provider: 'anthropic',
+          model: 'opus',
+        },
+      ],
+    } satisfies RunSnapshot);
+
+    const state = reduceEventRebootstrap(superseded, runLog, [], 3, 1);
+
+    expect(state.chatThreads.map(thread => thread.id)).toEqual([
+      DEFAULT_CHAT_THREAD_ID,
+      'thread-a',
+    ]);
+  });
+});
+
+// A batch folds its transcripts in one working array instead of copying them
+// per event. That is only sound while it stays indistinguishable from folding
+// the same events one at a time, which is what these pin.
+describe('batched transcript folding', () => {
+  it('folds a batch exactly like folding its events one at a time', () => {
+    const events = mixedTranscriptEvents();
+
+    expect(reduceEventBatch(initialCoreState(), events)).toEqual(
+      events.reduce(reduceEvent, initialCoreState()),
+    );
+  });
+
+  it('correlates interleaved tool results by call id within one batch', () => {
+    const events = [
+      toolEvent(1, 'tool_call', 'call-a', 'first'),
+      toolEvent(2, 'tool_call', 'call-b', 'second'),
+      toolEvent(3, 'tool_result', 'call-b', 'second result'),
+      toolEvent(4, 'tool_result', 'call-a', 'first result'),
+    ];
+
+    const state = reduceEventBatch(initialCoreState(), events);
+
+    expect(state.transcript).toHaveLength(2);
+    expect(state.transcript[0]?.toolResult?.content).toBe('first result');
+    expect(state.transcript[1]?.toolResult?.content).toBe('second result');
+  });
+
+  it('merges a result without a call id into the oldest open call of that tool', () => {
+    const events = [
+      toolEvent(1, 'tool_call', 'call-a', 'first'),
+      toolEvent(2, 'tool_call', 'call-b', 'second'),
+      {
+        ...baseEvent(3, 'tool_result'),
+        invocation_id: 'turn',
+        data: {kind: 'tool_result', tool: 'Bash', content: 'anonymous result', is_error: false},
+      } satisfies RunEvent,
+    ];
+
+    const state = reduceEventBatch(initialCoreState(), events);
+
+    expect(state.transcript).toHaveLength(2);
+    expect(state.transcript[0]?.content).toContain('anonymous result');
+    expect(state.transcript[1]?.toolResult).toBeUndefined();
+    expect(state).toEqual(events.reduce(reduceEvent, initialCoreState()));
+  });
+
+  it('evicts the oldest round whole when a batch passes the transcript cap', () => {
+    const events = [
+      ...Array.from({length: 10_000}, (_, index) => roundOutputEvent(index + 1, 1)),
+      roundToolEvent(10_001, 'tool_call', 'call-late', 'survivor'),
+      ...Array.from({length: 10_000}, (_, index) => roundOutputEvent(10_002 + index, 2)),
+      roundToolEvent(20_002, 'tool_result', 'call-late', 'late result'),
+    ];
+
+    const state = reduceEventBatch(initialCoreState(), events);
+
+    // Round 1 goes as a block; the surviving round-2 tool call still merges its
+    // result, so the open-call index survived the eviction.
+    expect(state.transcript).toHaveLength(10_001);
+    expect(state.transcript.every(entry => entry.roundNumber === 2)).toBe(true);
+    expect(state.transcript[0]?.toolResult?.content).toBe('late result');
+  });
+});
+
+/** One stream touching every transcript merge rule, plus both chat threads. */
+function mixedTranscriptEvents(): RunEvent[] {
+  return [
+    outputEvent(1, 'hello '),
+    outputEvent(2, 'world'),
+    outputEvent(3, 'separate', 'turn-2'),
+    toolEvent(4, 'tool_call', 'call-a', 'first'),
+    toolEvent(5, 'tool_call', 'call-b', 'second'),
+    toolEvent(6, 'tool_result', 'call-b', 'second result'),
+    outputEvent(7, 'between', 'turn-3'),
+    toolEvent(8, 'tool_result', 'call-a', 'first result'),
+    chatAnswerEvent(9, 'default answer'),
+    threadCreatedEvent(10, 'thread-x', 'anthropic'),
+    chatAnswerEvent(11, 'thread answer', 'thread-x'),
+    chatAnswerEvent(12, 'default again'),
+    todoEvent(13, 'exec-1', 'Write the fold'),
+    roundOutputEvent(14, 2),
+    roundToolEvent(15, 'tool_call', 'call-c', 'third'),
+    roundToolEvent(16, 'tool_result', 'call-c', 'third result'),
+  ];
+}
+
+function roundOutputEvent(sequence: number, round: number): RunEvent {
+  return {
+    ...baseEvent(sequence, 'agent_output_chunk'),
+    round_label: `round-${round}-implementer`,
+    invocation_id: `turn-${sequence}`,
+    data: {kind: 'agent_output_chunk', channel: 'assistant', content: `entry ${sequence}`},
+  };
+}
+
+function roundToolEvent(
+  sequence: number,
+  kind: 'tool_call' | 'tool_result',
+  callId: string,
+  content: string,
+): RunEvent {
+  return {
+    ...toolEvent(sequence, kind, callId, content),
+    round_label: 'round-2-implementer',
+  };
+}
+
 function baseEvent(sequence: number, type: RunEvent['type']): RunEvent {
   return {
     sequence,
@@ -550,6 +814,16 @@ function threadCreatedEvent(sequence: number, threadId: string, provider: string
       model: 'opus',
       created_at: `2026-01-01T00:00:0${sequence}Z`,
     },
+  };
+}
+
+function chatTitledEvent(sequence: number, threadId: string, title: string): RunEvent {
+  return {
+    ...baseEvent(sequence, 'chat'),
+    agent_kind: 'chat',
+    round_label: 'experiment-chat',
+    chat_thread_id: threadId,
+    data: {kind: 'chat', answer: 'answer', thread_title: title},
   };
 }
 

@@ -104,6 +104,28 @@ class ComputeBackendImpl(Protocol):
         ...
 
 
+def make_local_shell_sandbox(
+    *,
+    host_workspace: str,
+    env: dict[str, str],
+) -> SandboxBackendProtocol:
+    """Construct deepagents' local-shell sandbox, importing deepagents on first use.
+
+    Every backend builds the local sandbox the same way, so the construction
+    lives here once. The import is deferred because ``deepagents`` pulls
+    langchain + anthropic (seconds on a cold import) and ``backends.get`` runs
+    on the startup path, before the TUI can list experiments.
+    """
+    from deepagents.backends import LocalShellBackend  # noqa: PLC0415  # tracked: #288
+
+    return LocalShellBackend(
+        root_dir=host_workspace,
+        virtual_mode=True,
+        inherit_env=True,
+        env=env,
+    )
+
+
 class ModalOptions:
     """User-supplied Modal sandbox knobs — orthogonal to platform choice.
 

@@ -8,15 +8,14 @@ import subprocess
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from datetime import datetime
 from pathlib import Path
-
-from deepagents.backends import LocalShellBackend
-from deepagents.backends.protocol import SandboxBackendProtocol  # noqa: TC002  # tracked: #288
+from typing import TYPE_CHECKING
 
 from vibesys.backends.base import (
     ContentionMonitor,
     ModalOptions,
     SandboxKind,
     SetupFn,
+    make_local_shell_sandbox,
 )
 from vibesys.backends.cuda.gpu_monitor import (
     GpuContentionMonitor,
@@ -26,7 +25,10 @@ from vibesys.backends.cuda.gpu_monitor import (
 )
 from vibesys.constants import ComputeBackend
 from vibesys.profilers import ProfilerKind
-from vs_sandbox import DockerSandbox, ModalSandbox
+
+if TYPE_CHECKING:
+    # Annotation only; deepagents pulls langchain + anthropic (~seconds).
+    from deepagents.backends.protocol import SandboxBackendProtocol
 
 # Default container image for the cuda backend.  Carries CUDA toolkit + PyTorch.
 _DEFAULT_IMAGE = "nvcr.io/nvidia/pytorch:25.04-py3"
@@ -79,6 +81,10 @@ class CudaBackend:
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
         """Construct a sandbox configured for CUDA execution."""
+        # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
+        # pulls langchain + anthropic. Registration must stay import-cheap.
+        from vs_sandbox import DockerSandbox, ModalSandbox  # noqa: PLC0415  # tracked: #288
+
         bind_mounts = bind_mounts or []
         passthrough_paths = passthrough_paths or []
         extra_env = extra_env or {}
@@ -99,12 +105,7 @@ class CudaBackend:
             # LocalShellBackend (deepagents) has no setup_fns concept; for the
             # local sandbox there's nothing to install post-start anyway (no
             # docker symlinks, no restart scenarios), so we drop them silently.
-            sandbox = LocalShellBackend(
-                root_dir=host_workspace,
-                virtual_mode=True,
-                inherit_env=True,
-                env=env,
-            )
+            sandbox = make_local_shell_sandbox(host_workspace=host_workspace, env=env)
         elif kind is SandboxKind.DOCKER:
             sandbox = DockerSandbox(
                 host_workspace=host_workspace,

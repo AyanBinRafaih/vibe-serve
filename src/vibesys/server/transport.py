@@ -26,6 +26,19 @@ from vibesys.server.service import SupervisionService  # noqa: TC001  # tracked:
 _REQUEST_ADAPTER = TypeAdapter(ProtocolRequest)
 
 
+def _history_floor(request: SubscribeRequest, latest_sequence: int) -> tuple[int, int]:
+    """Return the replay floor, and the floor to report until the next bootstrap.
+
+    Without ``tail`` the reported floor stays 0: the client asked for
+    everything from its own cursor onward, so nothing was withheld and old
+    clients see the field's default.
+    """
+    if request.tail is None:
+        return request.after_sequence, 0
+    floor = max(request.after_sequence, latest_sequence - request.tail)
+    return floor, floor
+
+
 class _RequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         service: SupervisionService = self.server.service  # type: ignore[attr-defined]
@@ -66,25 +79,23 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 latest_sequence=snapshot.sequence,
             )
         )
-        through_sequence, replay, active_executions = service.subscription_checkpoint(
-            request.after_sequence
-        )
-        self._write_message(
-            EventBatchMessage(
-                events=replay,
-                through_sequence=through_sequence,
-                active_executions=active_executions,
-            )
-        )
-        cursor = through_sequence
+        cursor, reported_floor = self._write_bootstrap(service, request, snapshot.sequence)
         while True:
-            events = service.wait_for_events(cursor, timeout=1.0)
-            if not events:
+            if not service.wait_for_change(cursor, timeout=1.0):
                 if self._client_disconnected():
                     return
                 time.sleep(0.05)
                 continue
-            # ``wait_for_events`` only tells us that the stream changed. Take
+            latest_sequence = service.latest_sequence
+            if request.tail is not None and latest_sequence - cursor > request.tail:
+                # The run's durable event store is attached after the client
+                # subscribes, so a subscription that bootstrapped against the
+                # near-empty server store now faces the whole history as if it
+                # were live output. Bootstrap again at a fresh tail rather than
+                # replay a window the tail bound was meant to exclude.
+                cursor, reported_floor = self._write_bootstrap(service, request, latest_sequence)
+                continue
+            # ``wait_for_change`` only tells us that the stream changed. Take
             # one watermark-consistent snapshot before writing so a resumed
             # run, or a burst of live output, reaches the client as one state
             # transition instead of thousands of repaint-triggering messages.
@@ -94,9 +105,31 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                     events=events,
                     through_sequence=through_sequence,
                     active_executions=active_executions,
+                    history_after_sequence=reported_floor,
                 )
             )
             cursor = through_sequence
+
+    def _write_bootstrap(
+        self,
+        service: SupervisionService,
+        request: SubscribeRequest,
+        latest_sequence: int,
+    ) -> tuple[int, int]:
+        """Send one tail-bounded replay batch; return the new cursor and floor."""
+        history_after, reported_floor = _history_floor(request, latest_sequence)
+        through_sequence, replay, active_executions = service.subscription_checkpoint(
+            history_after, bootstrap_spine=request.tail is not None
+        )
+        self._write_message(
+            EventBatchMessage(
+                events=replay,
+                through_sequence=through_sequence,
+                active_executions=active_executions,
+                history_after_sequence=reported_floor,
+            )
+        )
+        return through_sequence, reported_floor
 
     def _write_stream_error(self, request_id: str, error: Exception) -> None:
         """Report a replay or stream failure without hiding a live connection."""

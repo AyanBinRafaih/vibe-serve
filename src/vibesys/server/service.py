@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING, Literal
 
 from vibesys.loops.agent.hypotheses import reproject_run_evidence
@@ -32,21 +33,35 @@ from vibesys.server.protocol import (
     RunSnapshot,
     SnapshotQuery,
     SteerCommand,
+    TuiDefaultsQuery,
 )
 from vibesys.server.supervisor import RunSupervisor  # noqa: TC001  # tracked: #288
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from vibesys.loops.agent.model import AgentRunState
+    from vibesys.repository import InteractiveSetupDefaults
 
 
 class SupervisionService:
     """Authoritative message API consumed by every presentation client."""
 
-    def __init__(self, supervisor: RunSupervisor):  # noqa: ANN204, D107  # tracked: #288
+    def __init__(  # noqa: D107  # tracked: #288
+        self,
+        supervisor: RunSupervisor,
+        *,
+        tui_defaults: Callable[[], InteractiveSetupDefaults] | None = None,
+    ) -> None:
         self.supervisor = supervisor
         self.inspector = RunInspector(supervisor)
+        # The server outlives configuration parsing, so defaults are resolved
+        # on the first request and then reused.
+        self._tui_defaults_provider = tui_defaults
+        self._tui_defaults: InteractiveSetupDefaults | None = None
+        self._tui_defaults_lock = threading.Lock()
 
-    def execute(self, request: ProtocolRequest) -> Response:  # noqa: D102, PLR0911  # tracked: #288
+    def execute(self, request: ProtocolRequest) -> Response:  # noqa: C901, D102, PLR0911  # tracked: #288
         if isinstance(request, (PauseCommand, ResumeCommand, SteerCommand)):
             return self._execute_command(request)
         if isinstance(request, ChatQuery):
@@ -55,6 +70,8 @@ class SupervisionService:
             return self._execute_chat_thread_create(request)
         if isinstance(request, ChatOptionsQuery):
             return Response(request_id=request.request_id, chat_options=self.chat_options())
+        if isinstance(request, TuiDefaultsQuery):
+            return Response(request_id=request.request_id, tui_defaults=self.tui_defaults())
         if isinstance(request, HistoryQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/history")
             return Response(request_id=request.request_id, events=self.history_events())
@@ -75,9 +92,9 @@ class SupervisionService:
         if isinstance(request, EventsQuery):
             timeout = request.timeout_ms / 1000 if request.timeout_ms else None
             events = (
-                self.wait_for_events(request.after_sequence, timeout)
+                self.wait_for_events(request.after_sequence, timeout, request.before_sequence)
                 if timeout is not None
-                else self.events(request.after_sequence)
+                else self.events(request.after_sequence, request.before_sequence)
             )
             return Response(request_id=request.request_id, events=events)
         raise TypeError(f"Unsupported protocol request: {type(request).__name__}")  # noqa: TRY003  # tracked: #288
@@ -128,17 +145,29 @@ class SupervisionService:
         settings = self.supervisor.chat_run_settings
         return None if settings is None else build_chat_options(settings)
 
+    def tui_defaults(self) -> InteractiveSetupDefaults | None:
+        """Resolve the run's TUI defaults once, or None without a provider."""
+        if self._tui_defaults_provider is None:
+            return None
+        with self._tui_defaults_lock:
+            if self._tui_defaults is None:
+                self._tui_defaults = self._tui_defaults_provider()
+            return self._tui_defaults
+
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         return self.supervisor.snapshot()
 
-    def events(self, after_sequence: int = 0) -> list[RunEvent]:  # noqa: D102  # tracked: #288
-        return self.supervisor.read_events(after_sequence)
+    def events(self, after_sequence: int = 0, before_sequence: int | None = None) -> list[RunEvent]:
+        """Read the events in the half-open window after a client's cursor."""
+        return self.supervisor.read_events(after_sequence, before_sequence)
 
     def subscription_checkpoint(
-        self, after_sequence: int
+        self, after_sequence: int, *, bootstrap_spine: bool = False
     ) -> tuple[int, list[RunEvent], list[ActiveAgentExecution]]:
         """Return one sequence-consistent replay and activity checkpoint."""
-        return self.supervisor.subscription_checkpoint(after_sequence)
+        return self.supervisor.subscription_checkpoint(
+            after_sequence, bootstrap_spine=bootstrap_spine
+        )
 
     def history_events(self) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.read_history_events()
@@ -195,8 +224,23 @@ class SupervisionService:
             state, legacy_directions=_metric_directions(manifest.configuration.objectives)
         )
 
-    def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
-        return self.supervisor.wait_for_events(after_sequence, timeout)
+    def wait_for_events(
+        self,
+        after_sequence: int,
+        timeout: float | None = None,
+        before_sequence: int | None = None,
+    ) -> list[RunEvent]:
+        """Block for new events after the cursor, bounded by ``before_sequence``."""
+        return self.supervisor.wait_for_events(after_sequence, timeout, before_sequence)
+
+    def wait_for_change(self, after_sequence: int, timeout: float | None = None) -> bool:
+        """Block until the stream advances past the cursor, parsing no events."""
+        return self.supervisor.wait_for_change(after_sequence, timeout)
+
+    @property
+    def latest_sequence(self) -> int:
+        """The newest sequence in the run's log, without a snapshot's copies."""
+        return self.supervisor.latest_sequence
 
 
 def _metric_directions(

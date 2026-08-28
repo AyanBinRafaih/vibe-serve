@@ -1,5 +1,6 @@
 export {
   type EventSubscription,
+  type SubscribeOptions,
   SupervisionClient,
   type SupervisionClientOptions,
   SupervisionError,
@@ -17,4 +18,5 @@ export type {
   RunEvent,
   RunSnapshot,
   ServerMessage,
+  TuiDefaults,
 } from './protocol.js';

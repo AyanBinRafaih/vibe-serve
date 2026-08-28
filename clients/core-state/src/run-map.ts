@@ -63,6 +63,99 @@ export function phasesForRound(phases: AgentPhase[], roundNumber: number | null)
   return phases.filter(phase => phase.roundNumber === roundNumber);
 }
 
+/**
+ * Merges a round list folded from older events under one folded from newer
+ * events, as a backfilled history prefix does.
+ *
+ * `mergeRound` already resolves every scalar the way replay would: the newer
+ * patch wins, the earliest start survives. Agent timing is the exception.
+ * Intervals recorded on either side are both real, so they concatenate instead
+ * of last-write-wins, and open starts union.
+ *
+ * Known boundary: an agent execution whose start is in `older` and whose finish
+ * is in `newer` loses its interval. The newer fold saw a finish with no start
+ * and dropped it, and the finish timestamp is not recoverable from the merged
+ * state. Rounds that do not straddle the boundary are exact.
+ */
+export function mergeRoundLists(
+  older: readonly RoundSummary[],
+  newer: readonly RoundSummary[],
+): RoundSummary[] {
+  const merged = new Map<number, RoundSummary>();
+  for (const round of older) merged.set(round.number, round);
+  for (const round of newer) {
+    const existing = merged.get(round.number);
+    merged.set(round.number, existing === undefined ? round : mergeRoundPrefix(existing, round));
+  }
+  return [...merged.values()].sort((left, right) => left.number - right.number);
+}
+
+/**
+ * Merges a phase list folded from older events under one folded from newer
+ * events.
+ *
+ * A phase is identified by role, round, and execution id. A newer phase that
+ * carries an execution id lands on the matching older phase, else on the slot
+ * the older fold seeded for that role, following `upsertPhase`'s precedence. A
+ * newer phase with no execution id is a slot the newer fold seeded for itself;
+ * replay would never have seeded it once the older phases existed, so it is
+ * dropped when the older list already covers that role and round.
+ */
+export function mergePhaseLists(
+  older: readonly AgentPhase[],
+  newer: readonly AgentPhase[],
+): AgentPhase[] {
+  const merged = [...older];
+  for (const phase of newer) {
+    const target = prefixPhaseTarget(merged, phase);
+    const existing = merged[target];
+    if (existing !== undefined) {
+      merged[target] = mergePhase(existing, phase);
+      continue;
+    }
+    if (phase.executionId === undefined && merged.some(candidate => sameSlot(candidate, phase))) {
+      continue;
+    }
+    merged.push(phase);
+  }
+  return merged;
+}
+
+function mergeRoundPrefix(older: RoundSummary, newer: RoundSummary): RoundSummary {
+  const round = mergeRound(older, newer);
+  const agentIntervals =
+    older.agentIntervals === undefined && newer.agentIntervals === undefined
+      ? undefined
+      : [...(older.agentIntervals ?? []), ...(newer.agentIntervals ?? [])];
+  const activeAgentStarts =
+    older.activeAgentStarts === undefined && newer.activeAgentStarts === undefined
+      ? undefined
+      : {...older.activeAgentStarts, ...newer.activeAgentStarts};
+  return {
+    ...round,
+    ...(agentIntervals === undefined ? {} : {agentIntervals}),
+    ...(activeAgentStarts === undefined ? {} : {activeAgentStarts}),
+  };
+}
+
+function sameSlot(phase: AgentPhase, patch: AgentPhase): boolean {
+  return phase.kind === patch.kind && phase.roundNumber === patch.roundNumber;
+}
+
+/** Where `patch` lands in `phases` under a prefix merge, or -1 to append. */
+function prefixPhaseTarget(phases: readonly AgentPhase[], patch: AgentPhase): number {
+  if (patch.executionId === undefined) return -1;
+  const byExecution = phases.findIndex(
+    phase => sameSlot(phase, patch) && phase.executionId === patch.executionId,
+  );
+  if (byExecution !== -1) return byExecution;
+  const seeded = phases.findIndex(
+    phase => sameSlot(phase, patch) && phase.executionId === undefined,
+  );
+  if (seeded !== -1) return seeded;
+  return phases.findIndex(phase => sameSlot(phase, patch) && phase.status === 'active');
+}
+
 export function roundAgentElapsedMs(round: RoundSummary, now: Date): number {
   return activeTimingElapsedMs(round, now);
 }
@@ -179,23 +272,24 @@ function upsertPhase(phases: AgentPhase[], patch: AgentPhase): AgentPhase[] {
     existing = phases.findIndex(phase => sameRoleAndRound(phase) && phase.status === 'active');
   }
   if (existing === -1) return [...phases, patch];
-  return phases.map((phase, index) =>
-    index === existing
-      ? {
-          ...phase,
-          ...patch,
-          ...(phase.executionId !== undefined && phase.executionId !== patch.executionId
-            ? {executionId: phase.executionId, invocationId: phase.invocationId}
-            : {}),
-          ...((patch.startedAt ?? phase.startedAt)
-            ? {startedAt: patch.startedAt ?? phase.startedAt}
-            : {}),
-          ...((patch.finishedAt ?? phase.finishedAt)
-            ? {finishedAt: patch.finishedAt ?? phase.finishedAt}
-            : {}),
-        }
-      : phase,
-  );
+  return phases.map((phase, index) => (index === existing ? mergePhase(phase, patch) : phase));
+}
+
+/** Applies `patch` to `phase`, keeping the identity and endpoints it already has. */
+function mergePhase(phase: AgentPhase, patch: AgentPhase): AgentPhase {
+  return {
+    ...phase,
+    ...patch,
+    ...(phase.executionId !== undefined && phase.executionId !== patch.executionId
+      ? {executionId: phase.executionId, invocationId: phase.invocationId}
+      : {}),
+    ...((patch.startedAt ?? phase.startedAt)
+      ? {startedAt: patch.startedAt ?? phase.startedAt}
+      : {}),
+    ...((patch.finishedAt ?? phase.finishedAt)
+      ? {finishedAt: patch.finishedAt ?? phase.finishedAt}
+      : {}),
+  };
 }
 
 function replaceRound(rounds: RoundSummary[], round: RoundSummary): RoundSummary[] {

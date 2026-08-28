@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
+from vibesys.repository import InteractiveSetupDefaults
 from vibesys.server.diagnostics import Diagnostic, DiagnosticScope, exception_to_diagnostic
 from vibesys.server.events import AgentExecutionActivityData, RunEvent
 
@@ -73,6 +74,17 @@ class ChatOptionsQuery(Request):
     type: Literal["query.chat_options"] = "query.chat_options"
 
 
+class TuiDefaultsQuery(Request):
+    """Request the launch-directory configuration defaults a TUI applies.
+
+    A terminal client resolves its theme from the run's configuration. Asking
+    over the control channel keeps TOML parsing in the backend and saves the
+    launcher an extra Python process on the boot path.
+    """
+
+    type: Literal["query.tui_defaults"] = "query.tui_defaults"
+
+
 class HistoryQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.history"] = "query.history"
 
@@ -90,12 +102,20 @@ class ExperimentQuery(Request):
 class EventsQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.events"] = "query.events"
     after_sequence: int = Field(default=0, ge=0)
+    # Exclusive upper bound: the result is ``after_sequence < sequence <
+    # before_sequence``. None keeps the open-ended read. This is the backfill
+    # query for history older than a tail subscription's floor.
+    before_sequence: int | None = Field(default=None, ge=1)
     timeout_ms: int = Field(default=0, ge=0, le=30_000)
 
 
 class SubscribeRequest(Request):  # noqa: D101  # tracked: #288
     type: Literal["subscribe"] = "subscribe"
     after_sequence: int = Field(default=0, ge=0)
+    # Replay from ``max(after_sequence, latest_sequence - tail)`` instead of
+    # ``after_sequence``. An old server forbids the field, so the rejection is
+    # the capability probe.
+    tail: int | None = Field(default=None, ge=1)
 
 
 ProtocolRequest = Annotated[
@@ -106,6 +126,7 @@ ProtocolRequest = Annotated[
     | ChatQuery
     | ChatThreadCreateQuery
     | ChatOptionsQuery
+    | TuiDefaultsQuery
     | HistoryQuery
     | PerformanceQuery
     | ExperimentQuery
@@ -131,6 +152,16 @@ class ActiveAgentExecution(ProtocolModel):
     model: str | None = None
 
 
+class ChatThreadInfo(ProtocolModel):
+    """Resolved identity and agent settings of one experiment-chat thread."""
+
+    thread_id: str
+    title: str = ""
+    driver: str
+    provider: str
+    model: str
+
+
 class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288
     protocol_version: Literal[1] = PROTOCOL_VERSION
     run_id: str
@@ -139,6 +170,10 @@ class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288
     agent_kind: str | None = None
     round_label: str | None = None
     active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
+    # Server-owned projection: a thread's title is backfilled from a later
+    # CHAT event, so a client that folds only a tail cannot rebuild the
+    # registry from the events it holds.
+    chat_threads: list[ChatThreadInfo] = Field(default_factory=list)
 
 
 class CommandAck(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -152,16 +187,6 @@ class ChatResult(ProtocolModel):  # noqa: D101  # tracked: #288
     effect: Literal["none"] = "none"
     # Echoes the requested thread; None is the default thread.
     thread_id: str | None = None
-
-
-class ChatThreadInfo(ProtocolModel):
-    """Resolved identity and agent settings of one experiment-chat thread."""
-
-    thread_id: str
-    title: str = ""
-    driver: str
-    provider: str
-    model: str
 
 
 class ChatModelOption(ProtocolModel):
@@ -269,6 +294,9 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     # None means the run has not attached its agent selection yet, which is
     # distinct from a run that offers no provider at all.
     chat_options: ChatOptions | None = None
+    # None means this server was started without a defaults provider, so the
+    # client keeps its own built-in defaults. It never means "no defaults".
+    tui_defaults: InteractiveSetupDefaults | None = None
     snapshot: RunSnapshot | None = None
     events: list[RunEvent] = Field(default_factory=list)
     performance: list[PerformanceRound] = Field(default_factory=list)
@@ -310,6 +338,10 @@ class EventBatchMessage(ProtocolModel):  # noqa: D101  # tracked: #288
     events: list[RunEvent]
     through_sequence: int = Field(default=0, ge=0)
     active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
+    # "Every event in this stream's history has sequence > this." 0 means the
+    # full history was delivered, which is the default and today's behavior.
+    # Carried on every batch of the subscription, live ones included.
+    history_after_sequence: int = Field(default=0, ge=0)
 
 
 class ProtocolErrorMessage(ProtocolModel):  # noqa: D101  # tracked: #288

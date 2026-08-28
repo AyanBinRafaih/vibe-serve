@@ -21,6 +21,8 @@ import {
   reconcileActiveExecutions,
   reduceEvent,
   reduceEventBatch,
+  reduceEventPrefix,
+  reduceEventRebootstrap,
   reduceSnapshot,
   type TodoItem,
   type TranscriptEntry,
@@ -1328,8 +1330,41 @@ export function applyEventBatch(
   events: readonly RunEvent[],
   activeExecutions?: ActiveExecutionCheckpoint,
   throughSequence?: number,
+  historyAfterSequence?: number,
 ): SessionState {
-  const core = reduceEventBatch(state.core, events, activeExecutions, throughSequence);
+  return applyReducedCore(
+    state,
+    reduceEventBatch(state.core, events, activeExecutions, throughSequence, historyAfterSequence),
+  );
+}
+
+/**
+ * Fold a batch that re-bootstraps the stream at a raised history floor, which
+ * happens when the run's durable event log is attached after the client
+ * subscribed. The batch supersedes the pre-attach state instead of extending
+ * it; see `reduceEventRebootstrap`.
+ */
+export function applyEventRebootstrap(
+  state: SessionState,
+  events: readonly RunEvent[],
+  activeExecutions: ActiveExecutionCheckpoint | undefined,
+  throughSequence: number | undefined,
+  historyAfterSequence: number,
+): SessionState {
+  return applyReducedCore(
+    state,
+    reduceEventRebootstrap(
+      state.core,
+      events,
+      activeExecutions,
+      throughSequence,
+      historyAfterSequence,
+    ),
+  );
+}
+
+/** The UI transition shared by both ways of folding a backend checkpoint. */
+function applyReducedCore(state: SessionState, core: CoreState): SessionState {
   if (core === state.core) return state;
   let next: SessionState = deriveActiveChat({
     ...state,
@@ -1341,6 +1376,29 @@ export function applyEventBatch(
     if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
   }
   return next;
+}
+
+/**
+ * Fold history older than everything already loaded, lowering the floor below
+ * which nothing has been read yet.
+ *
+ * No diagnostic is projected. A backfilled event is by construction older than
+ * every event on screen, so its failure is not news: reporting it would reopen
+ * the banner for something the operator has already scrolled past, or already
+ * dismissed.
+ */
+export function applyEventPrefix(
+  state: SessionState,
+  events: readonly RunEvent[],
+  historyAfterSequence: number,
+): SessionState {
+  const core = reduceEventPrefix(state.core, events, historyAfterSequence);
+  if (core === state.core) return state;
+  return deriveActiveChat({
+    ...state,
+    core,
+    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+  });
 }
 
 /** Folds every thread's replayed transcript into its local conversation. */

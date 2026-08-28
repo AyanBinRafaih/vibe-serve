@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 
 import {type ChildProcess, spawn} from 'node:child_process';
-import {randomUUID} from 'node:crypto';
 import {accessSync, closeSync, constants, openSync, realpathSync} from 'node:fs';
 import {access, mkdtemp, readFile, rm} from 'node:fs/promises';
-import {createConnection} from 'node:net';
 import {tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
+import {isThemeName, THEME_NAMES} from './ui/theme.js';
 
 const READY_TIMEOUT_MS = 30_000;
+const READY_POLL_INTERVAL_MS = 25;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 const BACKEND_EXIT_GRACE_MS = 2_000;
 
@@ -40,10 +39,11 @@ export async function launch(argv: string[]): Promise<number> {
     return 1;
   }
 
-  const prepared = await prepareInteractiveArgs(backend, argv);
-  if ('exitCode' in prepared) return prepared.exitCode;
-  const runArgv = prepared.argv;
-  const theme = prepared.theme;
+  const requestedTheme = optionValue(argv, '--theme');
+  if (requestedTheme !== undefined && !isThemeName(requestedTheme)) {
+    console.error(`vs: unknown --theme ${requestedTheme}. Available: ${THEME_NAMES.join(', ')}.`);
+    return 2;
+  }
 
   const sessionDir = await mkdtemp(join(tmpdir(), 'vibesys-session-'));
   const socketPath = join(sessionDir, 'control.sock');
@@ -52,7 +52,7 @@ export async function launch(argv: string[]): Promise<number> {
   let backendLogClosed = false;
   const backendProcess = spawn(
     backend.command,
-    [...backend.args, ...runArgv, '--headless', '--control-socket', socketPath],
+    [...backend.args, ...argv, '--headless', '--control-socket', socketPath],
     {
       detached: true,
       stdio: ['ignore', backendLogFd, backendLogFd],
@@ -79,19 +79,28 @@ export async function launch(argv: string[]): Promise<number> {
   };
   const disposeSignalCleanup = installSignalCleanup(runCleanup);
   try {
-    if (!(await waitUntilReady(socketPath, backendProcess))) {
-      await reportBackendFailure(backendProcess, backendLogPath);
-      return backendProcess.exitCode ?? 1;
-    }
+    // The frontend does its own connect retries, so it starts now and pays
+    // its interpreter and renderer startup while the backend is still coming
+    // up. Startup readiness is still watched here: only the launcher can see
+    // a backend that dies before it ever listens, and report its log.
+    const startupFailed = watchBackendStartup(socketPath, backendProcess).then(ready => {
+      if (!ready && frontend) frontend.kill('SIGTERM');
+      return !ready;
+    });
     frontend = spawn(runtime, [entrypoint], {
-      env: {...process.env, VIBESYS_CONTROL_SOCKET: socketPath, VIBESYS_THEME: theme},
+      env: frontendEnvironment(socketPath, requestedTheme),
       stdio: 'inherit',
     });
-    return await monitor(
+    const exitCode = await monitor(
       frontend,
       backendProcess,
       Boolean(process.env['VIBESYS_RELEASE_SMOKE_MARKER']),
     );
+    if (await startupFailed) {
+      await reportBackendFailure(backendProcess, backendLogPath);
+      return exitStatus(backendProcess) ?? 1;
+    }
+    return exitCode;
   } finally {
     disposeSignalCleanup();
     await runCleanup();
@@ -103,51 +112,21 @@ interface BackendCommand {
   args: string[];
 }
 
-type PreparedArguments = {argv: string[]; theme: ThemeName} | {exitCode: number};
-
-async function prepareInteractiveArgs(
-  backend: BackendCommand,
-  argv: string[],
-): Promise<PreparedArguments> {
-  const requestedTheme = optionValue(argv, '--theme');
-  if (requestedTheme !== undefined && !isThemeName(requestedTheme)) {
-    console.error(`vs: unknown --theme ${requestedTheme}. Available: ${THEME_NAMES.join(', ')}.`);
-    return {exitCode: 2};
-  }
-  if (requestedTheme !== undefined) return {argv, theme: requestedTheme};
-
-  const configuredTheme = await themeFromBackend(backend, argv);
-  if ('exitCode' in configuredTheme) return configuredTheme;
-  return {argv, theme: configuredTheme.theme};
-}
-
-async function themeFromBackend(
-  backend: BackendCommand,
-  argv: string[],
-): Promise<{theme: ThemeName} | {exitCode: number}> {
-  const args = [...backend.args, 'tui-defaults', '--directory-only'];
-  const config = optionValue(argv, '--config');
-  if (config !== undefined) args.push('--config', config);
-  if (argv.includes('--stub-agent')) args.push('--stub-agent');
-
-  const result = await runCaptured(backend.command, args);
-  if (result.exitCode !== 0) {
-    console.error(result.stderr.trim() || 'vs: could not resolve TUI defaults');
-    return {exitCode: result.exitCode};
-  }
-
-  try {
-    const defaults = JSON.parse(result.stdout) as {theme?: unknown};
-    if (typeof defaults.theme !== 'string' || !isThemeName(defaults.theme)) {
-      throw new Error('resolved an unknown theme');
-    }
-    return {theme: defaults.theme};
-  } catch (error) {
-    console.error(
-      `vs: invalid TUI defaults: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return {exitCode: 1};
-  }
+/**
+ * Build the frontend's environment.
+ *
+ * ``--theme`` is the only theme the launcher resolves. Without it the theme
+ * comes from the backend's configuration over the control channel, so any
+ * inherited ``VIBESYS_THEME`` is cleared rather than silently overriding it.
+ */
+function frontendEnvironment(
+  socketPath: string,
+  requestedTheme: string | undefined,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {...process.env, VIBESYS_CONTROL_SOCKET: socketPath};
+  if (requestedTheme === undefined) delete env['VIBESYS_THEME'];
+  else env['VIBESYS_THEME'] = requestedTheme;
+  return env;
 }
 
 function optionValue(argv: string[], option: string): string | undefined {
@@ -193,58 +172,22 @@ function installSignalCleanup(cleanup: () => Promise<void>): () => void {
   };
 }
 
-async function waitUntilReady(socketPath: string, backend: ChildProcess): Promise<boolean> {
+/**
+ * Resolve once the backend's control socket exists, false if it never does.
+ *
+ * The frontend owns the protocol handshake. The launcher only needs to know
+ * whether the backend got far enough to listen, which distinguishes a failed
+ * start (report the backend log) from a run that failed later (the frontend
+ * has already shown the diagnostic).
+ */
+async function watchBackendStartup(socketPath: string, backend: ChildProcess): Promise<boolean> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (backend.exitCode !== null || backend.signalCode !== null) return false;
-    try {
-      const response = await querySnapshot(socketPath);
-      if (response['ok'] === true) return true;
-    } catch {
-      await sleep(50);
-    }
+    if (await fileExists(socketPath)) return true;
+    if (exitStatus(backend) !== undefined) return fileExists(socketPath);
+    await sleep(READY_POLL_INTERVAL_MS);
   }
   return false;
-}
-
-function querySnapshot(socketPath: string): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(socketPath);
-    let buffer = '';
-    const fail = (error: Error) => {
-      socket.destroy();
-      reject(error);
-    };
-    socket.setEncoding('utf8');
-    socket.setTimeout(500, () => fail(new Error('Readiness probe timed out')));
-    socket.once('error', fail);
-    socket.once('connect', () => {
-      socket.write(
-        `${JSON.stringify({
-          protocol_version: 1,
-          request_id: randomUUID(),
-          timestamp: '1970-01-01T00:00:00Z',
-          type: 'query.snapshot',
-        })}\n`,
-      );
-    });
-    socket.on('data', chunk => {
-      buffer += chunk.toString();
-      const newline = buffer.indexOf('\n');
-      if (newline === -1) return;
-      const line = buffer.slice(0, newline);
-      socket.end();
-      try {
-        resolve(JSON.parse(line) as Record<string, unknown>);
-      } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-    socket.once('close', hadError => {
-      if (hadError) return;
-      if (!buffer.includes('\n')) reject(new Error('Backend closed before readiness response'));
-    });
-  });
 }
 
 async function monitor(
@@ -321,29 +264,6 @@ function runToCompletion(command: string, args: string[]): Promise<number> {
       console.error(`vs: failed to start backend: ${error.message}`);
       resolve(1);
     });
-  });
-}
-
-function runCaptured(
-  command: string,
-  args: string[],
-): Promise<{exitCode: number; stdout: string; stderr: string}> {
-  return new Promise(resolve => {
-    const child = spawn(command, args, {stdio: ['ignore', 'pipe', 'pipe']});
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.setEncoding('utf8');
-    child.stderr?.setEncoding('utf8');
-    child.stdout?.on('data', chunk => {
-      stdout += String(chunk);
-    });
-    child.stderr?.on('data', chunk => {
-      stderr += String(chunk);
-    });
-    child.once('exit', (code, signal) =>
-      resolve({exitCode: code ?? signalExitCode(signal), stdout, stderr}),
-    );
-    child.once('error', error => resolve({exitCode: 1, stdout, stderr: error.message}));
   });
 }
 

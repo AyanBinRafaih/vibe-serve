@@ -47,7 +47,7 @@ from vibesys.server.events import (
     json_value,
     make_event,
 )
-from vibesys.server.protocol import ActiveAgentExecution, RunSnapshot
+from vibesys.server.protocol import ActiveAgentExecution, ChatThreadInfo, RunSnapshot
 
 _MAX_EXCEPTION_CHAIN = 8
 _TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS = 5.0
@@ -68,6 +68,34 @@ _NONTERMINAL_FAILURE_EVENTS = frozenset(
         EventType.PHASE_FINISHED,
     }
 )
+_CANONICAL_LIFECYCLE_EVENTS = frozenset(
+    {EventType.AGENT_EXECUTION_STARTED, EventType.AGENT_EXECUTION_FINISHED}
+)
+_LEGACY_LIFECYCLE_EVENTS = frozenset({EventType.INVOCATION_STARTED, EventType.INVOCATION_FINISHED})
+_PAYLOAD_INDEXED_EVENTS = frozenset({EventType.CHAT_THREAD_CREATED, EventType.CHAT})
+"""Event types whose ``data`` payload feeds run-level supervisor state.
+
+They are rare, so an attach parses exactly these records out of the durable
+log instead of validating the history around them.
+"""
+_BOOTSTRAP_SPINE_TYPES = frozenset(
+    {
+        EventType.RUN_STARTED,
+        EventType.RUN_FINISHED,
+        EventType.RUN_FAILED,
+        EventType.RUN_INTERRUPTED,
+        EventType.CONFIGURATION_FAILED,
+        EventType.ROUND_FINISHED,
+        EventType.EXPERIMENTS_CHANGED,
+        EventType.CHAT_THREAD_CREATED,
+    }
+)
+"""Events whose effect on client state is run-level, not transcript-local.
+
+A client that folds only a tail still needs these, and there are O(rounds) of
+them, so a tail subscription replays them ahead of the tail rather than the
+server reprojecting what the client's own reducer already computes.
+"""
 
 if TYPE_CHECKING:
     from vs_project import Project, StateSnapshot
@@ -156,7 +184,11 @@ class RunSupervisor:
         # The run's own agent selection, attached by the run context. Chat
         # options are derived from it, so a client enumerates nothing.
         self._chat_run_settings: ChatRunSettings | None = None
+        # Default-chat and thread-chat borrowers are counted separately: the
+        # default handler can outlive the run context (retained terminal chat),
+        # so thread teardown must not wait on it.
         self._active_chat_calls = 0
+        self._active_chat_thread_calls = 0
         self._retain_terminal_chat = False
         self._terminal_chat_resource: TerminalChatResource | None = None
         self._retired_terminal_chat_resource: TerminalChatResource | None = None
@@ -208,7 +240,7 @@ class RunSupervisor:
             # A resumed run already owns durable events. Index them before
             # replay so legacy invocation records retain their canonical
             # execution projection.
-            self._index_execution_lifecycle(durable.read())
+            self._index_stored_history(durable)
             pending = store.read() if store is not None else self._pending_events
             self._pending_events = []
             # Appending through EventStore gives bootstrap events the next
@@ -219,6 +251,11 @@ class RunSupervisor:
             self._store = durable
             self.log_dir = log_dir
             started_fresh = store is None
+            if store is not None:
+                # Subscribers block on the store they last read. Wake them so
+                # they pick up the run's durable store now rather than after
+                # their poll timeout.
+                store.notify_change()
         if started_fresh:
             self.record(EventType.SERVER_STARTED, status=EventStatus.ACTIVE)
         with self._condition:
@@ -475,33 +512,77 @@ class RunSupervisor:
             )
             raise
 
-    def read_events(self, after_sequence: int = 0) -> list[RunEvent]:  # noqa: D102  # tracked: #288
+    def read_events(
+        self, after_sequence: int = 0, before_sequence: int | None = None
+    ) -> list[RunEvent]:
+        """Return the canonical events in ``(after_sequence, before_sequence)``.
+
+        The upper bound is exclusive and optional; it exists so a client can
+        backfill history older than the tail it was given without asking for
+        everything, and it goes through the same projection as every read.
+        """
         with self._condition:
             store = self._store
             if store is None:
                 return []
             return _canonical_execution_events(
-                store.read(after_sequence),
+                store.read(after_sequence, before_sequence),
                 canonical_lifecycle_ids=self._canonical_execution_ids,
                 invocation_lifecycle_ids=self._legacy_invocation_ids,
             )
 
     def read_history_events(self) -> list[RunEvent]:
         """Return the same durable event history used for subscription replay."""
-        store = self._store
-        return _canonical_execution_events(store.read()) if store else []
+        with self._condition:
+            store = self._store
+            if store is None:
+                return []
+            return _canonical_execution_events(
+                store.read(),
+                canonical_lifecycle_ids=self._canonical_execution_ids,
+                invocation_lifecycle_ids=self._legacy_invocation_ids,
+            )
 
-    def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
+    def wait_for_events(
+        self,
+        after_sequence: int,
+        timeout: float | None = None,
+        before_sequence: int | None = None,
+    ) -> list[RunEvent]:
+        """Block for new events after the cursor, then return the bounded window.
+
+        The wait itself is open-ended: ``before_sequence`` bounds what is
+        returned, not what counts as progress.
+        """
         store = self._store
         if store is None:
             return []
         store.wait(after_sequence, timeout)
         with self._condition:
             return _canonical_execution_events(
-                store.read(after_sequence),
+                store.read(after_sequence, before_sequence),
                 canonical_lifecycle_ids=self._canonical_execution_ids,
                 invocation_lifecycle_ids=self._legacy_invocation_ids,
             )
+
+    def wait_for_change(self, after_sequence: int, timeout: float | None = None) -> bool:
+        """Block until the stream advances past the cursor, parsing no events.
+
+        A subscriber that will take its own checkpoint afterwards only needs
+        the change signal, so it must not force the intervening window into
+        models on the way to discarding it.
+        """
+        store = self._store
+        if store is None:
+            return False
+        return store.wait_for_change(after_sequence, timeout)
+
+    @property
+    def latest_sequence(self) -> int:
+        """The newest durable sequence, without building a whole snapshot."""
+        with self._condition:
+            store = self._store
+            return store.last_sequence if store else 0
 
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         with self._condition:
@@ -516,16 +597,40 @@ class RunSupervisor:
                     execution.model_copy(deep=True)
                     for execution in self._active_executions.values()
                 ],
+                # Thread titles are backfilled from later CHAT events, so the
+                # registry is not recoverable from CHAT_THREAD_CREATED alone:
+                # a client that only folds a tail gets it from the server.
+                chat_threads=[
+                    ChatThreadInfo(
+                        thread_id=spec.thread_id,
+                        title=spec.title,
+                        driver=spec.driver,
+                        provider=spec.provider,
+                        model=spec.model,
+                    )
+                    # Insertion order is replay order, for both attach and live.
+                    for spec in self._chat_thread_specs.values()
+                ],
             )
 
     def subscription_checkpoint(
-        self, after_sequence: int
+        self, after_sequence: int, *, bootstrap_spine: bool = False
     ) -> tuple[int, list[RunEvent], list[ActiveAgentExecution]]:
-        """Atomically capture replay events and active state at one watermark."""
+        """Atomically capture replay events and active state at one watermark.
+
+        ``bootstrap_spine`` prepends the pre-cursor events that carry run-level
+        state (run lifecycle, round outcomes, thread creation). A client that
+        folds only a tail then derives the same run-level state a full replay
+        would, using its ordinary reducer and no server-side projection.
+        """
         with self._condition:
             store = self._store
             through_sequence = store.last_sequence if store else 0
             events = store.read(after_sequence) if store else []
+            if store is not None and bootstrap_spine and after_sequence > 0:
+                # Ascending throughout: the spine is entirely at or below the
+                # cursor, and clients drop out-of-order events.
+                events = self._bootstrap_spine_unlocked(store, after_sequence) + events
             events = _canonical_execution_events(
                 events,
                 canonical_lifecycle_ids=self._canonical_execution_ids,
@@ -537,32 +642,67 @@ class RunSupervisor:
             ]
             return through_sequence, events, active
 
+    def _bootstrap_spine_unlocked(self, store: EventStore, floor: int) -> list[RunEvent]:
+        """Select the pre-floor run-level events, parsing only those records."""
+        sequences = [
+            header.sequence
+            for header in store.event_headers()
+            if header.sequence <= floor and header.type in _BOOTSTRAP_SPINE_TYPES
+        ]
+        return store.read_sequences(sequences)
+
     def _index_execution_lifecycle(self, events: list[RunEvent]) -> None:
+        """Index freshly recorded events. The live-append path, one at a time."""
         for event in events:
-            if event.type is EventType.CHAT_THREAD_CREATED and isinstance(
-                event.data, ChatThreadCreatedData
+            self._index_event_payload(event)
+            self._index_execution_identity(event.type, event.execution_id)
+
+    def _index_stored_history(self, store: EventStore) -> None:
+        """Index a resumed run's durable history without parsing it.
+
+        The store's scan already knows every record's type and identity, so
+        the lifecycle sets come from headers alone and only the few records
+        whose payload the index needs are validated.
+        """
+        payload_sequences: list[int] = []
+        for header in store.event_headers():
+            self._index_execution_identity(header.type, header.execution_id)
+            # A CHAT event only carries indexable state when it belongs to a
+            # thread, and the scan already knows which ones do.
+            if header.type in _PAYLOAD_INDEXED_EVENTS and (
+                header.type is not EventType.CHAT or header.chat_thread_id is not None
             ):
-                self._chat_thread_specs.setdefault(event.data.thread_id, event.data)
-            if (
-                event.type is EventType.CHAT
-                and event.chat_thread_id is not None
-                and isinstance(event.data, ChatData)
-                and event.data.thread_title
-            ):
-                spec = self._chat_thread_specs.get(event.chat_thread_id)
-                if spec is not None and not spec.title:
-                    self._chat_thread_specs[event.chat_thread_id] = spec.model_copy(
-                        update={"title": event.data.thread_title}
-                    )
-            if event.execution_id is None:
-                continue
-            if event.type in {
-                EventType.AGENT_EXECUTION_STARTED,
-                EventType.AGENT_EXECUTION_FINISHED,
-            }:
-                self._canonical_execution_ids.add(event.execution_id)
-            elif event.type in {EventType.INVOCATION_STARTED, EventType.INVOCATION_FINISHED}:
-                self._legacy_invocation_ids.add(event.execution_id)
+                payload_sequences.append(header.sequence)
+        for event in store.read_sequences(payload_sequences):
+            self._index_event_payload(event)
+
+    def _index_execution_identity(self, event_type: EventType, execution_id: str | None) -> None:
+        """Record which lifecycle vocabulary one execution id was written with."""
+        if execution_id is None:
+            return
+        if event_type in _CANONICAL_LIFECYCLE_EVENTS:
+            self._canonical_execution_ids.add(execution_id)
+        elif event_type in _LEGACY_LIFECYCLE_EVENTS:
+            self._legacy_invocation_ids.add(execution_id)
+
+    def _index_event_payload(self, event: RunEvent) -> None:
+        """Index the run-level state carried in one event's ``data`` payload."""
+        if event.type is EventType.CHAT_THREAD_CREATED and isinstance(
+            event.data, ChatThreadCreatedData
+        ):
+            self._chat_thread_specs.setdefault(event.data.thread_id, event.data)
+            return
+        if (
+            event.type is EventType.CHAT
+            and event.chat_thread_id is not None
+            and isinstance(event.data, ChatData)
+            and event.data.thread_title
+        ):
+            spec = self._chat_thread_specs.get(event.chat_thread_id)
+            if spec is not None and not spec.title:
+                self._chat_thread_specs[event.chat_thread_id] = spec.model_copy(
+                    update={"title": event.data.thread_title}
+                )
 
     def chat_agent_available(self) -> bool:
         """True when an agent-backed chat handler is installed for this run.
@@ -616,7 +756,7 @@ class RunSupervisor:
             # no CHAT event is recorded for a thread that cannot answer.
             return handler
         with self._condition:
-            self._active_chat_calls += 1
+            self._active_chat_thread_calls += 1
         try:
             answer = handler(text)
             thread_title = self._title_thread_if_needed(thread_id, text)
@@ -631,7 +771,7 @@ class RunSupervisor:
             )
             return answer
         finally:
-            self._release_chat_call()
+            self._release_chat_thread_call()
 
     def _title_thread_if_needed(self, thread_id: str, question: str) -> str | None:
         """Derive and store an untitled thread's title from its first message."""
@@ -731,11 +871,17 @@ class RunSupervisor:
             return sorted(self._chat_thread_specs.values(), key=lambda spec: spec.created_at)
 
     def clear_chat_threads_and_drain(self) -> None:
-        """Stop routing thread chat and wait for in-flight calls to release."""
+        """Stop routing thread chat and wait for in-flight thread calls to release."""
         with self._condition:
             self._chat_thread_factory = None
             self._chat_thread_handlers.clear()
-            self._wait_for_chat_drain_locked(timeout=_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS)
+            self._wait_for_thread_chat_drain_locked(timeout=_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS)
+
+    def _release_chat_thread_call(self) -> None:
+        """Release one thread-handler lease."""
+        with self._condition:
+            self._active_chat_thread_calls -= 1
+            self._condition.notify_all()
 
     def _release_chat_call(self) -> None:
         """Release one handler lease and close a retired resource when safe."""
@@ -815,8 +961,16 @@ class RunSupervisor:
             resource.close()
 
     def _wait_for_chat_drain_locked(self, *, timeout: float | None) -> bool:
+        """Wait until the default chat handler has no borrowers."""
+        return self._wait_locked(lambda: self._active_chat_calls > 0, timeout=timeout)
+
+    def _wait_for_thread_chat_drain_locked(self, *, timeout: float | None) -> bool:
+        """Wait until no thread handler is borrowed."""
+        return self._wait_locked(lambda: self._active_chat_thread_calls > 0, timeout=timeout)
+
+    def _wait_locked(self, busy: Callable[[], bool], *, timeout: float | None) -> bool:
         deadline = time.monotonic() + timeout if timeout is not None else None
-        while self._active_chat_calls > 0:
+        while busy():
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 return False
