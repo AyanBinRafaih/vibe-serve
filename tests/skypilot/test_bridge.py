@@ -36,6 +36,7 @@ from vibesys.skypilot.runner import (
     JobStatus,
     SkyPilotJobRunner,
 )
+from vibesys.unix_socket import MAX_SOCKET_PATH_BYTES, SocketPathTooLongError
 from vs_project import StateNamespace
 
 if TYPE_CHECKING:
@@ -224,6 +225,7 @@ def test_decoded_log_spool_replays_persisted_undelivered_suffix(tmp_path: Path) 
 
 def test_startup_replacement_evidence_applies_only_to_preexisting_invocations(
     tmp_path: Path,
+    socket_dir: Path,
 ) -> None:
     namespace = _namespace(tmp_path)
     runner = FakeRunner()
@@ -239,7 +241,7 @@ def test_startup_replacement_evidence_applies_only_to_preexisting_invocations(
         commands={"accuracy": ("true",)},
         benchmark_output_argument=None,
         state_namespace=namespace,
-        socket_path=tmp_path / "bridge.sock",
+        socket_path=socket_dir / "bridge.sock",
         log=lambda _: None,
     )
     journal = InvocationJournal(namespace)
@@ -259,7 +261,9 @@ def test_startup_replacement_evidence_applies_only_to_preexisting_invocations(
     assert set(runner.release_names) == {"lease", "old-lease"}
 
 
-def test_terminal_replay_tracks_persisted_cluster_for_release(tmp_path: Path) -> None:
+def test_terminal_replay_tracks_persisted_cluster_for_release(
+    tmp_path: Path, socket_dir: Path
+) -> None:
     namespace = _namespace(tmp_path)
     runner = FakeRunner()
     workspace = tmp_path / "workspace"
@@ -274,7 +278,7 @@ def test_terminal_replay_tracks_persisted_cluster_for_release(tmp_path: Path) ->
         commands={"accuracy": ("true",)},
         benchmark_output_argument=None,
         state_namespace=namespace,
-        socket_path=tmp_path / "bridge.sock",
+        socket_path=socket_dir / "bridge.sock",
         log=lambda _: None,
     )
     request = EvaluationRequest(kind="accuracy", invocation_id="e" * 32)
@@ -327,7 +331,9 @@ def test_terminal_replay_tracks_persisted_cluster_for_release(tmp_path: Path) ->
     assert set(runner.release_names) == {"new-lease", "old-lease"}
 
 
-def test_job_discovered_during_close_is_cancelled_and_released(tmp_path: Path) -> None:
+def test_job_discovered_during_close_is_cancelled_and_released(
+    tmp_path: Path, socket_dir: Path
+) -> None:
     namespace = _namespace(tmp_path)
     runner = FakeRunner()
     workspace = tmp_path / "workspace"
@@ -342,7 +348,7 @@ def test_job_discovered_during_close_is_cancelled_and_released(tmp_path: Path) -
         commands={"accuracy": ("true",)},
         benchmark_output_argument=None,
         state_namespace=namespace,
-        socket_path=tmp_path / "bridge.sock",
+        socket_path=socket_dir / "bridge.sock",
         log=lambda _: None,
     )
     journal = InvocationJournal(namespace)
@@ -363,7 +369,9 @@ def test_job_discovered_during_close_is_cancelled_and_released(tmp_path: Path) -
     assert set(runner.release_names) == {"new-lease", "old-lease"}
 
 
-def test_bridge_stages_allowlisted_command_streams_and_cleans_up(tmp_path: Path) -> None:
+def test_bridge_stages_allowlisted_command_streams_and_cleans_up(
+    tmp_path: Path, socket_dir: Path
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "candidate.py").write_text("candidate")
@@ -386,7 +394,7 @@ def test_bridge_stages_allowlisted_command_streams_and_cleans_up(tmp_path: Path)
         commands={"benchmark": ("python", ".vibesys-evaluator-package/checker.py")},
         benchmark_output_argument="--output-json",
         state_namespace=_namespace(tmp_path),
-        socket_path=tmp_path / "bridge.sock",
+        socket_path=socket_dir / "bridge.sock",
         log=lambda _: None,
     )
     bridge.start()
@@ -420,7 +428,7 @@ def test_bridge_stages_allowlisted_command_streams_and_cleans_up(tmp_path: Path)
 
 
 def test_bridge_releases_cluster_when_socket_startup_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -442,7 +450,7 @@ def test_bridge_releases_cluster_when_socket_startup_fails(
         commands={"accuracy": ("true",)},
         benchmark_output_argument=None,
         state_namespace=_namespace(tmp_path),
-        socket_path=tmp_path / "bridge.sock",
+        socket_path=socket_dir / "bridge.sock",
         log=lambda _: None,
     )
 
@@ -451,10 +459,38 @@ def test_bridge_releases_cluster_when_socket_startup_fails(
 
     assert runner.ensure_calls == 1
     assert runner.release_calls == 1
+
+
+def test_bridge_rejects_an_unservable_socket_path_before_allocating_compute(
+    tmp_path: Path,
+) -> None:
+    """A log directory too deep for ``sun_path`` must not cost a cluster lease."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = FakeRunner()
+    bridge = SkyPilotBridge(
+        runner=runner,
+        cluster_name="lease",
+        resources=_resources(),
+        workspace=workspace,
+        evaluator_package_root=None,
+        hidden_paths=(),
+        commands={"accuracy": ("true",)},
+        benchmark_output_argument=None,
+        state_namespace=_namespace(tmp_path),
+        socket_path=tmp_path / ("d" * MAX_SOCKET_PATH_BYTES) / "bridge.sock",
+        log=lambda _: None,
+    )
+
+    with pytest.raises(SocketPathTooLongError):
+        bridge.start()
+
+    assert runner.ensure_calls == 0
+    assert runner.release_calls == 0
     assert not bridge.socket_path.exists()
 
 
-def test_bridge_rejects_special_workspace_file(tmp_path: Path) -> None:
+def test_bridge_rejects_special_workspace_file(tmp_path: Path, socket_dir: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     os.mkfifo(workspace / "pipe")
@@ -469,7 +505,7 @@ def test_bridge_rejects_special_workspace_file(tmp_path: Path) -> None:
         commands={"accuracy": ("true",)},
         benchmark_output_argument=None,
         state_namespace=_namespace(tmp_path),
-        socket_path=tmp_path / "bridge.sock",
+        socket_path=socket_dir / "bridge.sock",
         log=lambda _: None,
     )
     bridge.start()
@@ -492,7 +528,7 @@ def test_bridge_rejects_special_workspace_file(tmp_path: Path) -> None:
     assert not bridge.socket_path.exists()
 
 
-def test_bridge_rejects_workspace_symlink_escape(tmp_path: Path) -> None:
+def test_bridge_rejects_workspace_symlink_escape(tmp_path: Path, socket_dir: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "secret"
@@ -509,7 +545,7 @@ def test_bridge_rejects_workspace_symlink_escape(tmp_path: Path) -> None:
         commands={"accuracy": ("python", "checker.py")},
         benchmark_output_argument=None,
         state_namespace=_namespace(tmp_path),
-        socket_path=tmp_path / "bridge.sock",
+        socket_path=socket_dir / "bridge.sock",
         log=lambda _: None,
     )
     bridge.start()

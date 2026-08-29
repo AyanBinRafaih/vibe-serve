@@ -387,8 +387,11 @@ class TestLinuxBackendSelection:
         with pytest.raises(host_sandbox.SandboxUnavailableError, match="user namespace"):
             host_sandbox.build(workspace, env={}, require_enforcement=True)
 
-    def test_unknown_backend_value_is_rejected(self, tmp_path: Path) -> None:
+    def test_unknown_backend_value_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         workspace = _workspace(tmp_path)
+        monkeypatch.setattr(host_sandbox.sys, "platform", "linux")
 
         with pytest.raises(host_sandbox.SandboxUnavailableError, match="unknown"):
             host_sandbox.build(
