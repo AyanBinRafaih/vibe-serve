@@ -276,6 +276,8 @@ export class ExperimentLogView {
     const selectedRound = state.hypothesisDetail?.selectedRound ?? null;
     this.output.title = ` ${focusedTitlePrefix(state)}Hypothesis ${entry.hypothesis_id} `;
     this.#header.content = hypothesisMetadata(entry);
+    const title = entry.title?.trim();
+    if (title) this.#line(title, this.#theme.textStrong);
     this.#line('HYPOTHESIS', this.#theme.textSubtle);
     this.#wrappedLine(
       entry.claim?.trim() || 'No hypothesis text was recorded.',
