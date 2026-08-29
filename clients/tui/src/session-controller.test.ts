@@ -213,7 +213,9 @@ describe('session controller', () => {
 
   it('preserves backend execution state but suppresses live activity after a disconnect', async () => {
     const transport = new FakeTransport();
-    const controller = new SocketSessionController(transport);
+    // An empty backoff schedule: this test is about the disconnected state
+    // itself, not the reconnect that would otherwise follow.
+    const controller = new SocketSessionController(transport, undefined, undefined, []);
     await controller.start();
     transport.emit({
       type: 'event',
@@ -1709,6 +1711,106 @@ describe('a stream that re-bootstraps at a raised floor', () => {
   });
 });
 
+describe('stream reconnect', () => {
+  /** Lets the zero-delay reconnect timer and its subscribe settle. */
+  const settle = () => new Promise<void>(resolve => setTimeout(resolve, 1));
+
+  it('resumes from its own cursor, clears the outage, and folds nothing twice', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0]);
+    await controller.start();
+    transport.emitBatch([
+      event(1, 'agent_output_chunk', 'one\n'),
+      event(2, 'agent_output_chunk', 'two\n'),
+    ]);
+
+    transport.sever();
+    expect(controller.state.eventStreamAvailable).toBe(false);
+    expect(controller.state.errorBanner).toMatchObject({scope: 'transport'});
+
+    await settle();
+
+    // The resume asks for events after the last one folded, with no tail.
+    expect(transport.subscribeCalls).toEqual([
+      {afterSequence: 0, tail: 1_000},
+      {afterSequence: 2, tail: undefined},
+    ]);
+    expect(controller.state.eventStreamAvailable).toBe(true);
+    expect(controller.state.errorBanner).toBeNull();
+
+    // A server replaying the boundary event does not duplicate it.
+    transport.emitBatch([
+      event(2, 'agent_output_chunk', 'two\n'),
+      event(3, 'agent_output_chunk', 'three\n'),
+    ]);
+    expect(controller.state.core.sequence).toBe(3);
+    expect(controller.state.core.transcript.filter(item => item.content === 'two\n')).toHaveLength(
+      1,
+    );
+
+    // A success gives the next outage the full schedule again.
+    transport.sever();
+    await settle();
+    expect(transport.subscribeCalls).toHaveLength(3);
+    expect(transport.subscribeCalls[2]).toEqual({afterSequence: 3, tail: undefined});
+    expect(controller.state.eventStreamAvailable).toBe(true);
+  });
+
+  it('keeps the history floor a resumed stream cannot vouch for', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0]);
+    await controller.start();
+    // A tail bootstrap: everything at or below sequence 5 is unread history.
+    transport.emitBatch([event(6, 'agent_output_chunk', 'six\n')], 5);
+    expect(controller.state.core.historyAfterSequence).toBe(5);
+
+    transport.sever();
+    await settle();
+    // The resumed stream declares no floor of its own; taking its 0 literally
+    // would claim the unread history below 5 is already loaded.
+    transport.emitBatch([event(7, 'agent_output_chunk', 'seven\n')], 0);
+
+    expect(controller.state.core.sequence).toBe(7);
+    expect(controller.state.core.historyAfterSequence).toBe(5);
+  });
+
+  it('stops dialing when the schedule runs out and leaves the banner up', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0, 0]);
+    await controller.start();
+    transport.emitBatch([event(1, 'agent_output_chunk', 'one\n')]);
+
+    transport.refuseSubscribes = Number.POSITIVE_INFINITY;
+    transport.sever();
+    await settle();
+    await settle();
+    await settle();
+
+    // The boot subscribe plus one attempt per schedule entry, then silence.
+    expect(transport.subscribeCalls).toHaveLength(3);
+    expect(controller.state.eventStreamAvailable).toBe(false);
+    expect(controller.state.errorBanner).toMatchObject({scope: 'transport'});
+  });
+
+  it('does not reconnect after a terminal event or once stopped', async () => {
+    const finished = new ReconnectTransport();
+    const finishedController = new SocketSessionController(finished, undefined, undefined, [0]);
+    await finishedController.start();
+    finished.emitBatch([event(1, 'run_finished')]);
+    finished.sever();
+    await settle();
+    expect(finished.subscribeCalls).toHaveLength(1);
+
+    const stopped = new ReconnectTransport();
+    const stoppedController = new SocketSessionController(stopped, undefined, undefined, [0]);
+    await stoppedController.start();
+    await stoppedController.stop();
+    stopped.sever();
+    await settle();
+    expect(stopped.subscribeCalls).toHaveLength(1);
+  });
+});
+
 class FakeTransport implements SupervisionTransport {
   closed = false;
   /** Mutable so a test can change what a refetch returns mid-run. */
@@ -1771,6 +1873,63 @@ class FakeTransport implements SupervisionTransport {
 
   disconnect(error: Error): void {
     this.#disconnect?.(error);
+  }
+}
+
+/**
+ * A backend whose stream a test can sever and whose dials it can refuse:
+ * everything the reconnect path needs in order to be observed.
+ */
+class ReconnectTransport implements SupervisionTransport {
+  readonly requests: RequestInput[] = [];
+  /** Every subscribe: the cursor and tail it carried, in order. */
+  readonly subscribeCalls: Array<{afterSequence: number; tail: number | undefined}> = [];
+  /** How many upcoming subscribes to reject before letting one through. */
+  refuseSubscribes = 0;
+  #message: ((message: ServerMessage) => void) | null = null;
+  #disconnect: ((error: Error) => void) | null = null;
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    this.requests.push(input);
+    return Promise.resolve({
+      protocol_version: 1,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true,
+      ...(input.type === 'query.experiments' ? {experiments: [], experiments_ready: true} : {}),
+    });
+  }
+
+  subscribe(
+    afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    onDisconnect: (error: Error) => void,
+    options?: SubscribeOptions,
+  ): Promise<EventSubscription> {
+    this.subscribeCalls.push({afterSequence, tail: options?.tail});
+    if (this.refuseSubscribes > 0) {
+      this.refuseSubscribes -= 1;
+      return Promise.reject(new Error('connection refused'));
+    }
+    this.#message = onMessage;
+    this.#disconnect = onDisconnect;
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  emitBatch(events: readonly RunEvent[], historyAfterSequence = 0): void {
+    this.#message?.({
+      type: 'event_batch',
+      events: [...events],
+      history_after_sequence: historyAfterSequence,
+    });
+  }
+
+  sever(message = 'Supervision event stream disconnected'): void {
+    this.#disconnect?.(new Error(message));
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
   }
 }
 
