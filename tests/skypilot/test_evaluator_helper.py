@@ -26,25 +26,34 @@ type _Frame = ArtifactFrame | ErrorFrame | OutputFrame | ResultFrame
 
 
 def _serve_frames(socket_path: Path, frames: list[_Frame]) -> threading.Thread:
+    """Serve one bridge conversation on ``socket_path``, then exit.
+
+    ``ready`` is released from a ``finally`` so a server thread that dies
+    during setup surfaces as a connection failure in the test rather than
+    parking the main thread on ``ready.wait()`` for the life of the run.
+    """
     ready = threading.Event()
 
     def serve() -> None:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-            server.bind(str(socket_path))
-            server.listen(1)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(str(socket_path))
+                server.listen(1)
+                ready.set()
+                connection, _ = server.accept()
+                with connection:
+                    reader = connection.makefile("rb")
+                    request = json.loads(reader.readline())
+                    for frame in frames:
+                        connection.sendall(encode_message(frame))
+                    if any(isinstance(frame, ResultFrame) for frame in frames):
+                        acknowledgement = json.loads(reader.readline())
+                        assert acknowledgement["type"] == "ack"
+                        connection.sendall(
+                            encode_message(AckedFrame(invocation_id=request["invocation_id"]))
+                        )
+        finally:
             ready.set()
-            connection, _ = server.accept()
-            with connection:
-                reader = connection.makefile("rb")
-                request = json.loads(reader.readline())
-                for frame in frames:
-                    connection.sendall(encode_message(frame))
-                if any(isinstance(frame, ResultFrame) for frame in frames):
-                    acknowledgement = json.loads(reader.readline())
-                    assert acknowledgement["type"] == "ack"
-                    connection.sendall(
-                        encode_message(AckedFrame(invocation_id=request["invocation_id"]))
-                    )
 
     thread = threading.Thread(target=serve)
     thread.start()
@@ -57,11 +66,11 @@ def _serve_frames(socket_path: Path, frames: list[_Frame]) -> threading.Thread:
     [("COMPLETED", 0), ("APPLICATION_FAILED", 1), ("CANCELLED", 130)],
 )
 def test_helper_relays_streams_and_maps_terminal_status(
-    tmp_path: Path,
+    socket_dir: Path,
     status: Literal["COMPLETED", "APPLICATION_FAILED", "CANCELLED"],
     expected: int,
 ) -> None:
-    path = tmp_path / "bridge.sock"
+    path = socket_dir / "bridge.sock"
     thread = _serve_frames(
         path,
         [
@@ -78,8 +87,8 @@ def test_helper_relays_streams_and_maps_terminal_status(
     assert stderr.getvalue() == "err\n"
 
 
-def test_helper_reports_bridge_error_as_transport_failure(tmp_path: Path) -> None:
-    path = tmp_path / "bridge.sock"
+def test_helper_reports_bridge_error_as_transport_failure(socket_dir: Path) -> None:
+    path = socket_dir / "bridge.sock"
     thread = _serve_frames(path, [ErrorFrame(error="SkyPilotTimeoutError")])
     stderr = io.StringIO()
 
@@ -88,19 +97,22 @@ def test_helper_reports_bridge_error_as_transport_failure(tmp_path: Path) -> Non
     assert "SkyPilotTimeoutError" in stderr.getvalue()
 
 
-def test_helper_rejects_incomplete_terminal_result(tmp_path: Path) -> None:
-    path = tmp_path / "bridge.sock"
+def test_helper_rejects_incomplete_terminal_result(socket_dir: Path) -> None:
+    path = socket_dir / "bridge.sock"
     ready = threading.Event()
 
     def serve() -> None:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-            server.bind(str(path))
-            server.listen(1)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(str(path))
+                server.listen(1)
+                ready.set()
+                connection, _ = server.accept()
+                with connection:
+                    connection.makefile("rb").readline()
+                    connection.sendall(b'{"version":2,"type":"result","status":"COMPLETED"}\n')
+        finally:
             ready.set()
-            connection, _ = server.accept()
-            with connection:
-                connection.makefile("rb").readline()
-                connection.sendall(b'{"version":2,"type":"result","status":"COMPLETED"}\n')
 
     raw_thread = threading.Thread(target=serve)
     raw_thread.start()
@@ -112,8 +124,8 @@ def test_helper_rejects_incomplete_terminal_result(tmp_path: Path) -> None:
     assert "invalid result" in stderr.getvalue()
 
 
-def test_helper_materializes_narrow_framework_result_artifact(tmp_path: Path) -> None:
-    socket_path = tmp_path / "bridge.sock"
+def test_helper_materializes_narrow_framework_result_artifact(socket_dir: Path) -> None:
+    socket_path = socket_dir / "bridge.sock"
     output_path = Path("/tmp/vibesys-framework-benchmark-helper-test.json")  # noqa: S108
     output_path.unlink(missing_ok=True)
     thread = _serve_frames(
@@ -159,13 +171,13 @@ def test_pending_invocation_identity_survives_helper_process_state_reload(
 
 
 def test_acknowledged_pending_invocation_removal_is_directory_durable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("VIBESYS_SKYPILOT_CALLER_STATE", str(tmp_path))
     _, pending_path = helper_module._pending_invocation("accuracy", ())  # noqa: SLF001
     fsynced: list[Path] = []
     monkeypatch.setattr(helper_module, "_fsync_directory", fsynced.append)
-    socket_path = tmp_path / "bridge.sock"
+    socket_path = socket_dir / "bridge.sock"
     thread = _serve_frames(
         socket_path,
         [ResultFrame(status="COMPLETED", sky_exit_code=0, remote_job_id=7)],

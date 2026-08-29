@@ -22,6 +22,7 @@ from vibesys.server.protocol import (
     SubscribeRequest,
 )
 from vibesys.server.service import SupervisionService  # noqa: TC001  # tracked: #288
+from vibesys.unix_socket import validate_socket_path
 
 _REQUEST_ADAPTER = TypeAdapter(ProtocolRequest)
 
@@ -187,6 +188,7 @@ class SupervisionSocketServer:
         self._client_disconnected = threading.Event()
 
     def start(self) -> None:  # noqa: D102  # tracked: #288
+        validate_socket_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.unlink(missing_ok=True)
         self._server = _UnixServer(

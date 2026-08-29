@@ -44,6 +44,7 @@ from vibesys.skypilot.runner import (
     SkyPilotControlPlaneError,
     SkyPilotJobStateError,
 )
+from vibesys.unix_socket import validate_socket_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -266,6 +267,7 @@ class SkyPilotBridge:
             raise RuntimeError(  # noqa: TRY003
                 "SkyPilot bridge cannot be restarted after close"
             )
+        validate_socket_path(self.socket_path)
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.socket_path.unlink(missing_ok=True)
         try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -589,11 +590,15 @@ def test_rejects_symlinks_and_source_maps(release_fixture: tuple[Path, Path]) ->
 
 
 def test_bdist_wheel_revalidates_the_native_host(tmp_path: Path) -> None:
-    env = {
-        **os.environ,
-        "VIBESYS_WHEEL_TARGET": "macos-arm64",
-        "VIBESYS_TUI_BUNDLE": str(tmp_path / "missing"),
-    }
+    # The guard can only fire for a target the build host is not, so pick one
+    # rather than naming a fixed target that happens to be foreign to CI. In
+    # reverse declaration order the first non-native target is ``macos-arm64``
+    # everywhere except an Apple Silicon Mac, so CI keeps its existing case.
+    host = (platform.system(), platform.machine())
+    target_key = next(
+        key for key, target in reversed(TARGETS.items()) if (target.system, target.machine) != host
+    )
+    env = {**os.environ, "VIBESYS_WHEEL_TARGET": target_key}
 
     uv = shutil.which("uv")
     assert uv is not None
@@ -606,5 +611,7 @@ def test_bdist_wheel_revalidates_the_native_host(tmp_path: Path) -> None:
         check=False,
     )
 
+    # Name the target as well: a bare "nonzero exit" also matches unrelated
+    # build failures, which is how this assertion stayed green off-target.
     assert result.returncode != 0
-    assert "must be built natively" in result.stderr
+    assert f"{target_key} must be built natively" in result.stderr
