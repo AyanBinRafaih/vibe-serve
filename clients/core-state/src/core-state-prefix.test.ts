@@ -153,11 +153,12 @@ describe('prefix merges across the chunk boundary', () => {
         model: 'opus',
       },
     ]);
-    // Consecutive chat answers carry no turn id, so the fold concatenates them
-    // exactly as it does inside one batch. The point is that it still does when
-    // the two answers land on opposite sides of the boundary.
+    // Each chat answer is a complete turn and stays a separate entry. The point
+    // is that the prefix fold agrees with the in-batch fold even when the two
+    // answers land on opposite sides of the boundary.
     expect(merged.chatTranscripts['thread-a']?.map(entry => entry.content)).toEqual([
-      'first answersecond answer',
+      'first answer',
+      'second answer',
     ]);
   });
 
