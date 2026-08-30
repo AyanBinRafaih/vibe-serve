@@ -76,6 +76,7 @@ import {
   setChatMenuCustomModel,
   setChatModelMenuOptions,
   setChatThreadPending,
+  setDesignLog,
   setExperiments,
   setPaneContent,
   setTheme,
@@ -86,6 +87,7 @@ import {
   toggleTodos,
   updateChatConversation,
 } from './session-model.js';
+import {renderDesignSummary} from './ui/design-log.js';
 import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
 
 export interface SessionController {
@@ -713,6 +715,40 @@ export class SocketSessionController implements SessionController {
       const message = errorMessage(error);
       this.#setState(reportCaughtError(failExperiments(this.#state, message), error, 'request'));
     }
+    await this.#refreshDesignLog();
+  }
+
+  /**
+   * The design log annotates the hypothesis drill-down, so it rides the same
+   * triggers and single-flight as the experiment fetch. Best effort: on
+   * failure the drill-down keeps whatever it last showed and stays quiet,
+   * because `/design` reports errors through its own request path.
+   */
+  async #refreshDesignLog(): Promise<void> {
+    try {
+      const response = await this.client.request({type: 'query.design'});
+      if (response.design_ready === false) return;
+      this.#setState(setDesignLog(this.#state, response.design ?? []));
+    } catch {
+      // Supplemental data: no banner, no experiment-log error state.
+    }
+  }
+
+  /** `/design`: fetch fresh and show the per-round summary as an overlay. */
+  async #openDesignSummary(): Promise<void> {
+    try {
+      const response = await this.client.request({type: 'query.design'});
+      if (response.design_ready === false) {
+        this.#setState(
+          showDetail(this.#state, 'The design log is not available until a run is attached.'),
+        );
+        return;
+      }
+      const rounds = response.design ?? [];
+      this.#setState(showDetail(setDesignLog(this.#state, rounds), renderDesignSummary(rounds)));
+    } catch (error) {
+      this.#setState(reportCaughtError(this.#state, error, 'request'));
+    }
   }
 
   /** Reports the first delivery only: later refreshes are not a boot cost. */
@@ -895,6 +931,10 @@ export class SocketSessionController implements SessionController {
     if (parsed.localView === 'theme') {
       if (parsed.themeName === undefined) return this.openThemePicker();
       return this.setTheme(parsed.themeName);
+    }
+    if (parsed.designView === true) {
+      await this.#openDesignSummary();
+      return;
     }
     if (!parsed.request) return;
     if (parsed.paneView !== undefined) {

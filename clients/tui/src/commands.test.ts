@@ -35,6 +35,9 @@ describe('parseCommand', () => {
       localView: 'chat',
       chatMessage: 'what changed in the latest round?',
     });
+    // The design summary is an overlay, so it routes to neither pane nor request.
+    expect(parseCommand('/design')).toEqual({designView: true});
+    expect(SLASH_COMMANDS.map(command => command.name)).toContain('/design');
   });
 
   it('parses run-control commands', () => {
@@ -191,6 +194,7 @@ describe('slash-command input helpers', () => {
       '/steer',
       '/open-round',
       '/perf',
+      '/design',
       '/todos',
       '/prompt',
       '/theme',

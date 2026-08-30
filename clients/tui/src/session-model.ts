@@ -1,5 +1,6 @@
 import type {
   ChatOptions,
+  DesignRound,
   Diagnostic,
   HypothesisEntry,
   RunEvent,
@@ -65,6 +66,12 @@ export interface SessionState {
   todosExpanded: boolean;
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
+  /**
+   * Server-derived per-round design log: files each round changed and how its
+   * stages concluded. Null until the first fetch lands; kept when a refresh
+   * fails so the drill-down degrades to stale rather than empty.
+   */
+  designLog: DesignRound[] | null;
   /** Hypothesis summary between the experiment index and a round trajectory. */
   hypothesisDetail: HypothesisDetail | null;
   hypothesisScope: HypothesisScope | null;
@@ -293,6 +300,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     // The experiment log is the landing view: a run's history reads as a short
     // list of claims before it reads as a long list of rounds.
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
+    designLog: null,
     hypothesisDetail: null,
     hypothesisScope: null,
     layout: {right: null, focus: 'left', zoomedPane: null},
@@ -701,6 +709,19 @@ export function failExperiments(state: SessionState, error: string): SessionStat
   const log = state.experimentLog;
   if (log === null) return state;
   return {...state, experimentLog: {...log, pending: false, error}};
+}
+
+export function setDesignLog(state: SessionState, rounds: DesignRound[]): SessionState {
+  return {...state, designLog: rounds};
+}
+
+/** The design entry for one round, or null before the log has loaded it. */
+export function designRoundFor(
+  state: SessionState,
+  roundNumber: number | null,
+): DesignRound | null {
+  if (roundNumber === null || state.designLog === null) return null;
+  return state.designLog.find(round => round.round === roundNumber) ?? null;
 }
 
 export function moveExperimentSelection(state: SessionState, delta: number): SessionState {

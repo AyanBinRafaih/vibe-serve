@@ -102,6 +102,17 @@ class ExperimentQuery(Request):
     type: Literal["query.experiments"] = "query.experiments"
 
 
+class DesignQuery(Request):
+    """Request the per-round design log for the attached run.
+
+    The design log is the operator's view of what each round changed in the
+    system under optimization: the files the round touched and how each stage
+    of the round concluded.
+    """
+
+    type: Literal["query.design"] = "query.design"
+
+
 class EventsQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.events"] = "query.events"
     after_sequence: int = Field(default=0, ge=0)
@@ -133,6 +144,7 @@ ProtocolRequest = Annotated[
     | HistoryQuery
     | PerformanceQuery
     | ExperimentQuery
+    | DesignQuery
     | EventsQuery
     | SubscribeRequest,
     Field(discriminator="type"),
@@ -264,6 +276,45 @@ class HypothesisEntry(ProtocolModel):
     active: bool = False
 
 
+class DesignFileChange(ProtocolModel):
+    """One workspace file a round's commit range touched."""
+
+    path: str
+    change: Literal["added", "modified", "deleted", "renamed"]
+    # The pre-rename path, present exactly when ``change`` is "renamed".
+    renamed_from: str | None = None
+
+
+class DesignRound(ProtocolModel):
+    """One round of the design log: what changed and how each stage concluded.
+
+    Stage fields are copied from the authoritative round record, never
+    recomputed. ``files`` is derived from the run workspace's git history:
+    None means the round's commit range could not be resolved (no checkpoint
+    recorded, or the workspace history no longer has it), which is distinct
+    from an empty list, a resolved range that touched nothing outside
+    framework bookkeeping.
+    """
+
+    round: int
+    commit: str | None = None
+    hypothesis_id: str | None = None
+    # Display title of the owning hypothesis, same derivation as the
+    # experiment log's, so both surfaces name a hypothesis identically.
+    title: str | None = None
+    claim: str | None = None
+    task: str | None = None
+    passed: bool = False
+    hypothesis_outcome: str | None = None
+    judge_verdict: Literal["pass", "fail", "deferred"] | None = None
+    official_evaluation: bool = False
+    candidate_disposition: str | None = None
+    perf_metric: FiniteFloat | None = None
+    perf_unit: str | None = None
+    perf_delta_pct: FiniteFloat | None = None
+    files: list[DesignFileChange] | None = None
+
+
 class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     protocol_version: Literal[1] = PROTOCOL_VERSION
     request_id: str
@@ -291,6 +342,9 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     # readiness marker separate preserves the protocol-v1 list contract while
     # distinguishing bootstrap from an authoritative empty experiment log.
     experiments_ready: bool | None = None
+    design: list[DesignRound] = Field(default_factory=list)
+    # Same bootstrap-versus-empty distinction as ``experiments_ready``.
+    design_ready: bool | None = None
 
     @classmethod
     def from_exception(

@@ -18,6 +18,8 @@ export type ParsedCommand = {
   responseView?: 'perf';
   /** Opens a hypothesis trajectory: the selected row, or the given round. */
   openRound?: {round?: number};
+  /** Shows the per-round design change summary as an overlay. */
+  designView?: boolean;
   /**
    * Renders the response in the right pane beside the transcript. Every
    * visualization command opts in through this field; modal surfaces such as
@@ -43,6 +45,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
     description: 'Open the selected hypothesis, or /open-round --N for round N',
   },
   {name: '/perf', description: 'Plot performance by round in the right pane'},
+  {name: '/design', description: 'Summarize each round’s file and design changes'},
   {name: '/todos', description: "Expand or collapse the visible agent's todo list"},
   {name: '/prompt', description: 'Expand or collapse the latest prompt in view'},
   {name: '/theme', description: 'List themes, or switch with /theme <name>'},
@@ -188,6 +191,7 @@ export function parseCommand(text: string): ParsedCommand {
   if (text === '/perf') {
     return {request: {type: 'query.performance'}, responseView: 'perf', paneView: 'perf'};
   }
+  if (text === '/design') return {designView: true};
   if (text.startsWith('/')) return {error: `Unknown command: ${text}. Use /help.`};
   if (text === '') return {error: 'Enter a slash command. Use /help.'};
   return {error: 'Commands start with /. Use Experiment chat for questions.'};

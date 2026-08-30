@@ -867,6 +867,250 @@
       "title": "ConfigurationFailedData",
       "type": "object"
     },
+    "DesignFileChange": {
+      "additionalProperties": false,
+      "description": "One workspace file a round's commit range touched.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "change": {
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed"
+          ],
+          "title": "Change",
+          "type": "string"
+        },
+        "renamed_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Renamed From"
+        }
+      },
+      "required": [
+        "path",
+        "change"
+      ],
+      "title": "DesignFileChange",
+      "type": "object"
+    },
+    "DesignQuery": {
+      "additionalProperties": false,
+      "description": "Request the per-round design log for the attached run.\n\nThe design log is the operator's view of what each round changed in the\nsystem under optimization: the files the round touched and how each stage\nof the round concluded.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.design",
+          "default": "query.design",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "DesignQuery",
+      "type": "object"
+    },
+    "DesignRound": {
+      "additionalProperties": false,
+      "description": "One round of the design log: what changed and how each stage concluded.\n\nStage fields are copied from the authoritative round record, never\nrecomputed. ``files`` is derived from the run workspace's git history:\nNone means the round's commit range could not be resolved (no checkpoint\nrecorded, or the workspace history no longer has it), which is distinct\nfrom an empty list, a resolved range that touched nothing outside\nframework bookkeeping.",
+      "properties": {
+        "round": {
+          "title": "Round",
+          "type": "integer"
+        },
+        "commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commit"
+        },
+        "hypothesis_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hypothesis Id"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "claim": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Claim"
+        },
+        "task": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task"
+        },
+        "passed": {
+          "default": false,
+          "title": "Passed",
+          "type": "boolean"
+        },
+        "hypothesis_outcome": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hypothesis Outcome"
+        },
+        "judge_verdict": {
+          "anyOf": [
+            {
+              "enum": [
+                "pass",
+                "fail",
+                "deferred"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Judge Verdict"
+        },
+        "official_evaluation": {
+          "default": false,
+          "title": "Official Evaluation",
+          "type": "boolean"
+        },
+        "candidate_disposition": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Candidate Disposition"
+        },
+        "perf_metric": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Metric"
+        },
+        "perf_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Unit"
+        },
+        "perf_delta_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Delta Pct"
+        },
+        "files": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/DesignFileChange"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Files"
+        }
+      },
+      "required": [
+        "round"
+      ],
+      "title": "DesignRound",
+      "type": "object"
+    },
     "Diagnostic": {
       "additionalProperties": false,
       "description": "Structured, provider-neutral description of an operator diagnostic.\n\nFrozen for the same reason as ``RunEvent``: diagnostics ride along on\nreplayed events, which readers share rather than copy.",
@@ -2178,6 +2422,25 @@
           ],
           "default": null,
           "title": "Experiments Ready"
+        },
+        "design": {
+          "items": {
+            "$ref": "#/$defs/DesignRound"
+          },
+          "title": "Design",
+          "type": "array"
+        },
+        "design_ready": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Design Ready"
         }
       },
       "required": [
@@ -3114,6 +3377,7 @@
           "query.chat": "#/$defs/ChatQuery",
           "query.chat_options": "#/$defs/ChatOptionsQuery",
           "query.chat_thread_create": "#/$defs/ChatThreadCreateQuery",
+          "query.design": "#/$defs/DesignQuery",
           "query.events": "#/$defs/EventsQuery",
           "query.experiments": "#/$defs/ExperimentQuery",
           "query.history": "#/$defs/HistoryQuery",
@@ -3157,6 +3421,9 @@
         },
         {
           "$ref": "#/$defs/ExperimentQuery"
+        },
+        {
+          "$ref": "#/$defs/DesignQuery"
         },
         {
           "$ref": "#/$defs/EventsQuery"

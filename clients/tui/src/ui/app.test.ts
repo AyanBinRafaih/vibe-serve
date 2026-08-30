@@ -3479,6 +3479,46 @@ describe('theming', () => {
     expect(untitled).not.toContain('Batch prefill to cut latency');
   });
 
+  it('annotates the selected round with its design changes once the log loads', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      hypothesisDetail: {entryKey: 'H-07', selectedRound: 41},
+    });
+
+    // Before the design log loads there is no section to mislabel.
+    const bare = await testRenderer.waitForFrame(value => value.includes('Hypothesis H-07'));
+    expect(bare).not.toContain('CHANGES');
+
+    controller.publish({
+      ...controller.state,
+      designLog: [
+        {
+          round: 41,
+          hypothesis_id: 'H-07',
+          hypothesis_outcome: 'proven',
+          judge_verdict: 'pass',
+          commit: 'abcdef1234567890',
+          files: [
+            {path: 'src/ring.rs', change: 'added'},
+            {path: 'src/lib.rs', change: 'renamed', renamed_from: 'src/queue.rs'},
+            {path: 'src/ffi.rs', change: 'deleted'},
+          ],
+        },
+      ],
+    });
+
+    const annotated = await testRenderer.waitForFrame(value => value.includes('ROUND 41 CHANGES'));
+    expect(annotated).toContain('+ src/ring.rs');
+    expect(annotated).toContain('→ src/lib.rs (was src/queue.rs)');
+    expect(annotated).toContain('- src/ffi.rs');
+    expect(annotated).toContain('Outcome proven · Judge pass · Checkpoint abcdef1234');
+  });
+
   it('opens hypothesis detail from a row click and keeps pane clicks routed', async () => {
     const testRenderer = await createTestRenderer({width: 200, height: 22});
     const controller = logController();

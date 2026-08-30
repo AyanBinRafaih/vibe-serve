@@ -16,6 +16,8 @@ export type {
   ChatModelOption,
   ChatOptions,
   ChatProviderOptions,
+  DesignFileChange,
+  DesignRound,
   Diagnostic,
   HypothesisEntry,
   HypothesisRound,

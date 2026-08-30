@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
+from server.api.design import build_design_log
 from server.api.experiments import build_experiment_log
 from server.api.performance import (
     build_performance_context,
@@ -18,6 +19,8 @@ from server.api.protocol import (
     ChatThreadCreateQuery,
     ChatThreadInfo,
     CommandAck,
+    DesignQuery,
+    DesignRound,
     EventsQuery,
     ExperimentQuery,
     HistoryQuery,
@@ -107,6 +110,14 @@ class RunApi:
                 request_id=request.request_id,
                 experiments=self.experiments() if ready else [],
                 experiments_ready=ready,
+            )
+        if isinstance(request, DesignQuery):
+            self._journal.record(EventType.STATUS_QUERY, "/design")
+            ready = self._controller.project_run is not None
+            return Response(
+                request_id=request.request_id,
+                design=self.design_rounds() if ready else [],
+                design_ready=ready,
             )
         if isinstance(request, SnapshotQuery):
             return Response(request_id=request.request_id, snapshot=self.snapshot())
@@ -253,6 +264,19 @@ class RunApi:
         """Build the experiment log for an agent outer loop."""
         state = self._agent_run_state()
         return [] if state is None else build_experiment_log(state)
+
+    def design_rounds(self) -> list[DesignRound]:
+        """Project the per-round design log for the attached run."""
+        project_run = self._controller.project_run
+        state = self._agent_run_state()
+        if project_run is None or state is None:
+            return []
+        manifest = project_run.project.state.load_run(project_run.run_id)
+        return build_design_log(
+            state,
+            workspace=project_run.project.root,
+            baseline=manifest.trusted_input_baseline,
+        )
 
     def wait_for_events(
         self,
