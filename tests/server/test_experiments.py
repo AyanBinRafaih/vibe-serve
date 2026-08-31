@@ -164,6 +164,11 @@ def test_projection_uses_nested_rounds_and_one_official_measurement_tuple() -> N
         "ops_s",
         -9.09,
     )
+    assert (entry.perf_metric_name, entry.perf_direction, entry.perf_baseline_value) == (
+        "throughput",
+        "max",
+        110.0,
+    )
 
 
 def test_projection_surfaces_active_hypothesis_before_a_round_finishes() -> None:
@@ -408,6 +413,13 @@ def test_service_rebuilds_legacy_measurement_and_resolution_from_round_evidence(
         "ops_s",
         -10.0,
     )
+    # The configured objective direction and the rebuilt causal baseline reach
+    # the wire, so the client can label the numbers above.
+    assert (
+        regression.perf_metric_name,
+        regression.perf_direction,
+        regression.perf_baseline_value,
+    ) == ("ops_s", "max", 100.0)
 
 
 def test_service_returns_authoritative_empty_log_after_attach(tmp_path: Path) -> None:

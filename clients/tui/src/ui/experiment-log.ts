@@ -233,7 +233,7 @@ export class ExperimentLogView {
     const columns = resolveColumns(this.#bodyWidth());
     const items = experimentIndexItems(state);
     const selected = selectedExperimentIndexItem(state);
-    this.#header.content = headerRow(columns);
+    this.#header.content = headerRow(columns, measuredDirection(log.entries));
     let selectedRenderIndex = 0;
     let renderedRows = 0;
     for (const [navigationIndex, item] of items.entries()) {
@@ -514,7 +514,10 @@ export class ExperimentLogView {
 /** Widths of every column except the claim, which absorbs what is left over. */
 const ID_WIDTH = 15;
 const ROUNDS_WIDTH = 8;
-const MEASURED_WIDTH = 11;
+// Room for a trimmed value plus a short unit ("55434.2 ops/s"). A longer unit
+// truncates here and reads in full from the hypothesis drill-down. Growing
+// this further would push the fixed row past MEASURED_MIN_WIDTH.
+const MEASURED_WIDTH = 20;
 const OUTCOME_WIDTH = 11;
 const KEPT_WIDTH = 4;
 const COLUMN_GAP = '  ';
@@ -541,10 +544,16 @@ export function resolveColumns(width: number): Columns {
   };
 }
 
-export function headerRow(columns: Columns): string {
+export function headerRow(columns: Columns, direction: 'max' | 'min' | null = null): string {
   const parts = [' Hypothesis'.padEnd(ID_WIDTH), 'Rounds'.padEnd(ROUNDS_WIDTH)];
   if (columns.claim) parts.push('Implementation Details'.padEnd(columns.claimWidth));
-  if (columns.measured) parts.push('Measured'.padEnd(MEASURED_WIDTH));
+  if (columns.measured) {
+    // The glyph is the way improvement points, so a signed delta below reads
+    // as good or bad without task knowledge. A glyph rather than color, which
+    // the outcome column already spends; the drill-down spells out the word.
+    const label = direction === null ? 'Measured' : `Measured ${direction === 'max' ? '↑' : '↓'}`;
+    parts.push(label.padEnd(MEASURED_WIDTH));
+  }
   parts.push('Outcome'.padEnd(OUTCOME_WIDTH));
   if (columns.kept) parts.push('Kept'.padEnd(KEPT_WIDTH));
   return parts.join(COLUMN_GAP);
@@ -636,19 +645,39 @@ export function formatRounds(entry: HypothesisEntry): string {
 
 export function formatMeasured(entry: HypothesisEntry): string {
   const delta = entry.perf_delta_pct;
-  if (typeof delta === 'number') {
-    const sign = delta > 0 ? '+' : '';
-    return `${sign}${delta.toFixed(delta >= 10 || delta <= -10 ? 0 : 1)}%`;
+  if (typeof delta === 'number') return formatDelta(delta);
+  if (typeof entry.perf_metric === 'number') {
+    return `${trimNumber(entry.perf_metric)}${entry.perf_unit ? ` ${entry.perf_unit}` : ''}`;
   }
-  if (typeof entry.perf_metric === 'number') return trimNumber(entry.perf_metric);
   return '—';
+}
+
+function formatDelta(delta: number): string {
+  const sign = delta > 0 ? '+' : '';
+  return `${sign}${delta.toFixed(delta >= 10 || delta <= -10 ? 0 : 1)}%`;
+}
+
+/**
+ * The one improvement direction the header can honestly carry. Null when no
+ * entry recorded a direction, or when entries disagree, where a single glyph
+ * would mislabel some rows.
+ */
+export function measuredDirection(entries: readonly HypothesisEntry[]): 'max' | 'min' | null {
+  let direction: 'max' | 'min' | null = null;
+  for (const entry of entries) {
+    const candidate = entry.perf_direction ?? null;
+    if (candidate === null) continue;
+    if (direction === null) direction = candidate;
+    else if (direction !== candidate) return null;
+  }
+  return direction;
 }
 
 function focusedTitlePrefix(state: SessionState): string {
   return focusedPane(state) === 'experiments' ? '▸ ' : '';
 }
 
-function hypothesisMetadata(entry: HypothesisEntry): string {
+export function hypothesisMetadata(entry: HypothesisEntry): string {
   const parts = [`Rounds ${formatRounds(entry)}`];
   if (entry.judge_verdict !== null && entry.judge_verdict !== undefined) {
     parts.push(`Judge ${sentenceCase(entry.judge_verdict)}`);
@@ -656,7 +685,39 @@ function hypothesisMetadata(entry: HypothesisEntry): string {
   parts.push(`Decision ${outcomeLabel(entry)}`);
   if (entry.kept === true) parts.push('Candidate kept');
   else if (entry.kept === false) parts.push('Candidate reverted');
+  parts.push(...measurementMetadata(entry));
   return parts.join(' · ');
+}
+
+/**
+ * The measurement spelled out where width is unbounded: metric identity and
+ * direction as words, then the absolute value, its baseline, and the causal
+ * delta the table compresses into one cell.
+ */
+function measurementMetadata(entry: HypothesisEntry): string[] {
+  const parts: string[] = [];
+  const name = entry.perf_metric_name ?? null;
+  const direction =
+    entry.perf_direction === 'max'
+      ? 'maximize'
+      : entry.perf_direction === 'min'
+        ? 'minimize'
+        : null;
+  if (name !== null) parts.push(`Metric ${name}${direction === null ? '' : ` (${direction})`}`);
+  else if (direction !== null) parts.push(`Direction ${direction}`);
+  // Legacy rounds recorded the metric name as the unit; once the name clause
+  // carries that identity, repeating it after each number is noise.
+  const unit = entry.perf_unit && entry.perf_unit !== name ? ` ${entry.perf_unit}` : '';
+  if (typeof entry.perf_metric === 'number') {
+    parts.push(`Measured ${trimNumber(entry.perf_metric)}${unit}`);
+  }
+  if (typeof entry.perf_baseline_value === 'number') {
+    parts.push(`Baseline ${trimNumber(entry.perf_baseline_value)}${unit}`);
+  }
+  if (typeof entry.perf_delta_pct === 'number') {
+    parts.push(`Delta ${formatDelta(entry.perf_delta_pct)}`);
+  }
+  return parts;
 }
 
 function roundMetadata(roundNumber: number, round: HypothesisRound | undefined): string {
