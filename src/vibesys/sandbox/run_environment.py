@@ -39,7 +39,13 @@ from vibesys.backends import SandboxKind
 from vibesys.backends.base import ComputeBackendImpl  # noqa: TC001  # tracked: #288
 from vibesys.constants import DEFAULT_AGENT_BACKEND, PROJECT_ROOT
 from vibesys.domains.environment import EnvironmentBindMount  # noqa: TC001  # tracked: #288
-from vibesys.evaluators import PROJECT_ROOT_TOKEN, load_evaluator_package
+from vibesys.evaluators import (
+    PROJECT_ROOT_TOKEN,
+    CargoGitToolSpec,
+    load_evaluator_package,
+    prepare_evaluator_tools,
+    tool_path_replacements,
+)
 from vibesys.input_manifest import WorkspaceSource  # noqa: TC001  # tracked: #288
 from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, render_template
@@ -141,6 +147,7 @@ class RunEnvironmentRequest:  # noqa: D101  # tracked: #288
     benchmark_command: str | None = None
     benchmark_output_argument: str | None = None
     evaluator_package_root: Path | None = None
+    evaluator_tools_root: Path | None = None
     profiler_support_path: str | None = None
     profiler_support_name: str | None = None
     git_history_root: Path | None = None
@@ -273,6 +280,9 @@ class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
 
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:  # noqa: D102  # tracked: #288
         objective_document = _materialize_effective_objective(request)
+        tools = _evaluator_tools(request)
+        if tools:
+            prepare_evaluator_tools(tools, _required_evaluator_tools_root(request))
         sandbox = request.backend.make_sandbox(
             SandboxKind.LOCAL,
             host_workspace=str(request.workspace),
@@ -321,6 +331,7 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
         return cls(DockerEnvironmentConfig(image=str(image) if image else None))
 
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:  # noqa: D102  # tracked: #288
+        _reject_evaluator_tools(request, environment="Docker")
         bind_mounts, docker_symlinks, passthrough = _container_mount_plan(request)
         extra_init_commands, cli_provider_env = _cli_container_setup(request)
         extra_init_commands.extend(_evaluator_container_setup(request))
@@ -500,6 +511,7 @@ class SkyPilotEnvironment(DockerEnvironment):
 
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:
         """Open the bridge and CPU-only local editor container."""
+        _reject_evaluator_tools(request, environment="SkyPilot")
         if self.config.resources is None:
             raise ValueError("SkyPilot requires portable run resources")  # noqa: TRY003
         if request.state_namespace is None:
@@ -653,6 +665,8 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
         codex-vs-model-weight memory contention, and per-run sandbox
         cold-start overhead that this design eliminates.
         """
+        _reject_evaluator_tools(request, environment="Modal")
+
         # Host-side: ensure Modal Volumes exist for the model + optional
         # draft.  These run before the Docker container starts and are
         # idempotent (skip-if-ready sentinel).
@@ -1097,6 +1111,13 @@ def _environment_command(
                 ),
             )
         )
+    tools = _evaluator_tools(request)
+    if tools:
+        if isolated:
+            raise ValueError("isolated run environments do not yet support evaluator tools")  # noqa: TRY003
+        replacements.extend(
+            tool_path_replacements(tools, _required_evaluator_tools_root(request)).items()
+        )
     _reject_semantic_tokens_in_source(arguments, replacements)
     arguments = [_translate_command_argument(argument, replacements) for argument in arguments]
     return shlex.join(arguments)
@@ -1506,6 +1527,34 @@ def _evaluator_container_setup(request: RunEnvironmentRequest) -> list[str]:
             "ln -sf /root/.cargo/bin/* /usr/local/bin/ && rm -f /tmp/rustup-init.sh ;; esac"
         )
     return commands
+
+
+def _evaluator_tools(request: RunEnvironmentRequest) -> dict[str, CargoGitToolSpec]:
+    if request.evaluator_package_root is None:
+        return {}
+    return load_evaluator_package(request.evaluator_package_root).metadata.tools
+
+
+def _required_evaluator_tools_root(request: RunEnvironmentRequest) -> Path:
+    if request.evaluator_tools_root is None:
+        raise ValueError("evaluator tools require an operator-owned tools root")  # noqa: TRY003
+    root = request.evaluator_tools_root.resolve()
+    try:
+        root.relative_to(request.workspace.resolve())
+    except ValueError:
+        return root
+    raise ValueError("evaluator tools root must be outside the candidate workspace")  # noqa: TRY003
+
+
+def _reject_evaluator_tools(request: RunEnvironmentRequest, *, environment: str) -> None:
+    tools = _evaluator_tools(request)
+    if not tools:
+        return
+    names = ", ".join(sorted(tools))
+    raise ValueError(  # noqa: TRY003
+        f"{environment} does not yet support evaluator tools ({names}); "
+        "use the local run environment"
+    )
 
 
 def _dedupe_mounts(

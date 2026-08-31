@@ -248,16 +248,19 @@ class TestTaskAgentHostResources:
 
     def test_evaluator_package_is_read_only_and_domain_independent(self, tmp_path: Path) -> None:
         package_root = tmp_path / "evaluator"
+        tools_root = tmp_path / "operator-tools" / "request-factory" / "digest"
         declarations = host_resource_declarations.task_agent_host_resources(
             container_topology=False,
             cli_sandboxed=False,
             task_name=None,
             evaluator_package_root=package_root,
+            evaluator_tool_roots=(tools_root,),
             env={},
         )
 
         # Read-only: the evaluator is trusted, integrity-checked input no role
         # may edit.
         assert {resource.path: resource.access for resource in declarations} == {
-            package_root: HostResourceAccess.READ_ONLY
+            package_root: HostResourceAccess.READ_ONLY,
+            tools_root: HostResourceAccess.READ_ONLY,
         }

@@ -18,6 +18,11 @@ from vibesys.domains.base import DomainName
 from vibesys.domains.environment import EnvironmentPatch, NoopEnvironmentHooks
 from vibesys.domains.llm_serving.hooks import LLMServingEnvironmentHooks
 from vibesys.errors import ConfigurationError
+from vibesys.evaluators import (
+    EvaluatorPackageRequirement,
+    resolve_evaluator_package,
+    tool_install_root,
+)
 from vibesys.input_manifest import WorkspaceSource
 from vibesys.loops.agent.model import AgentRunState
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
@@ -26,6 +31,7 @@ from vibesys.run.events import CoreEventType
 from vibesys.sandbox.run_environment import RunEnvironmentSpec
 from vs_loop_state import PlainLoopCursor
 from vs_project import AgentRunConfiguration, Project, RunEnvironmentRecord
+from vs_sandbox import HostResourceAccess
 
 
 class _FakeBackend:
@@ -151,6 +157,7 @@ def _create_context(  # noqa: PLR0913
     *,
     runs_dir: Path | None = None,
     evaluator: Path | None = None,
+    evaluator_package_root: Path | None = None,
     exp_name: str = "queue",
     existing: bool = False,
     configuration: AgentRunConfiguration | None = None,
@@ -171,6 +178,7 @@ def _create_context(  # noqa: PLR0913
         task_name=task_name,
         task_root=task_root,
         evaluator_path=evaluator,
+        evaluator_package_root=evaluator_package_root,
         objective=objective,
         existing=existing,
         project_configuration=configuration or _configuration(),
@@ -236,6 +244,44 @@ def test_direct_run_uses_one_project_root_and_canonical_state(tmp_path):  # noqa
     assert manifest.branch == f"vibesys-runs/{ctx.run_id}"
     assert _git(project, "branch", "--show-current") == manifest.branch
     assert _git(project, "status", "--porcelain") == ""
+
+
+def test_context_places_evaluator_tools_in_operator_cache_and_imports_it_read_only(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "queue"
+    _write_project(project)
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+
+    def prepare(tools, root):  # noqa: ANN001, ANN202
+        root.mkdir(parents=True, exist_ok=True)
+        for name, spec in tools.items():
+            tool_install_root(root, name, spec).mkdir(parents=True)
+        return {}
+
+    with (
+        patch("vibesys.sandbox.run_environment.prepare_evaluator_tools", side_effect=prepare),
+        _create_context(project, evaluator_package_root=package.root) as ctx,
+    ):
+        tools_root = ctx.project.state.model_cache_directory("evaluator-tools")
+        resources = {resource.path: resource.access for resource in ctx.agent_host_resources}
+        expected_tool_roots = tuple(
+            tool_install_root(tools_root, name, spec)
+            for name, spec in package.metadata.tools.items()
+        )
+
+        assert ctx.evaluator_tools_root == tools_root
+        assert ctx.evaluator_tool_roots == expected_tool_roots
+        assert tools_root.is_dir()
+        assert not tools_root.is_relative_to(project)
+        assert tools_root not in resources
+        assert all(root.is_dir() for root in expected_tool_roots)
+        assert all(resources[root] is HostResourceAccess.READ_ONLY for root in expected_tool_roots)
 
 
 def test_run_context_announces_canonical_experiment_state(tmp_path):  # noqa: ANN001, ANN201

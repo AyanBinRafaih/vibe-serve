@@ -13,7 +13,11 @@ from vibesys.agents.cli_docker import DockerAuthPath
 from vibesys.backends import SandboxKind
 from vibesys.constants import ComputeBackend
 from vibesys.domains.environment import EnvironmentBindMount
-from vibesys.evaluators import EvaluatorPackageRequirement, resolve_evaluator_package
+from vibesys.evaluators import (
+    EvaluatorPackageRequirement,
+    resolve_evaluator_package,
+    tool_install_root,
+)
 from vibesys.input_manifest import load_project_task
 from vibesys.profilers import ProfilerKind
 from vibesys.sandbox.run_environment import (
@@ -316,6 +320,134 @@ def test_isolated_environment_mounts_and_translates_evaluator_package(tmp_path: 
     assert any("go1.23.12" in item for item in init_commands)
     assert any("rustup.rs" in item for item in init_commands)
     assert any("command -v cargo" in item for item in init_commands)
+
+
+def test_local_environment_prepares_and_translates_evaluator_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend()
+    env = build_run_environment(RunEnvironmentSpec("local"))
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    prepare = MagicMock()
+    monkeypatch.setattr(
+        "vibesys.sandbox.run_environment.prepare_evaluator_tools",
+        prepare,
+    )
+    command = shlex.join(
+        package.command(
+            "request-factory-engine",
+            "--trace",
+            "trace.jsonl",
+            "--model",
+            "m",
+            "--input-file-format",
+            "multimodal-independent-v1",
+            "--dry-run",
+        )
+    )
+    tools_root = tmp_path / "operator-tools"
+
+    session = env.open(
+        _request(
+            tmp_path,
+            backend,
+            accuracy_command="true",
+            benchmark_command=command,
+            evaluator_package_root=package.root,
+            evaluator_tools_root=tools_root,
+        )
+    )
+
+    prepare.assert_called_once_with(package.metadata.tools, tools_root)
+    tool = package.metadata.tools["request-factory"]
+    benchmark = shlex.split(session.view.paths.benchmark_command or "")
+    assert benchmark[benchmark.index("--engine") + 1] == str(
+        tool_install_root(tools_root, "request-factory", tool) / "bin" / "session_runner"
+    )
+    assert "${TOOL:" not in (session.view.paths.benchmark_command or "")
+
+
+def test_local_environment_rejects_evaluator_tools_root_inside_workspace(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    env = build_run_environment(RunEnvironmentSpec("local"))
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(ValueError, match="must be outside the candidate workspace"):
+        env.open(
+            _request(
+                tmp_path,
+                backend,
+                workspace=workspace,
+                accuracy_command="true",
+                benchmark_command="true",
+                evaluator_package_root=package.root,
+                evaluator_tools_root=workspace / "cache",
+            )
+        )
+
+    assert backend.calls == []
+
+
+@pytest.mark.parametrize("environment_name", ["docker", "modal", "skypilot"])
+def test_remote_environments_reject_evaluator_tools_before_startup(
+    tmp_path: Path, environment_name: str
+) -> None:
+    backend = FakeBackend()
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    if environment_name == "docker":
+        env = build_run_environment(RunEnvironmentSpec("docker"))
+    elif environment_name == "modal":
+        env = build_run_environment(RunEnvironmentSpec("modal"))
+    else:
+        env = build_run_environment(
+            RunEnvironmentSpec(
+                "skypilot",
+                options={
+                    "profile": "gpu",
+                    "profiles_file": tmp_path / "absent-clusters.toml",
+                },
+                resources=RunResourceRequest(
+                    accelerators_per_node=1,
+                    accelerator_backend="cuda",
+                ),
+            )
+        )
+
+    label = {"docker": "Docker", "modal": "Modal", "skypilot": "SkyPilot"}[environment_name]
+    with pytest.raises(
+        ValueError,
+        match=rf"{label} does not yet support evaluator tools",
+    ):
+        env.open(
+            _request(
+                tmp_path,
+                backend,
+                accuracy_command="true",
+                benchmark_command="true",
+                evaluator_package_root=package.root,
+            )
+        )
+
+    assert backend.calls == []
 
 
 def test_environment_quotes_project_root_after_token_expansion(tmp_path: Path) -> None:

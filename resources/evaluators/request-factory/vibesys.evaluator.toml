@@ -1,0 +1,27 @@
+schema_version = 1
+name = "vibesys-evaluator-request-factory"
+version = "0.1.0"
+protocol_version = 1
+
+[tools.request-factory]
+kind = "cargo-git"
+git = "https://github.com/uw-syfi/request-factory"
+rev = "118da6137275fda3a290e9012853214dc437c6c0"
+package = "req-frontend"
+bins = ["session_runner"]
+
+[entrypoints]
+request-factory-engine = [
+  "python3",
+  "${PACKAGE_ROOT}/runner.py",
+  "--engine",
+  "${TOOL:request-factory/session_runner}",
+  "--",
+]
+request-factory-adapter = [
+  "python3",
+  "${PACKAGE_ROOT}/adapter.py",
+  "--engine",
+  "${TOOL:request-factory/session_runner}",
+  "--",
+]
