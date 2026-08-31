@@ -381,7 +381,7 @@ export class ConversationView {
           : null;
       const content = prompt ? prompt.content : (output?.content ?? entry.content);
       card.add(new TextRenderable(this.renderer, {content, fg: palette.content, width: '100%'}));
-      if (output && output.collapsible) {
+      if (output?.collapsible) {
         const hidden =
           output.hiddenLines > 0
             ? `${output.hiddenLines} more line${output.hiddenLines === 1 ? '' : 's'}`
