@@ -1,19 +1,24 @@
 """Tests for vibesys.loops.agent — orchestrator-driven build loop."""
 
 import json
+import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack, cast
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 from vibesys.agents import AgentClient
+from vibesys.config import Config, as_config
+from vibesys.constants import ComputeBackend
 from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationError
+from vibesys.input_manifest import BenchmarkResult, WorkspaceSource
 from vibesys.loops.agent import issue_board
 from vibesys.loops.agent.loop import (
     FrameworkBenchmarkOutcome,
-    _ActiveHypothesis,
     _backfill_revert_commit,
     _candidate_evidence_is_fresh,
     _invoke_read_only_role,
@@ -28,15 +33,17 @@ from vibesys.loops.agent.loop import (
     _terminal_workspace_notice,
     run_agent_loop,
 )
-from vibesys.loops.agent.state import AgentStateStore
+from vibesys.loops.agent.model import Hypothesis
+from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.evolve.population import Objective
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.prompts import PROMPTS_DIR
-from vibesys.run import GitTracker
-from vibesys.sandbox.run_environment import make_run_environment_spec
+from vibesys.run import GitTracker, RepositoryVisibility
+from vibesys.sandbox.run_environment import RunEnvironmentSpec, make_run_environment_spec
 from vibesys.schemas import (
     CandidateDisposition,
     HypothesisOutcome,
+    HypothesisStrategyUpdate,
     ImplementerResponse,
     JudgeResponse,
     OrchestratorPlan,
@@ -49,6 +56,9 @@ from vibesys.schemas import (
 )
 from vs_loop_state.agent import RoundRecord
 from vs_project import Project, serialize_round
+
+if TYPE_CHECKING:
+    from vibesys.run.protocol import LoopContext
 
 # ---------------------------------------------------------------------------
 # Fixtures & helpers
@@ -65,13 +75,16 @@ def test_missing_implementer_response_fails_closed():  # noqa: ANN201  # tracked
 
 
 def test_legacy_active_hypothesis_backfills_framework_revert_commit():  # noqa: ANN201  # tracked: #288
-    state = _ActiveHypothesis(
-        plan=OrchestratorPlan(
-            task="restore parent",
-            pass_criteria="review",  # noqa: S106  # tracked: #288
-            revert_to_round=28,
-            reasoning="resume an older run",
-        ),
+    plan = OrchestratorPlan(
+        hypothesis_id="restore-parent",
+        task="restore parent",
+        pass_criteria="review",  # noqa: S106  # tracked: #288
+        revert_to_round=28,
+        reasoning="resume an older run",
+    )
+    state = Hypothesis(
+        hypothesis_id=plan.hypothesis_id,
+        plan=plan,
         started_round=34,
         parent_round=28,
         revert_applied=True,
@@ -248,34 +261,85 @@ def _make_orchestrate_runner(  # noqa: ANN202, PLR0913  # tracked: #288
     return runner
 
 
-def _invoke_orchestrate(tmp_path, ref_file, runner, **kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
+class _AgentLoopArguments(TypedDict, total=False):
+    """The keyword surface of :func:`run_agent_loop`, mirrored for the harness."""
+
+    config: Config
+    exp_name: str
+    input_path: str
+    accuracy_command: str
+    benchmark_command: str
+    objective: str
+    runs_dir: Path | None
+    task_name: str | None
+    task_root: Path | None
+    objectives: list[Objective] | None
+    pareto_relative_noise: float
+    workspace_sources: tuple[WorkspaceSource, ...]
+    evaluator_path: Path | None
+    evaluator_package_root: Path | None
+    benchmark_result: BenchmarkResult | None
+    benchmark_result_protocol: Literal[2] | None
+    accuracy_timeout_seconds: int | None
+    benchmark_timeout_seconds: int | None
+    max_rounds: int
+    max_retries_per_round: int
+    judge_every: int
+    official_eval_every: int
+    memory_layout: str
+    start_round: int | None
+    existing: bool
+    operator_constraints: tuple[str, ...]
+    trusted_input_baseline: str | None
+    debug: bool
+    profiler_kind: ProfilerKind
+    skills_dirs: list[str] | None
+    run_environment: RunEnvironmentSpec | None
+    agent_backend: str | None
+    cli_provider: str | None
+    backend: ComputeBackend
+    modality: str | None
+    inner_loop: str
+    domain: DomainName | None
+    interface: str
+    remote_repo: str | None
+    repo_visibility: RepositoryVisibility
+
+
+def _invoke_orchestrate(
+    tmp_path: Path,
+    ref_file: str,
+    runner: MagicMock,
+    *,
+    _accuracy_gate_results: Sequence[str | None] | None = None,
+    **kwargs: Unpack[_AgentLoopArguments],
+) -> bool:
     """Shared plumbing: patch context globals, run the loop, return result."""
-    accuracy_gate_results = kwargs.pop("_accuracy_gate_results", None)
-    defaults = dict(  # noqa: C408  # tracked: #288
-        config={"model": {"name": "claude-sonnet-4-6"}},
-        exp_name="test-orch",
-        runs_dir=tmp_path / "exp_env",
-        input_path=str(Path(ref_file).parent),
-        accuracy_command="uv run python accuracy_checker/checker.py",
-        benchmark_command="uv run python benchmark/benchmark.py",
-        objective="Maximize tok/s throughput.",
-        max_rounds=5,
-        max_retries_per_round=2,
-        domain=DomainName.LLM_SERVING,
-    )
+    defaults: _AgentLoopArguments = {
+        "config": as_config({"model": {"name": "claude-sonnet-4-6"}}),
+        "exp_name": "test-orch",
+        "runs_dir": tmp_path / "exp_env",
+        "input_path": str(Path(ref_file).parent),
+        "accuracy_command": "uv run python accuracy_checker/checker.py",
+        "benchmark_command": "uv run python benchmark/benchmark.py",
+        "objective": "Maximize tok/s throughput.",
+        "max_rounds": 5,
+        "max_retries_per_round": 2,
+        "domain": DomainName.LLM_SERVING,
+    }
     defaults.update(kwargs)
     with (
         patch("vibesys.context.build_model", return_value="mock-model"),
-        patch("vibesys.backends.cuda.LocalShellBackend"),
+        patch("vibesys.backends.cuda.make_local_shell_sandbox"),
         patch("vibesys.context.build_agent_client", return_value=runner),
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
         patch(
             "vibesys.loops.agent.loop._run_framework_accuracy_gate",
-            side_effect=accuracy_gate_results,
+            side_effect=_accuracy_gate_results,
             return_value=None,
         ),
     ):
-        return run_agent_loop(**defaults)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        return run_agent_loop(**defaults)
 
 
 def _created_project(tmp_path: Path) -> Path:
@@ -295,15 +359,20 @@ def _run_id(project: Path) -> str:
 
 def _round_payloads(tmp_path: Path) -> list[dict[str, object]]:
     project = _created_project(tmp_path)
-    records = Project.open(project).state.load_rounds(_run_id(project))
+    state = Project.open(project).state
+    records = AgentRunStateStore(state.portable_namespace(_run_id(project), "agent")).load().rounds
     assert records
     return [json.loads(serialize_round(record)) for record in records]
 
 
-def _active_hypothesis(tmp_path: Path) -> _ActiveHypothesis | None:
+def _active_hypothesis(tmp_path: Path) -> Hypothesis | None:
     project = _created_project(tmp_path)
     store = Project.open(project).state
-    return AgentStateStore(store.local_namespace(_run_id(project), "agent")).load_active()
+    return (
+        AgentRunStateStore(store.portable_namespace(_run_id(project), "agent"))
+        .load()
+        .active_hypothesis
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -320,17 +389,19 @@ def test_project_configuration_captures_effective_agent_behavior(tmp_path: Path)
         pytest.raises(RuntimeError, match="captured project configuration"),
     ):
         run_agent_loop(
-            config={  # pyright: ignore[reportArgumentType]  # tracked: #297
-                "model": {"name": "gpt-default"},
-                "thinking": {"level": "high"},
-                "agent": {
-                    "backend": "cli",
-                    "cli_provider": "codex",
-                    "cli_timeout": 900,
-                    "outer": {"model": "gpt-outer", "reasoning_effort": "xhigh"},
-                    "inner": {"model": "gpt-inner", "reasoning_effort": "medium"},
-                },
-            },
+            config=as_config(
+                {
+                    "model": {"name": "gpt-default"},
+                    "thinking": {"level": "high"},
+                    "agent": {
+                        "backend": "cli",
+                        "cli_provider": "codex",
+                        "cli_timeout": 900,
+                        "outer": {"model": "gpt-outer", "reasoning_effort": "xhigh"},
+                        "inner": {"model": "gpt-inner", "reasoning_effort": "medium"},
+                    },
+                }
+            ),
             exp_name="queue",
             input_path=str(tmp_path),
             accuracy_command="check",
@@ -378,6 +449,7 @@ def test_project_configuration_captures_effective_agent_behavior(tmp_path: Path)
         "inner_model": "gpt-inner",
         "inner_reasoning_effort": "medium",
         "operator_constraints": ("Preserve ordering",),
+        "objectives": (),
         "run_environment": {
             "name": "modal",
             "image": None,
@@ -508,7 +580,10 @@ def test_read_only_role_preserves_allowed_roadmap_and_reverts_other_writes(tmp_p
     )
 
     result = _invoke_read_only_role(
-        ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        # Deliberately a partial double: role isolation touches only these five
+        # members, and SimpleNamespace fails loudly on anything else, which is
+        # the property this test pins.
+        cast("LoopContext", ctx),
         role="orchestrator",
         checkpoint_label="round-2-plan-input",
         allowed_workspace_paths=("roadmap/index.md",),
@@ -553,7 +628,8 @@ def test_read_only_role_preserves_allowed_directory_and_reverts_candidate_edits(
     )
 
     result = _invoke_read_only_role(
-        ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        # Partial double, same rationale as the orchestrator case above.
+        cast("LoopContext", ctx),
         role="profiler",
         checkpoint_label="round-2-profiler-input",
         allowed_workspace_paths=("progress/profiles/round-0002",),
@@ -700,6 +776,32 @@ def test_official_evaluation_cadence_counts_reviewed_frontier_tradeoff():  # noq
     ]
 
     assert _provisional_candidates_since_official(records) == 1
+
+
+def test_typed_unknown_retention_is_not_trusted_as_pareto_state():  # noqa: ANN201  # tracked: #288
+    record = RoundRecord(
+        round_number=2,
+        commit="b" * 40,
+        perf_metric=None,
+        perf_unit=None,
+        passed=True,
+        reviewed=True,
+        hypothesis_id="qualitative-result",
+        hypothesis_declared_outcome="supported",
+        judge_verdict="pass",
+        hypothesis_outcome="proven",
+        candidate_disposition=CandidateDisposition.PARETO_FRONTIER.value,
+        candidate_metrics={"throughput": 120.0, "latency": 90.0},
+        candidate_retained=None,
+    )
+
+    assert (
+        _pareto_frontier_records(
+            [record],
+            [Objective("throughput", "max"), Objective("latency", "min")],
+        )
+        == []
+    )
 
 
 def test_noise_aware_dominance_preserves_sub_noise_alternatives():  # noqa: ANN201  # tracked: #288
@@ -1050,6 +1152,63 @@ def test_progress_writes_orchestrator_plan(tmp_path):  # noqa: ANN001, ANN201  #
     assert "Retain at >=1.15x with no latency regression" in text
 
 
+def test_invalid_hypothesis_update_is_not_written_to_progress(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="new-hypothesis",
+                hypothesis_updates=[
+                    HypothesisStrategyUpdate(
+                        hypothesis_id="unknown-hypothesis",
+                        disposition="abandoned",
+                        reason="This identifier was never created.",
+                    )
+                ],
+                task="attempt an invalid transition",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise fail-closed validation",
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unknown hypothesis"):
+        _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=1)
+
+    project = _created_project(tmp_path)
+    assert not list(project.rglob("plans/round-0001.json"))
+    assert all(
+        "attempt an invalid transition" not in path.read_text() for path in project.rglob("*.md")
+    )
+
+
+def test_reused_hypothesis_id_is_not_written_to_progress(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="already-used",
+                task="complete the first investigation",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="create the identifier",
+            ),
+            OrchestratorPlan(
+                hypothesis_id="already-used",
+                task="incorrectly reuse the identifier",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise unique identity validation",
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="already used"):
+        _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=2)
+
+    project = _created_project(tmp_path)
+    assert not list(project.rglob("plans/round-0002.json"))
+    assert all(
+        "incorrectly reuse the identifier" not in path.read_text() for path in project.rglob("*.md")
+    )
+
+
 @pytest.mark.parametrize(
     ("progress_name", "artifact_root"),
     [("progress", "progress"), ("progress.md", "progress-artifacts")],
@@ -1387,7 +1546,8 @@ def test_framework_local_validation_fails_and_restores_mutation(tmp_path):  # no
         progress_path=progress,
     )
 
-    assert "mutated the workspace" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert feedback is not None
+    assert "mutated the workspace" in feedback
     ctx.git.checkout_tree.assert_called_once_with("b" * 40, clean=True)
     artifact = progress / "validation" / "round-0003-attempt-01.json"
     assert '"passed": false' in artifact.read_text()
@@ -1435,8 +1595,9 @@ def test_framework_accuracy_gate_rejects_checker_failure(tmp_path):  # noqa: ANN
         progress_path=tmp_path / "progress.md",
     )
 
-    assert "Framework accuracy gate failed" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
-    assert "bad history" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert feedback is not None
+    assert "Framework accuracy gate failed" in feedback
+    assert "bad history" in feedback
 
 
 def test_framework_accuracy_gate_uses_manifest_timeout(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1526,7 +1687,8 @@ def test_framework_accuracy_gate_rejects_evaluator_changes_without_execution(tmp
         progress_path=tmp_path / "progress.md",
     )
 
-    assert "Evaluator-owned files were modified" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert feedback is not None
+    assert "Evaluator-owned files were modified" in feedback
     ctx.judge_backend.execute.assert_not_called()
 
 
@@ -1547,7 +1709,8 @@ def test_framework_accuracy_gate_rejects_changes_during_execution(tmp_path):  # 
         progress_path=tmp_path / "progress.md",
     )
 
-    assert "changed during accuracy execution" in feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert feedback is not None
+    assert "changed during accuracy execution" in feedback
 
 
 def test_framework_gates_reuse_accuracy_pass_after_later_gate_failure(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1707,7 +1870,8 @@ def test_framework_benchmark_rejects_ambiguous_metric(tmp_path):  # noqa: ANN001
     )
 
     assert outcome.metric_value is None
-    assert "expected exactly one 'ops' field" in outcome.feedback  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert outcome.feedback is not None
+    assert "expected exactly one 'ops' field" in outcome.feedback
 
 
 # ---------------------------------------------------------------------------
@@ -1915,7 +2079,7 @@ def test_loop_round_one_no_profile_runs_one_round(tmp_path, ref_file):  # noqa: 
     assert runner.counters["judge"] == 1
 
 
-def test_continuing_hypothesis_uses_canonical_local_state(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+def test_continuing_hypothesis_uses_unified_run_state(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
     runner = _make_orchestrate_runner(
         plans=[
             OrchestratorPlan(
@@ -1934,6 +2098,185 @@ def test_continuing_hypothesis_uses_canonical_local_state(tmp_path, ref_file):  
     assert active is not None
     assert active.plan.hypothesis_id == "continue-canonical"
     assert [round_data["round"] for round_data in _round_payloads(tmp_path)] == [1]
+
+
+def test_orchestrator_title_is_normalized_after_the_structured_call(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    raw_title = "  " + ("A" * 50 + " " + "B" * 20) + "  "
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="normalize-title",
+                title=raw_title,
+                task="normalize the title",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise title normalization",
+            )
+        ],
+        implementer_outcomes=[HypothesisOutcome.CONTINUE],
+    )
+
+    assert _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=1) is True
+
+    active = _active_hypothesis(tmp_path)
+    assert active is not None
+    assert active.plan.title == "A" * 50 + "…"
+
+
+def test_orchestrator_title_stays_empty_when_the_model_gives_none(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="no-title",
+                task="proceed without a title",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise the empty-title passthrough",
+            )
+        ],
+        implementer_outcomes=[HypothesisOutcome.CONTINUE],
+    )
+
+    assert _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=1) is True
+
+    active = _active_hypothesis(tmp_path)
+    assert active is not None
+    assert active.plan.title == ""
+
+
+def test_resume_migrates_legacy_hypothesis_state_without_losing_continuation(
+    tmp_path: Path,
+    ref_file: str,
+) -> None:
+    first_runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="legacy-continuation",
+                task="finish the interrupted change",
+                pass_criteria="review",  # noqa: S106  # tracked: #288
+                reasoning="exercise migration at the loop boundary",
+            )
+        ],
+        implementer_outcomes=[HypothesisOutcome.CONTINUE],
+    )
+    assert _invoke_orchestrate(tmp_path, ref_file, first_runner, max_rounds=1) is True
+
+    project_path = _created_project(tmp_path)
+    project = Project.open(project_path)
+    run_id = _run_id(project_path)
+    portable = project.state.portable_namespace(run_id, "agent")
+    local = project.state.local_namespace(run_id, "agent")
+    unified = AgentRunStateStore(portable).load()
+    hypothesis = unified.active_hypothesis
+    assert hypothesis is not None
+    assert len(hypothesis.rounds) == 1
+
+    portable_root = portable.external_directory()
+    local_root = local.external_directory()
+    portable.apply(portable.transition("state.json", None))
+    (portable_root / "rounds").mkdir(parents=True, exist_ok=True)
+    (portable_root / "rounds" / "0001.json").write_bytes(serialize_round(hypothesis.rounds[0]))
+    (portable_root / "hypotheses.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hypotheses": [
+                    {
+                        "hypothesis_id": hypothesis.hypothesis_id,
+                        "claim": hypothesis.plan.hypothesis,
+                        "task": hypothesis.plan.task,
+                        "started_round": hypothesis.started_round,
+                        "rounds": [1],
+                        "parent_round": hypothesis.parent_round,
+                        "parent_commit": hypothesis.parent_commit,
+                        "declared_outcome": hypothesis.declared_outcome,
+                        "review": hypothesis.review,
+                        "resolution": hypothesis.resolution,
+                        "measurement": hypothesis.measurement.model_dump(mode="json")
+                        if hypothesis.measurement is not None
+                        else None,
+                        "candidate_retained": hypothesis.candidate_retained,
+                        "strategy": "active",
+                        "strategy_reason": None,
+                    }
+                ],
+            },
+            default=str,
+        )
+    )
+    local_root.mkdir(parents=True, exist_ok=True)
+    active_payload = hypothesis.model_dump(
+        mode="json",
+        include={
+            "plan",
+            "started_round",
+            "parent_round",
+            "parent_commit",
+            "feedback",
+            "next_step",
+            "continuation_rounds",
+            "revert_applied",
+            "revert_commit",
+            "gate_revalidation_pending",
+            "gate_approved_perf_metric",
+            "gate_approved_perf_unit",
+            "gate_approved_metrics",
+            "gate_approved_evaluation_artifact",
+            "gate_approved_candidate_disposition",
+            "gate_approved_candidate_metrics",
+            "gate_approved_candidate_evaluation_artifact",
+            "gate_approved_candidate_operating_point",
+            "gate_approved_candidate_retention_reason",
+            "gate_candidate_commit",
+            "gate_accuracy_passed",
+        },
+    )
+    active_payload["schema_version"] = 1
+    (local_root / "active.json").write_text(json.dumps(active_payload))
+    subprocess.run(
+        ["git", "add", "-A", "--", ".vibesys"],  # noqa: S607  # test fixture
+        cwd=project_path,
+        check=True,
+    )
+    subprocess.run(
+        [  # noqa: S607  # test fixture
+            "git",
+            "-c",
+            "user.name=VibeSys Test",
+            "-c",
+            "user.email=test@vibesys.invalid",
+            "commit",
+            "-m",
+            "test: restore legacy hypothesis state",
+        ],
+        cwd=project_path,
+        check=True,
+        capture_output=True,
+    )
+
+    resumed_runner = _make_orchestrate_runner(
+        plans=[],
+        implementer_outcomes=[HypothesisOutcome.NOMINATED],
+    )
+    assert (
+        _invoke_orchestrate(
+            tmp_path,
+            str(project_path / "resume-input"),
+            resumed_runner,
+            exp_name=run_id,
+            existing=True,
+            start_round=2,
+            max_rounds=2,
+        )
+        is True
+    )
+
+    migrated = AgentRunStateStore(portable).load()
+    migrated_hypothesis = migrated.by_id("legacy-continuation")
+    assert migrated_hypothesis is not None
+    assert [record.round_number for record in migrated_hypothesis.rounds] == [1, 2]
+    assert resumed_runner.counters["orch_plan"] == 0
+    assert not (portable_root / "hypotheses.json").exists()
+    assert not (portable_root / "rounds").exists()
+    assert not (local_root / "active.json").exists()
 
 
 def test_agent_roles_reference_framework_owned_effective_objective(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
@@ -2835,6 +3178,13 @@ def test_hypothesis_revert_is_applied_once_across_continuation_rounds(tmp_path, 
             ),
             OrchestratorPlan(
                 hypothesis_id="continued-repair",
+                hypothesis_updates=[
+                    HypothesisStrategyUpdate(
+                        hypothesis_id="seed",
+                        disposition="abandoned",
+                        reason="The later evidence invalidated this direction.",
+                    )
+                ],
                 task="start from parent and continue",
                 pass_criteria="review",  # noqa: S106  # tracked: #288
                 revert_to_round=1,
@@ -2909,6 +3259,13 @@ def test_hypothesis_revert_is_applied_once_across_continuation_rounds(tmp_path, 
         in call.kwargs["system_prompt"].replace("\n", " ")
         for call in judge_calls
     )
+    project = _created_project(tmp_path)
+    store = Project.open(project).state
+    agent_run_state = AgentRunStateStore(store.portable_namespace(_run_id(project), "agent")).load()
+    seed = agent_run_state.by_id("seed")
+    assert seed is not None
+    assert seed.strategy.value == "abandoned"
+    assert seed.strategy_reason == "The later evidence invalidated this direction."
 
 
 def test_failed_hypothesis_revert_is_retried_and_not_claimed_as_applied(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
@@ -3032,6 +3389,74 @@ def test_official_framework_benchmark_scalar_populates_round_metrics(tmp_path, r
     # The trusted framework scalar is promoted into the objective row even
     # though the implementer reported no accepted_metrics.
     assert rounds[0]["metrics"] == {"tok/s": 512.0}
+
+
+def test_official_regression_disproves_and_drops_queue_candidate(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="m2-preallocated-spsc-ring",
+                hypothesis="preallocation improves queue throughput",
+                task="establish the measured parent",
+                pass_criteria="queue remains correct",  # noqa: S106  # tracked: #288
+                reasoning="establish the parent",
+            ),
+            OrchestratorPlan(
+                hypothesis_id="m3-pow2-mask-addressing",
+                hypothesis="mask addressing improves queue throughput",
+                task="replace modulo with mask addressing",
+                pass_criteria="queue remains correct",  # noqa: S106  # tracked: #288
+                reasoning="test the next mechanism",
+            ),
+        ]
+    )
+    benchmark_results = [
+        FrameworkBenchmarkOutcome(
+            metric_name="total_ops_per_sec",
+            metric_value=104_257_741.0,
+            metric_direction="max",
+        ),
+        FrameworkBenchmarkOutcome(
+            metric_name="total_ops_per_sec",
+            metric_value=97_028_091.721612,
+            metric_direction="max",
+        ),
+    ]
+
+    with patch(
+        "vibesys.loops.agent.loop._run_framework_benchmark",
+        side_effect=benchmark_results,
+    ):
+        _invoke_orchestrate(
+            tmp_path,
+            ref_file,
+            runner,
+            max_rounds=2,
+            official_eval_every=1,
+            benchmark_result=BenchmarkResult(
+                json_argument="--output-json",
+                metric="total_ops_per_sec",
+            ),
+        )
+
+    rounds = _round_payloads(tmp_path)
+    assert rounds[1]["judge_verdict"] == "pass"
+    assert rounds[1]["hypothesis_declared_outcome"] == "nominated"
+    assert rounds[1]["hypothesis_outcome"] == "disproven"
+    assert rounds[1]["candidate_retained"] is False
+    assert rounds[1]["perf_baseline_round"] == 1
+    assert rounds[1]["perf_baseline_metric"] == 104_257_741.0
+
+    project = _created_project(tmp_path)
+    store = Project.open(project).state
+    agent_run_state = AgentRunStateStore(store.portable_namespace(_run_id(project), "agent")).load()
+    m3 = agent_run_state.by_id("m3-pow2-mask-addressing")
+    assert m3 is not None
+    assert m3.resolution is not None
+    assert m3.resolution.value == "disproven"
+    assert m3.candidate_retained is False
 
 
 def test_loop_retries_when_framework_accuracy_gate_fails(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288

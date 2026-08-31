@@ -18,10 +18,72 @@ if TYPE_CHECKING:
 
 DEFAULT_AGENT_DRIVER = "agentshim"
 
+AGENT_DRIVERS: tuple[str, ...] = ("agentshim", "omnigent", "mock")
+"""Every driver this application configuration can select.
+
+``mock`` is test infrastructure: it satisfies the same driver contract while
+streaming a deterministic playbook, so integration tests exercise the real
+client, sink, supervisor, and transport path without an agent CLI.
+"""
+
 
 def resolve_agent_driver(config: Config) -> str:
     """Resolve the configured agent driver, defaulting to agentshim."""
     return config.agent.driver or DEFAULT_AGENT_DRIVER
+
+
+def agent_driver_supports_mcp_servers(
+    config: Config,
+    *,
+    agent_backend: str | None,
+) -> bool | None:
+    """Return whether the configured external driver supports session MCP.
+
+    This query has no runtime side effects, so wiring code can reject an
+    incompatible feature before creating a project or driver resources.
+    Non-CLI backends do not use the external-driver contract.
+    """
+    backend = agent_backend or config.agent.backend or DEFAULT_AGENT_BACKEND
+    if backend != "cli":
+        return None
+
+    driver_name = resolve_agent_driver(config)
+    if driver_name == "omnigent":
+        from vibesys.agents.drivers.omnigent import OMNIGENT_CAPABILITIES  # noqa: PLC0415
+
+        return OMNIGENT_CAPABILITIES.mcp_servers
+    if driver_name == "mock":
+        from vibesys.agents.drivers.mock import MOCK_CAPABILITIES  # noqa: PLC0415
+
+        return MOCK_CAPABILITIES.mcp_servers
+
+    from vibesys.agents.drivers.agentshim import AGENTSHIM_CAPABILITIES  # noqa: PLC0415
+
+    return AGENTSHIM_CAPABILITIES.mcp_servers
+
+
+def supported_cli_providers(driver_name: str) -> tuple[str, ...]:
+    """Return the provider names one external driver supports.
+
+    Raises ``ValueError`` for an unknown driver so callers validating a
+    requested driver/provider pair reject both halves before building
+    anything.
+    """
+    if driver_name == "omnigent":
+        from vibesys.agents.omnigent.providers import supported_providers  # noqa: PLC0415
+
+        return tuple(supported_providers())
+    if driver_name == "agentshim":
+        from vibesys.agents.drivers.agentshim import supported_providers  # noqa: PLC0415
+
+        return tuple(supported_providers())
+    if driver_name == "mock":
+        from vibesys.agents.drivers.mock import supported_providers  # noqa: PLC0415
+
+        return tuple(supported_providers())
+    raise ValueError(  # noqa: TRY003  # tracked: #288
+        f"unknown agent driver {driver_name!r}; expected one of: {', '.join(AGENT_DRIVERS)}"
+    )
 
 
 def build_agent_client(  # noqa: C901, PLR0912, PLR0913
@@ -87,7 +149,13 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
     timeout = agent_cfg.cli_timeout
     driver_log = AgentDiagnosticLog(run_log_file)
 
-    if driver_name == "omnigent":
+    if driver_name == "mock":
+        from vibesys.agents.drivers.mock import MockDriver  # noqa: PLC0415
+
+        # The mock runs no agent, so the provider name only labels the run.
+        provider = "mock"
+        driver = MockDriver()
+    elif driver_name == "omnigent":
         if use_docker:
             raise SystemExit(  # noqa: TRY003  # tracked: #288
                 "agent.driver='omnigent' is not supported with --docker"
@@ -137,6 +205,7 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
 
     return AgentClient(
         driver,
+        driver_name=driver_name,
         provider=provider,
         skills=skill_source_dirs,
         compute_backend=compute_backend,

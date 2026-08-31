@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shlex
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,12 +11,15 @@ import pytest
 from vibesys.agents import cli_docker
 from vibesys.agents.cli_docker import DockerAuthPath
 from vibesys.backends import SandboxKind
+from vibesys.constants import ComputeBackend
 from vibesys.domains.environment import EnvironmentBindMount
 from vibesys.evaluators import EvaluatorPackageRequirement, resolve_evaluator_package
 from vibesys.input_manifest import load_project_task
+from vibesys.profilers import ProfilerKind
 from vibesys.sandbox.run_environment import (
     RunEnvironmentRequest,
     RunEnvironmentSpec,
+    _SkyPilotRunEnvironmentSession,
     build_run_environment,
     make_run_environment_spec,
     run_environment_record,
@@ -23,23 +27,44 @@ from vibesys.sandbox.run_environment import (
 from vs_project import Project, RunEnvironmentRecord, RunResourceRequest
 from vs_sandbox import ProjectPathPolicy
 
+if TYPE_CHECKING:
+    from deepagents.backends.protocol import SandboxBackendProtocol
+
+    from vibesys.backends.base import ContentionMonitor
+
+
+# A committed two-file overlay, not a submodule: the contract under test is
+# how the run environment expands and quotes nested shell argv, not any
+# particular candidate repository.
+NESTED_SHELL_PROJECT = Path(__file__).parent / "fixtures" / "nested_shell_project"
+
 
 class FakeBackend:
+    """Structural stand-in for ``ComputeBackendImpl`` that records sandbox calls."""
+
     image = "fake-image"
+    name: ComputeBackend = ComputeBackend.CPU
+    profiler_kind: ProfilerKind = ProfilerKind.LINUX_CPU
 
     def __init__(self) -> None:
         self.sandbox = MagicMock()
-        self.calls = []
+        self.calls: list[tuple[SandboxKind, dict[str, Any]]] = []
 
-    def make_sandbox(self, kind, **kwargs):  # noqa: ANN001, ANN003, ANN201  # tracked: #288
+    def make_sandbox(self, kind: SandboxKind, **kwargs: Any) -> SandboxBackendProtocol:  # noqa: ANN401  # tracked: #288
         self.calls.append((kind, kwargs))
         return self.sandbox
 
+    def make_monitor(self, log_dir: Path) -> ContentionMonitor | None:  # noqa: ARG002  # tracked: #288
+        return None
 
-def _request(tmp_path: Path, backend: FakeBackend, **overrides):  # noqa: ANN003, ANN202  # tracked: #288
+    def reselect_device(self) -> None:
+        return
+
+
+def _request(tmp_path: Path, backend: FakeBackend, **overrides: Any) -> RunEnvironmentRequest:  # noqa: ANN401  # tracked: #288
     workspace = overrides.pop("workspace", tmp_path / "workspace")
     workspace.mkdir(exist_ok=True)
-    values = dict(  # noqa: C408  # tracked: #288
+    values: dict[str, Any] = dict(  # noqa: C408  # tracked: #288
         log_dir=tmp_path / "logs",
         workspace=workspace,
         ref_dir=None,
@@ -49,12 +74,12 @@ def _request(tmp_path: Path, backend: FakeBackend, **overrides):  # noqa: ANN003
         run_id="run-123",
     )
     values.update(overrides)
-    values["log_dir"].mkdir(exist_ok=True)  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
-    return RunEnvironmentRequest(**values)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    values["log_dir"].mkdir(exist_ok=True)
+    return RunEnvironmentRequest(**values)
 
 
 @pytest.fixture(autouse=True)
-def _synthetic_cli_auth(monkeypatch):  # pyright: ignore[reportUnusedFunction]  # noqa: ANN001, ANN202
+def _synthetic_cli_auth(monkeypatch):  # noqa: ANN001, ANN202
     """Pin a deterministic host auth source for container CLI setup.
 
     ``_cli_container_setup`` fails loud when a provider has neither a staged
@@ -293,13 +318,12 @@ def test_environment_quotes_project_root_after_token_expansion(tmp_path: Path) -
     ]
 
 
-def test_environment_quotes_hotel_nested_shell_paths(tmp_path: Path) -> None:
+def test_environment_quotes_nested_shell_paths(tmp_path: Path) -> None:
     backend = FakeBackend()
     workspace = tmp_path / "candidate's; touch injected"
     workspace.mkdir()
-    project = Path("examples/microservices/repositories/deathstarbench").resolve()
-    vibesys_project = Project.open(project)
-    bundle = load_project_task(vibesys_project, vibesys_project.select_task("hotel-reservation"))
+    vibesys_project = Project.open(NESTED_SHELL_PROJECT)
+    bundle = load_project_task(vibesys_project, vibesys_project.select_task("nested-shell"))
     env = build_run_environment(RunEnvironmentSpec("local"))
 
     session = env.open(
@@ -317,7 +341,7 @@ def test_environment_quotes_hotel_nested_shell_paths(tmp_path: Path) -> None:
     assert command is not None
     outer = shlex.split(command)
     nested = json.loads(outer[outer.index("--run-command-json") + 1])
-    assert nested[5] == str(workspace / "hotelReservation" / "docker-compose.yml")
+    assert nested[5] == str(workspace / "service" / "docker-compose.yml")
     assert "${PROJECT_ROOT}" not in json.dumps(nested)
 
 
@@ -645,7 +669,8 @@ def test_modal_environment_owns_candidate_runtime_naming(tmp_path):  # noqa: ANN
     assert runtime.deployment_name is not None
     assert runtime.deployment_name.endswith("-g12c7")
     assert len(runtime.deployment_name) <= 63
-    assert session.view.deployment_namespace in runtime.prompt_notes  # pyright: ignore[reportOperatorIssue]  # tracked: #297
+    assert session.view.deployment_namespace is not None
+    assert session.view.deployment_namespace in runtime.prompt_notes
     assert "Candidate-specific namespace override" in runtime.prompt_notes
     assert runtime.deployment_name in runtime.prompt_notes
 
@@ -871,7 +896,7 @@ def test_modal_environment_uses_explicit_run_id_for_namespace(tmp_path):  # noqa
         log_dir=log_a,
         workspace=ws_a,
         ref_dir=None,
-        backend=backend_a,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        backend=backend_a,
         agent_backend="cli",
         cli_provider="codex",
         run_id="20260429-100000-runa",
@@ -880,7 +905,7 @@ def test_modal_environment_uses_explicit_run_id_for_namespace(tmp_path):  # noqa
         log_dir=log_b,
         workspace=ws_b,
         ref_dir=None,
-        backend=backend_b,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        backend=backend_b,
         agent_backend="cli",
         cli_provider="codex",
         run_id="20260429-100100-runb",
@@ -1011,15 +1036,20 @@ remote_artifact_root = "/remote/vibesys"
         "benchmark": ("python", "benchmark.py"),
     }
     assert captures["benchmark_output_argument"] == "--output-json"
-    assert session.view.paths.accuracy_command.endswith(" accuracy")  # type: ignore[union-attr]
-    assert session.view.paths.benchmark_command.endswith(" benchmark")  # type: ignore[union-attr]
+    assert session.view.paths.accuracy_command is not None
+    assert session.view.paths.accuracy_command.endswith(" accuracy")
+    assert session.view.paths.benchmark_command is not None
+    assert session.view.paths.benchmark_command.endswith(" benchmark")
     assert session.view.profile_execution == "remote"
     assert session.view.supports_parallel_candidate_evaluation is False
 
     session.close()
     session.close()
     backend.sandbox.stop.assert_called_once()
-    assert session.bridge.closed == 1
+    assert isinstance(session, _SkyPilotRunEnvironmentSession)
+    bridge = session.bridge
+    assert isinstance(bridge, FakeBridge)
+    assert bridge.closed == 1
 
 
 def test_docker_remove_workspace_child_quotes_path(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1039,7 +1069,7 @@ def test_docker_remove_workspace_child_quotes_path(tmp_path, monkeypatch):  # no
     ok = env.remove_workspace_child(
         tmp_path,
         "semi;touch hacked",
-        backend=backend,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        backend=backend,
     )
 
     assert ok is True

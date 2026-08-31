@@ -7,7 +7,7 @@ import json
 from pathlib import Path  # noqa: TC003
 
 import pytest
-from tui_packaging import (  # pyright: ignore[reportMissingImports]
+from tui_packaging import (
     TuiPackagingError,
     stage_prebuilt_tui,
     validate_tui_payload,
@@ -26,6 +26,10 @@ def _write_payload(
         "app/dist/launcher.js": b"// launcher\n",
         "app/dist/self-test.js": b"// self-test\n",
         "app/package.json": json.dumps({"name": "@vibesys/tui", "version": tui_version}).encode(),
+        "app/node_modules/@vibesys/backend-client/package.json": b'{"name":"@vibesys/backend-client"}\n',
+        "app/node_modules/@vibesys/backend-client/dist/index.js": b"// backend client\n",
+        "app/node_modules/@vibesys/core-state/package.json": b'{"name":"@vibesys/core-state"}\n',
+        "app/node_modules/@vibesys/core-state/dist/index.js": b"// core state\n",
         "app/node_modules/@opentui/core/index.js": b"// core\n",
         "app/node_modules/@opentui/core-linux-x64/index.js": b"// native\n",
         "licenses/BUN-LICENSE.md": b"Bun license\n",
@@ -93,6 +97,19 @@ def test_tui_payload_rejects_manifest_and_package_version_drift(tmp_path: Path) 
         validate_tui_payload(source, expected_target="linux-x86_64")
 
 
+def test_tui_payload_rejects_checkout_specific_dependencies(tmp_path: Path) -> None:
+    source = _write_payload(tmp_path / "source")
+    package_path = source / "app" / "package.json"
+    package = json.loads(package_path.read_text())
+    package["dependencies"] = {
+        "@vibesys/core-state": "@vibesys/core-state@file:///build/clients/core-state"
+    }
+    package_path.write_text(json.dumps(package))
+
+    with pytest.raises(TuiPackagingError, match="local path"):
+        validate_tui_payload(source, expected_target="linux-x86_64")
+
+
 def test_optional_staging_without_a_payload_is_a_noop(tmp_path):  # noqa: ANN001, ANN201
     destination = tmp_path / "destination"
 
@@ -110,6 +127,8 @@ def test_required_staging_rejects_a_missing_payload(tmp_path):  # noqa: ANN001, 
     [
         ("app/dist/launcher.js", "launcher.js"),
         ("app/dist/self-test.js", "self-test.js"),
+        ("app/node_modules/@vibesys/backend-client/dist/index.js", "backend-client"),
+        ("app/node_modules/@vibesys/core-state/dist/index.js", "core-state"),
         ("licenses/BUN-LICENSE.md", "BUN-LICENSE"),
         ("licenses/opentui-core.txt", "opentui-core"),
     ],

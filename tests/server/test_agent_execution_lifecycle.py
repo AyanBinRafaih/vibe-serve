@@ -66,6 +66,95 @@ def test_explicit_executions_remain_independent_and_finish_idempotently(tmp_path
     )
 
 
+def test_start_agent_execution_records_runtime_identity_when_provided(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.start_agent_execution(
+        "implementer",
+        "round-1",
+        "work",
+        driver="agentshim",
+        provider="codex",
+        model="gpt-5.1-codex-max",
+    )
+
+    started = next(
+        event
+        for event in supervisor.read_events()
+        if event.type is EventType.AGENT_EXECUTION_STARTED
+    )
+    assert started.data is not None
+    assert started.data.kind == "agent_execution_started"
+    assert started.data.driver == "agentshim"
+    assert started.data.provider == "codex"
+    assert started.data.model == "gpt-5.1-codex-max"
+
+
+def test_start_agent_execution_omits_runtime_identity_by_default(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.start_agent_execution("implementer", "round-1", "work")
+
+    started = next(
+        event
+        for event in supervisor.read_events()
+        if event.type is EventType.AGENT_EXECUTION_STARTED
+    )
+    assert started.data is not None
+    assert started.data.kind == "agent_execution_started"
+    assert started.data.driver is None
+    assert started.data.provider is None
+    assert started.data.model is None
+
+
+def test_active_execution_checkpoint_carries_runtime_identity(tmp_path):  # noqa: ANN001, ANN201
+    """The snapshot/checkpoint record must match the live event's identity.
+
+    A TUI reconnecting mid-round, or reconciling a periodic subscription
+    checkpoint, reads this record instead of the agent_execution_started
+    event: if it dropped driver/provider/model, the harness+model label would
+    disappear from any round whose checkpoint arrived after the round's own
+    start event.
+    """
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.start_agent_execution(
+        "implementer",
+        "round-1",
+        "work",
+        driver="agentshim",
+        provider="codex",
+        model="gpt-5.1-codex-max",
+    )
+
+    active = supervisor.snapshot().active_executions
+    assert len(active) == 1
+    assert active[0].driver == "agentshim"
+    assert active[0].provider == "codex"
+    assert active[0].model == "gpt-5.1-codex-max"
+
+    _, _, checkpointed = supervisor.subscription_checkpoint(0)
+    assert len(checkpointed) == 1
+    assert checkpointed[0].driver == "agentshim"
+    assert checkpointed[0].provider == "codex"
+    assert checkpointed[0].model == "gpt-5.1-codex-max"
+
+
+def test_active_execution_checkpoint_omits_runtime_identity_by_default(tmp_path):  # noqa: ANN001, ANN201
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path)
+
+    supervisor.start_agent_execution("implementer", "round-1", "work")
+
+    active = supervisor.snapshot().active_executions
+    assert active[0].driver is None
+    assert active[0].provider is None
+    assert active[0].model is None
+
+
 def test_activity_tracks_todo_and_parallel_tools(tmp_path):  # noqa: ANN001, ANN201
     supervisor = RunSupervisor()
     supervisor.attach(tmp_path)
@@ -163,6 +252,56 @@ def test_checkpoint_watermark_and_active_state_are_consistent(tmp_path):  # noqa
     through_sequence, events, active = supervisor.subscription_checkpoint(through_sequence)
     assert events[-1].sequence == through_sequence
     assert active == []
+
+
+def test_resume_moves_bootstrap_events_into_durable_subscription_history(tmp_path):  # noqa: ANN001, ANN201
+    """A resumed TUI must replay prior rounds and the current process together."""
+    durable_dir = tmp_path / "durable"
+    durable_dir.mkdir()
+    legacy_execution_id = "a" * 32
+    durable = EventStore(durable_dir / "run-events.jsonl", "run-1")
+    durable.append(
+        RunEvent(
+            timestamp=datetime.now(UTC),
+            type=EventType.INVOCATION_STARTED,
+            status=EventStatus.ACTIVE,
+            agent_kind="implementer",
+            round_label="round-1-implementer",
+            invocation_id=legacy_execution_id,
+            data=InvocationStartedData(system_prompt="system", user_prompt="prior work"),
+        )
+    )
+
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    supervisor.publish_agent_output(
+        "bootstrap work",
+        agent_kind="orchestrator",
+        round_label="round-2-plan",
+    )
+    supervisor.attach(durable_dir)
+    supervisor.publish_agent_output(
+        "current work",
+        agent_kind="implementer",
+        round_label="round-2-implementer",
+    )
+
+    through_sequence, events, _active = supervisor.subscription_checkpoint(0)
+
+    assert [event.sequence for event in events] == list(range(1, through_sequence + 1))
+    assert any(
+        event.type is EventType.AGENT_EXECUTION_STARTED
+        and event.execution_id == legacy_execution_id
+        and event.round_label == "round-1-implementer"
+        for event in events
+    )
+    output = [
+        event.data.content
+        for event in events
+        if event.data is not None and event.data.kind == "agent_output_chunk"
+    ]
+    assert output == ["bootstrap work", "current work"]
+    assert supervisor.read_history_events() == events
 
 
 def test_streamed_text_does_not_override_active_tool(tmp_path):  # noqa: ANN001, ANN201

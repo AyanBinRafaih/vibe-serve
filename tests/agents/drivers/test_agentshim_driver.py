@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import pytest
 
@@ -17,9 +17,11 @@ from vibesys.agents.contracts import (
     MCPServerSpec,
 )
 from vibesys.agents.drivers import agentshim as subject
+from vibesys.server.events import CommandResultPayload
 from vs_sandbox import ProjectPathPolicy
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -29,6 +31,19 @@ class _Observer:
 
     def on_event(self, event: AgentEvent) -> None:
         self.events.append(event)
+
+
+class _GenerateOverride(Protocol):
+    def __call__(
+        self,
+        prompt: str,
+        /,
+        *,
+        cwd: str | None,
+        timeout: int | None,
+        silent: bool,
+    ) -> str:
+        """Replace one fake agent's generate behavior."""
 
 
 class _FakeAgent:
@@ -56,6 +71,9 @@ class _FakeAgent:
         self.output_schema_paths: list[str | None] = []
         self.reasoning_effort: str | None = None
         self.error: BaseException | None = None
+        self.generate_override: _GenerateOverride | None = None
+        self.uninstall_override: Callable[[Path, list[Any]], None] | None = None
+        self.tool_result_events: list[dict[str, Any]] = []
         self._last_session = SimpleNamespace(
             final_usage={"input_tokens": 12, "output_tokens": 3},
             total_cost_usd=0.25,
@@ -72,6 +90,9 @@ class _FakeAgent:
         self.install_calls.append((workspace, servers))
 
     def uninstall_mcp_servers(self, workspace: Path, servers: list[Any]) -> None:
+        if self.uninstall_override is not None:
+            self.uninstall_override(workspace, servers)
+            return
         self.uninstall_calls.append((workspace, servers))
 
     def generate(
@@ -82,10 +103,14 @@ class _FakeAgent:
         timeout: int | None,
         silent: bool,
     ) -> str:
+        if self.generate_override is not None:
+            return self.generate_override(prompt, cwd=cwd, timeout=timeout, silent=silent)
         assert silent
         assert self.event_handler is not None
         self.generate_calls.append((prompt, cwd, timeout))
         self.event_handler.on_thinking("working")
+        for tool_result in self.tool_result_events:
+            self.event_handler.on_tool_result(**tool_result)
         self.event_handler.on_usage({"input_tokens": 12, "output_tokens": 3})
         if self.error is not None:
             raise self.error
@@ -185,6 +210,35 @@ def test_turn_forwards_prompt_timeout_events_and_usage(
     ]
 
 
+def test_turn_translates_tool_results_into_typed_command_payloads(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    driver = subject.AgentShimDriver(provider="codex")
+    session = driver.create_session(_spec(tmp_path))
+    fake_agent[0].tool_result_events = [
+        {"tool": "shell", "stdout": "out", "stderr": "warn", "exit_code": 3, "duration": 0.7}
+    ]
+    observer = _Observer()
+
+    session.run_turn(AgentTurnRequest(message="Do it"), observer)
+
+    event = next(
+        event for event in observer.events if event.kind is subject.AgentEventKind.TOOL_RESULT
+    )
+    assert event.text == "out"
+    assert event.payload["result_payload"] == CommandResultPayload(
+        stdout="out",
+        stderr="warn",
+        exit_code=3,
+        duration=0.7,
+    )
+    # The flat fields remain for consumers that predate the typed payload.
+    assert event.payload["stdout"] == "out"
+    assert event.payload["stderr"] == "warn"
+    assert event.payload["exit_code"] == 3
+    assert event.payload["duration"] == 0.7
+
+
 def test_independent_sessions_overlap_and_chat_cleanup_does_not_interrupt_optimizer(
     fake_agent: list[_FakeAgent], tmp_path: Path
 ) -> None:
@@ -229,8 +283,8 @@ def test_independent_sessions_overlap_and_chat_cleanup_does_not_interrupt_optimi
         fake_agent[1].event_handler.on_thinking("chat event")
         return "chat result"
 
-    fake_agent[0].generate = generate_optimizer
-    fake_agent[1].generate = generate_chat
+    fake_agent[0].generate_override = generate_optimizer
+    fake_agent[1].generate_override = generate_chat
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         optimizer_turn = pool.submit(
@@ -284,7 +338,7 @@ def test_mcp_cleanup_preserves_original_turn_error(
     def fail_cleanup(_workspace: Path, _servers: list[Any]) -> None:
         raise OSError("cleanup failed")  # noqa: TRY003  # tracked: #288
 
-    fake_agent[0].uninstall_mcp_servers = fail_cleanup
+    fake_agent[0].uninstall_override = fail_cleanup
 
     with pytest.raises(ValueError, match="turn failed"):
         session.run_turn(AgentTurnRequest(message="review"))

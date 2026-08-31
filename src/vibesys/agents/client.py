@@ -32,6 +32,7 @@ from vibesys.agents.contracts import (
     MCPServerSpec,
     SessionDisposition,
 )
+from vibesys.server.events import CommandResultPayload, JsonResultPayload
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -89,12 +90,18 @@ class _LoggerObserver:
         elif event.kind is AgentEventKind.TOOL_RESULT:
             exit_code = event.payload.get("exit_code")
             duration = event.payload.get("duration")
+            result_payload = event.payload.get("result_payload")
             self._logger.on_tool_result(
                 str(event.payload.get("tool", "unknown")),
                 stdout=str(event.payload.get("stdout", event.text or "")),
                 stderr=str(event.payload.get("stderr", "")),
                 exit_code=exit_code if isinstance(exit_code, int) else None,
                 duration=float(duration) if isinstance(duration, (int, float)) else None,
+                payload=(
+                    result_payload
+                    if isinstance(result_payload, (CommandResultPayload, JsonResultPayload))
+                    else None
+                ),
             )
         elif event.kind is AgentEventKind.USAGE and event.usage is not None:
             self._logger.update_usage(_usage_dict(event.usage))
@@ -160,9 +167,11 @@ class AgentClient:
         require_host_sandbox: bool = False,
         containerized: bool = False,
         driver_log: AgentDiagnosticLog | None = None,
+        driver_name: str | None = None,
     ) -> None:
         """Create a client that owns ``driver`` and every session it creates."""
         self._driver = driver
+        self._driver_name = driver_name
         self._provider = provider
         self._skills = tuple(skills)
         self._compute_backend = compute_backend
@@ -187,6 +196,25 @@ class AgentClient:
     def capabilities(self) -> AgentCapabilities:
         """Return the selected driver's factual capabilities."""
         return self._driver.capabilities
+
+    @property
+    def driver_name(self) -> str | None:
+        """Return the stable configured driver name (``"agentshim"``/``"omnigent"``).
+
+        This is the application-configuration string, not the driver's Python
+        class name, so it stays stable across implementation refactors.
+        """
+        return getattr(self, "_driver_name", None)
+
+    @property
+    def provider(self) -> str | None:
+        """Return the configured CLI provider (``"codex"``, ``"claude"``, ...)."""
+        return getattr(self, "_provider", None) or "codex"
+
+    def model_for_kind(self, kind: str) -> str | None:
+        """Return the effective model for ``kind``, honoring role overrides."""
+        role_models: Mapping[str, str] = getattr(self, "_role_models", {})
+        return role_models.get(kind, getattr(self, "_model_name", None))
 
     def set_log_file(self, stream: TextIO | None) -> None:
         """Direct subsequent application logs to ``stream``."""
@@ -339,7 +367,7 @@ class AgentClient:
         )
         log_and_print(f"\n=== {label} ROUND START: {round_label} ===", self._run_log_file)
         log_and_print(
-            f"driver: {type(self._driver).__name__}, provider: {spec.provider}, "
+            f"driver: {self.driver_name or type(self._driver).__name__}, provider: {spec.provider}, "
             f"model: {model}, reasoning_effort: {reasoning_effort or 'provider_default'}, "
             f"cwd: {workspace}",
             self._run_log_file,

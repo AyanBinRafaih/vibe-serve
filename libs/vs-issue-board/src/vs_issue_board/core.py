@@ -7,6 +7,7 @@ derived views such as markdown mirrors.
 
 from __future__ import annotations
 
+import builtins  # noqa: TC003  # tracked: #288
 import json
 import os
 import sys
@@ -264,7 +265,7 @@ class IssueBoard:
         actor: str,
         iteration: int,
         note: str = "",
-    ) -> list[int]:
+    ) -> builtins.list[int]:
         """Reopen every blocked issue, resetting its attempt budget."""
         reopened: list[int] = []
         with self._lock:
@@ -320,12 +321,15 @@ class IssueBoard:
             self._save_locked()
             return issue
 
+    # This method shadows the builtin ``list`` inside the class body, which is
+    # the scope where method annotations are resolved.  Return annotations that
+    # need the builtin sequence type must therefore spell it ``builtins.list``.
     def list(  # noqa: D102  # tracked: #288
         self,
         *,
         status: IssueStatus | str | None = None,
         type: IssueType | str | None = None,  # noqa: A002  # tracked: #288
-    ) -> list[Issue]:
+    ) -> builtins.list[Issue]:
         if status is not None and not isinstance(status, IssueStatus):
             status = IssueStatus(status)
         if type is not None and not isinstance(type, IssueType):
@@ -340,7 +344,7 @@ class IssueBoard:
                 out.append(issue.model_copy(deep=True))
         return out
 
-    def search(self, query: str) -> list[Issue]:
+    def search(self, query: str) -> builtins.list[Issue]:
         """Substring search across title and description.
 
         Comma-separated keywords are AND-matched. Matching is case-insensitive.

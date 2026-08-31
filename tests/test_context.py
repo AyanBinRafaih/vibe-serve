@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -5,13 +6,24 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vibesys.context import _RunContext, create_candidate_context, create_run_context
+from vibesys import boot_trace
+from vibesys.config import Config
+from vibesys.context import (
+    _EXPERIMENT_CHAT_SYSTEM_PROMPT,
+    _ExperimentChatDependencies,
+    _ExperimentChatService,
+    _resolve_chat_thread_settings,
+    _resume_configuration_update,
+    _RunContext,
+    create_candidate_context,
+    create_run_context,
+)
 from vibesys.domains.base import DomainName
 from vibesys.domains.environment import EnvironmentPatch, NoopEnvironmentHooks
 from vibesys.domains.llm_serving.hooks import LLMServingEnvironmentHooks
 from vibesys.errors import ConfigurationError
 from vibesys.input_manifest import WorkspaceSource
-from vibesys.loops.agent.model import ActiveHypothesis
+from vibesys.loops.agent.model import AgentRunState
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
 from vibesys.run import RunLogger, RunPaths, RunStateNamespace
 from vibesys.sandbox.run_environment import RunEnvironmentSpec
@@ -49,7 +61,7 @@ class _RecordingHooks:
 
 
 @pytest.fixture(autouse=True)
-def _context_dependencies(monkeypatch):  # pyright: ignore[reportUnusedFunction]  # noqa: ANN001, ANN202
+def context_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("vibesys.context.backends.get", lambda *_args, **_kwargs: _FakeBackend())
     monkeypatch.setattr("vibesys.context.build_agent_client", lambda *_args, **_kwargs: MagicMock())
     monkeypatch.setattr(
@@ -74,6 +86,15 @@ def _configuration(max_rounds: int = 1) -> AgentRunConfiguration:
         official_eval_every=1,
         memory_layout="files",
     )
+
+
+def test_resume_adopts_objectives_omitted_by_legacy_agent_manifest() -> None:
+    requested = _configuration().model_copy(update={"objectives": ("throughput:max",)})
+    legacy_payload = requested.model_dump(exclude={"objectives"})
+    recorded = AgentRunConfiguration.model_validate(legacy_payload)
+
+    assert "objectives" not in recorded.model_fields_set
+    assert _resume_configuration_update(recorded, requested) == requested
 
 
 def _write_project(root: Path, *, evaluator_name: str = "checker") -> Path:
@@ -145,7 +166,7 @@ def _create_context(  # noqa: PLR0913
     hooks=None,  # noqa: ANN001
 ) -> _RunContext:
     return create_run_context(
-        config={"model": {"name": "gpt-test"}},  # pyright: ignore[reportArgumentType]
+        config=Config.model_validate({"model": {"name": "gpt-test"}}),
         exp_name=exp_name,
         runs_dir=runs_dir,
         input_path=str(project),
@@ -163,13 +184,20 @@ def _create_context(  # noqa: PLR0913
         agent_backend="stub",
         environment_hooks=hooks or NoopEnvironmentHooks(),
         remote_repo=remote_repo,
-        active_state_model_type=ActiveHypothesis,
+        agent_state_model_type=AgentRunState,
     )
 
 
 def _git(project: Path, *args: str) -> str:
     return subprocess.run(  # noqa: S603
-        ["git", *args],  # noqa: S607
+        [  # noqa: S607
+            "git",
+            "-c",
+            "user.name=VibeSys Test",
+            "-c",
+            "user.email=test@vibesys.invalid",
+            *args,
+        ],
         cwd=project,
         check=True,
         capture_output=True,
@@ -237,6 +265,131 @@ def test_run_context_announces_canonical_experiment_state(tmp_path):  # noqa: AN
         REGISTRY.deactivate(supervisor)
 
 
+def test_context_assembly_logs_stage_timings(tmp_path):  # noqa: ANN001, ANN201
+    """Every assembly span up to and past the experiments gate reaches the run log.
+
+    This is a regression guard for the diagnostic used to find where
+    ``create_run_context`` spends time before the TUI's hypothesis screen
+    can leave "loading experiments..." (the gate flips when the second
+    ``supervisor.attach`` records ``EXPERIMENTS_CHANGED``).
+    """
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            log_text = ctx.run_log_path.read_text()
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+    for stage in (
+        "config_and_inputs",
+        "backend_and_model",
+        "profiler_preflight",
+        "workspace_materialize",
+        "project_open",
+        "log_bootstrap",
+        "git_tracker_init",
+        "project_state_resume",
+        "round_transaction_recovery",
+        "workspace_setup",
+        "environment_open",
+        "device_monitor_start",
+        "agent_client_build",
+    ):
+        assert f"boot span context.{stage}: " in log_text, f"missing span timing for {stage!r}"
+    # The enclosing span is assembly's total, recorded after its children.
+    assert "boot span context: " in log_text
+    assert "experiments gate open after " in log_text
+
+
+def test_dispatch_preamble_spans_reach_run_log(tmp_path):  # noqa: ANN001, ANN201
+    """Spans closed before ``create_run_context`` land in the run log, first.
+
+    ``_dispatch`` and ``_run_agent`` (main.py) do substantial work before a
+    ``RunLogger`` exists and record ``boot_trace`` spans as they go.
+    ``_assemble_run_context`` must drain that buffer at entry, so the
+    preamble's spans reach the persistent run log ahead of assembly's own.
+    """
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+
+    boot_trace.drain_log_lines()
+    with boot_trace.span("agent_preamble"), boot_trace.span("load_config_and_skills"):
+        pass
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            log_text = ctx.run_log_path.read_text()
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+    assert "boot span agent_preamble.load_config_and_skills: " in log_text
+    assert "boot span agent_preamble: " in log_text
+    # The preamble happened before assembly in real dispatch; the run log
+    # should preserve that order.
+    preamble_index = log_text.index("boot span agent_preamble: ")
+    context_index = log_text.index("boot span context.config_and_inputs: ")
+    assert preamble_index < context_index
+
+
+def test_context_assembly_without_recorded_preamble_omits_preamble_lines(tmp_path):  # noqa: ANN001, ANN201
+    """No preamble spans (e.g. a test-built context) means no stray lines."""
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+    boot_trace.drain_log_lines()
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            log_text = ctx.run_log_path.read_text()
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+    assert "boot span agent_preamble" not in log_text
+    assert "boot span dispatch" not in log_text
+
+
+def test_context_assembly_spans_stay_off_stderr_by_default(tmp_path, capfd):  # noqa: ANN001, ANN201
+    """Boot spans are forensics in the run log, not narration at the operator."""
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            log_text = ctx.run_log_path.read_text()
+            captured_err = capfd.readouterr().err
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+    assert "boot span context: " in log_text
+    assert "boot span" not in captured_err
+
+
+def test_boot_trace_env_puts_assembly_spans_on_stderr(tmp_path, capfd, monkeypatch):  # noqa: ANN001, ANN201
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "bootstrap")
+    REGISTRY.activate(supervisor)
+    monkeypatch.setenv(boot_trace.BOOT_TRACE_ENV, "1")
+    try:
+        with _create_context(project, evaluator=evaluator) as ctx:
+            assert "boot span context: " in ctx.run_log_path.read_text()
+            captured_err = capfd.readouterr().err
+    finally:
+        REGISTRY.deactivate(supervisor)
+
+    assert "boot span context.config_and_inputs: " in captured_err
+
+
 def test_retained_experiment_chat_uses_one_dedicated_client_across_run_teardown(
     tmp_path: Path,
 ) -> None:
@@ -300,6 +453,135 @@ def test_nonretained_experiment_chat_closes_when_context_construction_fails(
         chat_client.close.assert_called_once_with()
     finally:
         REGISTRY.deactivate(supervisor)
+
+
+def test_chat_thread_settings_resolve_run_defaults() -> None:
+    resolved = _resolve_chat_thread_settings(
+        agent_backend="cli",
+        default_driver="agentshim",
+        default_provider="codex",
+        default_model="gpt-run",
+        driver=None,
+        provider=None,
+        model=None,
+    )
+    assert resolved == ("agentshim", "codex", "gpt-run")
+
+
+def test_chat_thread_settings_reject_invalid_combinations() -> None:
+    def resolve(agent_backend: str, driver: str | None, provider: str | None) -> tuple[str, ...]:
+        return _resolve_chat_thread_settings(
+            agent_backend=agent_backend,
+            default_driver="agentshim",
+            default_provider="codex",
+            default_model="gpt-run",
+            driver=driver,
+            provider=provider,
+            model=None,
+        )
+
+    with pytest.raises(ValueError, match="does not support provider 'gemini'"):
+        resolve("cli", "omnigent", "gemini")
+    with pytest.raises(ValueError, match="unknown agent driver 'other'"):
+        resolve("cli", "other", None)
+    with pytest.raises(ValueError, match="require the CLI agent backend"):
+        resolve("deepagents", None, None)
+
+
+def _chat_service(
+    tmp_path: Path, thread_id: str | None, answer: str = "the answer"
+) -> tuple[_ExperimentChatService, MagicMock]:
+    supervisor = RunSupervisor()
+    supervisor.attach(tmp_path / "logs")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    agent_client = MagicMock()
+    agent_client.invoke_text.return_value = answer
+    project = MagicMock()
+    project.state.portable_run_export.return_value = MagicMock(files=[])
+    service = _ExperimentChatService(
+        _ExperimentChatDependencies(
+            supervisor=supervisor,
+            agent_client=agent_client,
+            workspace=workspace,
+            log_dir=tmp_path / "logs",
+            project=project,
+            run_id="run-1",
+            log=lambda _line: None,
+            flush_logs=lambda: None,
+            environment=dict,
+            progress=lambda: None,
+            driver="agentshim",
+            provider="codex",
+            model="gpt-test",
+            thread_id=thread_id,
+        )
+    )
+    return service, agent_client
+
+
+def test_default_chat_thread_keeps_the_legacy_state_layout(tmp_path: Path) -> None:
+    service, agent_client = _chat_service(tmp_path, thread_id=None)
+
+    service.ask("what happened?")
+
+    workspace = tmp_path / "workspace"
+    transcript = workspace / "_vibesys_chat" / "conversation.jsonl"
+    assert json.loads(transcript.read_text()) == {
+        "question": "what happened?",
+        "answer": "the answer",
+    }
+    prompt = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    assert prompt == _EXPERIMENT_CHAT_SYSTEM_PROMPT
+    assert (workspace / "_vibesys_chat" / "instructions.md").read_text() == prompt
+
+
+def test_created_chat_thread_owns_its_state_dir_and_shares_trajectory(tmp_path: Path) -> None:
+    service, agent_client = _chat_service(tmp_path, thread_id="thread-a")
+
+    service.ask("what happened?")
+
+    workspace = tmp_path / "workspace"
+    thread_dir = workspace / "_vibesys_chat" / "threads" / "thread-a"
+    assert json.loads((thread_dir / "conversation.jsonl").read_text()) == {
+        "question": "what happened?",
+        "answer": "the answer",
+    }
+    prompt = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    # The thread reads its own conversation but the shared trajectory.
+    assert "_vibesys_chat/threads/thread-a/conversation.jsonl" in prompt
+    assert "_vibesys_chat/trajectory/state/" in prompt
+    assert (thread_dir / "instructions.md").read_text() == prompt
+    assert (workspace / "_vibesys_chat" / "trajectory").is_dir()
+    assert not (thread_dir / "trajectory").exists()
+    # The legacy transcript is untouched by thread traffic.
+    assert not (workspace / "_vibesys_chat" / "conversation.jsonl").exists()
+
+    # A follow-up turn continues from the thread's own instructions file.
+    service.ask("and then?")
+    continuation = agent_client.invoke_text.call_args.kwargs["system_prompt"]
+    assert "_vibesys_chat/threads/thread-a/instructions.md" in continuation
+
+
+def test_chat_execution_events_carry_the_threads_runtime_identity(tmp_path: Path) -> None:
+    """A chat execution is labelled like a round agent's, not as an anonymous chat."""
+    service, _ = _chat_service(tmp_path, thread_id="thread-a")
+
+    service.ask("what happened?")
+
+    recorded = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "run-events.jsonl").read_text().splitlines()
+        if line
+    ]
+    started = [
+        event for event in recorded if event["type"] == EventType.AGENT_EXECUTION_STARTED.value
+    ]
+    assert len(started) == 1
+    assert started[0]["agent_kind"] == "chat"
+    assert started[0]["data"]["driver"] == "agentshim"
+    assert started[0]["data"]["provider"] == "codex"
+    assert started[0]["data"]["model"] == "gpt-test"
 
 
 def test_repository_task_exposes_its_actual_reference_path(tmp_path: Path) -> None:
@@ -414,8 +696,43 @@ def test_resume_reuses_project_and_run_id_and_only_increases_limit(tmp_path):  #
         assert resumed.run_id == run_id
 
     stored = Project.open(project).state.load_run(run_id)
+    assert isinstance(stored.configuration, AgentRunConfiguration)
     assert stored.configuration.max_rounds == 2
     assert _git(project, "branch", "--show-current") == f"vibesys-runs/{run_id}"
+
+
+def test_resume_migrates_legacy_objectives_with_dirty_candidate(tmp_path):  # noqa: ANN001, ANN201
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    with _create_context(project, evaluator=evaluator) as first:
+        run_id = first.run_id
+
+    state = Project.open(project).state
+    manifest_path = state._run_manifest_path(run_id)  # noqa: SLF001  # migration fixture
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["configuration"].pop("objectives")
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _git(project, "add", str(manifest_path.relative_to(project)))
+    _git(project, "commit", "-m", "simulate legacy run manifest")
+    candidate = project / "queue.py"
+    candidate.write_text(candidate.read_text() + "\n# interrupted edit\n")
+
+    requested = _configuration().model_copy(update={"objectives": ("total_ops_per_sec:max",)})
+    with _create_context(
+        project,
+        evaluator=evaluator,
+        exp_name=run_id,
+        existing=True,
+        configuration=requested,
+    ):
+        pass
+
+    stored = state.load_run(run_id)
+    assert isinstance(stored.configuration, AgentRunConfiguration)
+    assert stored.configuration.objectives == ("total_ops_per_sec:max",)
+    assert "# interrupted edit" in candidate.read_text()
+    assert "queue.py" in _git(project, "status", "--porcelain")
+    assert "# interrupted edit" not in _git(project, "show", "HEAD:queue.py")
 
 
 def test_collection_resume_pushes_existing_origin_on_teardown(tmp_path):  # noqa: ANN001, ANN201
@@ -559,7 +876,7 @@ def test_direct_run_rejects_unmaterialized_workspace_source(tmp_path):  # noqa: 
 
     with pytest.raises(ConfigurationError, match="pass --runs-dir"):
         create_run_context(
-            config={"model": {"name": "gpt-test"}},  # pyright: ignore[reportArgumentType]
+            config=Config.model_validate({"model": {"name": "gpt-test"}}),
             exp_name="queue",
             runs_dir=None,
             input_path=str(project),
@@ -573,6 +890,40 @@ def test_direct_run_rejects_unmaterialized_workspace_source(tmp_path):  # noqa: 
             run_environment=RunEnvironmentSpec("local"),
             agent_backend="stub",
         )
+
+
+def test_omnigent_accepts_active_profiler_configuration(tmp_path):  # noqa: ANN001, ANN201
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+    configuration = _configuration().model_copy(
+        update={
+            "agent_backend": "cli",
+            "agent_driver": "omnigent",
+            "cli_provider": "codex",
+            "profiler": "macos_cpu",
+        }
+    )
+
+    with create_run_context(
+        config=Config.model_validate(
+            {
+                "model": {"name": "gpt-test"},
+                "agent": {"backend": "cli", "driver": "omnigent", "cli_provider": "codex"},
+            }
+        ),
+        exp_name="queue",
+        runs_dir=None,
+        input_path=str(project),
+        accuracy_command="python _evaluator/checker/check.py",
+        benchmark_command="python _evaluator/checker/check.py",
+        evaluator_path=evaluator,
+        project_configuration=configuration,
+        profiler_kind=ProfilerKind.MACOS_CPU,
+        profiler_domain=DomainName.GENERIC,
+        run_environment=RunEnvironmentSpec("local"),
+        agent_state_model_type=AgentRunState,
+    ) as context:
+        assert context.profiler_kind is ProfilerKind.MACOS_CPU
 
 
 def test_portable_state_snapshot_replaces_namespace_exactly(tmp_path):  # noqa: ANN001, ANN201
@@ -603,7 +954,7 @@ def test_candidate_context_uses_project_worktree_directory(tmp_path):  # noqa: A
         assert parent_commit is not None
         candidate = create_candidate_context(
             parent,
-            config={"model": {"name": "gpt-test"}},  # pyright: ignore[reportArgumentType]
+            config=Config.model_validate({"model": {"name": "gpt-test"}}),
             generation=2,
             child_idx=3,
             parent_commit=parent_commit,

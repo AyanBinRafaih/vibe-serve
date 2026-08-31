@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from wheel_targets import (  # pyright: ignore[reportMissingImports]
+from wheel_targets import (
     TARGETS,
     WheelTargetError,
     resolve_wheel_target,

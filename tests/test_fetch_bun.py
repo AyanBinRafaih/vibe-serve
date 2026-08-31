@@ -8,8 +8,8 @@ import zipfile
 from typing import TYPE_CHECKING
 
 import pytest
-from scripts.fetch_bun import BunFetchError, fetch_bun  # pyright: ignore[reportMissingImports]
-from wheel_targets import TARGETS  # pyright: ignore[reportMissingImports]
+from scripts.fetch_bun import BunFetchError, fetch_bun
+from wheel_targets import TARGETS
 
 if TYPE_CHECKING:
     from pathlib import Path

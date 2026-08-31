@@ -15,7 +15,9 @@ bundles, and the TUI.
 
 ```text
 src/vibesys/             Python framework and loop implementation
-clients/tui/             TypeScript terminal client and launcher
+clients/backend-client/  TypeScript supervision protocol and transport
+clients/core-state/      Pure backend-event projection
+clients/tui/             TypeScript terminal UI and launcher
 libs/                    Reusable standalone libraries
 examples/                Candidate repositories, tasks, and legacy input bundles
 resources/evaluators/    Reusable versioned evaluator packages
@@ -80,6 +82,17 @@ vendored sources, using `--checkout` to override their default update policy:
 git submodule update --init --recursive --checkout
 ```
 
+`uv run pytest` does not need any of them. The tests that assert on a
+repository-native example's tasks skip when its submodule is absent, and CI's
+`validate-examples` job covers them instead. To get the same coverage locally
+without cloning the candidate repositories, fetch just their `.vibesys`
+overlays (a few MB and a few seconds, against hundreds of MB for a full
+checkout):
+
+```bash
+uv run python scripts/example_repositories.py
+```
+
 Run the Python checks from the repository root:
 
 ```bash
@@ -100,15 +113,17 @@ The TypeScript client has its own workflow; see
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm --dir clients/tui generate:protocol
-pnpm --dir clients/tui check
-pnpm --dir clients/tui test
-pnpm --dir clients/tui build
+pnpm --dir clients/backend-client generate:protocol
+pnpm check:ts-architecture
+pnpm check:clients
+pnpm test:clients
+pnpm build:clients
 pnpm check:ts
 ```
 
 When Python protocol models change, regenerate the files under
-`clients/tui/src/generated/` and review the diff.
+`clients/backend-client/src/generated/` and review the diff.
+See the [TUI architecture guide](tui-architecture.md) for package ownership and dependency rules.
 
 ## Extend VibeSys
 

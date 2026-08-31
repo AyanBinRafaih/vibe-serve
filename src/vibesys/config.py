@@ -176,12 +176,13 @@ class AgentRoleCfg(_Strict):
 
 
 class AgentCfg(_Strict):  # noqa: D101  # tracked: #288
-    driver: Literal["agentshim", "omnigent"] | None = Field(
+    driver: Literal["agentshim", "omnigent", "mock"] | None = Field(
         default=None,
         description=(
             "Optional agent execution driver override. When omitted, VibeSys "
             "uses its current default driver. This is independent of the "
-            "agent provider selected below."
+            "agent provider selected below. 'mock' is test infrastructure: it "
+            "streams a deterministic playbook instead of running an agent."
         ),
     )
     backend: str | None = Field(

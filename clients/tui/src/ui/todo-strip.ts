@@ -1,6 +1,7 @@
 import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
+import type {TodoItem} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
-import type {SessionState, TodoItem} from '../session-model.js';
+import type {SessionState} from '../session-model.js';
 import {visibleTodos} from '../session-model.js';
 import type {Theme} from './theme.js';
 

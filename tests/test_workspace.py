@@ -8,7 +8,6 @@ only the edge-case tests materialize files.
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,12 +16,20 @@ from vibesys.constants import ComputeBackend
 from vibesys.input_manifest import WorkspaceSource
 from vibesys.run import CopySpec, InputProjectSpec, Workspace
 from vibesys.run.workspace import GitSourceSpec
+from vibesys.sandbox.run_environment import LocalEnvironment
+
+
+class _StubRunEnvironment(LocalEnvironment):
+    """LocalEnvironment with ``isolated`` under the test's control."""
+
+    def __init__(self, *, isolated: bool) -> None:
+        self.isolated = isolated
 
 
 def _make_workspace(root, *, isolated=False, excluded_dirs=None, compute_backend=None):  # noqa: ANN001, ANN202  # tracked: #288
     return Workspace(
         root,
-        run_environment=SimpleNamespace(isolated=isolated),  # pyright: ignore[reportArgumentType]  # tracked: #297
+        run_environment=_StubRunEnvironment(isolated=isolated),
         backend=MagicMock(),
         log=MagicMock(),
         project_root=root.parent,

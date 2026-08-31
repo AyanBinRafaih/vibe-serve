@@ -31,6 +31,7 @@ from tui_packaging import BUN_VERSION, validate_tui_payload  # noqa: E402
 from wheel_targets import resolve_wheel_target  # noqa: E402
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+_WORKSPACE_RUNTIME_PACKAGES = ("@vibesys/backend-client", "@vibesys/core-state")
 
 
 class ReleaseBuildError(RuntimeError):
@@ -111,7 +112,7 @@ def build_release_wheel(
         runner=build_environment.runner,
     )
     _run(
-        ["pnpm", "--dir", "clients/tui", "build"],
+        ["pnpm", "build:clients"],
         cwd=repo_root,
         runner=build_environment.runner,
     )
@@ -129,6 +130,7 @@ def build_release_wheel(
             str(app),
         ]
         _run(deploy_command, cwd=repo_root, runner=build_environment.runner)
+        _normalize_deployed_workspace_dependencies(app)
         _prune_deployment(app, expected_native_package=target.opentui_package)
         _stage_runtime_and_licenses(repo_root, bun=bun, payload=payload)
         _write_manifest(
@@ -175,6 +177,31 @@ def _project_versions(repo_root: Path) -> tuple[str, str]:
     if not isinstance(distribution_version, str) or not isinstance(tui_version, str):
         _fail("Python and TUI projects must declare string versions")
     return distribution_version, tui_version
+
+
+def _normalize_deployed_workspace_dependencies(app: Path) -> None:
+    """Replace pnpm's checkout-specific workspace URLs with package versions."""
+    package_path = app / "package.json"
+    try:
+        package = json.loads(package_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        error = ReleaseBuildError("Production deployment has an invalid package.json")
+        raise error from exc
+    if not isinstance(package, dict) or not isinstance(package.get("dependencies"), dict):
+        _fail("Production deployment has no dependency metadata")
+    dependencies = cast("dict[str, object]", package["dependencies"])
+    for name in _WORKSPACE_RUNTIME_PACKAGES:
+        dependency_path = app / "node_modules" / Path(*name.split("/")) / "package.json"
+        try:
+            dependency = json.loads(dependency_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            error = ReleaseBuildError(f"Production deployment has an invalid {name} package")
+            raise error from exc
+        version = dependency.get("version") if isinstance(dependency, dict) else None
+        if not isinstance(version, str):
+            _fail(f"Production deployment {name} package has no version")
+        dependencies[name] = version
+    package_path.write_text(json.dumps(package, indent=2, sort_keys=True) + "\n")
 
 
 def _prune_deployment(app: Path, *, expected_native_package: str) -> None:

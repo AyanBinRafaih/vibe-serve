@@ -7,9 +7,9 @@ from pathlib import Path  # noqa: TC003  # tracked: #288
 import pytest
 
 # `resources_packaging` is a repo-root, build-time module (imported by
-# setup.py). It is not part of the installed package, so pyright's project
-# roots cannot resolve it; pytest picks it up via `pythonpath = ["."]`.
-from resources_packaging import (  # pyright: ignore[reportMissingImports]
+# setup.py). It is not part of the installed package; pytest picks it up via
+# `pythonpath = ["."]`, and the type checker via `[tool.ty.environment] root`.
+from resources_packaging import (
     PackagingError,
     stage_resources,
     stage_sdk,

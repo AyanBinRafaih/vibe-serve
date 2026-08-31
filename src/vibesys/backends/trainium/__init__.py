@@ -25,19 +25,21 @@ from __future__ import annotations
 import glob
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from pathlib import Path
-
-from deepagents.backends import LocalShellBackend
-from deepagents.backends.protocol import SandboxBackendProtocol  # noqa: TC002  # tracked: #288
+from typing import TYPE_CHECKING
 
 from vibesys.backends.base import (
     ContentionMonitor,
     ModalOptions,
     SandboxKind,
     SetupFn,
+    make_local_shell_sandbox,
 )
 from vibesys.constants import ComputeBackend
 from vibesys.profilers import ProfilerKind
-from vs_sandbox import DockerSandbox
+
+if TYPE_CHECKING:
+    # Annotation only; deepagents pulls langchain + anthropic (~seconds).
+    from deepagents.backends.protocol import SandboxBackendProtocol
 
 # AWS Neuron DLC.  Tag chosen to match the host's Neuron tools (2.30):
 # PyTorch 2.9 / Python 3.12 / Neuron SDK 2.30 on Ubuntu 24.04.  Carries
@@ -119,6 +121,10 @@ class TrainiumBackend:
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
+        # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
+        # pulls langchain + anthropic. Registration must stay import-cheap.
+        from vs_sandbox import DockerSandbox  # noqa: PLC0415  # tracked: #288
+
         bind_mounts = list(bind_mounts or [])
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
@@ -150,12 +156,7 @@ class TrainiumBackend:
                 "TMPDIR": str(host_tmp),
             }
             local_env.update(extra_env)
-            return LocalShellBackend(
-                root_dir=host_workspace,
-                virtual_mode=True,
-                inherit_env=True,
-                env=local_env,
-            )
+            return make_local_shell_sandbox(host_workspace=host_workspace, env=local_env)
 
         if kind is SandboxKind.DOCKER:
             # Persistent host-side compile cache → container, kept out of

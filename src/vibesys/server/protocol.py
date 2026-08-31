@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
+from vibesys.repository import InteractiveSetupDefaults
 from vibesys.server.diagnostics import Diagnostic, DiagnosticScope, exception_to_diagnostic
 from vibesys.server.events import AgentExecutionActivityData, RunEvent
 
@@ -45,6 +46,43 @@ class SnapshotQuery(Request):  # noqa: D101  # tracked: #288
 class ChatQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.chat"] = "query.chat"
     text: str
+    # None targets the default thread, preserving pre-thread clients.
+    thread_id: str | None = None
+
+
+class ChatThreadCreateQuery(Request):
+    """Create a new experiment-chat thread with its own agent selection.
+
+    Omitted fields resolve to the run's configured driver, provider, and
+    model. The response carries the resolved settings and thread identity.
+    ``driver`` exists for completeness and stays validated when supplied, but
+    which driver backs a run is a deployment detail: clients omit it so every
+    thread inherits the run's.
+    """
+
+    type: Literal["query.chat_thread_create"] = "query.chat_thread_create"
+    driver: Literal["agentshim", "omnigent"] | None = None
+    provider: str | None = None
+    model: str | None = None
+    # Without a title the server derives one from the thread's first message.
+    title: str | None = None
+
+
+class ChatOptionsQuery(Request):
+    """Request the agent selections this run's experiment chat offers."""
+
+    type: Literal["query.chat_options"] = "query.chat_options"
+
+
+class TuiDefaultsQuery(Request):
+    """Request the launch-directory configuration defaults a TUI applies.
+
+    A terminal client resolves its theme from the run's configuration. Asking
+    over the control channel keeps TOML parsing in the backend and saves the
+    launcher an extra Python process on the boot path.
+    """
+
+    type: Literal["query.tui_defaults"] = "query.tui_defaults"
 
 
 class HistoryQuery(Request):  # noqa: D101  # tracked: #288
@@ -64,12 +102,20 @@ class ExperimentQuery(Request):
 class EventsQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.events"] = "query.events"
     after_sequence: int = Field(default=0, ge=0)
+    # Exclusive upper bound: the result is ``after_sequence < sequence <
+    # before_sequence``. None keeps the open-ended read. This is the backfill
+    # query for history older than a tail subscription's floor.
+    before_sequence: int | None = Field(default=None, ge=1)
     timeout_ms: int = Field(default=0, ge=0, le=30_000)
 
 
 class SubscribeRequest(Request):  # noqa: D101  # tracked: #288
     type: Literal["subscribe"] = "subscribe"
     after_sequence: int = Field(default=0, ge=0)
+    # Replay from ``max(after_sequence, latest_sequence - tail)`` instead of
+    # ``after_sequence``. An old server forbids the field, so the rejection is
+    # the capability probe.
+    tail: int | None = Field(default=None, ge=1)
 
 
 ProtocolRequest = Annotated[
@@ -78,6 +124,9 @@ ProtocolRequest = Annotated[
     | SteerCommand
     | SnapshotQuery
     | ChatQuery
+    | ChatThreadCreateQuery
+    | ChatOptionsQuery
+    | TuiDefaultsQuery
     | HistoryQuery
     | PerformanceQuery
     | ExperimentQuery
@@ -98,6 +147,19 @@ class ActiveAgentExecution(ProtocolModel):
     assignment: str
     started_at: datetime
     activity: AgentExecutionActivityData
+    driver: str | None = None
+    provider: str | None = None
+    model: str | None = None
+
+
+class ChatThreadInfo(ProtocolModel):
+    """Resolved identity and agent settings of one experiment-chat thread."""
+
+    thread_id: str
+    title: str = ""
+    driver: str
+    provider: str
+    model: str
 
 
 class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -108,6 +170,10 @@ class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288
     agent_kind: str | None = None
     round_label: str | None = None
     active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
+    # Server-owned projection: a thread's title is backfilled from a later
+    # CHAT event, so a client that folds only a tail cannot rebuild the
+    # registry from the events it holds.
+    chat_threads: list[ChatThreadInfo] = Field(default_factory=list)
 
 
 class CommandAck(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -119,6 +185,39 @@ class ChatResult(ProtocolModel):  # noqa: D101  # tracked: #288
     question: str
     answer: str
     effect: Literal["none"] = "none"
+    # Echoes the requested thread; None is the default thread.
+    thread_id: str | None = None
+
+
+class ChatModelOption(ProtocolModel):
+    """One model a chat thread can be started with, and where it came from.
+
+    ``source`` is provenance, not presentation: ``run`` is the run's own
+    configured model, ``role`` an ``[agent.outer]``/``[agent.inner]``
+    override, ``suggested`` an entry from the backend's short curated list.
+    """
+
+    model: str
+    source: Literal["run", "role", "suggested"]
+    # True for exactly one option across the whole response: the run's model.
+    default: bool = False
+
+
+class ChatProviderOptions(ProtocolModel):
+    """One CLI provider the run's configured driver supports, with models."""
+
+    provider: str
+    models: list[ChatModelOption] = Field(default_factory=list)
+
+
+class ChatOptions(ProtocolModel):
+    """Every chat agent selection this run offers, grouped by provider.
+
+    The agent driver is absent by design. Threads inherit the run's driver, so
+    a client never chooses one and never enumerates them.
+    """
+
+    providers: list[ChatProviderOptions] = Field(default_factory=list)
 
 
 class PerformanceRound(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -127,6 +226,24 @@ class PerformanceRound(ProtocolModel):  # noqa: D101  # tracked: #288
     perf_unit: str
     passed: bool
     profile_skipped: bool = False
+
+
+class PerformanceContext(ProtocolModel):
+    """What the performance plot measures and how to read it.
+
+    Copied from recorded run state and the run manifest, never recomputed.
+    Every field is optional so the section can describe the objective before
+    the first measurement and omit facts a run never recorded; a run whose
+    prose is known before its metric still gets a description-only context.
+    """
+
+    objective_metric: str | None = None
+    objective_unit: str | None = None
+    objective_direction: Literal["max", "min"] | None = None
+    objective_baseline_value: FiniteFloat | None = None
+    objective_baseline_round: int | None = None
+    objective_baseline_commit: str | None = None
+    objective_description: str | None = None
 
 
 class HypothesisRound(ProtocolModel):
@@ -146,10 +263,8 @@ class HypothesisRound(ProtocolModel):
 class HypothesisEntry(ProtocolModel):
     """One unit of investigation: a hypothesis and every round it spans.
 
-    ``resolved_outcome`` is the terminal value the agent loop itself recorded
-    for the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``
-    member). It is copied, never recomputed, so the client cannot drift from
-    the framework's resolution semantics.
+    ``resolved_outcome`` is copied from the backend's typed hypothesis state,
+    never recomputed by the server or client.
     """
 
     hypothesis_id: str
@@ -157,24 +272,39 @@ class HypothesisEntry(ProtocolModel):
     # directory written before hypothesis tracking. The row is still returned
     # so history stays complete; clients render it as an explicit placeholder.
     identified: bool = True
+    # Backend-derived display title: the orchestrator's own title, or a
+    # fallback derived from ``claim`` when the orchestrator gave none. None
+    # when there is no text to title at all.
+    title: str | None = None
     claim: str | None = None
     action: str | None = None
     first_round: int
     last_round: int
     rounds: list[HypothesisRound] = Field(default_factory=list)
     resolved_outcome: str | None = None
-    # ``pass``/``fail`` from the closing round, or None when independent review
-    # was deferred by sparse-review policy and the round is still provisional.
+    # Independent review from the authoritative hypothesis state.
     judge_verdict: Literal["pass", "fail"] | None = None
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
-    # Change against the last measured round preceding this hypothesis. None
-    # when either side is unmeasured or the baseline is zero.
+    # Causal delta paired with ``perf_metric`` by the hypothesis state. None
+    # means no official comparison is available.
     perf_delta_pct: FiniteFloat | None = None
-    # Integration, not truth: whether a framework-owned gate accepted the
-    # candidate or it was retained on the Pareto frontier. Deliberately
-    # independent of ``resolved_outcome``.
-    kept: bool = False
+    # Identity of the measured metric, so clients can label the bare number.
+    # Legacy rounds recorded only a unit, so this may repeat ``perf_unit``.
+    perf_metric_name: str | None = None
+    # Which way improvement points for the metric. None when the run recorded
+    # no objective direction; clients must not guess one.
+    perf_direction: Literal["max", "min"] | None = None
+    # The other side of ``perf_delta_pct``, from the same official
+    # measurement, so the comparison stays interpretable in absolute terms.
+    perf_baseline_value: FiniteFloat | None = None
+    # Integration, not truth: the framework's explicit retention decision.
+    # None means legacy or not yet assessed, never "official evaluation ran".
+    kept: bool | None = None
+    # Orchestrator strategy is separate from empirical resolution and
+    # candidate retention. It is structured backend state, not roadmap prose.
+    strategy_disposition: Literal["available", "parked", "abandoned"] | None = None
+    strategy_reason: str | None = None
     active: bool = False
 
 
@@ -187,9 +317,19 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     diagnostic: Diagnostic | None = None
     ack: CommandAck | None = None
     chat: ChatResult | None = None
+    chat_thread: ChatThreadInfo | None = None
+    # None means the run has not attached its agent selection yet, which is
+    # distinct from a run that offers no provider at all.
+    chat_options: ChatOptions | None = None
+    # None means this server was started without a defaults provider, so the
+    # client keeps its own built-in defaults. It never means "no defaults".
+    tui_defaults: InteractiveSetupDefaults | None = None
     snapshot: RunSnapshot | None = None
     events: list[RunEvent] = Field(default_factory=list)
     performance: list[PerformanceRound] = Field(default_factory=list)
+    # None means the run has not recorded what its metric is, which is
+    # distinct from a run whose plot is merely empty so far.
+    performance_context: PerformanceContext | None = None
     experiments: list[HypothesisEntry] = Field(default_factory=list)
     # False means canonical project/run state is not attached yet. Keeping the
     # readiness marker separate preserves the protocol-v1 list contract while
@@ -228,6 +368,10 @@ class EventBatchMessage(ProtocolModel):  # noqa: D101  # tracked: #288
     events: list[RunEvent]
     through_sequence: int = Field(default=0, ge=0)
     active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
+    # "Every event in this stream's history has sequence > this." 0 means the
+    # full history was delivered, which is the default and today's behavior.
+    # Carried on every batch of the subscription, live ones included.
+    history_after_sequence: int = Field(default=0, ge=0)
 
 
 class ProtocolErrorMessage(ProtocolModel):  # noqa: D101  # tracked: #288

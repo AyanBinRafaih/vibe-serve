@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import weakref
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from vibesys._agent_cli.base import CodingAgent
@@ -28,7 +29,17 @@ from vibesys.agents.contracts import (
 )
 from vibesys.agents.docker_executor import DockerCommandExecutor
 from vibesys.agents.host_resource_declarations import declare_agent_host_resources
+from vibesys.server.events import CommandResultPayload
 from vs_sandbox import build_host_sandbox
+
+AGENTSHIM_CAPABILITIES = AgentCapabilities(
+    mcp_servers=True,
+    nested_read_only_paths=True,
+    hidden_paths=True,
+    timeouts=True,
+    session_reuse=True,
+)
+"""Capabilities invariant across AgentShim host and container execution."""
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -52,6 +63,12 @@ _PROVIDER_CLASSES: dict[str, _ProviderFactory] = {
     "codex": CodexCodingAgent,
     "opencode": OpencodeCodingAgent,
 }
+
+
+def supported_providers() -> list[str]:
+    """Return the sorted provider names the AgentShim driver can run."""
+    return sorted(_PROVIDER_CLASSES)
+
 
 _REASONING_EFFORT_PROVIDERS = frozenset({"codex", "claude"})
 _PYTHON_MCP_COMMANDS = frozenset({"python", "python3"})
@@ -147,6 +164,12 @@ class _AgentShimEventHandler:
                     "stderr": stderr,
                     "exit_code": exit_code,
                     "duration": duration,
+                    "result_payload": CommandResultPayload(
+                        stdout=stdout,
+                        stderr=stderr,
+                        exit_code=exit_code,
+                        duration=duration,
+                    ),
                 },
             )
         )
@@ -355,8 +378,7 @@ class AgentShimSession:
     def _refresh_container(self) -> None:
         if self._docker_sandboxes is None:
             return
-        executor = getattr(self._agent, "executor", None)
-        executor.container_id = self._docker_sandboxes[self._spec.role]._container_id  # pyright: ignore[reportOptionalMemberAccess]  # noqa: SLF001  # tracked: #288
+        self._agent.executor.container_id = self._docker_sandboxes[self._spec.role]._container_id  # noqa: SLF001  # tracked: #288
 
     def _repair_workspace_ownership(self) -> None:
         if self._docker_sandboxes is None:
@@ -391,14 +413,10 @@ class AgentShimDriver:
     @property
     def capabilities(self) -> AgentCapabilities:
         """Describe the policy and lifecycle features this driver enforces."""
-        return AgentCapabilities(
-            mcp_servers=True,
-            nested_read_only_paths=True,
-            hidden_paths=True,
+        return replace(
+            AGENTSHIM_CAPABILITIES,
             host_path_grants=self._docker_sandboxes is None,
             container_execution=self._docker_sandboxes is not None,
-            timeouts=True,
-            session_reuse=True,
         )
 
     def create_session(self, spec: AgentSessionSpec) -> AgentSession:

@@ -6,11 +6,8 @@ ProfilerResponse / parser / nsys-toolkit tests.
 
 The ``resources.profilers.nsys.analyze_nsys`` imports below resolve at
 runtime because pytest's ``pythonpath = ["."]`` setting (pyproject.toml)
-puts the repo root on ``sys.path``. Pyright's per-directory execution
-environment for ``tests`` does not carry that same implicit root, so it
-cannot resolve them statically; each import is suppressed by name rather
-than widened via ``extraPaths`` (widening was tried and made pyright treat
-the first-party ``vibesys`` package as an external stub-only dependency).
+puts the repo root on ``sys.path``, and statically because the repo root is
+listed in ``[tool.ty.environment] root``.
 """
 
 import json
@@ -241,7 +238,7 @@ def nsys_db(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
 
 
 def test_analyze_kernels(nsys_db):  # noqa: ANN001, ANN201  # tracked: #288
-    from resources.profilers.nsys.analyze_nsys import (  # pyright: ignore[reportMissingImports]  # noqa: PLC0415  # tracked: #288
+    from resources.profilers.nsys.analyze_nsys import (  # noqa: PLC0415  # tracked: #288
         _build_string_map,
         analyze_kernels,
     )
@@ -258,7 +255,7 @@ def test_analyze_kernels(nsys_db):  # noqa: ANN001, ANN201  # tracked: #288
 
 
 def test_analyze_cpu_overhead(nsys_db):  # noqa: ANN001, ANN201  # tracked: #288
-    from resources.profilers.nsys.analyze_nsys import (  # pyright: ignore[reportMissingImports]  # noqa: PLC0415  # tracked: #288
+    from resources.profilers.nsys.analyze_nsys import (  # noqa: PLC0415  # tracked: #288
         _build_string_map,
         analyze_cpu_overhead,
     )
@@ -275,7 +272,7 @@ def test_analyze_cpu_overhead(nsys_db):  # noqa: ANN001, ANN201  # tracked: #288
 
 
 def test_analyze_gpu_idle_gaps(nsys_db):  # noqa: ANN001, ANN201  # tracked: #288
-    from resources.profilers.nsys.analyze_nsys import (  # pyright: ignore[reportMissingImports]  # noqa: PLC0415  # tracked: #288
+    from resources.profilers.nsys.analyze_nsys import (  # noqa: PLC0415  # tracked: #288
         _build_string_map,
         analyze_gpu_idle_gaps,
     )
@@ -291,7 +288,7 @@ def test_analyze_gpu_idle_gaps(nsys_db):  # noqa: ANN001, ANN201  # tracked: #28
 
 
 def test_analyze_memory_ops(nsys_db):  # noqa: ANN001, ANN201  # tracked: #288
-    from resources.profilers.nsys.analyze_nsys import (  # pyright: ignore[reportMissingImports]  # noqa: PLC0415  # tracked: #288
+    from resources.profilers.nsys.analyze_nsys import (  # noqa: PLC0415  # tracked: #288
         analyze_memory_ops,
     )
 
@@ -303,7 +300,7 @@ def test_analyze_memory_ops(nsys_db):  # noqa: ANN001, ANN201  # tracked: #288
 
 
 def test_short_kernel_name():  # noqa: ANN201  # tracked: #288
-    from resources.profilers.nsys.analyze_nsys import (  # pyright: ignore[reportMissingImports]  # noqa: PLC0415  # tracked: #288
+    from resources.profilers.nsys.analyze_nsys import (  # noqa: PLC0415  # tracked: #288
         _short_kernel_name,
     )
 

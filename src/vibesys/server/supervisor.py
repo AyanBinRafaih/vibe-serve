@@ -7,13 +7,14 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Callable, Generator  # noqa: TC003  # tracked: #288
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path  # noqa: TC003  # tracked: #288
 from typing import TYPE_CHECKING, Any
 
+from vibesys.server.chat_options import ChatRunSettings  # noqa: TC001  # tracked: #288
 from vibesys.server.diagnostics import (
     Diagnostic,
     DiagnosticRetryability,
@@ -29,6 +30,7 @@ from vibesys.server.events import (
     AgentOutputChannel,
     AgentOutputChunkData,
     ChatData,
+    ChatThreadCreatedData,
     EventData,
     EventStatus,
     EventStore,
@@ -45,7 +47,7 @@ from vibesys.server.events import (
     json_value,
     make_event,
 )
-from vibesys.server.protocol import ActiveAgentExecution, RunSnapshot
+from vibesys.server.protocol import ActiveAgentExecution, ChatThreadInfo, RunSnapshot
 
 _MAX_EXCEPTION_CHAIN = 8
 _TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS = 5.0
@@ -66,6 +68,34 @@ _NONTERMINAL_FAILURE_EVENTS = frozenset(
         EventType.PHASE_FINISHED,
     }
 )
+_CANONICAL_LIFECYCLE_EVENTS = frozenset(
+    {EventType.AGENT_EXECUTION_STARTED, EventType.AGENT_EXECUTION_FINISHED}
+)
+_LEGACY_LIFECYCLE_EVENTS = frozenset({EventType.INVOCATION_STARTED, EventType.INVOCATION_FINISHED})
+_PAYLOAD_INDEXED_EVENTS = frozenset({EventType.CHAT_THREAD_CREATED, EventType.CHAT})
+"""Event types whose ``data`` payload feeds run-level supervisor state.
+
+They are rare, so an attach parses exactly these records out of the durable
+log instead of validating the history around them.
+"""
+_BOOTSTRAP_SPINE_TYPES = frozenset(
+    {
+        EventType.RUN_STARTED,
+        EventType.RUN_FINISHED,
+        EventType.RUN_FAILED,
+        EventType.RUN_INTERRUPTED,
+        EventType.CONFIGURATION_FAILED,
+        EventType.ROUND_FINISHED,
+        EventType.EXPERIMENTS_CHANGED,
+        EventType.CHAT_THREAD_CREATED,
+    }
+)
+"""Events whose effect on client state is run-level, not transcript-local.
+
+A client that folds only a tail still needs these, and there are O(rounds) of
+them, so a tail subscription replays them ahead of the tail rather than the
+server reprojecting what the client's own reducer already computes.
+"""
 
 if TYPE_CHECKING:
     from vs_project import Project, StateSnapshot
@@ -102,6 +132,23 @@ class TerminalChatResource:
     close: Callable[[], None]
 
 
+@dataclass(frozen=True)
+class ChatThreadHandle:
+    """Resolved thread settings and the handler that answers its questions."""
+
+    spec: ChatThreadCreatedData
+    handler: Callable[[str], str]
+
+
+ChatThreadFactory = Callable[[str, str | None, str | None, str | None], ChatThreadHandle]
+"""Builds one thread's chat service: (thread_id, driver, provider, model).
+
+None arguments resolve to the run's configured defaults. The factory raises
+``ValueError`` for an unsupported driver/provider combination; resource
+cleanup for the built service stays with the factory's owner (the run
+context), not the supervisor."""
+
+
 class RunSupervisor:
     """Own pause state, invocation metadata, and the run audit store."""
 
@@ -117,15 +164,31 @@ class RunSupervisor:
         self._canonical_execution_ids: set[str] = set()
         self._legacy_invocation_ids: set[str] = set()
         self._run_status = "starting"
+        # One durable event stream is both the live subscription source and
+        # the replay source. A process starts on a bootstrap directory before
+        # it knows the project run; ``attach`` moves that short prefix into the
+        # run's durable store once the context is available.
         self._store: EventStore | None = None
-        self._audit_store: EventStore | None = None
         self._pending_events: list[RunEvent] = []
         self.log_dir: Path | None = None
         self._project_run: ProjectRunState | None = None
         self._current_kind: str | None = None
         self._current_round: str | None = None
         self._chat_handler: Callable[[str], str] | None = None
+        # Per-thread chat routing. Specs replay from CHAT_THREAD_CREATED
+        # events so a resumed run can rebuild handlers on demand through the
+        # context-owned factory.
+        self._chat_thread_factory: ChatThreadFactory | None = None
+        self._chat_thread_handlers: dict[str, Callable[[str], str]] = {}
+        self._chat_thread_specs: dict[str, ChatThreadCreatedData] = {}
+        # The run's own agent selection, attached by the run context. Chat
+        # options are derived from it, so a client enumerates nothing.
+        self._chat_run_settings: ChatRunSettings | None = None
+        # Default-chat and thread-chat borrowers are counted separately: the
+        # default handler can outlive the run context (retained terminal chat),
+        # so thread teardown must not wait on it.
         self._active_chat_calls = 0
+        self._active_chat_thread_calls = 0
         self._retain_terminal_chat = False
         self._terminal_chat_resource: TerminalChatResource | None = None
         self._retired_terminal_chat_resource: TerminalChatResource | None = None
@@ -163,27 +226,37 @@ class RunSupervisor:
         if (project is None) != (run_id is None):
             raise ValueError("project and run_id must be provided together")  # noqa: TRY003  # tracked: #288
         log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir = log_dir
         events_path = log_dir / "run-events.jsonl"
         with self._condition:
             if project is not None and run_id is not None:
                 self._project_run = ProjectRunState(project, run_id)
             store = self._store
-            if store is not None and run_id is not None:
-                store.run_id = run_id
-            if store is not None and (store.path == events_path or self._audit_store is not None):
+            if store is not None and store.path == events_path:
+                if run_id is not None:
+                    store.run_id = run_id
+                self.log_dir = log_dir
                 return
-            if store is None:
-                store = EventStore(events_path, run_id=run_id or log_dir.parent.name)
-                self._store = store
-                self._index_execution_lifecycle(store.read())
-                pending, self._pending_events = self._pending_events, []
-            else:
-                self._audit_store = EventStore(events_path, run_id=run_id or log_dir.parent.name)
-                pending = store.read()
-        for event in pending:
-            (self._audit_store or store).append(event)
-        if self._audit_store is None:
+            durable = EventStore(events_path, run_id=run_id or log_dir.parent.name)
+            # A resumed run already owns durable events. Index them before
+            # replay so legacy invocation records retain their canonical
+            # execution projection.
+            self._index_stored_history(durable)
+            pending = store.read() if store is not None else self._pending_events
+            self._pending_events = []
+            # Appending through EventStore gives bootstrap events the next
+            # durable sequence numbers, rather than preserving a second,
+            # colliding sequence space from the temporary server directory.
+            for event in pending:
+                self._index_execution_lifecycle([durable.append(event)])
+            self._store = durable
+            self.log_dir = log_dir
+            started_fresh = store is None
+            if store is not None:
+                # Subscribers block on the store they last read. Wake them so
+                # they pick up the run's durable store now rather than after
+                # their poll timeout.
+                store.notify_change()
+        if started_fresh:
             self.record(EventType.SERVER_STARTED, status=EventStatus.ACTIVE)
         with self._condition:
             self._run_status = "running"
@@ -336,9 +409,6 @@ class RunSupervisor:
                 return event
             recorded = store.append(event)
             self._index_execution_lifecycle([recorded])
-            audit_store = self._audit_store
-            if audit_store is not None:
-                audit_store.append(event)
             return recorded
 
     def record_failure(  # noqa: PLR0913  # failure event fields belong at this boundary
@@ -348,7 +418,8 @@ class RunSupervisor:
         *,
         scope: DiagnosticScope,
         operation: str,
-        data: EventData | Callable[[Diagnostic], EventData] | None = None,
+        data: EventData | None = None,
+        data_factory: Callable[[Diagnostic], EventData] | None = None,
         text: str | None = None,
         severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
         status: EventStatus = EventStatus.FAILED,
@@ -360,6 +431,8 @@ class RunSupervisor:
         This API handles nonterminal invocation and phase boundaries. Pass an
         existing diagnostic when related events must share an identity.
         Terminal failures remain owned by ``finish`` and ``run_server``.
+        Pass ``data_factory`` instead of ``data`` when the payload needs the
+        canonical diagnostic; it takes precedence over ``data``.
         """
         if event_type not in _NONTERMINAL_FAILURE_EVENTS:
             raise ValueError(f"Cannot record {event_type.value} without owning run termination")  # noqa: TRY003  # contract violation, not a user-facing error
@@ -369,6 +442,7 @@ class RunSupervisor:
             scope=scope,
             operation=operation,
             data=data,
+            data_factory=data_factory,
             text=text,
             severity=severity,
             status=status,
@@ -383,7 +457,8 @@ class RunSupervisor:
         *,
         scope: DiagnosticScope,
         operation: str,
-        data: EventData | Callable[[Diagnostic], EventData] | None = None,
+        data: EventData | None = None,
+        data_factory: Callable[[Diagnostic], EventData] | None = None,
         text: str | None = None,
         severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
         status: EventStatus = EventStatus.FAILED,
@@ -396,7 +471,7 @@ class RunSupervisor:
         diagnostic = diagnostic or self._diagnostic_for(error, scope, operation=operation)
         if diagnostic.severity is not severity:
             diagnostic = diagnostic.model_copy(update={"severity": severity})
-        event_data = data(diagnostic) if callable(data) else data
+        event_data = data_factory(diagnostic) if data_factory is not None else data
         return self.record(
             event_type,
             diagnostic.summary if text is None else text,
@@ -413,7 +488,8 @@ class RunSupervisor:
         event_type: EventType,
         scope: DiagnosticScope,
         operation: str,
-        data: EventData | Callable[[Diagnostic], EventData] | None = None,
+        data: EventData | None = None,
+        data_factory: Callable[[Diagnostic], EventData] | None = None,
         text: str | None = None,
         severity: DiagnosticSeverity = DiagnosticSeverity.ERROR,
         **fields: Any,  # noqa: ANN401  # tracked: #288
@@ -436,39 +512,84 @@ class RunSupervisor:
                 scope=scope,
                 operation=operation,
                 data=data,
+                data_factory=data_factory,
                 text=text,
                 severity=severity,
                 **fields,
             )
             raise
 
-    def read_events(self, after_sequence: int = 0) -> list[RunEvent]:  # noqa: D102  # tracked: #288
+    def read_events(
+        self, after_sequence: int = 0, before_sequence: int | None = None
+    ) -> list[RunEvent]:
+        """Return the canonical events in ``(after_sequence, before_sequence)``.
+
+        The upper bound is exclusive and optional; it exists so a client can
+        backfill history older than the tail it was given without asking for
+        everything, and it goes through the same projection as every read.
+        """
         with self._condition:
             store = self._store
             if store is None:
                 return []
             return _canonical_execution_events(
-                store.read(after_sequence),
+                store.read(after_sequence, before_sequence),
                 canonical_lifecycle_ids=self._canonical_execution_ids,
                 invocation_lifecycle_ids=self._legacy_invocation_ids,
             )
 
     def read_history_events(self) -> list[RunEvent]:
-        """Return the durable session history, including earlier attachments."""
-        store = self._audit_store or self._store
-        return _canonical_execution_events(store.read()) if store else []
+        """Return the same durable event history used for subscription replay."""
+        with self._condition:
+            store = self._store
+            if store is None:
+                return []
+            return _canonical_execution_events(
+                store.read(),
+                canonical_lifecycle_ids=self._canonical_execution_ids,
+                invocation_lifecycle_ids=self._legacy_invocation_ids,
+            )
 
-    def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
+    def wait_for_events(
+        self,
+        after_sequence: int,
+        timeout: float | None = None,
+        before_sequence: int | None = None,
+    ) -> list[RunEvent]:
+        """Block for new events after the cursor, then return the bounded window.
+
+        The wait itself is open-ended: ``before_sequence`` bounds what is
+        returned, not what counts as progress.
+        """
         store = self._store
         if store is None:
             return []
         store.wait(after_sequence, timeout)
         with self._condition:
             return _canonical_execution_events(
-                store.read(after_sequence),
+                store.read(after_sequence, before_sequence),
                 canonical_lifecycle_ids=self._canonical_execution_ids,
                 invocation_lifecycle_ids=self._legacy_invocation_ids,
             )
+
+    def wait_for_change(self, after_sequence: int, timeout: float | None = None) -> bool:
+        """Block until the stream advances past the cursor, parsing no events.
+
+        A subscriber that will take its own checkpoint afterwards only needs
+        the change signal, so it must not force the intervening window into
+        models on the way to discarding it.
+        """
+        store = self._store
+        if store is None:
+            return False
+        return store.wait_for_change(after_sequence, timeout)
+
+    @property
+    def latest_sequence(self) -> int:
+        """The newest durable sequence, without building a whole snapshot."""
+        with self._condition:
+            store = self._store
+            return store.last_sequence if store else 0
 
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         with self._condition:
@@ -483,16 +604,40 @@ class RunSupervisor:
                     execution.model_copy(deep=True)
                     for execution in self._active_executions.values()
                 ],
+                # Thread titles are backfilled from later CHAT events, so the
+                # registry is not recoverable from CHAT_THREAD_CREATED alone:
+                # a client that only folds a tail gets it from the server.
+                chat_threads=[
+                    ChatThreadInfo(
+                        thread_id=spec.thread_id,
+                        title=spec.title,
+                        driver=spec.driver,
+                        provider=spec.provider,
+                        model=spec.model,
+                    )
+                    # Insertion order is replay order, for both attach and live.
+                    for spec in self._chat_thread_specs.values()
+                ],
             )
 
     def subscription_checkpoint(
-        self, after_sequence: int
+        self, after_sequence: int, *, bootstrap_spine: bool = False
     ) -> tuple[int, list[RunEvent], list[ActiveAgentExecution]]:
-        """Atomically capture replay events and active state at one watermark."""
+        """Atomically capture replay events and active state at one watermark.
+
+        ``bootstrap_spine`` prepends the pre-cursor events that carry run-level
+        state (run lifecycle, round outcomes, thread creation). A client that
+        folds only a tail then derives the same run-level state a full replay
+        would, using its ordinary reducer and no server-side projection.
+        """
         with self._condition:
             store = self._store
             through_sequence = store.last_sequence if store else 0
             events = store.read(after_sequence) if store else []
+            if store is not None and bootstrap_spine and after_sequence > 0:
+                # Ascending throughout: the spine is entirely at or below the
+                # cursor, and clients drop out-of-order events.
+                events = self._bootstrap_spine_unlocked(store, after_sequence) + events
             events = _canonical_execution_events(
                 events,
                 canonical_lifecycle_ids=self._canonical_execution_ids,
@@ -504,17 +649,67 @@ class RunSupervisor:
             ]
             return through_sequence, events, active
 
+    def _bootstrap_spine_unlocked(self, store: EventStore, floor: int) -> list[RunEvent]:
+        """Select the pre-floor run-level events, parsing only those records."""
+        sequences = [
+            header.sequence
+            for header in store.event_headers()
+            if header.sequence <= floor and header.type in _BOOTSTRAP_SPINE_TYPES
+        ]
+        return store.read_sequences(sequences)
+
     def _index_execution_lifecycle(self, events: list[RunEvent]) -> None:
+        """Index freshly recorded events. The live-append path, one at a time."""
         for event in events:
-            if event.execution_id is None:
-                continue
-            if event.type in {
-                EventType.AGENT_EXECUTION_STARTED,
-                EventType.AGENT_EXECUTION_FINISHED,
-            }:
-                self._canonical_execution_ids.add(event.execution_id)
-            elif event.type in {EventType.INVOCATION_STARTED, EventType.INVOCATION_FINISHED}:
-                self._legacy_invocation_ids.add(event.execution_id)
+            self._index_event_payload(event)
+            self._index_execution_identity(event.type, event.execution_id)
+
+    def _index_stored_history(self, store: EventStore) -> None:
+        """Index a resumed run's durable history without parsing it.
+
+        The store's scan already knows every record's type and identity, so
+        the lifecycle sets come from headers alone and only the few records
+        whose payload the index needs are validated.
+        """
+        payload_sequences: list[int] = []
+        for header in store.event_headers():
+            self._index_execution_identity(header.type, header.execution_id)
+            # A CHAT event only carries indexable state when it belongs to a
+            # thread, and the scan already knows which ones do.
+            if header.type in _PAYLOAD_INDEXED_EVENTS and (
+                header.type is not EventType.CHAT or header.chat_thread_id is not None
+            ):
+                payload_sequences.append(header.sequence)
+        for event in store.read_sequences(payload_sequences):
+            self._index_event_payload(event)
+
+    def _index_execution_identity(self, event_type: EventType, execution_id: str | None) -> None:
+        """Record which lifecycle vocabulary one execution id was written with."""
+        if execution_id is None:
+            return
+        if event_type in _CANONICAL_LIFECYCLE_EVENTS:
+            self._canonical_execution_ids.add(execution_id)
+        elif event_type in _LEGACY_LIFECYCLE_EVENTS:
+            self._legacy_invocation_ids.add(execution_id)
+
+    def _index_event_payload(self, event: RunEvent) -> None:
+        """Index the run-level state carried in one event's ``data`` payload."""
+        if event.type is EventType.CHAT_THREAD_CREATED and isinstance(
+            event.data, ChatThreadCreatedData
+        ):
+            self._chat_thread_specs.setdefault(event.data.thread_id, event.data)
+            return
+        if (
+            event.type is EventType.CHAT
+            and event.chat_thread_id is not None
+            and isinstance(event.data, ChatData)
+            and event.data.thread_title
+        ):
+            spec = self._chat_thread_specs.get(event.chat_thread_id)
+            if spec is not None and not spec.title:
+                self._chat_thread_specs[event.chat_thread_id] = spec.model_copy(
+                    update={"title": event.data.thread_title}
+                )
 
     def chat_agent_available(self) -> bool:
         """True when an agent-backed chat handler is installed for this run.
@@ -525,7 +720,9 @@ class RunSupervisor:
         with self._condition:
             return self._chat_handler is not None
 
-    def chat(self, text: str) -> str:  # noqa: D102  # tracked: #288
+    def chat(self, text: str, thread_id: str | None = None) -> str:  # noqa: D102  # tracked: #288
+        if thread_id is not None:
+            return self._thread_chat(text, thread_id)
         with self._condition:
             handler = self._chat_handler
             if handler is not None:
@@ -557,6 +754,141 @@ class RunSupervisor:
         finally:
             if handler is not None:
                 self._release_chat_call()
+
+    def _thread_chat(self, text: str, thread_id: str) -> str:
+        """Route one question to a created thread's handler and audit it."""
+        handler = self._resolve_thread_handler(thread_id)
+        if isinstance(handler, str):
+            # A routing failure is an answer to this caller, not run history:
+            # no CHAT event is recorded for a thread that cannot answer.
+            return handler
+        with self._condition:
+            self._active_chat_thread_calls += 1
+        try:
+            answer = handler(text)
+            thread_title = self._title_thread_if_needed(thread_id, text)
+            self.record(
+                EventType.CHAT,
+                text,
+                status=EventStatus.ANSWERED,
+                agent_kind="chat",
+                round_label="experiment-chat",
+                chat_thread_id=thread_id,
+                data=ChatData(answer=answer, thread_title=thread_title),
+            )
+            return answer
+        finally:
+            self._release_chat_thread_call()
+
+    def _title_thread_if_needed(self, thread_id: str, question: str) -> str | None:
+        """Derive and store an untitled thread's title from its first message."""
+        with self._condition:
+            spec = self._chat_thread_specs.get(thread_id)
+            if spec is None or spec.title:
+                return None
+            title = _chat_thread_title(question)
+            if not title:
+                return None
+            self._chat_thread_specs[thread_id] = spec.model_copy(update={"title": title})
+            return title
+
+    def _resolve_thread_handler(self, thread_id: str) -> Callable[[str], str] | str:
+        """Return the thread's handler, or the error answer explaining why not."""
+        with self._condition:
+            handler = self._chat_thread_handlers.get(thread_id)
+            spec = self._chat_thread_specs.get(thread_id)
+            factory = self._chat_thread_factory
+        if handler is not None:
+            return handler
+        if spec is None:
+            return (
+                f"Unknown experiment chat thread {thread_id!r}. Create one with "
+                "/new-chat, or omit the thread to use the default experiment chat."
+            )
+        if factory is None:
+            return (
+                f"Experiment chat thread {thread_id!r} cannot answer right now "
+                f"({self._chat_unavailable_reason()})."
+            )
+        try:
+            handle = factory(thread_id, spec.driver, spec.provider, spec.model)
+        except Exception as exc:  # noqa: BLE001  # routing failures become answers
+            return (
+                f"Could not restore experiment chat thread {thread_id!r}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        with self._condition:
+            return self._chat_thread_handlers.setdefault(thread_id, handle.handler)
+
+    def set_chat_thread_factory(self, factory: ChatThreadFactory | None) -> None:
+        """Install the context-owned builder for per-thread chat services."""
+        with self._condition:
+            self._chat_thread_factory = factory
+
+    def set_chat_run_settings(self, settings: ChatRunSettings | None) -> None:
+        """Record the run's agent selection, the basis of every chat option."""
+        with self._condition:
+            self._chat_run_settings = settings
+
+    @property
+    def chat_run_settings(self) -> ChatRunSettings | None:
+        """The run's agent selection, or None before a run context attaches."""
+        with self._condition:
+            return self._chat_run_settings
+
+    def create_chat_thread(
+        self,
+        *,
+        driver: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        title: str | None = None,
+    ) -> ChatThreadCreatedData:
+        """Create one chat thread, record its durable event, and register it.
+
+        An untitled thread is titled by the server from its first message.
+        """
+        with self._condition:
+            factory = self._chat_thread_factory
+        if factory is None:
+            raise RuntimeError(  # noqa: TRY003  # surfaced to the requesting client
+                "Experiment chat threads are not available for this run "
+                f"({self._chat_unavailable_reason()})"
+            )
+        thread_id = uuid.uuid4().hex
+        handle = factory(thread_id, driver, provider, model)
+        spec = handle.spec
+        if title is not None and title.strip():
+            spec = spec.model_copy(update={"title": title.strip()})
+        with self._condition:
+            self._chat_thread_specs[spec.thread_id] = spec
+            self._chat_thread_handlers[spec.thread_id] = handle.handler
+        self.record(
+            EventType.CHAT_THREAD_CREATED,
+            agent_kind="chat",
+            round_label="experiment-chat",
+            chat_thread_id=spec.thread_id,
+            data=spec,
+        )
+        return spec
+
+    def chat_threads(self) -> list[ChatThreadCreatedData]:
+        """Return every created thread's replayable spec, oldest first."""
+        with self._condition:
+            return sorted(self._chat_thread_specs.values(), key=lambda spec: spec.created_at)
+
+    def clear_chat_threads_and_drain(self) -> None:
+        """Stop routing thread chat and wait for in-flight thread calls to release."""
+        with self._condition:
+            self._chat_thread_factory = None
+            self._chat_thread_handlers.clear()
+            self._wait_for_thread_chat_drain_locked(timeout=_TERMINAL_CHAT_DRAIN_TIMEOUT_SECONDS)
+
+    def _release_chat_thread_call(self) -> None:
+        """Release one thread-handler lease."""
+        with self._condition:
+            self._active_chat_thread_calls -= 1
+            self._condition.notify_all()
 
     def _release_chat_call(self) -> None:
         """Release one handler lease and close a retired resource when safe."""
@@ -636,8 +968,16 @@ class RunSupervisor:
             resource.close()
 
     def _wait_for_chat_drain_locked(self, *, timeout: float | None) -> bool:
+        """Wait until the default chat handler has no borrowers."""
+        return self._wait_locked(lambda: self._active_chat_calls > 0, timeout=timeout)
+
+    def _wait_for_thread_chat_drain_locked(self, *, timeout: float | None) -> bool:
+        """Wait until no thread handler is borrowed."""
+        return self._wait_locked(lambda: self._active_chat_thread_calls > 0, timeout=timeout)
+
+    def _wait_locked(self, busy: Callable[[], bool], *, timeout: float | None) -> bool:
         deadline = time.monotonic() + timeout if timeout is not None else None
-        while self._active_chat_calls > 0:
+        while busy():
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 return False
@@ -698,6 +1038,9 @@ class RunSupervisor:
         *,
         consume_steering: bool = True,
         participates_in_run_control: bool = True,
+        driver: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> AgentExecutionHandle:
         """Start one prompt-to-result execution and return its explicit identity."""
         with self._condition:
@@ -725,6 +1068,9 @@ class RunSupervisor:
                 assignment=effective_prompt,
                 started_at=datetime.now(UTC),
                 activity=activity,
+                driver=driver,
+                provider=provider,
+                model=model,
             )
             self.record(
                 EventType.AGENT_EXECUTION_STARTED,
@@ -738,6 +1084,9 @@ class RunSupervisor:
                     system_prompt=system_prompt,
                     user_prompt=effective_prompt,
                     activity=activity,
+                    driver=driver,
+                    provider=provider,
+                    model=model,
                 ),
             )
             self._active_executions[execution_id] = active
@@ -816,7 +1165,7 @@ class RunSupervisor:
                     scope=DiagnosticScope.INVOCATION,
                     operation="Agent execution",
                     status=terminal_status,
-                    data=lambda diagnostic: AgentExecutionFinishedData(
+                    data_factory=lambda diagnostic: AgentExecutionFinishedData(
                         result=json_value(result), error=diagnostic.summary
                     ),
                     agent_kind=active.agent_kind,
@@ -1008,6 +1357,19 @@ class RunSupervisor:
         with self._condition:
             self._error_diagnostics[key] = (error, diagnostic)
         return diagnostic
+
+
+_CHAT_THREAD_TITLE_MAX_CHARS = 40
+
+
+def _chat_thread_title(question: str) -> str:
+    """Title a thread from its first message: first line, cut on a word."""
+    line = next((part.strip() for part in question.strip().splitlines() if part.strip()), "")
+    if len(line) <= _CHAT_THREAD_TITLE_MAX_CHARS:
+        return line
+    cut = line[:_CHAT_THREAD_TITLE_MAX_CHARS]
+    head, separator, _rest = cut.rpartition(" ")
+    return f"{head.rstrip() if separator else cut}…"
 
 
 def _attempt_from_label(round_label: str) -> int | None:

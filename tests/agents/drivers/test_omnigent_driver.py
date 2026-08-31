@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -39,6 +39,7 @@ from vibesys.agents.drivers.omnigent import (
 )
 from vibesys.agents.omnigent.providers import OMNIGENT_PROVIDER_EXECUTORS
 from vibesys.schemas import JudgeResponse
+from vibesys.server.events import CommandResultPayload, JsonResultPayload
 from vs_sandbox import HostResource, ProjectPathPolicy
 
 omnigent = pytest.importorskip("omnigent")
@@ -282,7 +283,7 @@ def test_distinct_tool_helpers_snapshot_their_own_environment_without_command_re
             ).strip()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [
+            futures: list[concurrent.futures.Future[Any]] = [
                 pool.submit(
                     asyncio.run,
                     os_tools.dispatch("sys_os_shell", {"command": "cargo test"}),
@@ -459,6 +460,43 @@ def test_turn_normalizes_events_usage_schema_and_session_id(tmp_path: Path) -> N
         "usage",
     ]
     driver.close()
+
+
+def test_tool_call_complete_attaches_typed_result_payloads(tmp_path: Path) -> None:
+    executor = _FakeExecutor(
+        [
+            ToolCallComplete(name="query", result={"rows": [1, 2]}, duration_ms=250),
+            ToolCallComplete(name="list", result=["a", "b"], duration_ms=100),
+            ToolCallComplete(name="shell", result="stdout text", error="boom", duration_ms=500),
+            TurnComplete(response="final"),
+        ]
+    )
+    driver, session = _session(tmp_path, executor)
+    observer = _Observer()
+
+    session.run_turn(AgentTurnRequest("go"), observer)
+    driver.close()
+
+    results = [event.payload for event in observer.events if event.kind.value == "tool_result"]
+    assert [payload["tool"] for payload in results] == ["query", "list", "shell"]
+
+    json_payload = results[0]["result_payload"]
+    assert isinstance(json_payload, JsonResultPayload)
+    assert json_payload.value == {"rows": [1, 2]}
+    # content stays the flattened string even when the payload is typed JSON.
+    assert results[0]["stdout"] == str({"rows": [1, 2]})
+
+    list_payload = results[1]["result_payload"]
+    assert isinstance(list_payload, JsonResultPayload)
+    assert list_payload.value == ["a", "b"]
+
+    command_payload = results[2]["result_payload"]
+    assert command_payload == CommandResultPayload(
+        stdout="stdout text",
+        stderr="boom",
+        exit_code=None,
+        duration=0.5,
+    )
 
 
 def test_turn_complete_response_wins_and_chunks_are_fallback(tmp_path: Path) -> None:
@@ -775,7 +813,7 @@ def test_independent_sessions_overlap_on_one_driver_loop(
     monkeypatch.setattr(
         driver,
         "_build_executor",
-        lambda _spec: (next(remaining), [], _resources()),
+        lambda _spec: (next(remaining), [], None, _resources()),
     )
     sessions = [driver.create_session(_spec(tmp_path)) for _ in executors]
 
@@ -879,7 +917,7 @@ def test_driver_close_continues_after_cleanup_base_exception(
     monkeypatch.setattr(
         driver,
         "_build_executor",
-        lambda _spec: (next(remaining), [], _resources()),
+        lambda _spec: (next(remaining), [], None, _resources()),
     )
     for _ in executors:
         driver.create_session(_spec(tmp_path))
@@ -936,10 +974,15 @@ def test_driver_close_waits_for_in_flight_session_creation(
 
     def build(
         _spec: AgentSessionSpec,
-    ) -> tuple[_FakeExecutor, list[dict[str, Any]], driver_subject._ExecutorResources]:
+    ) -> tuple[
+        _FakeExecutor,
+        list[dict[str, Any]],
+        None,
+        driver_subject._ExecutorResources,
+    ]:
         build_started.set()
         assert release_build.wait(timeout=2)
-        return executor, [], _resources()
+        return executor, [], None, _resources()
 
     monkeypatch.setattr(driver, "_build_executor", build)
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -967,7 +1010,6 @@ def test_driver_close_waits_for_in_flight_session_creation(
 @pytest.mark.parametrize(
     ("change", "message"),
     [
-        ({"mcp_servers": (MCPServerSpec("issues", "python"),)}, "MCP"),
         (
             {
                 "policy": AgentExecutionPolicy(
@@ -1013,7 +1055,7 @@ def test_create_session_accepts_supported_top_level_project_policy(
     monkeypatch.setattr(
         driver,
         "_build_executor",
-        lambda _spec: (executor, [], _resources()),
+        lambda _spec: (executor, [], None, _resources()),
     )
     policy = ProjectPathPolicy(
         read_only_paths=(".git", ".vibesys"),
@@ -1037,7 +1079,7 @@ def test_create_session_accepts_non_dot_hidden_path(
     monkeypatch.setattr(
         driver,
         "_build_executor",
-        lambda _spec: (executor, [], _resources()),
+        lambda _spec: (executor, [], None, _resources()),
     )
     policy = ProjectPathPolicy(hidden_paths=("agent.toml",))
 
@@ -1058,7 +1100,7 @@ def test_driver_owns_session_cleanup(
     monkeypatch.setattr(
         driver,
         "_build_executor",
-        lambda _spec: (executor, [], _resources()),
+        lambda _spec: (executor, [], None, _resources()),
     )
 
     driver.create_session(_spec(tmp_path))
@@ -1240,7 +1282,7 @@ def test_codex_executor_disables_native_tools(
         build_tools,
     )
 
-    executor, _schemas, resources = driver._build_executor(  # noqa: SLF001
+    executor, _schemas, mcp_tools, resources = driver._build_executor(  # noqa: SLF001
         _spec(tmp_path, environment=(("DRIVER_TEST", "session"),))
     )
 
@@ -1255,5 +1297,245 @@ def test_codex_executor_disables_native_tools(
     assert not cargo_home.is_relative_to(tmp_path)
     assert "CARGO_TARGET_DIR" not in captured["tool_environment"]
     assert not any(key.endswith("_LINKER") for key in captured["tool_environment"])
+    assert mcp_tools is None
     driver.close_executor(executor, resources=resources)
     assert not cargo_home.parent.exists()
+
+
+@pytest.mark.parametrize(
+    ("provider", "harness", "environment_attribute"),
+    [("claude", "claude-sdk", "_extra_env"), ("codex", "codex", "_env")],
+)
+def test_executor_routes_only_declared_os_and_mcp_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    harness: str,
+    environment_attribute: str,
+) -> None:
+    dispatched: list[tuple[str, str, dict[str, Any]]] = []
+
+    class Executor(_FakeExecutor):
+        def __init__(self, **_kwargs: Any) -> None:  # noqa: ANN401
+            super().__init__([])
+            setattr(self, environment_attribute, {})
+
+    class MCPTools:
+        schemas: ClassVar[list[dict[str, Any]]] = [{"name": "profiler__analyze", "parameters": {}}]
+        close_calls = 0
+        initialize_calls = 0
+
+        @staticmethod
+        def handles(name: str) -> bool:
+            return name == "profiler__analyze"
+
+        async def dispatch(self, name: str, args: dict[str, Any]) -> str:
+            dispatched.append(("mcp", name, args))
+            return "mcp result"
+
+        async def initialize(self) -> None:
+            self.initialize_calls += 1
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    mcp_tools = MCPTools()
+
+    class MCPFactory:
+        @staticmethod
+        def build(**kwargs: Any) -> MCPTools:  # noqa: ANN401
+            assert kwargs["harness"] == harness
+            return mcp_tools
+
+    async def dispatch_os(name: str, args: dict[str, Any]) -> str:
+        dispatched.append(("os", name, args))
+        return "os result"
+
+    driver = OmnigentDriver()
+    monkeypatch.setattr(driver, "_executor_class", lambda _spec: Executor)
+    monkeypatch.setattr(driver, "_build_os_env", lambda _spec, **_kwargs: object())
+    monkeypatch.setattr(driver_subject, "resolve_active_rust_toolchain", lambda *_a, **_k: None)
+    monkeypatch.setattr(driver_subject, "_OmnigentMCPTools", MCPFactory)
+    monkeypatch.setattr(
+        driver_subject,
+        "_build_os_tools",
+        lambda *_args, **_kwargs: driver_subject._OwnedOSTools(  # noqa: SLF001
+            schemas=[{"name": "sys_os_read", "parameters": {}}],
+            dispatch=dispatch_os,
+            environments=(),
+        ),
+    )
+
+    executor, schemas, built_mcp, resources = driver._build_executor(  # noqa: SLF001
+        _spec(
+            tmp_path,
+            provider=provider,
+            mcp_servers=(MCPServerSpec("profiler", "python"),),
+        )
+    )
+
+    assert built_mcp is mcp_tools
+    assert mcp_tools.initialize_calls == 1
+    assert [schema["name"] for schema in schemas] == ["sys_os_read", "profiler__analyze"]
+    assert asyncio.run(executor._tool_executor("sys_os_read", {"path": "x"})) == "os result"  # noqa: SLF001
+    assert (
+        asyncio.run(executor._tool_executor("profiler__analyze", {"pid": 1}))  # noqa: SLF001
+        == "mcp result"
+    )
+    assert asyncio.run(executor._tool_executor("undeclared", {})) == {  # noqa: SLF001
+        "error": "unknown tool 'undeclared'"
+    }
+    assert dispatched == [
+        ("os", "sys_os_read", {"path": "x"}),
+        ("mcp", "profiler__analyze", {"pid": 1}),
+    ]
+
+    asyncio.run(mcp_tools.close())
+    driver.close_executor(executor, resources=resources)
+    driver.close()
+    assert mcp_tools.close_calls == 1
+
+
+def test_tool_schema_conflict_attempts_all_cleanup_and_preserves_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor: _FakeExecutor | None = None
+
+    class Executor(_FakeExecutor):
+        def __init__(self, **_kwargs: Any) -> None:  # noqa: ANN401
+            nonlocal executor
+            super().__init__([])
+            self._env: dict[str, str] = {}
+            executor = self
+
+    class MCPTools:
+        schemas: ClassVar[list[dict[str, Any]]] = [{"name": "sys_os_read", "parameters": {}}]
+        close_calls = 0
+
+        async def initialize(self) -> None:
+            pass
+
+        @staticmethod
+        def handles(_name: str) -> bool:
+            return False
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("MCP cleanup failed")  # noqa: TRY003
+
+    mcp_tools = MCPTools()
+
+    class MCPFactory:
+        @staticmethod
+        def build(**_kwargs: Any) -> MCPTools:  # noqa: ANN401
+            return mcp_tools
+
+    class Resource:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    resource = Resource()
+    driver = OmnigentDriver()
+    monkeypatch.setattr(driver, "_executor_class", lambda _spec: Executor)
+    monkeypatch.setattr(driver, "_build_os_env", lambda _spec, **_kwargs: object())
+    monkeypatch.setattr(driver_subject, "resolve_active_rust_toolchain", lambda *_a, **_k: None)
+    monkeypatch.setattr(driver_subject, "_OmnigentMCPTools", MCPFactory)
+    monkeypatch.setattr(
+        driver_subject,
+        "_build_os_tools",
+        lambda *_args, **_kwargs: driver_subject._OwnedOSTools(  # noqa: SLF001
+            schemas=[{"name": "sys_os_read", "parameters": {}}],
+            dispatch=lambda *_args: None,
+            environments=(resource,),
+        ),
+    )
+
+    with pytest.raises(OmnigentDriverError, match="conflict") as caught:
+        driver._build_executor(  # noqa: SLF001
+            _spec(tmp_path, mcp_servers=(MCPServerSpec("profiler", "python"),))
+        )
+
+    assert any("MCP cleanup also failed" in note for note in caught.value.__notes__)
+    assert mcp_tools.close_calls == 1
+    assert executor is not None
+    assert executor.close_calls == 1
+    assert resource.close_calls == 1
+    driver.close()
+
+
+def test_interrupted_mcp_initialization_keeps_owner_for_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Executor:
+        close_calls = 0
+
+        def __init__(self, **_kwargs: Any) -> None:  # noqa: ANN401
+            self._env: dict[str, str] = {}
+            self._tool_executor = None
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class MCPTools:
+        schemas: ClassVar[list[dict[str, Any]]] = []
+        close_calls = 0
+
+        async def initialize(self) -> None:
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    mcp_tools = MCPTools()
+
+    class MCPFactory:
+        @staticmethod
+        def build(**_kwargs: Any) -> MCPTools:  # noqa: ANN401
+            return mcp_tools
+
+    resource = SimpleNamespace(close_calls=0)
+
+    def close_resource() -> None:
+        resource.close_calls += 1
+
+    resource.close = close_resource
+    driver = OmnigentDriver()
+    executor = Executor()
+    monkeypatch.setattr(driver, "_executor_class", lambda _spec: lambda **_kwargs: executor)
+    monkeypatch.setattr(driver, "_build_os_env", lambda _spec, **_kwargs: object())
+    monkeypatch.setattr(driver_subject, "resolve_active_rust_toolchain", lambda *_a, **_k: None)
+    monkeypatch.setattr(driver_subject, "_OmnigentMCPTools", MCPFactory)
+    monkeypatch.setattr(
+        driver_subject,
+        "_build_os_tools",
+        lambda *_args, **_kwargs: driver_subject._OwnedOSTools(  # noqa: SLF001
+            schemas=[],
+            dispatch=lambda *_args: None,
+            environments=(resource,),
+        ),
+    )
+    run_calls = 0
+
+    def interrupt_first(awaitable: Any) -> Any:  # noqa: ANN401
+        nonlocal run_calls
+        run_calls += 1
+        if run_calls == 1:
+            awaitable.close()
+            raise KeyboardInterrupt
+        return asyncio.run(awaitable)
+
+    monkeypatch.setattr(driver, "run_awaitable", interrupt_first)
+
+    with pytest.raises(KeyboardInterrupt):
+        driver._build_executor(  # noqa: SLF001
+            _spec(tmp_path, mcp_servers=(MCPServerSpec("profiler", "python"),))
+        )
+
+    assert mcp_tools.close_calls == 1
+    assert executor.close_calls == 1
+    assert resource.close_calls == 1
+    driver.close()

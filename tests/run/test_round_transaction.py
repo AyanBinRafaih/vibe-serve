@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -20,6 +23,7 @@ from vs_project import (
     Project,
     RunEnvironmentRecord,
     StateTransition,
+    serialize_round,
 )
 
 if TYPE_CHECKING:
@@ -28,10 +32,15 @@ if TYPE_CHECKING:
 _RUN_ID = "transaction-test"
 
 
-class _ActiveState(BaseModel):
+class _AgentState(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    hypothesis: str
+    active_hypothesis_id: str | None = None
+    completed_rounds: tuple[int, ...] = ()
+
+
+class _LegacyFixture(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True, strict=True)
 
 
 def _configuration() -> AgentRunConfiguration:
@@ -76,107 +85,118 @@ def _project(tmp_path: Path) -> tuple[Project, GitTracker, RoundTransactionCoord
         project,
         tracker,
         RoundTransactionCoordinator(
-            project, tracker, _RUN_ID, active_state_model_type=_ActiveState
+            project,
+            tracker,
+            _RUN_ID,
+            agent_state_model_type=_AgentState,
         ),
     )
 
 
-def _record(tracker: GitTracker, round_number: int = 1) -> RoundRecord:
-    return RoundRecord(
-        round_number=round_number,
-        commit=tracker.current_sha(),
-        perf_metric=12.5,
-        perf_unit="ns/op",
-        passed=True,
-        hypothesis_id=f"hypothesis-{round_number}",
-        hypothesis_outcome="proven",
+def _state_slot(project: Project):  # noqa: ANN202
+    return project.state.portable_namespace(_RUN_ID, "agent").slot(
+        "state.json",
+        _AgentState,
     )
 
 
-def _active_transition(project: Project, hypothesis: str | None) -> StateTransition:
-    model = None if hypothesis is None else _ActiveState(hypothesis=hypothesis)
-    return project.state.local_namespace(_RUN_ID, "agent").transition("active.json", model)
-
-
-def _apply_active(project: Project, transition: StateTransition) -> None:
-    project.state.local_namespace(_RUN_ID, "agent").apply(transition)
-
-
-def _save_active(project: Project, hypothesis: str) -> None:
-    project.state.local_namespace(_RUN_ID, "agent").save(
-        "active.json",
-        _ActiveState(hypothesis=hypothesis),
+def _transition(
+    project: Project,
+    *,
+    active: str | None,
+    rounds: tuple[int, ...],
+) -> StateTransition:
+    return _state_slot(project).transition(
+        _AgentState(active_hypothesis_id=active, completed_rounds=rounds)
     )
 
 
-def _load_active(project: Project) -> _ActiveState | None:
-    return project.state.local_namespace(_RUN_ID, "agent").load_optional(
-        "active.json",
-        _ActiveState,
+def _load_state(project: Project) -> _AgentState | None:
+    return _state_slot(project).load_optional()
+
+
+def _restart(
+    project: Project,
+    tracker: GitTracker,
+) -> RoundTransactionCoordinator:
+    return RoundTransactionCoordinator(
+        project,
+        tracker,
+        _RUN_ID,
+        agent_state_model_type=_AgentState,
     )
 
 
-def test_complete_commits_candidate_and_typed_round_state(tmp_path: Path) -> None:
-    store, tracker, coordinator = _project(tmp_path)
-    _save_active(store, "before")
-    record = _record(tracker)
-    transition = _active_transition(store, "after")
+def test_complete_commits_candidate_and_exact_typed_agent_state(tmp_path: Path) -> None:
+    project, tracker, coordinator = _project(tmp_path)
+    transition = _transition(project, active="hypothesis-1", rounds=(1,))
 
-    transaction = coordinator.begin(record, active_transition=transition)
+    transaction = coordinator.begin(1, state_transition=transition)
     (tmp_path / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
-    _apply_active(store, transition)
     completed = transaction.complete()
 
     assert completed.checkpoint == tracker.current_sha()
     assert tracker.run(["git", "show", "HEAD:main.py"]).stdout == b"VALUE = 2\n"
-    assert store.state.load_rounds(_RUN_ID) == [record]
-    assert _load_active(store) == _ActiveState(hypothesis="after")
+    assert _load_state(project) == _AgentState(
+        active_hypothesis_id="hypothesis-1",
+        completed_rounds=(1,),
+    )
+    assert (
+        tracker.run(
+            [
+                "git",
+                "show",
+                f"HEAD:.vibesys/state/runs/{_RUN_ID}/agent/state.json",
+            ]
+        ).stdout
+        == _state_slot(project).snapshot_transition(transition).files[0].contents
+    )
     assert coordinator.recover() is RoundRecoveryOutcome.NO_TRANSACTION
 
 
-def test_recovery_rolls_prepared_round_forward(tmp_path: Path) -> None:
-    store, tracker, coordinator = _project(tmp_path)
-    _save_active(store, "before")
+def test_recovery_rolls_prepared_state_and_candidate_forward(tmp_path: Path) -> None:
+    project, tracker, coordinator = _project(tmp_path)
     (tmp_path / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
-    record = _record(tracker)
-    coordinator.begin(record, active_transition=_active_transition(store, None))
-
-    restarted = RoundTransactionCoordinator(
-        store,
-        tracker,
-        _RUN_ID,
-        active_state_model_type=_ActiveState,
+    coordinator.begin(
+        1,
+        state_transition=_transition(project, active=None, rounds=(1,)),
     )
 
+    restarted = _restart(project, tracker)
+
     assert restarted.recover() is RoundRecoveryOutcome.COMMITTED
-    assert store.state.load_rounds(_RUN_ID) == [record]
-    assert _load_active(store) is None
+    assert _load_state(project) == _AgentState(completed_rounds=(1,))
     assert tracker.run(["git", "show", "HEAD:main.py"]).stdout == b"VALUE = 2\n"
     assert restarted.recover() is RoundRecoveryOutcome.NO_TRANSACTION
 
 
-def test_recovery_preserves_an_already_applied_active_transition(tmp_path: Path) -> None:
-    store, tracker, coordinator = _project(tmp_path)
-    record = _record(tracker)
-    transition = _active_transition(store, "next hypothesis")
-    coordinator.begin(record, active_transition=transition)
-    _apply_active(store, transition)
+def test_recovery_restores_an_already_committed_state_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, tracker, coordinator = _project(tmp_path)
+    transition = _transition(project, active=None, rounds=(1,))
+    transaction = coordinator.begin(1, state_transition=transition)
 
-    restarted = RoundTransactionCoordinator(
-        store,
-        tracker,
-        _RUN_ID,
-        active_state_model_type=_ActiveState,
-    )
+    original_clear = coordinator._clear_journal  # noqa: SLF001
+    monkeypatch.setattr(coordinator, "_clear_journal", lambda: None)
+    transaction.complete()
+    monkeypatch.setattr(coordinator, "_clear_journal", original_clear)
+    _state_slot(project).save(_AgentState(active_hypothesis_id="corrupt"))
+    committed_head = tracker.current_sha()
 
+    restarted = _restart(project, tracker)
     assert restarted.recover() is RoundRecoveryOutcome.COMMITTED
-    assert _load_active(store) == _ActiveState(hypothesis="next hypothesis")
-    assert store.state.load_rounds(_RUN_ID) == [record]
+    assert tracker.current_sha() == committed_head
+    assert _load_state(project) == _AgentState(completed_rounds=(1,))
 
 
 def test_recovery_translates_corrupt_journal_state(tmp_path: Path) -> None:
-    store, _tracker, coordinator = _project(tmp_path)
-    journal_directory = store.state.local_namespace(_RUN_ID, "transaction").external_directory()
+    project, _tracker, coordinator = _project(tmp_path)
+    journal_directory = project.state.local_namespace(
+        _RUN_ID,
+        "transaction",
+    ).external_directory()
     (journal_directory / "round.json").write_text("{not-json", encoding="utf-8")
 
     with pytest.raises(RoundTransactionError, match="Invalid round transaction journal"):
@@ -184,23 +204,30 @@ def test_recovery_translates_corrupt_journal_state(tmp_path: Path) -> None:
 
 
 def test_begin_translates_corrupt_journal_state(tmp_path: Path) -> None:
-    store, tracker, coordinator = _project(tmp_path)
-    journal_directory = store.state.local_namespace(_RUN_ID, "transaction").external_directory()
+    project, _tracker, coordinator = _project(tmp_path)
+    journal_directory = project.state.local_namespace(
+        _RUN_ID,
+        "transaction",
+    ).external_directory()
     (journal_directory / "round.json").write_text("{not-json", encoding="utf-8")
 
     with pytest.raises(RoundTransactionError, match="Invalid round transaction journal"):
-        coordinator.begin(_record(tracker), active_transition=_active_transition(store, None))
+        coordinator.begin(
+            1,
+            state_transition=_transition(project, active=None, rounds=(1,)),
+        )
 
 
 def test_snapshot_failure_remains_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store, tracker, coordinator = _project(tmp_path)
-    record = _record(tracker)
-    transition = _active_transition(store, "after")
-    transaction = coordinator.begin(record, active_transition=transition)
-    _apply_active(store, transition)
+    project, tracker, coordinator = _project(tmp_path)
+    transaction = coordinator.begin(
+        1,
+        state_transition=_transition(project, active="after", rounds=(1,)),
+    )
+    (tmp_path / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
     original_snapshot = tracker.snapshot_with_framework_metadata
 
     def fail_snapshot(_label: str, _snapshot: object) -> None:
@@ -211,75 +238,56 @@ def test_snapshot_failure_remains_recoverable(
         transaction.complete()
     monkeypatch.setattr(tracker, "snapshot_with_framework_metadata", original_snapshot)
 
-    assert coordinator.recover() is RoundRecoveryOutcome.COMMITTED
-    assert store.state.load_rounds(_RUN_ID) == [record]
-    assert _load_active(store) == _ActiveState(hypothesis="after")
-
-
-def test_recovery_after_commit_does_not_create_a_duplicate_commit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store, tracker, coordinator = _project(tmp_path)
-    record = _record(tracker)
-    transition = _active_transition(store, "after")
-    transaction = coordinator.begin(record, active_transition=transition)
-    _apply_active(store, transition)
-
-    def fail_to_clear() -> None:
-        raise OSError("simulated process failure after commit")  # noqa: TRY003
-
-    monkeypatch.setattr(coordinator, "_clear_journal", fail_to_clear)
-    with pytest.raises(OSError, match="simulated process failure"):
-        transaction.complete()
-    committed_head = tracker.current_sha()
-    completed_round_directory = store.state.portable_namespace(
-        _RUN_ID,
-        "agent",
-    ).external_directory("rounds")
-    (completed_round_directory / "0001.json").write_text("{not-json", encoding="utf-8")
-
-    restarted = RoundTransactionCoordinator(
-        store,
-        tracker,
-        _RUN_ID,
-        active_state_model_type=_ActiveState,
-    )
+    restarted = _restart(project, tracker)
     assert restarted.recover() is RoundRecoveryOutcome.COMMITTED
-    assert tracker.current_sha() == committed_head
-    assert store.state.load_rounds(_RUN_ID) == [record]
+    assert _load_state(project) == _AgentState(
+        active_hypothesis_id="after",
+        completed_rounds=(1,),
+    )
 
 
 def test_begin_rejects_staged_changes_without_leaving_a_transaction(tmp_path: Path) -> None:
-    store, tracker, coordinator = _project(tmp_path)
+    project, tracker, coordinator = _project(tmp_path)
     (tmp_path / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
     tracker.run(["git", "add", "--", "main.py"])
 
     with pytest.raises(RoundTransactionError, match="index contains staged changes"):
-        coordinator.begin(_record(tracker), active_transition=_active_transition(store, None))
+        coordinator.begin(
+            1,
+            state_transition=_transition(project, active=None, rounds=(1,)),
+        )
 
     tracker.run(["git", "reset", "--quiet", "HEAD", "--", "."])
     assert coordinator.recover() is RoundRecoveryOutcome.NO_TRANSACTION
 
 
-def test_begin_rejects_a_transition_from_another_namespace(tmp_path: Path) -> None:
-    store, tracker, coordinator = _project(tmp_path)
-    wrong_transition = store.state.local_namespace(_RUN_ID, "plain").transition(
+def test_begin_rejects_a_transition_from_another_slot(tmp_path: Path) -> None:
+    project, _tracker, coordinator = _project(tmp_path)
+    wrong_transition = project.state.portable_namespace(_RUN_ID, "plain").transition(
         "cursor.json",
-        _ActiveState(hypothesis="after"),
+        _AgentState(completed_rounds=(1,)),
     )
 
     with pytest.raises(RoundTransactionError, match="typed slot"):
-        coordinator.begin(_record(tracker), active_transition=wrong_transition)
+        coordinator.begin(1, state_transition=wrong_transition)
+
+    assert coordinator.recover() is RoundRecoveryOutcome.NO_TRANSACTION
+
+
+def test_begin_rejects_agent_state_deletion(tmp_path: Path) -> None:
+    project, _tracker, coordinator = _project(tmp_path)
+
+    with pytest.raises(RoundTransactionError, match="deletion transition"):
+        coordinator.begin(1, state_transition=_state_slot(project).transition(None))
 
     assert coordinator.recover() is RoundRecoveryOutcome.NO_TRANSACTION
 
 
 def test_transaction_handle_cannot_complete_twice(tmp_path: Path) -> None:
-    store, tracker, coordinator = _project(tmp_path)
+    project, _tracker, coordinator = _project(tmp_path)
     transaction = coordinator.begin(
-        _record(tracker),
-        active_transition=_active_transition(store, None),
+        1,
+        state_transition=_transition(project, active=None, rounds=(1,)),
     )
     transaction.complete()
 
@@ -288,15 +296,72 @@ def test_transaction_handle_cannot_complete_twice(tmp_path: Path) -> None:
 
 
 def test_coordinator_requires_matching_run_tracker(tmp_path: Path) -> None:
-    store, tracker, _coordinator = _project(tmp_path)
+    project, tracker, _coordinator = _project(tmp_path)
     wrong_run = GitTracker(tmp_path, log=lambda _message: None, run_id="another-run")
 
     with pytest.raises(RoundTransactionError, match="does not match"):
         RoundTransactionCoordinator(
-            store,
+            project,
             wrong_run,
             _RUN_ID,
-            active_state_model_type=_ActiveState,
+            agent_state_model_type=_AgentState,
         )
 
     assert tracker.current_sha() is not None
+
+
+def test_recovery_accepts_v3_round_and_permissive_active_transition(tmp_path: Path) -> None:
+    project, tracker, coordinator = _project(tmp_path)
+    record = RoundRecord(
+        round_number=1,
+        commit=tracker.current_sha(),
+        perf_metric=12.5,
+        perf_unit="ns/op",
+        passed=True,
+        hypothesis_id="legacy-hypothesis",
+        hypothesis_outcome="proven",
+    )
+    round_payload = serialize_round(record)
+    legacy_active = project.state.local_namespace(_RUN_ID, "agent").transition(
+        "active.json",
+        _LegacyFixture.model_validate(
+            {
+                "hypothesis_id": "legacy-hypothesis",
+                "nested": {"unknown": [1, 2, 3]},
+            },
+            strict=True,
+        ),
+    )
+    legacy_slot = project.state.local_namespace(_RUN_ID, "agent").slot(
+        "active.json",
+        _LegacyFixture,
+    )
+    active_payload = legacy_slot.serialize_transition(legacy_active)
+    journal = {
+        "schema_version": 3,
+        "run_id": _RUN_ID,
+        "round_number": 1,
+        "pre_commit": tracker.current_sha(),
+        "active_transition_base64": base64.b64encode(active_payload).decode(),
+        "round_payload_base64": base64.b64encode(round_payload).decode(),
+        "round_payload_sha256": hashlib.sha256(round_payload).hexdigest(),
+    }
+    journal_path = (
+        project.state.local_namespace(
+            _RUN_ID,
+            "transaction",
+        ).external_directory()
+        / "round.json"
+    )
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    assert coordinator.recover() is RoundRecoveryOutcome.COMMITTED
+    assert project.state.load_rounds(_RUN_ID) == [record]
+    assert json.loads(
+        (
+            project.state.local_namespace(_RUN_ID, "agent").external_directory() / "active.json"
+        ).read_text(encoding="utf-8")
+    ) == {
+        "hypothesis_id": "legacy-hypothesis",
+        "nested": {"unknown": [1, 2, 3]},
+    }

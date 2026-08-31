@@ -17,19 +17,21 @@ from __future__ import annotations
 
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from pathlib import Path
-
-from deepagents.backends import LocalShellBackend
-from deepagents.backends.protocol import SandboxBackendProtocol  # noqa: TC002  # tracked: #288
+from typing import TYPE_CHECKING
 
 from vibesys.backends.base import (
     ContentionMonitor,
     ModalOptions,
     SandboxKind,
     SetupFn,
+    make_local_shell_sandbox,
 )
 from vibesys.constants import ComputeBackend
 from vibesys.profilers import ProfilerKind
-from vs_sandbox import DockerSandbox
+
+if TYPE_CHECKING:
+    # Annotation only; deepagents pulls langchain + anthropic (~seconds).
+    from deepagents.backends.protocol import SandboxBackendProtocol
 
 _DEFAULT_CPU_IMAGE = "python:3.12-bookworm"
 
@@ -75,6 +77,10 @@ class LocalBackend:
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
+        # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
+        # pulls langchain + anthropic. Registration must stay import-cheap.
+        from vs_sandbox import DockerSandbox  # noqa: PLC0415  # tracked: #288
+
         del attach_accelerator
         bind_mounts = list(bind_mounts or [])
         passthrough_paths = list(passthrough_paths or [])
@@ -83,12 +89,7 @@ class LocalBackend:
         setup_fns = setup_fns or []
 
         if kind is SandboxKind.LOCAL:
-            return LocalShellBackend(
-                root_dir=host_workspace,
-                virtual_mode=True,
-                inherit_env=True,
-                env=extra_env,
-            )
+            return make_local_shell_sandbox(host_workspace=host_workspace, env=extra_env)
         if kind is SandboxKind.DOCKER and self._supports_docker:
             if self.image is None:
                 raise ValueError(f"{self.name.value} backend requires a Docker image")  # noqa: TRY003  # tracked: #288

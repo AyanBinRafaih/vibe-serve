@@ -1,13 +1,13 @@
 import {type CliRenderer, TextRenderable} from '@opentui/core';
-import type {ActiveAgentExecution, SessionState} from '../session-model.js';
-import {visibleRoundNumber} from '../session-model.js';
+import type {ActiveAgentExecution} from '@vibesys/core-state';
+import type {SessionState} from '../session-model.js';
+import {visibleActiveExecutions} from '../session-model.js';
+import {agentRuntimeLabel} from './agent-runtime-label.js';
 import type {Theme} from './theme.js';
 
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPINNER_INTERVAL_MS = 120;
-export type ActivityBarScope = 'global' | 'conversation';
-
-/** Stable, selection-aware status line for backend-authoritative execution activity. */
+/** Status for executions visible in the selected agent conversation. */
 export class ActivityBarView {
   readonly output: TextRenderable;
   #executions: ActiveAgentExecution[] = [];
@@ -27,18 +27,8 @@ export class ActivityBarView {
     });
   }
 
-  render(state: SessionState, scope: ActivityBarScope, visible = true): void {
-    const all = Object.values(state.activeExecutions);
-    const roundNumber = visibleRoundNumber(state);
-    this.#executions = visible
-      ? scope === 'global'
-        ? all
-        : all.filter(
-            execution =>
-              (roundNumber === null || execution.roundNumber === roundNumber) &&
-              (state.selectedAgentKind === null || execution.agentKind === state.selectedAgentKind),
-          )
-      : [];
+  render(state: SessionState, visible = true): void {
+    this.#executions = visible ? visibleActiveExecutions(state) : [];
     this.output.visible = this.#executions.length > 0;
     this.#refresh();
     this.#syncTimer();
@@ -72,12 +62,16 @@ export class ActivityBarView {
     if (this.#executions.length === 1) {
       const execution = this.#executions[0];
       if (execution === undefined) return;
-      this.output.content = `${spinner} ${roleLabel(execution.agentKind)} · ${activitySummary(execution)} · ${elapsed(execution.startedAt, nowMs)}`;
+      const runtime = runtimeSuffix(execution);
+      this.output.content = `${spinner} ${roleLabel(execution.agentKind)} · ${activitySummary(execution)}${runtime} · ${elapsed(execution.startedAt, nowMs)}`;
       return;
     }
     const summaries = this.#executions
       .slice(0, 3)
-      .map(execution => `${roleLabel(execution.agentKind)}: ${activitySummary(execution)}`)
+      .map(
+        execution =>
+          `${roleLabel(execution.agentKind)}: ${activitySummary(execution)}${runtimeSuffix(execution)}`,
+      )
       .join(' · ');
     const remainder = this.#executions.length > 3 ? ` · +${this.#executions.length - 3} more` : '';
     this.output.content = `${spinner} ${this.#executions.length} agents active · ${summaries}${remainder}`;
@@ -86,6 +80,11 @@ export class ActivityBarView {
 
 export function activitySummary(_execution: ActiveAgentExecution): string {
   return 'Working';
+}
+
+export function runtimeSuffix(execution: ActiveAgentExecution): string {
+  const label = agentRuntimeLabel(execution.provider, execution.model);
+  return label === null ? '' : ` · ${label}`;
 }
 
 function roleLabel(role: string): string {

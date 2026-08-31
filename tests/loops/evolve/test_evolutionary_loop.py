@@ -15,11 +15,13 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, TypedDict, Unpack
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from vibesys.agents import AgentClient
+from vibesys.config import Config
 from vibesys.context import create_run_context
 from vibesys.domains.base import DomainName
 from vibesys.domains.llm_serving.hooks import LLMServingEnvironmentHooks
@@ -51,12 +53,106 @@ from vibesys.loops.evolve.search_policy import (
 )
 from vibesys.loops.evolve.state import EvolutionStateStore
 from vibesys.profilers import ProfilerKind
-from vibesys.run import GitTracker, RunState, RunStateNamespace
+from vibesys.run import GitTracker, LoopContext, RunState, RunStateNamespace
 from vibesys.sandbox.run_environment import CandidateRuntime, RunEnvironmentSpec
 from vibesys.schemas import JudgeResponse, MutatorResponse, ProfilerSummary, Verdict
 from vs_project import EvolveRunConfiguration, Project, RunEnvironmentRecord
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from vibesys.constants import ComputeBackend
+    from vibesys.input_manifest import WorkspaceSource
+    from vibesys.loops.evolve.search_policy import SearchPolicyName
+    from vibesys.run import RepositoryVisibility
+
 _LLM_SERVING_DOMAIN = resolve_domain(DomainName.LLM_SERVING)
+
+
+class _EvolveLoopKwargs(TypedDict, total=False):
+    """The keyword arguments ``run_evolve_loop`` accepts.
+
+    ``_invoke_loop`` merges shared defaults with per-test overrides before
+    splatting them into the loop, so the merged mapping needs a per-key type
+    instead of the heterogeneous union a plain ``dict`` infers.
+    """
+
+    config: Config
+    exp_name: str
+    input_path: str
+    accuracy_command: str
+    benchmark_command: str
+    objective: str
+    runs_dir: Path | None
+    task_name: str | None
+    task_root: Path | None
+    workspace_sources: tuple[WorkspaceSource, ...]
+    evaluator_path: Path | None
+    evaluator_package_root: Path | None
+    accuracy_timeout_seconds: int | None
+    max_generations: int
+    children_per_generation: int
+    k_top_inspirations: int
+    k_random_inspirations: int
+    selection_temperature: float
+    seed: int | None
+    pass_criteria: str
+    existing: bool
+    debug: bool
+    profiler_kind: ProfilerKind
+    skills_dirs: list[str] | None
+    run_environment: RunEnvironmentSpec | None
+    agent_backend: str | None
+    cli_provider: str | None
+    backend: ComputeBackend
+    modality: str | None
+    domain: DomainName | None
+    objectives: list[Objective] | None
+    frontier_bias: float
+    bootstrap_max_attempts: int
+    keep_deployments: bool
+    max_parallelism: int
+    search_policy: SearchPolicyName | str | None
+    openevolve_config: OpenEvolveSearchConfig | None
+    remote_repo: str | None
+    repo_visibility: RepositoryVisibility
+
+
+def _discard_log(_message: str) -> None:
+    """Drop log output emitted by a helper under test."""
+
+
+class _FakeLoopContext(LoopContext):
+    """A ``LoopContext`` exposing only the members a helper under test reads.
+
+    Subclassing the protocol keeps the fake assignable to the declared
+    parameter type. Members a test does not wire up stay unset, so a helper
+    that reaches past what the test set up fails loudly.
+    """
+
+    def __init__(
+        self,
+        *,
+        git: GitTracker | None = None,
+        state: RunState | None = None,
+        run_environment: object | None = None,
+        run_environment_view: object | None = None,
+        log: Callable[[str], None] = _discard_log,
+    ) -> None:
+        if git is not None:
+            self.git = git
+        if state is not None:
+            self.state = state
+        if run_environment is not None:
+            self.run_environment = run_environment
+        if run_environment_view is not None:
+            self.run_environment_view = run_environment_view
+        self._log = log
+
+    def lprint(self, text: str) -> None:
+        """Record a log line the same way the real context would emit it."""
+        self._log(text)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -169,30 +265,36 @@ def _make_runner(  # noqa: ANN202, C901, PLR0913  # tracked: #288
     return runner
 
 
-def _invoke_loop(tmp_path, ref_file, runner, **kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
+def _invoke_loop(
+    tmp_path: Path,
+    ref_file: str,
+    runner: MagicMock,
+    *,
+    _accuracy_gate_feedbacks: list[str | None] | None = None,
+    **kwargs: Unpack[_EvolveLoopKwargs],
+) -> bool:
     """Shared plumbing — patch context globals, run the loop, return result."""
-    accuracy_gate_feedbacks = kwargs.pop("_accuracy_gate_feedbacks", None)
     accuracy_gate = MagicMock(return_value=None)
-    if accuracy_gate_feedbacks is not None:
-        accuracy_gate.side_effect = list(accuracy_gate_feedbacks)
+    if _accuracy_gate_feedbacks is not None:
+        accuracy_gate.side_effect = list(_accuracy_gate_feedbacks)
     runner.accuracy_gate = accuracy_gate
-    defaults = dict(  # noqa: C408  # tracked: #288
-        config={"model": {"name": "claude-sonnet-4-6"}},
-        exp_name="test-evolve",
-        runs_dir=tmp_path / "exp_env",
-        input_path=str(Path(ref_file).parent),
-        accuracy_command="uv run python accuracy_checker/checker.py",
-        benchmark_command="uv run python benchmark/benchmark.py",
-        objective="Maximize tok/s throughput.",
-        max_generations=2,
-        children_per_generation=1,
-        seed=0,
-        domain=DomainName.LLM_SERVING,
-    )
+    defaults: _EvolveLoopKwargs = {
+        "config": Config.model_validate({"model": {"name": "claude-sonnet-4-6"}}),
+        "exp_name": "test-evolve",
+        "runs_dir": tmp_path / "exp_env",
+        "input_path": str(Path(ref_file).parent),
+        "accuracy_command": "uv run python accuracy_checker/checker.py",
+        "benchmark_command": "uv run python benchmark/benchmark.py",
+        "objective": "Maximize tok/s throughput.",
+        "max_generations": 2,
+        "children_per_generation": 1,
+        "seed": 0,
+        "domain": DomainName.LLM_SERVING,
+    }
     defaults.update(kwargs)
     with (
         patch("vibesys.context.build_model", return_value="mock-model"),
-        patch("vibesys.backends.cuda.LocalShellBackend"),
+        patch("vibesys.backends.cuda.make_local_shell_sandbox"),
         patch("vibesys.context.build_agent_client", return_value=runner),
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
         patch(
@@ -200,18 +302,27 @@ def _invoke_loop(tmp_path, ref_file, runner, **kwargs):  # noqa: ANN001, ANN003,
             accuracy_gate,
         ),
     ):
-        return run_evolve_loop(**defaults)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        return run_evolve_loop(**defaults)
 
 
-def _invoke_bootstrap(tmp_path, ref_file, runner, **kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
+def _invoke_bootstrap(
+    tmp_path: Path,
+    ref_file: str,
+    runner: MagicMock,
+    *,
+    _accuracy_gate_feedbacks: list[str | None] | None = None,
+    **kwargs: Unpack[_EvolveLoopKwargs],
+) -> bool:
     """Exercise bootstrap through a valid one-generation run contract."""
+    overrides: _EvolveLoopKwargs = {"max_generations": 1}
+    overrides.update(kwargs)
     with patch("vibesys.loops.evolve.loop._run_generation_serial"):
         return _invoke_loop(
             tmp_path,
             ref_file,
             runner,
-            max_generations=1,
-            **kwargs,
+            _accuracy_gate_feedbacks=_accuracy_gate_feedbacks,
+            **overrides,
         )
 
 
@@ -837,7 +948,7 @@ def test_candidate_code_is_multi_file_but_excludes_framework_state(tmp_path):  #
     commit = tracker.current_sha()
 
     assert commit is not None
-    code = _candidate_code(SimpleNamespace(git=tracker), commit)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    code = _candidate_code(_FakeLoopContext(git=tracker), commit)
     assert "src/lib.rs" in code
     assert "src/ffi.rs" in code
     assert "population.json" not in code
@@ -861,7 +972,7 @@ def test_search_policy_initialization_failure_closes_context(tmp_path):  # noqa:
         ),
     ):
         result = run_evolve_loop(
-            {"model": {"name": "test-model"}},  # pyright: ignore[reportArgumentType]  # tracked: #297
+            Config.model_validate({"model": {"name": "test-model"}}),
             "test",
             "input",
             "check",
@@ -881,7 +992,7 @@ def test_programmatic_openevolve_config_infers_policy(tmp_path):  # noqa: ANN001
     config = OpenEvolveSearchConfig(num_islands=1)
 
     name, policy = _initialize_search_policy(
-        ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        ctx,
         Population(),
         state_store,
         requested=None,
@@ -900,7 +1011,7 @@ def test_programmatic_openevolve_config_rejects_vibesys_policy(tmp_path):  # noq
 
     with pytest.raises(ValueError, match="requires the OpenEvolve search policy"):
         _initialize_search_policy(
-            ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
+            ctx,
             Population(),
             state_store,
             requested="vibesys",
@@ -965,7 +1076,7 @@ def test_latest_wip_seed_none_when_no_snapshotted_failure():  # noqa: ANN201  # 
 
 def test_candidate_runtime_notes_delegates_deployment_naming_to_environment():  # noqa: ANN201  # tracked: #288
     base = "run-20260720-abcd1234-llama3"
-    ctx = SimpleNamespace(
+    ctx = _FakeLoopContext(
         run_environment_view=SimpleNamespace(
             deployment_namespace=base,
             prompt_notes=f"Deploy to Modal app {base}; endpoint {base}-web.",
@@ -977,14 +1088,14 @@ def test_candidate_runtime_notes_delegates_deployment_naming_to_environment():  
             )
         ),
     )
-    notes, app = _candidate_runtime_notes(ctx, generation=3, child_idx=2)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    notes, app = _candidate_runtime_notes(ctx, generation=3, child_idx=2)
     assert app == "candidate-3-2"
     assert notes == "provider-owned candidate instructions"
 
 
 def test_candidate_runtime_notes_noop_without_named_deployment():  # noqa: ANN201  # tracked: #288
     notes_in = "Local run; no named deployment."
-    ctx = SimpleNamespace(
+    ctx = _FakeLoopContext(
         run_environment_view=SimpleNamespace(deployment_namespace=None, prompt_notes=notes_in),
         run_environment=SimpleNamespace(
             candidate_runtime=lambda view, generation, child_idx: CandidateRuntime(  # noqa: ARG005  # tracked: #288
@@ -992,7 +1103,7 @@ def test_candidate_runtime_notes_noop_without_named_deployment():  # noqa: ANN20
             )
         ),
     )
-    notes, app = _candidate_runtime_notes(ctx, generation=1, child_idx=1)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    notes, app = _candidate_runtime_notes(ctx, generation=1, child_idx=1)
     assert app is None
     assert notes == notes_in
 
@@ -1006,21 +1117,21 @@ def test_teardown_candidate_deployment_delegates_to_run_environment():  # noqa: 
     """The loop stays backend-agnostic: it hands the deployment name to the run
     environment, which decides how to release it."""
     run_env = MagicMock()
-    ctx = SimpleNamespace(run_environment=run_env, lprint=lambda _: None)
+    ctx = _FakeLoopContext(run_environment=run_env)
 
-    _teardown_candidate_deployment(ctx, "vibesys-run-g1c2", keep=False)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    _teardown_candidate_deployment(ctx, "vibesys-run-g1c2", keep=False)
 
     run_env.teardown_deployment.assert_called_once_with("vibesys-run-g1c2", log=ctx.lprint)
 
 
 def test_teardown_candidate_deployment_noop_when_kept_or_absent():  # noqa: ANN201  # tracked: #288
     run_env = MagicMock()
-    ctx = SimpleNamespace(run_environment=run_env, lprint=lambda _: None)
+    ctx = _FakeLoopContext(run_environment=run_env)
 
     # Opt-out: keep the app for post-hoc inspection.
-    _teardown_candidate_deployment(ctx, "vibesys-run-g1c2", keep=True)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    _teardown_candidate_deployment(ctx, "vibesys-run-g1c2", keep=True)
     # No per-candidate deployment (non-Modal env).
-    _teardown_candidate_deployment(ctx, None, keep=False)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    _teardown_candidate_deployment(ctx, None, keep=False)
 
     run_env.teardown_deployment.assert_not_called()
 
@@ -1047,7 +1158,7 @@ def _passing_seed(commit: str = "seedsha", perf: float = 1.0) -> Individual:
 def _stateful_context(
     tmp_path: Path,
     log=None,  # noqa: ANN001  # tracked: #288
-) -> tuple[SimpleNamespace, EvolutionStateStore]:
+) -> tuple[_FakeLoopContext, EvolutionStateStore]:
     project = Project.open(tmp_path)
     project.state.create_project("test")
     run = project.state.new_run_manifest(
@@ -1061,11 +1172,7 @@ def _stateful_context(
     project.state.create_run(run)
     git = MagicMock(history_root=project.root, run_id=run.run_id)
     state = RunState(project, git, run.run_id)
-    ctx = SimpleNamespace(
-        lprint=log or (lambda _message: None),
-        git=git,
-        state=state,
-    )
+    ctx = _FakeLoopContext(git=git, state=state, log=log or _discard_log)
     return ctx, EvolutionStateStore(state.portable(RunStateNamespace.EVOLVE))
 
 
@@ -1077,7 +1184,7 @@ def test_plan_candidate_falls_back_to_latest_passer_then_none(tmp_path):  # noqa
     empty = Population([])
     assert (
         _plan_candidate(
-            ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
+            ctx,
             empty,
             state_store,
             rng,
@@ -1093,7 +1200,7 @@ def test_plan_candidate_falls_back_to_latest_passer_then_none(tmp_path):  # noqa
     # A passer exists → returned as parent.
     pop = Population([_passing_seed()])
     plan = _plan_candidate(
-        ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
+        ctx,
         pop,
         state_store,
         rng,
@@ -1141,8 +1248,8 @@ def test_run_generation_parallel_bounds_concurrency_and_records_all(tmp_path, mo
     monkeypatch.setattr(evolve_loop, "_evaluate_in_subcontext", fake_eval)
 
     _run_generation_parallel(
-        ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
-        config={"model": {"name": "m"}},  # pyright: ignore[reportArgumentType]  # tracked: #297
+        ctx,
+        config=Config.model_validate({"model": {"name": "m"}}),
         agent_backend=None,
         cli_provider=None,
         max_parallelism=2,
@@ -1199,8 +1306,8 @@ def test_run_generation_parallel_skips_parent_without_commit(tmp_path, monkeypat
     monkeypatch.setattr(evolve_loop, "_evaluate_in_subcontext", fake_eval)
 
     _run_generation_parallel(
-        ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
-        config={"model": {"name": "m"}},  # pyright: ignore[reportArgumentType]  # tracked: #297
+        ctx,
+        config=Config.model_validate({"model": {"name": "m"}}),
         agent_backend=None,
         cli_provider=None,
         max_parallelism=2,
@@ -1235,12 +1342,12 @@ def test_evaluate_in_subcontext_skips_parent_without_commit():  # noqa: ANN201  
     """A parent with no commit can't seed a worktree — folded into a failed
     outcome without ever building a sub-context."""
     logs: list[str] = []
-    parent_ctx = SimpleNamespace(lprint=logs.append)
+    parent_ctx = _FakeLoopContext(log=logs.append)
     parentless = Individual(id=3, generation=1, parent_id=1, commit=None, passed=True, summary="x")
 
     outcome = _evaluate_in_subcontext(
-        parent_ctx,  # pyright: ignore[reportArgumentType]  # tracked: #297
-        config={"model": {"name": "m"}},  # pyright: ignore[reportArgumentType]  # tracked: #297
+        parent_ctx,
+        config=Config.model_validate({"model": {"name": "m"}}),
         agent_backend=None,
         cli_provider=None,
         generation=2,
@@ -1271,12 +1378,12 @@ def test_evaluate_in_subcontext_builds_worktree_and_evaluates(tmp_path, ref_file
     runner = _make_runner(mutator_writes=True)
     with (
         patch("vibesys.context.build_model", return_value="mock-model"),
-        patch("vibesys.backends.cuda.LocalShellBackend"),
+        patch("vibesys.backends.cuda.make_local_shell_sandbox"),
         patch("vibesys.context.build_agent_client", return_value=runner),
         patch("vibesys.context.PROJECT_ROOT", tmp_path),
         patch("vibesys.loops.evolve.loop._run_framework_accuracy_gate", return_value=None),
         create_run_context(
-            config={"model": {"name": "claude-sonnet-4-6"}},  # pyright: ignore[reportArgumentType]  # tracked: #297
+            config=Config.model_validate({"model": {"name": "claude-sonnet-4-6"}}),
             exp_name="test-parallel-subctx",
             runs_dir=tmp_path / "exp_env",
             input_path=str(Path(ref_file).parent),
@@ -1317,7 +1424,7 @@ def test_evaluate_in_subcontext_builds_worktree_and_evaluates(tmp_path, ref_file
 
         outcome = _evaluate_in_subcontext(
             parent,
-            config={"model": {"name": "claude-sonnet-4-6"}},  # pyright: ignore[reportArgumentType]  # tracked: #297
+            config=Config.model_validate({"model": {"name": "claude-sonnet-4-6"}}),
             agent_backend=None,
             cli_provider=None,
             generation=1,

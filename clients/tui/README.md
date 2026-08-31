@@ -18,8 +18,8 @@ the Python `vibesys` package in the Python environment you want to use, or set
 
 ## Operator interface
 
-Enter ordinary text to ask the supervision backend about the current run. The
-available slash commands are:
+Use Experiment chat for ordinary questions about the current run. The command
+input accepts these slash commands:
 
 | Command | Behavior |
 | --- | --- |
@@ -39,27 +39,26 @@ available slash commands are:
 The client opens on the experiment log rather than on the per-round
 transcript. It groups rounds by `hypothesis_id`, so one hypothesis held across
 continuation rounds is a single row showing the claim, the round range, what
-the implementation details, the measured result, the judge verdict, the outcome the loop
-resolved (`Proven`, `Rejected`, or a terminal `HypothesisOutcome`), and whether
-the candidate was kept. The active hypothesis is marked with `▸` and carries no
-outcome until it resolves. `Proven` reads in the theme's success color and
-`Disproven` in its error color; the word is always spelled out, so the reading
-does not depend on color.
+was implemented, the measured result, the outcome the loop resolved (`Accepted`,
+`Rejected`, or a terminal `HypothesisOutcome`), and whether the candidate was
+kept. The active hypothesis is marked with `▸` and carries no outcome until it
+resolves. `Accepted` reads in the theme's success color and `Rejected` in its
+error color; the word is always spelled out, so the reading does not depend on
+color.
 
 The log is the landing view and the root of the client, so no command is
 needed to reach it: it is what the client opens on, and Escape or Ctrl+L
 returns to it from anywhere.
 
-Arrow keys move the selection, the wheel and trackpad scroll the table
-independently of it, and clicking a row selects it. Enter on an empty input, or
-`/open-round`, opens the rounds behind the selected hypothesis: the ordinary
-transcript, rounds strip, and agent map, filtered to that hypothesis. The input
-keeps Enter whenever something is typed, so a command entered from the log runs
-on its first Enter and its result opens over the table. `/open-round --N`
-jumps straight to round N inside whichever hypothesis owns it. Escape steps
-back to the table with the selection intact. The log is the root view, so
-opening a hypothesis is the only route to per-round output; there is no
-unfiltered live transcript to fall back to.
+Arrow keys move the selection, and the wheel and trackpad scroll the table
+independently of it. Clicking a hypothesis, or pressing Enter on an empty input,
+opens its summary. The summary gives the full wrapped hypothesis text first,
+then brief decision metadata and its rounds. Arrow keys select a round; clicking
+it or pressing Enter opens the ordinary transcript, rounds strip, and agent map.
+Escape returns from a round to its hypothesis, then from the hypothesis to the
+index. The input keeps Enter whenever something is typed, so a command entered
+from the log runs on its first Enter. `/open-round` and `/open-round --N` remain
+explicit shortcuts directly to the selected or numbered round.
 
 The agent strip is headed `Round N flow · 45s` for the round on screen. That
 elapsed time is agent-active: wall clock minus the gaps where no agent was
@@ -70,9 +69,14 @@ with no recorded agent time is headed `Round N flow` alone.
 
 `Measured` shows the verified metric for the round that resolved the
 hypothesis, as a delta against the last measurement preceding it once there is
-one to compare against. The framework records a verified metric only when its
-own official evaluation ran, on the sparse cadence or the final round, so a
-hypothesis resolved between evaluations legitimately shows no measurement.
+one to compare against, or as the absolute value with its unit before that.
+When every measured hypothesis shares one objective direction the column
+header carries it as an arrow (`Measured ↑` for maximize, `↓` for minimize),
+so a signed delta reads as good or bad without task knowledge. The hypothesis
+summary spells the measurement out in words: metric name, direction, absolute
+value, baseline, and delta. The framework records a verified metric only when
+its own official evaluation ran, on the sparse cadence or the final round, so
+a hypothesis resolved between evaluations legitimately shows no measurement.
 
 The table refetches when an agent phase or a round finishes, so it stays
 current without being reopened. Rows are ordered by first round and never
@@ -90,13 +94,11 @@ list rises out of the command input rather than across the chat.
 The cursor starts in the command input, and `Ctrl+W` moves both it and the pane
 keys to the chat and back; the chat's instruction line says so (`Ctrl+W to type
 here`) until it holds them, and the focused input carries the focus border, so
-where a keystroke lands is never a guess. A question typed into either box
-reaches the same agent and is answered in the same column. Page Up and Page Down scroll the focused pane, and
+where a keystroke lands is never a guess. Only the chat composer accepts
+ordinary questions; the command input accepts slash commands. Page Up and Page Down scroll the focused pane, and
 Escape hands the keys back to the table. Arrows, Enter, and the rest of the
 table's keys are unaffected by the dock. A slash command typed into the chat
-input runs through the same path as anywhere else, and ordinary text typed into
-the command input is still a question for the agent: the two boxes are a
-division of attention, not of capability.
+input runs through the same command path as the command box.
 
 `/chat` leaves the command surface on this view, since the chat is already
 beside the table: it is absent from `/help` and from the completions, though it
@@ -127,10 +129,18 @@ live. A second visualization command replaces the pane's contents rather than
 stacking another surface on top.
 
 `Ctrl+W` moves focus one column to the right and wraps, through whichever
-columns are actually on screen; the focused one carries the theme's focus
-border and says so in its title. Page Up and Page Down scroll whichever pane
-has focus, and Escape on the right pane closes it and restores the full-width
-view. Chat and transcript state survive the pane closing.
+columns are actually on screen. Every pane reads the same authoritative focus
+state: the focused pane carries the theme's focus border and a `▸` in its title,
+while every other pane uses the neutral border. Page Up and Page Down scroll
+whichever pane has focus, and Escape on the right pane closes it and restores
+the full-width view. Chat and transcript state survive the pane closing.
+
+`F4` toggles zoom for the focused pane. Zoom gives that pane the complete
+content row; pressing `F4` again restores the previous split and focus. It does
+not create a second pane or move its data, so hypothesis and agent selection,
+chat drafts, and pane scroll positions remain in place. The shortcut works for
+the hypothesis list, agent graph, transcript, experiment chat, and performance
+pane. Modal dialogs keep `F4` to themselves until they close.
 
 Pane widths are computed from the terminal, so a wide terminal gives the
 visualization real room while the left pane keeps a readable floor. Below 100
@@ -171,7 +181,11 @@ Control chord for itself, and on macOS several do.
 
 Escape unwinds the round view one step at a time: the entry cursor, then the
 agent filter, then the hypothesis. Ctrl+L returns to the experiment log from
-anywhere, and Ctrl+C exits. Rounds and agents can also be clicked: a round chip
+anywhere. Drag to select rendered text, then press Ctrl+C to copy it through
+OSC52; Ctrl+C exits when there is no nonempty selection. If the terminal does
+not support OSC52, VibeSys keeps the selection and shows a status explaining
+that the terminal's native copy command is the fallback. Rounds and agents can
+also be clicked: a round chip
 selects its round, an agent node filters the transcript to that agent, and
 clicking the selected node clears the filter. Commands listed under "Planned" in
 `/help` are not accepted yet.
@@ -230,10 +244,11 @@ round shows elapsed time.
 ## Architecture
 
 The Python backend owns the validated, append-only event contract and serves it
-as JSONL over a private Unix socket. `src/generated/` is generated from those
-Pydantic models. The TypeScript client owns framing and request correlation,
-`session-controller.ts` owns effects, `session-model.ts` and `run-map.ts` reduce
-events into presentation state, and `ui/` owns OpenTUI rendering and input.
+as JSONL over a private Unix socket. `@vibesys/backend-client` owns the generated
+TypeScript protocol, framing, request correlation, and event subscription.
+`@vibesys/core-state` owns the pure projection of backend messages. This package
+owns UI interaction state, effects, OpenTUI rendering, and input. The detailed
+ownership matrix is in the [TUI architecture guide](../../docs/contributing/tui-architecture.md).
 
 Conversation state retains at most 1,000 semantic entries. Rendering is keyed
 by entry identity: state-only updates reuse existing cards, streamed tail
@@ -248,15 +263,16 @@ From the repository root:
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm --dir clients/tui generate:protocol
-pnpm --dir clients/tui check
-pnpm --dir clients/tui test
-pnpm --dir clients/tui build
+pnpm --dir clients/backend-client generate:protocol
+pnpm check:ts-architecture
+pnpm check:clients
+pnpm test:clients
+pnpm build:clients
 pnpm check:ts
 uv run pytest tests/test_tui.py tests/agents/test_callbacks.py tests/render/test_sink.py
 ```
 
 After changing Python protocol models, regenerate both files in
-`src/generated/` and review their diff. The test suite covers reducer behavior,
+`clients/backend-client/src/generated/` and review their diff. The test suite covers reducer behavior,
 OpenTUI frames and navigation, launcher cleanup, socket fragmentation and
 timeouts, replay/live delivery, and the Python supervision service.

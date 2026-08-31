@@ -1,15 +1,27 @@
 import {afterEach, describe, expect, it} from 'bun:test';
-import {CliRenderEvents, InputRenderable, rgbToHex, ScrollBoxRenderable} from '@opentui/core';
+import {
+  CliRenderEvents,
+  InputRenderable,
+  rgbToHex,
+  ScrollBoxRenderable,
+  TextareaRenderable,
+} from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
-import type {HypothesisEntry} from '../protocol.js';
+import type {ChatOptions, HypothesisEntry} from '@vibesys/backend-client';
+import {parseChatCommand} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
+  activeChatThreadSettings,
+  type ChatThreadSettings,
+  chatMenuCustomModel,
   clearAgentSelection,
   clearEntrySelection,
+  closeChatMenu,
   closeOverlays,
   closePane,
   closeThemePicker,
   cyclePaneFocus,
+  dismissErrorBanner,
   enterExperimentDrilldown,
   enterExperimentRound,
   enterUnownedExperimentRound,
@@ -17,27 +29,40 @@ import {
   focusRound,
   initialSessionState,
   leaveExperimentDrilldown,
+  leaveHypothesisDetail,
+  moveChatMenuSelection,
   moveExperimentSelection,
+  moveHypothesisRoundSelection,
   moveThemeSelection,
   normalizeFocus,
+  openChatModelMenu,
+  openChatResumeMenu,
   openExperimentLog,
+  openHypothesisDetail,
   openPane,
   type PaneFocus,
   type PaneView,
   type RoundFocus,
+  reportError,
   type SessionState,
   selectAgent,
   selectExperimentActivity,
+  selectedChatMenuRow,
   selectNextEntry,
   selectNextRound,
   selectNextTodo,
   selectPreviousRound,
   setChatDockFits,
+  setChatMenuCustomModel,
+  setChatModelMenuOptions,
   setExperiments,
   setPaneContent,
   setTheme,
+  switchChatThread,
+  togglePaneZoom,
 } from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
+import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 import {resolveTheme, type ThemeName} from './theme.js';
 
 const cleanup: Array<() => void> = [];
@@ -51,26 +76,29 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      agentKind: 'optimizer',
-      roundLabel: 'round 2',
-      phases: [
-        {
-          kind: 'optimizer',
-          status: 'active',
-          roundNumber: null,
-          roundLabel: 'round 2',
-        },
-      ],
-      conversation: [
-        {
-          id: '1',
-          kind: 'assistant',
-          label: 'optimizer · round 2',
-          agentKind: 'optimizer',
-          content: '## Result\n\nUse `fast_path()`.',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        agentKind: 'optimizer',
+        roundLabel: 'round 2',
+        phases: [
+          {
+            kind: 'optimizer',
+            status: 'active',
+            roundNumber: null,
+            roundLabel: 'round 2',
+          },
+        ],
+        transcript: [
+          {
+            id: '1',
+            kind: 'assistant',
+            label: 'optimizer · round 2',
+            agentKind: 'optimizer',
+            content: '## Result\n\nUse `fast_path()`.',
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -82,34 +110,36 @@ describe('OpenTUI presentation', () => {
     expect(frame).toContain('Rounds');
     expect(frame).toContain('● optimizer');
     expect(frame).toContain('Result');
-    expect(frame).toContain('Ask or command');
-    expect(frame).toContain('Type a question or /help');
+    expect(frame).toContain('Command');
+    expect(frame).toContain('Type /help for commands');
   });
 
-  it('keeps a fatal error visible above the empty experiment log', async () => {
+  it('shows and dismisses a fatal error above the empty experiment log', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 24});
     const controller = new FakeController(initialSessionState());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    const fatalBanner: NonNullable<SessionState['errorBanner']> = {
+      title: 'Run failed',
+      message: 'RuntimeError: app-server initialization was denied\nOperation not permitted',
+      detail: 'The run server exited before accepting a client.',
+      hint: 'Check the startup log and retry.',
+      diagnosticId: 'diagnostic-1',
+      severity: 'fatal',
+      scope: 'run',
+      agentKind: 'orchestrator',
+      roundLabel: 'round-1-pre',
+      invocationId: null,
+      count: 1,
+    };
     controller.publish({
       ...controller.state,
       experimentLog: {entries: [], selectedId: null, pending: false, error: null},
-      errorBanner: {
-        title: 'Run failed',
-        message: 'RuntimeError: app-server initialization was denied\nOperation not permitted',
-        detail: 'The run server exited before accepting a client.',
-        hint: 'Check the startup log and retry.',
-        diagnosticId: 'diagnostic-1',
-        severity: 'fatal',
-        scope: 'run',
-        agentKind: 'orchestrator',
-        roundLabel: 'round-1-pre',
-        invocationId: null,
-        count: 1,
-      },
+      errorBanner: fatalBanner,
     });
 
-    const frame = await testRenderer.waitForFrame(value =>
+    let frame = await testRenderer.waitForFrame(value =>
       value.includes('app-server initialization was denied'),
     );
     expect(frame).toContain('Run failed · orchestrator · round-1-pre');
@@ -118,7 +148,29 @@ describe('OpenTUI presentation', () => {
     expect(frame).toContain('Hint: Check the startup log and retry.');
     expect(frame).toContain('Experiments');
 
-    expect(frame).toContain('Ctrl+PgUp/PgDn: scroll');
+    expect(frame).toContain('[× Dismiss] · Esc: dismiss · Ctrl+PgUp/PgDn: scroll');
+
+    const lines = frame.split('\n');
+    const row = lines.findIndex(line => line.includes('[× Dismiss]'));
+    const column = (lines[row]?.indexOf('[× Dismiss]') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.errorBanner).toBeNull();
+    expect(frame).not.toContain('app-server initialization was denied');
+    expect(frame).toContain('Experiments');
+
+    controller.publish({
+      ...controller.state,
+      errorBanner: {...fatalBanner, title: 'Request failed', message: 'A later failure.'},
+    });
+    frame = await testRenderer.waitForFrame(value => value.includes('A later failure.'));
+    expect(frame).toContain('Esc: dismiss');
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    frame = await frameAfterEscape(testRenderer);
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(frame).not.toContain('A later failure.');
   });
 
   it('renders quiet round labels without status text or symbols', async () => {
@@ -126,17 +178,20 @@ describe('OpenTUI presentation', () => {
     const activeStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {number: 1, status: 'completed'},
-        {
-          number: 2,
-          status: 'active',
-          startedAt: activeStartedAt,
-          activeAgentStarts: {'judge:judge-1': activeStartedAt},
-        },
-        {number: 3, status: 'failed'},
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {
+            number: 2,
+            status: 'active',
+            startedAt: activeStartedAt,
+            activeAgentStarts: {'judge:judge-1': activeStartedAt},
+          },
+          {number: 3, status: 'failed'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -158,16 +213,19 @@ describe('OpenTUI presentation', () => {
     const activeStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {
-          number: 2,
-          status: 'active',
-          startedAt: activeStartedAt,
-          activeAgentStarts: {'judge:judge-1': activeStartedAt},
-        },
-      ],
-      phases: [{kind: 'judge', status: 'active', roundNumber: 2, roundLabel: 'round-2-judge'}],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {
+            number: 2,
+            status: 'active',
+            startedAt: activeStartedAt,
+            activeAgentStarts: {'judge:judge-1': activeStartedAt},
+          },
+        ],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 2, roundLabel: 'round-2-judge'}],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -181,13 +239,21 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 150, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
-        {kind: 'implementer', status: 'active', roundNumber: 1, roundLabel: 'round-1-implementer'},
-        {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+          {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -209,43 +275,46 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 140, height: 26});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      activeExecutions: {
-        'judge-1': {
-          executionId: 'judge-1',
-          agentKind: 'judge',
-          roundLabel: 'round-1-judge',
-          roundNumber: 1,
-          stage: 'evaluation',
-          attempt: 1,
-          assignment: 'Evaluate the candidate',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'thinking', summary: 'Checking the diff'},
-        },
-      },
       selectedRound: 1,
-      conversation: [
-        {
-          id: 'e1',
-          kind: 'assistant',
-          label: 'implementer · round-1',
-          content: 'edited the kernel',
-          agentKind: 'implementer',
-          roundNumber: 1,
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        activeExecutions: {
+          'judge-1': {
+            executionId: 'judge-1',
+            agentKind: 'judge',
+            roundLabel: 'round-1-judge',
+            roundNumber: 1,
+            stage: 'evaluation',
+            attempt: 1,
+            assignment: 'Evaluate the candidate',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'thinking', summary: 'Checking the diff'},
+          },
         },
-        {
-          id: 'e2',
-          kind: 'assistant',
-          label: 'judge · round-1',
-          content: 'checking the diff',
-          agentKind: 'judge',
-          roundNumber: 1,
-        },
-      ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant',
+            label: 'implementer · round-1',
+            content: 'edited the kernel',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant',
+            label: 'judge · round-1',
+            content: 'checking the diff',
+            agentKind: 'judge',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -278,28 +347,31 @@ describe('OpenTUI presentation', () => {
     const controller = new FakeController({
       ...base,
       selectedRound: 2,
-      activeExecutions: {
-        implementer: {
-          executionId: 'implementer',
-          agentKind: 'implementer',
-          roundLabel: 'round-2-implementer',
-          roundNumber: 2,
-          stage: 'implementation',
-          attempt: 1,
-          assignment: 'Implement the queue',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'tool', summary: 'Running queue tests', tool: 'Bash'},
-        },
-        reviewer: {
-          executionId: 'reviewer',
-          agentKind: 'reviewer',
-          roundLabel: 'round-2-review',
-          roundNumber: 2,
-          stage: 'review',
-          attempt: 1,
-          assignment: 'Review the diff',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'thinking', summary: 'Inspecting the diff'},
+      core: {
+        ...base.core,
+        activeExecutions: {
+          implementer: {
+            executionId: 'implementer',
+            agentKind: 'implementer',
+            roundLabel: 'round-2-implementer',
+            roundNumber: 2,
+            stage: 'implementation',
+            attempt: 1,
+            assignment: 'Implement the queue',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'tool', summary: 'Running queue tests', tool: 'Bash'},
+          },
+          reviewer: {
+            executionId: 'reviewer',
+            agentKind: 'reviewer',
+            roundLabel: 'round-2-review',
+            roundNumber: 2,
+            stage: 'review',
+            attempt: 1,
+            assignment: 'Review the diff',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'thinking', summary: 'Inspecting the diff'},
+          },
         },
       },
     });
@@ -312,7 +384,13 @@ describe('OpenTUI presentation', () => {
     expect(active).not.toContain('Running queue tests');
     expect(active).not.toContain('Inspecting the diff');
 
-    controller.publish({...controller.state, activeExecutions: {}});
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        activeExecutions: {},
+      },
+    });
     const finished = await frameAfter(testRenderer);
     expect(finished).not.toContain('agents active');
     expect(finished).not.toContain('Running queue tests');
@@ -322,26 +400,29 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {
-          kind: 'implementer',
-          status: 'pending',
-          roundNumber: 1,
-          roundLabel: 'round-1-implementer',
-        },
-      ],
       selectedRound: 1,
       selectedAgentKind: 'implementer',
-      conversation: [
-        {
-          id: 'prompt',
-          kind: 'prompt',
-          content: 'Implement the queue',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {
+            kind: 'implementer',
+            status: 'pending',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+        ],
+        transcript: [
+          {
+            id: 'prompt',
+            kind: 'prompt',
+            content: 'Implement the queue',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -350,17 +431,20 @@ describe('OpenTUI presentation', () => {
 
     controller.publish({
       ...controller.state,
-      activeExecutions: {
-        'impl-1': {
-          executionId: 'impl-1',
-          agentKind: 'implementer',
-          roundLabel: 'round-1-implementer',
-          roundNumber: 1,
-          stage: 'implementation',
-          attempt: 1,
-          assignment: 'Implement the queue',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'responding', summary: 'Editing the queue'},
+      core: {
+        ...controller.state.core,
+        activeExecutions: {
+          'impl-1': {
+            executionId: 'impl-1',
+            agentKind: 'implementer',
+            roundLabel: 'round-1-implementer',
+            roundNumber: 1,
+            stage: 'implementation',
+            attempt: 1,
+            assignment: 'Implement the queue',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'responding', summary: 'Editing the queue'},
+          },
         },
       },
     });
@@ -409,21 +493,24 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
       selectedRound: 1,
       selectedAgentKind: 'implementer',
-      conversation,
-      activeExecutions: {
-        'impl-1': {
-          executionId: 'impl-1',
-          agentKind: 'implementer',
-          roundLabel: 'round-1-implementer',
-          roundNumber: 1,
-          stage: 'implementation',
-          attempt: 1,
-          assignment: 'Implement the queue',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'thinking', summary: 'Thinking'},
+      core: {
+        ...initialSessionState().core,
+        transcript: conversation,
+        rounds: [{number: 1, status: 'active'}],
+        activeExecutions: {
+          'impl-1': {
+            executionId: 'impl-1',
+            agentKind: 'implementer',
+            roundLabel: 'round-1-implementer',
+            roundNumber: 1,
+            stage: 'implementation',
+            attempt: 1,
+            assignment: 'Implement the queue',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'thinking', summary: 'Thinking'},
+          },
         },
       },
     });
@@ -438,16 +525,19 @@ describe('OpenTUI presentation', () => {
     testRenderer.renderer.on(CliRenderEvents.FRAME, captureFrame);
     controller.publish({
       ...controller.state,
-      conversation: [
-        ...conversation,
-        {
-          id: 'new-turn',
-          kind: 'assistant',
-          content: 'newly rendered turn',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...controller.state.core,
+        transcript: [
+          ...conversation,
+          {
+            id: 'new-turn',
+            kind: 'assistant',
+            content: 'newly rendered turn',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     await testRenderer.waitForVisualIdle();
     testRenderer.renderer.off(CliRenderEvents.FRAME, captureFrame);
@@ -472,21 +562,24 @@ describe('OpenTUI presentation', () => {
     expect(firstTurn?.x).toBe(activity.x);
   });
 
-  it('keeps the global working indicator on the hypothesis log', async () => {
+  it('keeps working indicators scoped to agent conversations', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      activeExecutions: {
-        'impl-1': {
-          executionId: 'impl-1',
-          agentKind: 'implementer',
-          roundLabel: 'round-1-implementer',
-          roundNumber: 1,
-          stage: 'implementation',
-          attempt: 1,
-          assignment: 'Implement the queue',
-          startedAt: new Date().toISOString(),
-          activity: {mode: 'responding', summary: 'Editing the queue'},
+      core: {
+        ...initialSessionState().core,
+        activeExecutions: {
+          'impl-1': {
+            executionId: 'impl-1',
+            agentKind: 'implementer',
+            roundLabel: 'round-1-implementer',
+            roundNumber: 1,
+            stage: 'implementation',
+            attempt: 1,
+            assignment: 'Implement the queue',
+            startedAt: new Date().toISOString(),
+            activity: {mode: 'responding', summary: 'Editing the queue'},
+          },
         },
       },
     });
@@ -494,8 +587,9 @@ describe('OpenTUI presentation', () => {
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
 
-    const frame = await testRenderer.waitForFrame(value => value.includes('Implementer · Working'));
+    const frame = await frameAfter(testRenderer);
     expect(frame).toContain('Experiments');
+    expect(frame).not.toContain('Implementer · Working');
     expect(frame).not.toContain('Editing the queue');
   });
 
@@ -503,14 +597,16 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      // A run that announced 100 rounds and has reached 12 of them.
-      maxRounds: 100,
-      rounds: Array.from({length: 12}, (_, index) => ({
-        number: index + 1,
-        status: index === 11 ? ('active' as const) : ('completed' as const),
-      })),
-      phases: [{kind: 'judge', status: 'active', roundNumber: 12, roundLabel: 'round-12-judge'}],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+      core: {
+        ...initialSessionState().core,
+        maxRounds: 100,
+        rounds: Array.from({length: 12}, (_, index) => ({
+          number: index + 1,
+          status: index === 11 ? ('active' as const) : ('completed' as const),
+        })),
+        phases: [{kind: 'judge', status: 'active', roundNumber: 12, roundLabel: 'round-12-judge'}],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -536,30 +632,33 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 150, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
       selectedRound: 1,
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [
-        {
-          id: 'e1',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'edited the kernel',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-        {
-          id: 'e2',
-          kind: 'assistant',
-          label: 'judge',
-          content: 'checking the diff',
-          agentKind: 'judge',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'edited the kernel',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant',
+            label: 'judge',
+            content: 'checking the diff',
+            agentKind: 'judge',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -580,38 +679,41 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 150, height: 26});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
       selectedRound: 1,
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [
-        {
-          id: 'e1',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'edited the kernel',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-        {
-          id: 'e2',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'guarded the tail tile',
-          agentKind: 'implementer',
-          roundNumber: 1,
-        },
-        {
-          id: 'e3',
-          kind: 'assistant',
-          label: 'judge',
-          content: 'checking the diff',
-          agentKind: 'judge',
-          roundNumber: 1,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'edited the kernel',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'guarded the tail tile',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e3',
+            kind: 'assistant',
+            label: 'judge',
+            content: 'checking the diff',
+            agentKind: 'judge',
+            roundNumber: 1,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -648,6 +750,88 @@ describe('OpenTUI presentation', () => {
     expect(controller.state.selectedAgentKind).not.toBe(firstAgent);
   });
 
+  it('focuses round panes from blank and interactive click targets', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      experimentLog: null,
+      selectedRound: 1,
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'edited the kernel',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant',
+            label: 'judge',
+            content: 'checking the diff',
+            roundNumber: 1,
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    let frame = await testRenderer.waitForFrame(value => value.includes('edited the kernel'));
+
+    // The graph heading has no action of its own. Clicking it still focuses
+    // the containing pane rather than requiring a click on an agent.
+    let lines = frame.split('\n');
+    let row = lines.findIndex(line => line.includes('Round 1'));
+    let column = (lines[row]?.indexOf('Round 1') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(frame).toContain('▸ Agents');
+
+    // Entering the pane selects its active agent. Clicking that inner node
+    // keeps Agents focused and clears the filter, preserving node semantics.
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('● judge'));
+    column = (lines[row]?.indexOf('judge') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(controller.state.selectedAgentKind).toBeNull();
+
+    // A turn card has its own selection action. It composes pane focus with
+    // that action, and the next arrow is consequently routed to transcript.
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('edited the kernel'));
+    column = (lines[row]?.indexOf('edited the kernel') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+    expect(controller.state.selectedEntryId).toBe('e1');
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedEntryId).toBe('e2');
+
+    // Agent nodes likewise keep their selection behavior while taking focus.
+    frame = testRenderer.captureCharFrame();
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('✓ implementer'));
+    column = (lines[row]?.indexOf('implementer') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(controller.state.selectedAgentKind).toBe('implementer');
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedAgentKind).toBe('judge');
+  });
+
   it('marks the chat input as focused when it is clicked', async () => {
     const testRenderer = await createTestRenderer({width: 150, height: 22});
     const controller = new FakeController({...initialSessionState(), chatDockFits: true});
@@ -660,21 +844,23 @@ describe('OpenTUI presentation', () => {
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
     await controller.openExperimentLog();
-    const docked = await testRenderer.waitForFrame(value => value.includes('Type a question'));
+    const docked = await testRenderer.waitForFrame(value =>
+      value.includes('Ask about this experiment'),
+    );
     // The hint says the keys are elsewhere, which is the state being reported.
     expect(docked).toContain('Ctrl+W to type here');
 
     // Click the box the operator types into, not the conversation above it.
     const lines = docked.split('\n');
-    const row = lines.findIndex(line => line.includes('Type a question'));
-    const column = (lines[row]?.indexOf('Type a question') ?? 0) + 2;
+    const row = lines.findIndex(line => line.includes('Ask about this experiment'));
+    const column = (lines[row]?.indexOf('Ask about this experiment') ?? 0) + 2;
     await testRenderer.mockMouse.click(column, row);
     const focused = await frameAfter(testRenderer);
 
     expect(controller.state.layout.focus).toBe('chat');
     // And the box says so: clicking must move the border, not only the cursor.
     expect(focused).not.toContain('Ctrl+W to type here');
-    expect(spanColors(testRenderer, 'Chat')?.fg).toBe(resolveTheme('dark').borderFocus);
+    expect(spanColors(testRenderer, 'Message')?.fg).toBe(resolveTheme('dark').borderFocus);
   });
 
   it('gives the chat the keys when it is clicked, not only on Ctrl+W', async () => {
@@ -711,13 +897,16 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      maxRounds: 20,
-      rounds: [{number: 1, status: 'completed'}],
-      phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
       selectedRound: 9,
-      conversation: [
-        {id: 'e1', kind: 'assistant', label: 'judge', content: 'done', roundNumber: 1},
-      ],
+      core: {
+        ...initialSessionState().core,
+        maxRounds: 20,
+        rounds: [{number: 1, status: 'completed'}],
+        phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [
+          {id: 'e1', kind: 'assistant', label: 'judge', content: 'done', roundNumber: 1},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -732,13 +921,16 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 130, height: 22});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
       hypothesisScope: {id: 'H-01', label: 'H-01 · r1', rounds: [1]},
       selectedRound: 1,
-      conversation: [
-        {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [
+          {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -759,12 +951,15 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 130, height: 22});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
       selectedRound: 1,
-      conversation: [
-        {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [
+          {id: 'e1', kind: 'assistant', label: 'judge', content: 'weighing it', roundNumber: 1},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -790,9 +985,12 @@ describe('OpenTUI presentation', () => {
         {id: 'q1', kind: 'user', label: 'You', content: 'what changed?'},
         {id: 'a1', kind: 'assistant', label: 'Answer', content: 'the epilogue was fused'},
       ],
-      rounds: [{number: 1, status: 'active'}],
-      phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
       chatOpen: true,
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -815,17 +1013,20 @@ describe('OpenTUI presentation', () => {
     });
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        phase('orchestrator', 'completed', 0),
-        phase('implementer', 'completed', 1),
-        phase('implementer', 'active', 2),
-        phase('implementer', 'active', 3),
-        phase('judge', 'pending', 4),
-        phase('judge', 'pending', 5),
-        phase('profiler', 'pending', 6),
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          phase('orchestrator', 'completed', 0),
+          phase('implementer', 'completed', 1),
+          phase('implementer', 'active', 2),
+          phase('implementer', 'active', 3),
+          phase('judge', 'pending', 4),
+          phase('judge', 'pending', 5),
+          phase('profiler', 'pending', 6),
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'out'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -844,13 +1045,21 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 30});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
-        {kind: 'implementer', status: 'active', roundNumber: 1, roundLabel: 'round-1-implementer'},
-        {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-plan'},
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+          {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -861,23 +1070,106 @@ describe('OpenTUI presentation', () => {
     expect(frame).not.toContain('▶');
   });
 
+  it('shows each graph node’s agent harness and model, when known', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'completed',
+            roundNumber: 1,
+            roundLabel: 'round-1-plan',
+            provider: 'codex',
+            model: 'gpt-5.1-codex-max',
+          },
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    // Graph nodes are narrow enough that the label truncates like every other
+    // node line; this stays inside the kept prefix regardless of node width.
+    expect(frame).toContain('Codex (GPT');
+    // The implementer node carries no runtime identity, so its row stays
+    // blank rather than reusing the orchestrator's label.
+    const implementerRow = frame.split('\n').find(line => line.includes('implementer'));
+    expect(implementerRow).toBeDefined();
+  });
+
+  it('shows the stacked strip’s runtime label when the terminal is too narrow for a graph', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 30});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'completed',
+            roundNumber: 1,
+            roundLabel: 'round-1-plan',
+            // Short enough to stay on one line in the narrow stacked column;
+            // the wrapping case for a long label is covered elsewhere.
+            provider: 'codex',
+            model: 'gpt-5',
+          },
+          {
+            kind: 'implementer',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+          {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+
+    // Confirms the stacked (non-graph) layout is in play, as in the sibling
+    // narrow-terminal test above.
+    expect(frame).toContain('        ↓');
+    expect(frame).toContain('Codex (GPT 5)');
+  });
+
   it('holds the agent-active elapsed time of a finished round', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {
-          number: 1,
-          status: 'completed',
-          // 60s of wall clock with a 15s gap where no agent was running.
-          agentIntervals: [
-            {startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:30Z'},
-            {startedAt: '2026-01-01T00:00:45Z', finishedAt: '2026-01-01T00:01:00Z'},
-          ],
-        },
-      ],
-      phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {
+            number: 1,
+            status: 'completed',
+            // 60s of wall clock with a 15s gap where no agent was running.
+            agentIntervals: [
+              {startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:30Z'},
+              {startedAt: '2026-01-01T00:00:45Z', finishedAt: '2026-01-01T00:01:00Z'},
+            ],
+          },
+        ],
+        phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -891,9 +1183,12 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 1, status: 'completed'}],
-      phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'completed'}],
+        phases: [{kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'}],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -915,7 +1210,7 @@ describe('OpenTUI presentation', () => {
     expect(controller.submissions).toEqual(['/help']);
   });
 
-  it('submits ordinary text as an operator question', async () => {
+  it('rejects ordinary text from the command input without sending chat', async () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController(initialSessionState());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -923,8 +1218,10 @@ describe('OpenTUI presentation', () => {
 
     await testRenderer.mockInput.typeText('what is running?');
     testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
-    expect(controller.submissions).toEqual(['what is running?']);
+    const frame = await testRenderer.waitForFrame(value => value.includes('Commands start with /'));
+    expect(frame).toContain('Use Experiment chat for questions.');
+    expect(controller.submissions).toEqual([]);
+    expect(controller.chatSubmissions).toEqual([]);
   });
 
   it('suggests and completes slash commands with Tab', async () => {
@@ -938,13 +1235,52 @@ describe('OpenTUI presentation', () => {
     expect(suggestions).toContain('/pause');
     expect(suggestions).not.toContain('/help  ');
     expect(suggestions).not.toContain('/perf');
-    expect(suggestions.indexOf('/pause')).toBeLessThan(suggestions.indexOf('Ask or command'));
-    expect(testRenderer.renderer.root.findDescendantById('input-box')?.height).toBe(3);
+    expect(suggestions.indexOf('/pause')).toBeLessThan(suggestions.indexOf('Command'));
+    expect(testRenderer.renderer.root.findDescendantById('command-input-box')?.height).toBe(3);
 
     testRenderer.mockInput.pressKey('TAB');
     testRenderer.mockInput.pressEnter();
     await testRenderer.waitForFrame(() => controller.submissions.length === 1);
     expect(controller.submissions).toEqual(['/pause']);
+  });
+
+  it('completes the default-highlighted suggestion with Tab on the experiment log landing view', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    // The landing view: the experiment log (hypothesis table) is on screen,
+    // same as the operator sees before opening a round.
+    controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
+
+    await testRenderer.mockInput.typeText('/p');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+
+    testRenderer.mockInput.pressKey('TAB');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    expect(controller.submissions).toEqual(['/pause']);
+  });
+
+  it('completes a navigated suggestion with Tab on the experiment log landing view', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
+
+    // /pause, /perf, /prompt: navigate down twice to land on /prompt.
+    await testRenderer.mockInput.typeText('/p');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    testRenderer.mockInput.pressArrow('down');
+    testRenderer.mockInput.pressArrow('down');
+    const suggestions = await testRenderer.waitForFrame(value => value.includes('› /prompt'));
+    expect(suggestions).toContain('/prompt');
+
+    testRenderer.mockInput.pressKey('TAB');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    expect(controller.submissions).toEqual(['/prompt']);
   });
 
   it('highlights a leading slash-command token', async () => {
@@ -954,14 +1290,14 @@ describe('OpenTUI presentation', () => {
     registerCleanup(testRenderer.renderer, app);
 
     await testRenderer.mockInput.typeText('/steer inspect the cache');
-    const input = testRenderer.renderer.root.findDescendantById('input');
+    const input = testRenderer.renderer.root.findDescendantById('command-input');
     expect(input).toBeInstanceOf(InputRenderable);
     if (!(input instanceof InputRenderable)) throw new Error('input was not rendered');
     expect(input.getLineHighlights(0)).toMatchObject([{start: 0, end: 6}]);
   });
 
   it('exits on the first Ctrl-C even while the input is focused', async () => {
-    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const testRenderer = await createTestRenderer({width: 80, height: 16, exitOnCtrlC: false});
     const controller = new FakeController(initialSessionState());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     cleanup.push(() => app.destroy());
@@ -972,12 +1308,49 @@ describe('OpenTUI presentation', () => {
     await destroyed;
   });
 
+  it('copies a selected range on Ctrl-C without exiting', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16, exitOnCtrlC: false});
+    const controller = new FakeController(initialSessionState());
+    const clipboard = clipboardReturning('copied');
+    const app = createOpenTuiApp(testRenderer.renderer, controller, clipboard);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Command'));
+
+    testRenderer.mockInput.pressKey('c', {ctrl: true});
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('Copied selected text'));
+    expect(frame).toContain('Ctrl+C exits when no text is selected');
+    expect(clipboard.calls).toBe(1);
+
+    testRenderer.mockInput.pressKey('x');
+    await testRenderer.waitForFrame(value => !value.includes('Copied selected text'));
+  });
+
+  it('keeps running and explains the fallback when OSC52 copy is unavailable', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 16, exitOnCtrlC: false});
+    const controller = new FakeController(initialSessionState());
+    const clipboard = clipboardReturning('unsupported');
+    const app = createOpenTuiApp(testRenderer.renderer, controller, clipboard);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Command'));
+
+    testRenderer.mockInput.pressKey('c', {ctrl: true});
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('Copy unavailable'));
+    expect(frame).toContain('selection kept');
+    expect(frame).toContain('terminal copy command');
+    expect(clipboard.calls).toBe(1);
+  });
+
   it('advertises Escape and returns a non-live view to live output', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
       overlay: {kind: 'help', content: 'Available commands'},
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -998,7 +1371,10 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
-      conversation: [{id: 'assistant', kind: 'assistant', label: 'Agent', content: lines}],
+      core: {
+        ...initialSessionState().core,
+        transcript: [{id: 'assistant', kind: 'assistant', label: 'Agent', content: lines}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1013,23 +1389,117 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
-      conversation: [
-        {
-          id: 'tool',
-          kind: 'tool',
-          label: 'implementer · round 1',
-          content: '→ Bash(command="pytest")\n2 passed',
-          toolCall: '→ Bash(command="pytest")\n',
-          toolResponse: '2 passed',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: '2 passed',
+            toolName: 'Bash',
+            toolArguments: {command: 'pytest'},
+            toolResult: {kind: 'tool_result', tool: 'Bash', content: '2 passed'},
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
 
     const frame = await testRenderer.waitForFrame(value => value.includes('2 passed'));
     expect(frame).toContain('→ Bash(command="pytest")');
+    expect(frame).toContain('← 2 passed');
     expect(frame.match(/╭/g)).toHaveLength(5);
+  });
+
+  it('renders a typed command payload with labeled stderr and exit code', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: '1 failed',
+            toolName: 'Bash',
+            toolArguments: {command: 'pytest'},
+            toolResult: {
+              kind: 'tool_result',
+              tool: 'Bash',
+              content: '1 failed',
+              payload: {
+                kind: 'command',
+                stdout: '1 failed',
+                stderr: 'assertion error',
+                exit_code: 1,
+                duration: 0.4,
+              },
+            },
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('exit code: 1'));
+    expect(frame).toContain('← 1 failed');
+    expect(frame).toContain('stderr:');
+    expect(frame).toContain('assertion error');
+  });
+
+  it('collapses, prettifies, and expands long JSON tool responses', async () => {
+    const response = JSON.stringify(
+      Object.fromEntries(Array.from({length: 12}, (_, index) => [`field_${index}`, index])),
+    );
+    const testRenderer = await createTestRenderer({width: 100, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedEntryId: 'tool',
+      core: {
+        ...initialSessionState().core,
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: response,
+            toolName: 'Read',
+            toolArguments: {path: 'run-state.json'},
+            toolResult: {kind: 'tool_result', tool: 'Read', content: response},
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const collapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(collapsed).toContain('← {');
+    expect(collapsed).toContain('"field_0": 0');
+    expect(collapsed).not.toContain('"field_11": 11');
+
+    testRenderer.mockInput.pressEnter();
+    const expanded = await testRenderer.waitForFrame(value => value.includes('"field_11": 11'));
+    expect(expanded).toContain('click or Enter to collapse response');
+
+    // Expanding scrolls the card's tail into view, so click the collapse hint,
+    // which the previous assertion proves is on screen.
+    const hint = 'click or Enter to collapse response';
+    const lines = expanded.split('\n');
+    const row = lines.findIndex(line => line.includes(hint));
+    const column = (lines[row]?.indexOf(hint) ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    const recollapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(recollapsed).not.toContain('"field_11": 11');
   });
 
   it('collapses prompts and expands the latest prompt with Ctrl+P', async () => {
@@ -1037,7 +1507,10 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      conversation: [{id: 'prompt', kind: 'prompt', label: 'Prompt', content}],
+      core: {
+        ...initialSessionState().core,
+        transcript: [{id: 'prompt', kind: 'prompt', label: 'Prompt', content}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1062,23 +1535,26 @@ describe('OpenTUI presentation', () => {
       ...initialSessionState(),
       selectedRound: 1,
       selectedAgentKind: 'implementer',
-      rounds: [{number: 1, status: 'active'}],
-      conversation: [
-        {
-          id: 'implementer-prompt',
-          kind: 'prompt',
-          agentKind: 'implementer',
-          roundNumber: 1,
-          content: visiblePrompt,
-        },
-        {
-          id: 'judge-prompt',
-          kind: 'prompt',
-          agentKind: 'judge',
-          roundNumber: 1,
-          content: hiddenPrompt,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        transcript: [
+          {
+            id: 'implementer-prompt',
+            kind: 'prompt',
+            agentKind: 'implementer',
+            roundNumber: 1,
+            content: visiblePrompt,
+          },
+          {
+            id: 'judge-prompt',
+            kind: 'prompt',
+            agentKind: 'judge',
+            roundNumber: 1,
+            content: hiddenPrompt,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1098,14 +1574,24 @@ describe('OpenTUI presentation', () => {
       content: `event ${index}`,
     }));
     const testRenderer = await createTestRenderer({width: 100, height: 20});
-    const controller = new FakeController({...initialSessionState(), conversation});
+    const initial = initialSessionState();
+    const controller = new FakeController({
+      ...initial,
+      core: {...initial.core, transcript: conversation},
+    });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
     await testRenderer.waitForFrame(value => value.includes('event 999'));
     const firstCard = testRenderer.renderer.root.findDescendantById('event-entry-0');
     const lastCard = testRenderer.renderer.root.findDescendantById('event-entry-999');
 
-    controller.publish({...controller.state, status: 'paused'});
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        status: 'paused',
+      },
+    });
     expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBe(firstCard);
     expect(testRenderer.renderer.root.findDescendantById('event-entry-999')).toBe(lastCard);
 
@@ -1114,40 +1600,127 @@ describe('OpenTUI presentation', () => {
     const updatedLast = {...previousLast, content: 'updated tail'};
     controller.publish({
       ...controller.state,
-      conversation: [...conversation.slice(0, -1), updatedLast],
+      core: {
+        ...controller.state.core,
+        transcript: [...conversation.slice(0, -1), updatedLast],
+      },
     });
     await testRenderer.waitForFrame(value => value.includes('updated tail'));
     expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBe(firstCard);
     expect(testRenderer.renderer.root.findDescendantById('event-entry-999')).not.toBe(lastCard);
   });
 
+  it('paints only the tail of a huge transcript, then reveals history on scroll', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const controller = new FakeController(hugeTranscriptState(20_000));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 19999'));
+    // Only a bounded tail gets cards: the newest entry is on screen, the run's
+    // older history is not built at all.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBeDefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBeUndefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19799')).toBeUndefined();
+
+    testRenderer.mockInput.pressKey('HOME');
+    await testRenderer.waitForFrame(() => true);
+
+    // Scrolling back materializes the next block, so the capped history stays
+    // reachable rather than being discarded.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19799')).toBeDefined();
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBeDefined();
+  });
+
+  it('asks the controller for history once the window reaches what is loaded', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const state = hugeTranscriptState(2_400);
+    const controller = new FakeController({
+      ...state,
+      // The client folded a suffix of the run: everything at or below sequence
+      // 3000 is still on the server.
+      core: {...state.core, historyAfterSequence: 3_000},
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 2399'));
+
+    // Each press materializes another block of what is already loaded, and asks
+    // for nothing while there is more of it left.
+    for (let press = 0; press < 11; press += 1) {
+      testRenderer.mockInput.pressKey('HOME');
+      await testRenderer.waitForFrame(() => true);
+    }
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-0')).toBeDefined();
+    expect(controller.historyLoads).toBe(0);
+
+    testRenderer.mockInput.pressKey('HOME');
+    await testRenderer.waitForFrame(() => true);
+
+    // The window starts at the oldest entry the client holds, so the next block
+    // has to come from the backend.
+    expect(controller.historyLoads).toBe(1);
+  });
+
+  it('appends live entries incrementally on a windowed transcript', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const state = hugeTranscriptState(20_000);
+    const controller = new FakeController(state);
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.waitForFrame(value => value.includes('event 19999'));
+    const tailCard = testRenderer.renderer.root.findDescendantById('event-entry-19999');
+
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        transcript: [
+          ...state.core.transcript,
+          {id: 'entry-20000', kind: 'status' as const, content: 'event 20000'},
+        ],
+      },
+    });
+    await testRenderer.waitForFrame(value => value.includes('event 20000'));
+
+    // The window anchor held, so the append stayed a prefix extension and the
+    // cards already on screen were not rebuilt.
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-19999')).toBe(tailCard);
+    expect(testRenderer.renderer.root.findDescendantById('event-entry-20000')).toBeDefined();
+  });
+
   it('selects an agent with Tab and filters the transcript', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
-        {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1'},
-      ],
-      rounds: [{number: 1, status: 'active'}],
-      conversation: [
-        {
-          id: 'implementer',
-          kind: 'assistant',
-          label: 'implementer · round 1',
-          agentKind: 'implementer',
-          roundNumber: 1,
-          content: 'edited files',
-        },
-        {
-          id: 'judge',
-          kind: 'assistant',
-          label: 'judge · round 1',
-          agentKind: 'judge',
-          roundNumber: 1,
-          content: 'checking behavior',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1'},
+        ],
+        rounds: [{number: 1, status: 'active'}],
+        transcript: [
+          {
+            id: 'implementer',
+            kind: 'assistant',
+            label: 'implementer · round 1',
+            agentKind: 'implementer',
+            roundNumber: 1,
+            content: 'edited files',
+          },
+          {
+            id: 'judge',
+            kind: 'assistant',
+            label: 'judge · round 1',
+            agentKind: 'judge',
+            roundNumber: 1,
+            content: 'checking behavior',
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1165,19 +1738,22 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      agentKind: 'implementer',
-      todoPhases: [
-        {
-          agentKind: 'implementer',
-          roundNumber: null,
-          items: [
-            {content: 'Profile the hot loop', status: 'completed'},
-            {content: 'Vectorize the kernel', status: 'in_progress'},
-            {content: 'Re-run the benchmark', status: 'pending'},
-          ],
-        },
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        agentKind: 'implementer',
+        todos: [
+          {
+            agentKind: 'implementer',
+            roundNumber: null,
+            items: [
+              {content: 'Profile the hot loop', status: 'completed'},
+              {content: 'Vectorize the kernel', status: 'in_progress'},
+              {content: 'Re-run the benchmark', status: 'pending'},
+            ],
+          },
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1198,15 +1774,18 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      agentKind: 'judge',
-      todoPhases: [
-        {
-          agentKind: 'implementer',
-          roundNumber: null,
-          items: [{content: 'Edit files', status: 'completed'}],
-        },
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        agentKind: 'judge',
+        todos: [
+          {
+            agentKind: 'implementer',
+            roundNumber: null,
+            items: [{content: 'Edit files', status: 'completed'}],
+          },
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1220,17 +1799,20 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'failed',
-      terminal: true,
-      conversation: [
-        {
-          id: 'configuration-error',
-          kind: 'result',
-          label: 'Configuration failed',
-          content: 'Invalid --max-rounds value',
-          tone: 'failure',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'failed',
+        terminal: true,
+        transcript: [
+          {
+            id: 'configuration-error',
+            kind: 'result',
+            label: 'Configuration failed',
+            content: 'Invalid --max-rounds value',
+            tone: 'failure',
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1251,17 +1833,20 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'failed',
-      terminal: true,
-      conversation: [
-        {
-          id: 'configuration-error',
-          kind: 'result',
-          label: 'Configuration failed',
-          content: 'agent.toml was not found',
-          tone: 'failure',
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'failed',
+        terminal: true,
+        transcript: [
+          {
+            id: 'configuration-error',
+            kind: 'result',
+            label: 'Configuration failed',
+            content: 'agent.toml was not found',
+            tone: 'failure',
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1282,7 +1867,7 @@ describe('OpenTUI presentation', () => {
     const overlay = testRenderer.renderer.root.findDescendantById('chat-overlay');
     const transcript = testRenderer.renderer.root.findDescendantById('chat-transcript');
     const turn = testRenderer.renderer.root.findDescendantById('event-chat-user');
-    const input = testRenderer.renderer.root.findDescendantById('chat-input-box');
+    const input = testRenderer.renderer.root.findDescendantById('chat-modal-composer-box');
     if (
       overlay === undefined ||
       transcript === undefined ||
@@ -1336,8 +1921,11 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 20});
     const controller = new FakeController({
       ...initialSessionState('light'),
-      status: 'running',
-      conversation: [assistantEntry],
+      core: {
+        ...initialSessionState('light').core,
+        status: 'running',
+        transcript: [assistantEntry],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1354,8 +1942,11 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      conversation: [assistantEntry],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        transcript: [assistantEntry],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1373,8 +1964,11 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      conversation: [assistantEntry],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        transcript: [assistantEntry],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1395,11 +1989,14 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {number: 1, status: 'completed'},
-        {number: 2, status: 'active'},
-      ],
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'active'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1431,7 +2028,10 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 90, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      conversation: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      core: {
+        ...initialSessionState().core,
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1531,24 +2131,27 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 36});
     const controller = new FakeController({
       ...initialSessionState('high-contrast-light'),
-      rounds: [{number: 1, status: 'active'}],
-      phases: [
-        {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
-        {kind: 'judge', status: 'failed', roundNumber: 1, roundLabel: 'round-1'},
-        {kind: 'profiler', status: 'cancelled', roundNumber: 1, roundLabel: 'round-1'},
-        {kind: 'reviewer', status: 'interrupted', roundNumber: 1, roundLabel: 'round-1'},
-      ],
-      todoPhases: [
-        {
-          agentKind: null,
-          roundNumber: null,
-          items: [
-            {content: 'write the kernel', status: 'completed'},
-            {content: 'benchmark it', status: 'in_progress'},
-          ],
-        },
-      ],
       todosExpanded: true,
+      core: {
+        ...initialSessionState('high-contrast-light').core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1'},
+          {kind: 'judge', status: 'failed', roundNumber: 1, roundLabel: 'round-1'},
+          {kind: 'profiler', status: 'cancelled', roundNumber: 1, roundLabel: 'round-1'},
+          {kind: 'reviewer', status: 'interrupted', roundNumber: 1, roundLabel: 'round-1'},
+        ],
+        todos: [
+          {
+            agentKind: null,
+            roundNumber: null,
+            items: [
+              {content: 'write the kernel', status: 'completed'},
+              {content: 'benchmark it', status: 'in_progress'},
+            ],
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -1569,16 +2172,19 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 120, height: 22});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 41, status: 'completed'}],
-      conversation: [
-        {
-          id: 'a',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'round 41 detail',
-          roundNumber: 41,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 41, status: 'completed'}],
+        transcript: [
+          {
+            id: 'a',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'round 41 detail',
+            roundNumber: 41,
+          },
+        ],
+      },
     });
     // The landing view is what a fresh client starts on.
     controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
@@ -1597,7 +2203,11 @@ describe('theming', () => {
     const landing = await frameAfter(testRenderer);
     expect(landing).toContain('Experiments');
     expect(landing).toContain('Implementation Details');
+    expect(landing).toContain('Outcome');
     expect(landing).toContain('H-07');
+    expect(landing).toContain('Accepted');
+    expect(landing).not.toContain('Verdict');
+    expect(landing).not.toContain('Pass');
     // Per-round detail is what the operator opts into, not what greets them.
     expect(landing).not.toContain('round 41 detail');
     // The rounds strip and agent map are per-round chrome; neither is drawn.
@@ -1605,32 +2215,93 @@ describe('theming', () => {
     expect(landing).not.toContain('Agents');
   });
 
-  it('opens the round trajectory behind a hypothesis and steps back out', async () => {
+  it('shows a round’s agent harness and model inside a hypothesis round drilldown', async () => {
+    // The Agents pane inside a hypothesis round drilldown is the same
+    // AgentMapView the live run uses, driven by the same core.phases replayed
+    // from the full event history, so a completed historical round must
+    // carry its runtime label exactly like a live one does.
     const testRenderer = await createTestRenderer({width: 120, height: 24});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [
-        {number: 41, status: 'completed'},
-        {number: 42, status: 'completed'},
-        {number: 43, status: 'completed'},
-      ],
-      conversation: [
-        {
-          id: 'a',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'unrelated round 41',
-          roundNumber: 41,
-        },
-        {
-          id: 'b',
-          kind: 'assistant',
-          label: 'implementer',
-          content: 'grew the block',
-          roundNumber: 42,
-        },
-        {id: 'c', kind: 'assistant', label: 'judge', content: 'regression found', roundNumber: 43},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 42, status: 'completed'}],
+        phases: [
+          {
+            kind: 'implementer',
+            status: 'completed',
+            roundNumber: 42,
+            roundLabel: 'round-42-implementer',
+            provider: 'codex',
+            model: 'gpt-5.1-codex-max',
+          },
+        ],
+        transcript: [
+          {
+            id: 'b',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'grew the block',
+            roundNumber: 42,
+          },
+        ],
+      },
+    });
+    controller.experiments = [
+      logEntry('H-08', 42, 42, {
+        claim: 'increase kv cache block',
+        resolved_outcome: 'proven',
+        rounds: [{round: 42, passed: true, reviewed: true}],
+      }),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressEnter(); // hypothesis summary
+    await frameAfter(testRenderer);
+    testRenderer.mockInput.pressEnter(); // round trajectory
+    const trajectory = await frameAfter(testRenderer);
+
+    expect(trajectory).toContain('Codex (GPT');
+  });
+
+  it('drills from a full hypothesis summary into a round trajectory and back', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 41, status: 'completed'},
+          {number: 42, status: 'completed'},
+          {number: 43, status: 'completed'},
+        ],
+        transcript: [
+          {
+            id: 'a',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'unrelated round 41',
+            roundNumber: 41,
+          },
+          {
+            id: 'b',
+            kind: 'assistant',
+            label: 'implementer',
+            content: 'grew the block',
+            roundNumber: 42,
+          },
+          {
+            id: 'c',
+            kind: 'assistant',
+            label: 'judge',
+            content: 'regression found',
+            roundNumber: 43,
+          },
+        ],
+      },
     });
     controller.experiments = [
       logEntry('H-07', 41, 41, {
@@ -1639,7 +2310,8 @@ describe('theming', () => {
         rounds: [{round: 41, passed: true, reviewed: true}],
       }),
       logEntry('H-08', 42, 43, {
-        claim: 'bigger KV cache block',
+        claim:
+          'Increasing the KV cache block should reduce allocator synchronization across producer and consumer operations without changing queue ordering.',
         resolved_outcome: 'rejected',
         rounds: [
           {round: 42, passed: false, reviewed: false},
@@ -1655,6 +2327,19 @@ describe('theming', () => {
     expect(table).not.toContain('grew the block');
 
     testRenderer.mockInput.pressKey('ARROW_DOWN');
+    testRenderer.mockInput.pressEnter();
+    const detail = await frameAfter(testRenderer);
+
+    expect(detail).toContain('Hypothesis H-08');
+    expect(detail).toContain(
+      'Increasing the KV cache block should reduce allocator synchronization',
+    );
+    expect(detail).toContain('without changing queue ordering.');
+    expect(detail).toContain('Decision Rejected');
+    expect(detail).toContain('Round 42 · Judge pending');
+    expect(detail).toContain('Round 43 · Judge fail');
+    expect(controller.state.hypothesisScope).toBeNull();
+
     testRenderer.mockInput.pressEnter();
     const trajectory = await frameAfter(testRenderer);
 
@@ -1672,9 +2357,13 @@ describe('theming', () => {
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-08', rounds: [42, 43]});
 
     testRenderer.mockInput.pressKey('ESCAPE');
-    const back = await frameAfterEscape(testRenderer);
-    expect(back).toContain('Implementation Details');
-    expect(back).not.toContain('grew the block');
+    const backToHypothesis = await frameAfterEscape(testRenderer);
+    expect(backToHypothesis).toContain('Increasing the KV cache block');
+    expect(backToHypothesis).not.toContain('grew the block');
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const backToIndex = await frameAfterEscape(testRenderer);
+    expect(backToIndex).toContain('Implementation Details');
     expect(controller.state.experimentLog?.selectedId).toBe('H-08');
   });
 
@@ -1755,8 +2444,8 @@ describe('theming', () => {
       await controller.openExperimentLog();
       await frameAfter(testRenderer);
 
-      expect(spanColors(testRenderer, 'Proven')?.fg).toBe(theme.success);
-      expect(spanColors(testRenderer, 'Disproven')?.fg).toBe(theme.error);
+      expect(spanColors(testRenderer, 'Accepted')?.fg).toBe(theme.success);
+      expect(spanColors(testRenderer, 'Rejected')?.fg).toBe(theme.error);
       expect(spanColors(testRenderer, 'Active')?.fg).toBe(theme.warning);
       // The claim keeps body text: only the resolution is colored.
       expect(spanColors(testRenderer, 'Batch the prefill step')?.fg).toBe(theme.textPrimary);
@@ -1835,9 +2524,10 @@ describe('theming', () => {
     expect(landing).toContain('Ctrl+W to type here');
     const lines = landing.split('\n');
     const paneTop = lines.find(line => line.includes('╭─ Experiment chat')) ?? '';
-    const inputTop = lines.find(line => line.includes('╭─ Chat ')) ?? '';
-    expect(inputTop).toContain('╭─ Ask or command');
-    expect(inputTop.indexOf('╭─ Ask or command')).toBe(paneTop.indexOf('╭─ Experiments'));
+    const messageTop = lines.find(line => line.includes('╭─ Message ')) ?? '';
+    const commandTop = lines.find(line => line.includes('╭─ Command')) ?? '';
+    expect(messageTop).not.toBe('');
+    expect(commandTop.indexOf('╭─ Command')).toBe(paneTop.indexOf('╭─ ▸ Experiments'));
   });
 
   it('routes typing to whichever input Ctrl+W points at', async () => {
@@ -1847,6 +2537,14 @@ describe('theming', () => {
     registerCleanup(testRenderer.renderer, app);
     await controller.openExperimentLog();
     await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('this belongs in chat');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Commands start with /'));
+    expect(controller.submissions).toEqual([]);
+    expect(controller.chatSubmissions).toEqual([]);
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
 
     testRenderer.mockInput.pressKey('w', {ctrl: true});
     await frameAfter(testRenderer);
@@ -1868,6 +2566,100 @@ describe('theming', () => {
     expect(controller.chatSubmissions).toHaveLength(1);
   });
 
+  it('wraps a long docked question, caps its growth, and submits every character', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 22});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    const question = Array.from({length: 28}, (_, index) => `word-${index}`).join(' ');
+    await testRenderer.mockInput.typeText(question);
+    await frameAfter(testRenderer);
+
+    const composer = testRenderer.renderer.root.findDescendantById('chat-dock-composer');
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    if (composer === undefined || editor === undefined)
+      throw new Error('chat composer was missing');
+    expect(composer.height).toBe(9);
+    expect(editor.height).toBe(6);
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual([question]);
+    await frameAfter(testRenderer);
+    expect(composer.height).toBe(4);
+  });
+
+  it('keeps multiline editor keys out of experiment navigation', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20, kittyKeyboard: true});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+    const selected = controller.state.experimentLog?.selectedId;
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('first line');
+    testRenderer.mockInput.pressEnter({shift: true});
+    await testRenderer.mockInput.typeText('second line');
+    testRenderer.mockInput.pressArrow('up');
+    await frameAfter(testRenderer);
+
+    expect(controller.state.experimentLog?.selectedId).toBe(selected);
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length >= 1);
+    expect(controller.chatSubmissions).toEqual(['first line\nsecond line']);
+  });
+
+  it('preserves a draft when a resize moves chat from dock to modal', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('draft survives the layout change');
+    testRenderer.renderer.resize(80, 20);
+    await frameAfter(testRenderer);
+    controller.publish({...controller.state, chatOpen: true});
+    const modal = await testRenderer.waitForFrame(value =>
+      value.includes('draft survives the layout change'),
+    );
+
+    expect(modal).toContain('Experiment chat');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual(['draft survives the layout change']);
+  });
+
+  it('lets the docked chat span the table and command surface', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    const chatPane = testRenderer.renderer.root.findDescendantById('chat-pane');
+    const workspace = testRenderer.renderer.root.findDescendantById('workspace');
+    const composer = testRenderer.renderer.root.findDescendantById('chat-dock-composer-box');
+    if (chatPane === undefined || workspace === undefined || composer === undefined)
+      throw new Error('landing layout was missing');
+    expect(chatPane.y).toBe(workspace.y);
+    expect(chatPane.y + chatPane.height).toBe(workspace.y + workspace.height);
+    expect(composer.x).toBeGreaterThan(chatPane.x);
+    expect(composer.x + composer.width).toBeLessThan(chatPane.x + chatPane.width);
+  });
+
   it('raises the command list out of the command input, clear of the chat', async () => {
     const testRenderer = await createTestRenderer({width: 140, height: 20});
     const controller = logController();
@@ -1881,10 +2673,10 @@ describe('theming', () => {
 
     const lines = frame.split('\n');
     const suggestion = lines.find(line => line.includes('/perf')) ?? '';
-    const commandInput = lines.find(line => line.includes('╭─ Ask or command')) ?? '';
+    const commandInput = lines.find(line => line.includes('╭─ Command')) ?? '';
     // The list belongs to the box it completes, so it starts where that box
     // starts rather than running back across the chat column.
-    expect(suggestion.indexOf('│')).toBe(commandInput.indexOf('╭─ Ask or command'));
+    expect(suggestion.indexOf('/perf')).toBeGreaterThan(commandInput.indexOf('╭─ Command'));
   });
 
   it('drops /chat from the command surface while the chat is already docked', async () => {
@@ -1898,8 +2690,9 @@ describe('theming', () => {
     await testRenderer.mockInput.typeText('/c');
     const frame = await frameAfter(testRenderer);
 
-    // Nothing to open: the chat is the column beside the table.
-    expect(frame).not.toContain('/chat');
+    // Nothing to open: the chat is the column beside the table. The thread
+    // commands (/chats, /new-chat) remain, so match /chat as a whole word.
+    expect(frame).not.toMatch(/\/chat\s/);
   });
 
   it('says when the docked chat is waiting on the agent', async () => {
@@ -1921,9 +2714,11 @@ describe('theming', () => {
     registerCleanup(testRenderer.renderer, app);
     await controller.openExperimentLog();
 
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
     await testRenderer.mockInput.typeText('why is r41 slow?');
     testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
     controller.publish({
       ...controller.state,
       chatConversation: [
@@ -1945,6 +2740,374 @@ describe('theming', () => {
       throw new Error('docked chat geometry was missing');
     expect(scroll.x).toBe(pane.x + 2);
     expect(turn.x).toBe(scroll.x);
+  });
+
+  it('switches chat threads, swapping the transcript and the composer draft', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      core: {
+        ...controller.state.core,
+        chatThreads: [
+          ...controller.state.core.chatThreads,
+          {
+            id: 'thread-a',
+            title: 'GPU stalls',
+            driver: 'omnigent',
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
+      },
+      chatConversations: {
+        default: [
+          {id: 'd1', kind: 'assistant', label: 'Answer', content: 'Default thread answer.'},
+        ],
+        'thread-a': [
+          {id: 't1', kind: 'assistant', label: 'Answer', content: 'Stalls come from prefill.'},
+        ],
+      },
+      chatConversation: [
+        {id: 'd1', kind: 'assistant', label: 'Answer', content: 'Default thread answer.'},
+      ],
+    });
+
+    // Focus the docked chat and leave a half-typed question on the default thread.
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('half-typed question');
+    let frame = await frameAfter(testRenderer);
+    expect(frame).toContain('Default thread answer.');
+    expect(frame).toContain('half-typed question');
+
+    controller.switchChatThread('thread-a');
+    frame = await frameAfter(testRenderer);
+    // The pane is titled by the backend-owned thread title, shows the
+    // thread's own transcript, and the other thread's draft is parked.
+    expect(frame).toContain('GPU stalls');
+    expect(frame).toContain('Stalls come from prefill.');
+    expect(frame).not.toContain('Default thread answer.');
+    expect(frame).not.toContain('half-typed question');
+
+    controller.switchChatThread('default');
+    frame = await frameAfter(testRenderer);
+    expect(frame).toContain('Default thread answer.');
+    expect(frame).not.toContain('Stalls come from prefill.');
+    // The parked draft returns with its thread.
+    expect(frame).toContain('half-typed question');
+  });
+
+  it('opens /model as a menu beside the composer, grouped by harness', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/model');
+    testRenderer.mockInput.pressEnter();
+    const frame = await testRenderer.waitForFrame(value => value.includes('Harness and model'));
+
+    // Grouped by harness, showing exactly what the backend reported. The
+    // driver behind the run is never named.
+    expect(frame).toContain('Codex');
+    expect(frame).toContain('gpt-run');
+    expect(frame).toContain('run default');
+    expect(frame).toContain('Claude Code');
+    expect(frame).toContain('custom model');
+    expect(frame).not.toContain('agentshim');
+    expect(frame).not.toContain('omnigent');
+
+    // The menu is anchored to the composer, not centred over the screen: its
+    // rows sit in the chat column, directly above the message box.
+    const rows = frameRows(frame);
+    const menuRow = rows.findIndex(row => row.includes('Harness and model'));
+    const messageRow = rows.findIndex(row => row.includes('Message'));
+    expect(menuRow).toBeGreaterThan(-1);
+    expect(messageRow).toBeGreaterThan(menuRow);
+    const chatColumn = rows[messageRow]?.indexOf('Message') ?? 0;
+    // Both belong to the same column, so the menu never spans the whole width.
+    expect(rows[menuRow]?.indexOf('Harness and model')).toBeGreaterThan(chatColumn - 6);
+    // The table it was opened over is still on screen beside it, which a
+    // centred dialog would have covered.
+    expect(frame).toContain('Experiments');
+    expect(frame).toContain('No hypotheses have been recorded yet.');
+  });
+
+  it('takes typing into a group custom entry rather than the composer', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/model');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(value => value.includes('Harness and model'));
+    // Down onto the codex group's custom entry.
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(
+      () => controller.state.chatMenu?.rows[controller.state.chatMenu.selected]?.kind === 'custom',
+    );
+
+    await testRenderer.mockInput.typeText('gpt-5.5');
+    const frame = await testRenderer.waitForFrame(value => value.includes('gpt-5.5'));
+    expect(frame).toContain('gpt-5.5');
+    // The keystrokes went to the entry, not to the question underneath it.
+    expect(controller.chatSubmissions).toEqual([]);
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.state.chatMenu === null);
+    expect(controller.createdThreads).toEqual([{provider: 'codex', model: 'gpt-5.5'}]);
+  });
+
+  it('lists the chat threads for /resume and switches to the highlighted one', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({
+      ...controller.state,
+      experimentLog: emptyLog(),
+      layout: chatFocus(),
+      core: {
+        ...controller.state.core,
+        chatThreads: [
+          ...controller.state.core.chatThreads,
+          {
+            id: 'thread-a',
+            title: 'GPU stalls',
+            driver: 'omnigent',
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/resume');
+    testRenderer.mockInput.pressEnter();
+    const frame = await testRenderer.waitForFrame(value => value.includes('Chat threads'));
+    // The implicit default is named by the client; a created thread shows the
+    // backend-owned title beside its harness and model. Not its driver.
+    expect(frame).toContain('Experiment chat');
+    expect(frame).toContain('GPU stalls');
+    expect(frame).toContain('Claude Code');
+    expect(frame).not.toContain('omnigent');
+
+    // Anchored to the composer, above the message box, not centred on screen.
+    const rows = frameRows(frame);
+    expect(rows.findIndex(row => row.includes('Chat threads'))).toBeLessThan(
+      rows.findIndex(row => row.includes('Message')),
+    );
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await testRenderer.waitForFrame(value => value.includes('› GPU stalls'));
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.state.chatMenu === null);
+
+    expect(controller.state.activeChatThreadId).toBe('thread-a');
+  });
+
+  it('/clear starts a thread on the active thread settings from the composer', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({
+      ...controller.state,
+      experimentLog: emptyLog(),
+      layout: chatFocus(),
+      activeChatThreadId: 'thread-a',
+      core: {
+        ...controller.state.core,
+        chatThreads: [
+          ...controller.state.core.chatThreads,
+          {
+            id: 'thread-a',
+            title: 'GPU stalls',
+            driver: 'omnigent',
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    // The pane header names the thread and the agent answering it.
+    const opening = await frameAfter(testRenderer);
+    expect(opening).toContain('GPU stalls');
+    expect(opening).toContain('Claude Code');
+
+    await testRenderer.mockInput.typeText('/clear');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.clearedSettings.length === 1);
+
+    expect(controller.clearedSettings).toEqual([{provider: 'claude', model: 'opus'}]);
+    // A command, not a question: nothing was sent to the agent.
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
+  it('suggests the chat commands beside the composer as they are typed', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/');
+    const frame = await testRenderer.waitForFrame(value => value.includes('/resume'));
+
+    // Only the chat's own commands, and only beside the composer.
+    expect(frame).toContain('/clear');
+    expect(frame).toContain('/model');
+    expect(frame).toContain('/resume');
+    const rows = frameRows(frame);
+    expect(rows.findIndex(row => row.includes('/model'))).toBeLessThan(
+      rows.findIndex(row => row.includes('Message')),
+    );
+  });
+
+  it('highlights and navigates the chat composer suggestions like the command bar', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    // /clear, /model, /resume: the composer's own command set, in that order.
+    await testRenderer.mockInput.typeText('/');
+    const first = await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    expect(first).toContain('› /clear');
+
+    testRenderer.mockInput.pressArrow('down');
+    const second = await testRenderer.waitForFrame(value => value.includes('› /model'));
+    expect(second).not.toContain('› /clear');
+
+    testRenderer.mockInput.pressArrow('down');
+    const third = await testRenderer.waitForFrame(value => value.includes('› /resume'));
+    expect(third).not.toContain('› /model');
+  });
+
+  it('fills the highlighted chat composer suggestion into the composer with Tab', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    testRenderer.mockInput.pressArrow('down');
+    await testRenderer.waitForFrame(value => value.includes('› /model'));
+
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('/model');
+
+    // The highlighted match already equals the typed text, so a second Tab
+    // does not clobber what was just filled in.
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    expect(editor.plainText).toBe('/model');
+  });
+
+  it('leaves the chat composer alone when Tab has no suggestion to complete', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('what is running?');
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('what is running?');
+    expect(controller.chatSubmissions).toEqual([]);
+  });
+
+  it('dismisses the chat composer suggestion menu once nothing matches', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+
+    await testRenderer.mockInput.typeText('zz');
+    const frame = await testRenderer.waitForFrame(value => value.includes('/zz'));
+    expect(frame).not.toContain('/clear');
+    expect(frame).not.toContain('/model');
+    expect(frame).not.toContain('/resume');
+
+    // Nothing to complete once the menu is gone: Tab is a no-op.
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-dock-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable)) throw new Error('composer editor was missing');
+    expect(editor.plainText).toBe('/zz');
+  });
+
+  it('fills the highlighted suggestion into the modal chat composer with Tab', async () => {
+    const testRenderer = await createTestRenderer({width: 90, height: 26});
+    const controller = new FakeController({...initialSessionState(), chatOpen: true});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Ask a question about'));
+
+    await testRenderer.mockInput.typeText('/');
+    await testRenderer.waitForFrame(value => value.includes('[Tab]'));
+    testRenderer.mockInput.pressArrow('down');
+    await testRenderer.waitForFrame(value => value.includes('› /model'));
+
+    testRenderer.mockInput.pressKey('TAB');
+    await frameAfter(testRenderer);
+    const editor = testRenderer.renderer.root.findDescendantById('chat-modal-composer-editor');
+    expect(editor).toBeInstanceOf(TextareaRenderable);
+    if (!(editor instanceof TextareaRenderable))
+      throw new Error('modal composer editor was missing');
+    expect(editor.plainText).toBe('/model');
+    // Only the modal moved; the docked chat is not on screen to disturb.
+    expect(controller.state.chatOpen).toBe(true);
+  });
+
+  it('answers unknown composer slash input with the chat help', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 30});
+    const controller = new FakeController(initialSessionState());
+    controller.publish({...controller.state, experimentLog: emptyLog(), layout: chatFocus()});
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    await testRenderer.mockInput.typeText('/threads');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatHelpShown.length === 1);
+
+    expect(controller.chatHelpShown[0]).toContain('/model');
+    expect(controller.submissions).toEqual([]);
+    expect(controller.chatSubmissions).toEqual([]);
   });
 
   it('keeps the chat, the table, and the visualization on screen together', async () => {
@@ -2063,15 +3226,186 @@ describe('theming', () => {
     await controller.openPane('perf');
 
     const onRight = await frameAfter(testRenderer);
-    expect(onRight).toContain('· focused');
+    expect(onRight).toContain('▸ Performance');
     const theme = resolveTheme('dark');
-    expect(spanColors(testRenderer, 'Performance · focused')?.fg).toBe(theme.borderFocus);
+    expect(spanColors(testRenderer, '▸ Performance')?.fg).toBe(theme.borderFocus);
 
     testRenderer.mockInput.pressKey('w', {ctrl: true});
     const onLeft = await frameAfter(testRenderer);
 
     expect(controller.state.layout.focus).toBe('left');
-    expect(onLeft).not.toContain('· focused');
+    expect(onLeft).toContain('▸ Transcript');
+  });
+
+  it('marks exactly one focused pane across the hypothesis layout', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 20});
+    const controller = logController();
+    controller.paneContent = 'Performance · tok_s\nbest r7 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await controller.openPane('perf');
+
+    expect(await frameAfter(testRenderer)).toContain('▸ Performance');
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    expect(await frameAfter(testRenderer)).toContain('▸ Experiment chat');
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    expect(await frameAfter(testRenderer)).toContain('▸ Experiments');
+    expect(controller.state.layout.focus).toBe('left');
+  });
+
+  it('shows the hypothesis title as a heading in the detail view', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 22});
+    const controller = logController();
+    controller.experiments = [
+      logEntry('H-01', 1, 1, {
+        title: 'Batch prefill to cut latency',
+        claim: 'batching the prefill step reduces latency',
+      }),
+      logEntry('H-02', 2, 2, {claim: 'untitled legacy hypothesis'}),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    controller.publish({
+      ...controller.state,
+      hypothesisDetail: {entryKey: 'H-01', selectedRound: 1},
+    });
+
+    const titled = await testRenderer.waitForFrame(value => value.includes('Hypothesis H-01'));
+    expect(titled).toContain('Batch prefill to cut latency');
+
+    controller.publish({
+      ...controller.state,
+      hypothesisDetail: {entryKey: 'H-02', selectedRound: 2},
+    });
+    const untitled = await testRenderer.waitForFrame(value => value.includes('Hypothesis H-02'));
+    expect(untitled).toContain('untitled legacy hypothesis');
+    expect(untitled).not.toContain('Batch prefill to cut latency');
+  });
+
+  it('opens hypothesis detail from a row click and keeps pane clicks routed', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 22});
+    const controller = logController();
+    controller.experiments = [
+      logEntry('H-07', 41, 41, {claim: 'batch the prefill step'}),
+      logEntry('H-08', 42, 43, {
+        claim: 'increase the cache block',
+        rounds: [
+          {round: 42, passed: true, reviewed: true},
+          {round: 43, passed: false, reviewed: true},
+        ],
+      }),
+    ];
+    controller.paneContent = 'Performance · tok_s\nbest r7 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await controller.openPane('perf');
+    let frame = await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('right');
+
+    // A table row opens the hypothesis summary directly and gives it the full
+    // content row, closing an unrelated visualization.
+    let lines = frame.split('\n');
+    let row = lines.findIndex(line => line.includes('H-08'));
+    let column = (lines[row]?.indexOf('H-08') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('left');
+    expect(controller.state.experimentLog?.selectedId).toBe('H-08');
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-08', selectedRound: 43});
+    expect(controller.state.layout.right).toBeNull();
+    expect(frame).toContain('▸ Hypothesis H-08');
+    testRenderer.mockInput.pressKey('ARROW_UP');
+    frame = await frameAfter(testRenderer);
+    expect(controller.state.hypothesisDetail?.selectedRound).toBe(42);
+
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('Round 42'));
+    column = (lines[row]?.indexOf('Round 42') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    await frameAfter(testRenderer);
+    expect(controller.state.hypothesisScope).toMatchObject({id: 'H-08'});
+    expect(controller.state.selectedRound).toBe(42);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.hypothesisDetail?.selectedRound).toBe(42);
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    await controller.openPane('perf');
+    frame = await frameAfter(testRenderer);
+
+    // The chart body is inside a scroll surface. Clicking it focuses the
+    // performance pane, so Escape is routed there and closes it.
+    frame = testRenderer.captureCharFrame();
+    lines = frame.split('\n');
+    row = lines.findIndex(line => line.includes('best r7 1135 tok_s'));
+    column = (lines[row]?.indexOf('best r7 1135 tok_s') ?? 0) + 2;
+    await testRenderer.mockMouse.click(column, row);
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('right');
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.layout.right).toBeNull();
+  });
+
+  it('zooms and restores every pane without replacing its model state', async () => {
+    const testRenderer = await createTestRenderer({width: 200, height: 20});
+    const controller = logController();
+    controller.paneContent = 'Performance · tok_s\nbest r7 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await controller.openPane('perf');
+    const right = controller.state.layout.right;
+
+    testRenderer.mockInput.pressKey('F4');
+    const performance = await frameAfter(testRenderer);
+    expect(performance).toContain('best r7 1135 tok_s');
+    expect(performance).not.toContain('H-07');
+    expect(performance).not.toContain('Experiment chat');
+
+    testRenderer.mockInput.pressKey('F4');
+    const restored = await frameAfter(testRenderer);
+    expect(restored).toContain('H-07');
+    expect(restored).toContain('Experiment chat');
+    expect(controller.state.layout.right).toBe(right);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    testRenderer.mockInput.pressKey('F4');
+    const chat = await frameAfter(testRenderer);
+    expect(chat).toContain('Experiment chat');
+    expect(chat).not.toContain('H-07');
+
+    testRenderer.mockInput.pressKey('F4');
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    testRenderer.mockInput.pressKey('F4');
+    const experiments = await frameAfter(testRenderer);
+    expect(experiments).toContain('H-07');
+    expect(experiments).not.toContain('Experiment chat');
+    expect(experiments).not.toContain('best r7 1135 tok_s');
+  });
+
+  it('zooms the selected agents or transcript pane in a round', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = splitController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    controller.focusRound('agents');
+    testRenderer.mockInput.pressKey('F4');
+    const agents = await frameAfter(testRenderer);
+    expect(agents).toContain('▸ Agents');
+    expect(agents).not.toContain('batched the prefill step');
+
+    testRenderer.mockInput.pressKey('F4');
+    controller.focusRound('transcript');
+    testRenderer.mockInput.pressKey('F4');
+    const transcript = await frameAfter(testRenderer);
+    expect(transcript).toContain('batched the prefill step');
+    expect(transcript).not.toContain('Agents');
   });
 
   it('closes the pane with Escape and restores the full-width transcript', async () => {
@@ -2146,7 +3480,7 @@ describe('theming', () => {
     await controller.openPane('perf');
     await frameAfter(testRenderer);
 
-    expect(spanColors(testRenderer, 'Performance · focused')?.fg).toBe(theme.borderFocus);
+    expect(spanColors(testRenderer, '▸ Performance')?.fg).toBe(theme.borderFocus);
     expect(spanColors(testRenderer, 'best r7 1135 tok_s')?.fg).toBe(theme.textPrimary);
 
     controller.cyclePaneFocus();
@@ -2208,16 +3542,19 @@ describe('theming', () => {
     const planningStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      phases: [
-        {
-          kind: 'orchestrator',
-          status: 'active',
-          roundNumber: 1,
-          roundLabel: 'round-1-pre',
-          startedAt: planningStartedAt,
-        },
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'active',
+            roundNumber: 1,
+            roundLabel: 'round-1-pre',
+            startedAt: planningStartedAt,
+          },
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -2238,21 +3575,26 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      rounds: [{number: 1, status: 'completed'}],
-      phases: [{kind: 'orchestrator', status: 'active', roundNumber: 2, roundLabel: 'round-2-pre'}],
-      conversation: [
-        {id: 'r1', kind: 'assistant', content: 'earlier unassociated turn', roundNumber: 1},
-        {id: 'r2', kind: 'assistant', content: 'planning turn', roundNumber: 2},
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        rounds: [{number: 1, status: 'completed'}],
+        phases: [
+          {kind: 'orchestrator', status: 'active', roundNumber: 2, roundLabel: 'round-2-pre'},
+        ],
+        transcript: [
+          {id: 'r1', kind: 'assistant', content: 'earlier unassociated turn', roundNumber: 1},
+          {id: 'r2', kind: 'assistant', content: 'planning turn', roundNumber: 2},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
     await controller.openExperimentLog();
 
     const kickoff = await frameAfter(testRenderer);
-    expect(kickoff).toContain('Planning Hypothesis 1 · Round 2');
-    expect(kickoff).toContain('UNASSOCIATED ROUNDS');
+    expect(kickoff).toContain('Planning Hypothesis 1');
+    expect(kickoff).toContain('Round 2');
     expect(kickoff).toContain('Round 1 · recorded agent turns · no hypothesis');
 
     testRenderer.mockInput.pressEnter();
@@ -2265,11 +3607,14 @@ describe('theming', () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      rounds: [{number: 7, status: 'completed'}],
-      conversation: [
-        {id: 'r6', kind: 'assistant', content: 'other round', roundNumber: 6},
-        {id: 'r7', kind: 'assistant', content: 'unindexed turn', roundNumber: 7},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 7, status: 'completed'}],
+        transcript: [
+          {id: 'r6', kind: 'assistant', content: 'other round', roundNumber: 6},
+          {id: 'r7', kind: 'assistant', content: 'unindexed turn', roundNumber: 7},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -2286,17 +3631,22 @@ describe('theming', () => {
     expect(detail).not.toContain('other round');
 
     testRenderer.mockInput.pressKey('ESCAPE');
-    expect(await frameAfterEscape(testRenderer)).toContain('UNASSOCIATED ROUNDS');
+    expect(await frameAfterEscape(testRenderer)).toContain(
+      'Round 7 · recorded agent turns · no hypothesis',
+    );
   });
 
-  it('pins later hypothesis planning above the existing history', async () => {
+  it('keeps later hypothesis planning below the existing history', async () => {
     const testRenderer = await createTestRenderer({width: 120, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      phases: [
-        {kind: 'orchestrator', status: 'active', roundNumber: 42, roundLabel: 'round-42-plan'},
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        phases: [
+          {kind: 'orchestrator', status: 'active', roundNumber: 42, roundLabel: 'round-42-plan'},
+        ],
+      },
     });
     controller.experiments = [logEntry('H-07', 41, 41, {claim: 'batch the prefill step'})];
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -2307,17 +3657,58 @@ describe('theming', () => {
     expect(frame).toContain('CURRENT ACTIVITY');
     expect(frame).toContain('Planning Hypothesis 2 · forming it · Round 42');
     expect(frame).toContain('H-07');
+    expect(frame.indexOf('H-07')).toBeLessThan(frame.indexOf('Planning Hypothesis 2'));
     expect(frame).not.toContain('UNASSOCIATED ROUNDS');
+  });
+
+  it('renders shuffled hypotheses and unassociated rounds in one ascending index', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        rounds: [
+          {number: 4, status: 'completed'},
+          {number: 2, status: 'completed'},
+          {number: 5, status: 'active'},
+        ],
+        phases: [
+          {kind: 'orchestrator', status: 'active', roundNumber: 5, roundLabel: 'round-5-plan'},
+        ],
+      },
+    });
+    controller.experiments = [
+      logEntry('H-03', 3, 3, {claim: 'third'}),
+      logEntry('H-01', 1, 1, {claim: 'first'}),
+    ];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+
+    const frame = await frameAfter(testRenderer);
+    const positions = [
+      frame.indexOf('H-01'),
+      frame.indexOf('Round 2 · recorded'),
+      frame.indexOf('H-03'),
+      frame.indexOf('Round 4 · recorded'),
+      frame.indexOf('Planning Hypothesis 3'),
+    ];
+    expect(positions.every(position => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((left, right) => left - right));
   });
 
   it('labels an explicit profiler phase without claiming it will happen earlier', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 16});
     const controller = new FakeController({
       ...initialSessionState(),
-      status: 'running',
-      phases: [
-        {kind: 'profiler', status: 'active', roundNumber: 1, roundLabel: 'round-1-profiler'},
-      ],
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        phases: [
+          {kind: 'profiler', status: 'active', roundNumber: 1, roundLabel: 'round-1-profiler'},
+        ],
+      },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -2336,6 +3727,21 @@ async function frameAfter(testRenderer: TestRendererSetup): Promise<string> {
   return testRenderer.captureCharFrame();
 }
 
+/** A captured frame as its screen rows, for asserting where something sits. */
+function frameRows(frame: string): string[] {
+  return frame.split('\n');
+}
+
+/** The landing view, which is where the chat is a docked pane. */
+function emptyLog(): NonNullable<SessionState['experimentLog']> {
+  return {entries: [], selectedId: null, pending: false, error: null};
+}
+
+/** Puts the keys on the docked chat, which is where its commands are typed. */
+function chatFocus(): SessionState['layout'] {
+  return {right: null, focus: 'chat', zoomedPane: null};
+}
+
 /**
  * A bare ESC is held by the stdin parser until its escape-sequence timeout
  * expires, so the key lands a beat after it is pressed.
@@ -2349,8 +3755,11 @@ async function frameAfterEscape(testRenderer: TestRendererSetup): Promise<string
 function logController(): FakeController {
   const controller = new FakeController({
     ...initialSessionState(),
-    status: 'running',
-    rounds: [{number: 41, status: 'completed'}],
+    core: {
+      ...initialSessionState().core,
+      status: 'running',
+      rounds: [{number: 41, status: 'completed'}],
+    },
   });
   controller.publish({...controller.state, experimentLog: initialSessionState().experimentLog});
   controller.experiments = [
@@ -2367,17 +3776,20 @@ function logController(): FakeController {
 function splitController(): FakeController {
   const controller = new FakeController({
     ...initialSessionState(),
-    status: 'running',
-    rounds: [{number: 7, status: 'active'}],
-    conversation: [
-      {
-        id: 'a',
-        kind: 'assistant',
-        label: 'implementer · round 7',
-        content: 'batched the prefill step',
-        roundNumber: 7,
-      },
-    ],
+    core: {
+      ...initialSessionState().core,
+      status: 'running',
+      rounds: [{number: 7, status: 'active'}],
+      transcript: [
+        {
+          id: 'a',
+          kind: 'assistant',
+          label: 'implementer · round 7',
+          content: 'batched the prefill step',
+          roundNumber: 7,
+        },
+      ],
+    },
   });
   controller.paneContent = 'Performance · tok_s\n    1135 ┤   ●\nbest r7 1135 tok_s';
   return controller;
@@ -2415,6 +3827,22 @@ function spanColors(
   return undefined;
 }
 
+/** A run long enough that building every card would block the first frame. */
+function hugeTranscriptState(entries: number): SessionState {
+  const initial = initialSessionState();
+  return {
+    ...initial,
+    core: {
+      ...initial.core,
+      transcript: Array.from({length: entries}, (_, index) => ({
+        id: `entry-${index}`,
+        kind: 'status' as const,
+        content: `event ${index}`,
+      })),
+    },
+  };
+}
+
 function registerCleanup(
   renderer: Awaited<ReturnType<typeof createTestRenderer>>['renderer'],
   app: OpenTuiApp,
@@ -2425,11 +3853,45 @@ function registerCleanup(
   });
 }
 
+function clipboardReturning(
+  result: ClipboardCopyResult,
+): SelectionClipboard & {readonly calls: number} {
+  let calls = 0;
+  return {
+    get calls(): number {
+      return calls;
+    },
+    copySelection(): ClipboardCopyResult {
+      calls += 1;
+      return result;
+    },
+  };
+}
+
 class FakeController implements SessionController {
   readonly #listeners = new Set<(state: SessionState) => void>();
   readonly submissions: string[] = [];
   readonly chatSubmissions: string[] = [];
+  /** Chat-scoped help the composer answered unknown slash input with. */
+  readonly chatHelpShown: string[] = [];
+  readonly createdThreads: ChatThreadSettings[] = [];
+  readonly clearedSettings: (ChatThreadSettings | null)[] = [];
+  /** Stands in for the backend's `query.chat_options` response. */
+  chatOptions: ChatOptions = {
+    providers: [
+      {
+        provider: 'codex',
+        models: [
+          {model: 'gpt-run', source: 'run', default: true},
+          {model: 'gpt-5.6-sol', source: 'suggested', default: false},
+        ],
+      },
+      {provider: 'claude', models: [{model: 'claude-opus-5', source: 'suggested', default: false}]},
+    ],
+  };
   liveCalls = 0;
+  /** How many times the reveal path asked for history the client does not hold. */
+  historyLoads = 0;
 
   /**
    * Tests that exercise the transcript start past the landing view. The
@@ -2454,7 +3916,15 @@ class FakeController implements SessionController {
   stop(): Promise<void> {
     return Promise.resolve();
   }
-  submit(value: string): Promise<void> {
+  submitCommand(value: string): Promise<void> {
+    if (!value.trim().startsWith('/')) {
+      this.publish(
+        reportError(this.state, 'Commands start with /. Use Experiment chat for questions.', {
+          scope: 'input',
+        }),
+      );
+      return Promise.resolve();
+    }
     this.submissions.push(value);
     if (value.trim() === '/chat') {
       this.state = {...this.state, chatOpen: true, overlay: null};
@@ -2466,6 +3936,47 @@ class FakeController implements SessionController {
   closeChat(): void {
     this.state = {...this.state, chatOpen: false};
     this.#notify();
+  }
+  switchChatThread(threadId: string): void {
+    this.publish(switchChatThread(this.state, threadId));
+  }
+  openChatResumeMenu(): void {
+    this.publish(openChatResumeMenu(this.state));
+  }
+  openChatModelMenu(): Promise<void> {
+    // Mocked protocol response: the client renders exactly what it receives.
+    this.publish(setChatModelMenuOptions(openChatModelMenu(this.state), this.chatOptions));
+    return Promise.resolve();
+  }
+  clearChatThread(): Promise<void> {
+    this.clearedSettings.push(activeChatThreadSettings(this.state));
+    return Promise.resolve();
+  }
+  moveChatMenuSelection(delta: number): void {
+    this.publish(moveChatMenuSelection(this.state, delta));
+  }
+  confirmChatMenu(): Promise<void> {
+    const row = selectedChatMenuRow(this.state);
+    if (row === null) return Promise.resolve();
+    if (row.kind === 'thread') {
+      this.switchChatThread(row.threadId);
+      return Promise.resolve();
+    }
+    if (row.kind !== 'model' && row.kind !== 'custom') return Promise.resolve();
+    const model = row.kind === 'custom' ? chatMenuCustomModel(this.state).trim() : row.model;
+    if (model === '') return Promise.resolve();
+    this.createdThreads.push({provider: row.provider, model});
+    this.publish(closeChatMenu(this.state));
+    return Promise.resolve();
+  }
+  closeChatMenu(): void {
+    this.publish(closeChatMenu(this.state));
+  }
+  typeChatMenuCustomModel(text: string): void {
+    this.publish(setChatMenuCustomModel(this.state, chatMenuCustomModel(this.state) + text));
+  }
+  backspaceChatMenuCustomModel(): void {
+    this.publish(setChatMenuCustomModel(this.state, chatMenuCustomModel(this.state).slice(0, -1)));
   }
   setTheme(themeName: ThemeName): void {
     this.state = {...this.state, themeName};
@@ -2484,10 +3995,24 @@ class FakeController implements SessionController {
   closeThemePicker(): void {
     this.publish(closeThemePicker(this.state));
   }
+  /** Records the reveal path asking the backend for history it does not hold. */
+  loadOlderHistory(): Promise<boolean> {
+    this.historyLoads += 1;
+    return Promise.resolve(this.state.core.historyAfterSequence > 0);
+  }
   submitChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text.startsWith('/')) return this.sendChat(value);
-    return this.submit(text);
+    const parsed = parseChatCommand(text);
+    if (parsed.command === 'clear') return this.clearChatThread();
+    if (parsed.command === 'model') return this.openChatModelMenu();
+    if (parsed.command === 'resume') {
+      this.openChatResumeMenu();
+      return Promise.resolve();
+    }
+    if (parsed.global === true) return this.submitCommand(text);
+    this.chatHelpShown.push(parsed.help ?? '');
+    return Promise.resolve();
   }
 
   sendChat(value: string): Promise<void> {
@@ -2531,9 +4056,9 @@ class FakeController implements SessionController {
     const current = this.state.selectedAgentKind;
     const visibleRound =
       this.state.selectedRound ??
-      this.state.rounds.find(round => round.status === 'active')?.number ??
+      this.state.core.rounds.find(round => round.status === 'active')?.number ??
       null;
-    const phases = this.state.phases.filter(phase => phase.roundNumber === visibleRound);
+    const phases = this.state.core.phases.filter(phase => phase.roundNumber === visibleRound);
     const index = current === null ? -1 : phases.findIndex(phase => phase.kind === current);
     const next = phases[(index + 1 + phases.length) % phases.length];
     this.state = {...this.state, selectedAgentKind: next?.kind ?? null, overlay: null};
@@ -2592,6 +4117,12 @@ class FakeController implements SessionController {
   moveExperimentSelection(delta: number): void {
     this.publish(moveExperimentSelection(this.state, delta));
   }
+  openHypothesisDetail(entryKey?: string): void {
+    this.publish(openHypothesisDetail(this.state, entryKey));
+  }
+  moveHypothesisRoundSelection(delta: number): void {
+    this.publish(moveHypothesisRoundSelection(this.state, delta));
+  }
   selectExperimentActivity(): void {
     this.publish(selectExperimentActivity(this.state));
   }
@@ -2608,11 +4139,17 @@ class FakeController implements SessionController {
   closeOverlays(): void {
     this.publish(closeOverlays(this.state));
   }
+  dismissErrorBanner(): void {
+    this.publish(dismissErrorBanner(this.state));
+  }
   cyclePaneFocus(): void {
     this.publish(cyclePaneFocus(this.state));
   }
   focusPane(focus: PaneFocus): void {
     this.publish(focusPane(this.state, focus));
+  }
+  togglePaneZoom(): void {
+    this.publish(togglePaneZoom(this.state));
   }
   setChatDockFits(fits: boolean): void {
     this.publish(setChatDockFits(this.state, fits));
@@ -2631,6 +4168,9 @@ class FakeController implements SessionController {
   }
   leaveExperimentDrilldown(): void {
     this.publish(leaveExperimentDrilldown(this.state));
+  }
+  leaveHypothesisDetail(): void {
+    this.publish(leaveHypothesisDetail(this.state));
   }
 
   subscribe(listener: (state: SessionState) => void): () => void {

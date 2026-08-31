@@ -95,6 +95,10 @@ _REQUIRED_TUI_FILES = (
     "app/dist/launcher.js",
     "app/dist/self-test.js",
     "app/package.json",
+    "app/node_modules/@vibesys/backend-client/package.json",
+    "app/node_modules/@vibesys/backend-client/dist/index.js",
+    "app/node_modules/@vibesys/core-state/package.json",
+    "app/node_modules/@vibesys/core-state/dist/index.js",
     "app/node_modules/@opentui/core/index.js",
     "licenses/BUN-LICENSE.md",
     "licenses/opentui-core.txt",
@@ -517,6 +521,7 @@ def _verify_tui_payload(
     if not isinstance(raw_manifest_version, str):
         _fail("TUI payload manifest version must be a string")
     package_document = _load_manifest(archive.read(f"{root}/app/package.json"))
+    _verify_portable_tui_dependencies(package_document)
     raw_package_version = package_document.get("version")
     if not isinstance(raw_package_version, str):
         _fail("TUI payload app/package.json version must be a string")
@@ -541,6 +546,18 @@ def _verify_tui_payload(
     manifest_members = _verify_manifest_hashes(archive, members, root=root, manifest=manifest)
     _verify_native_package(members, root=root, target=target)
     return manifest_members
+
+
+def _verify_portable_tui_dependencies(package: dict[str, object]) -> None:
+    raw_dependencies = package.get("dependencies", {})
+    if not isinstance(raw_dependencies, dict):
+        _fail("TUI payload app/package.json dependencies must be an object")
+    for name, value in raw_dependencies.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            _fail("TUI payload app/package.json dependencies must contain strings")
+        is_windows_absolute = PureWindowsPath(value).is_absolute()
+        if "file:" in value or value.startswith(("/", "\\", "./", "../")) or is_windows_absolute:
+            _fail(f"TUI payload dependency {name!r} contains a local path")
 
 
 def _load_manifest(content: bytes) -> dict[str, object]:

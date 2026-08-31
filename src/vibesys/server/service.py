@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
-from vibesys.loops.agent.model import ActiveHypothesis  # noqa: TC001  # tracked: #288
-from vibesys.loops.agent.state import AgentStateStore
+import threading
+from typing import TYPE_CHECKING
+
+from vibesys.loops.agent.hypotheses import reproject_run_evidence
+from vibesys.loops.agent.state import AgentRunStateStore
+from vibesys.server.chat_options import build_chat_options
 from vibesys.server.events import EventType, RunEvent
-from vibesys.server.experiments import apply_baselines, build_experiment_log
+from vibesys.server.experiments import build_experiment_log
 from vibesys.server.inspector import RunInspector
+from vibesys.server.performance import (
+    build_performance_context,
+    metric_directions,
+    summarize_objective,
+)
 from vibesys.server.protocol import (
     ActiveAgentExecution,
+    ChatOptions,
+    ChatOptionsQuery,
     ChatQuery,
     ChatResult,
+    ChatThreadCreateQuery,
+    ChatThreadInfo,
     CommandAck,
     EventsQuery,
     ExperimentQuery,
     HistoryQuery,
     HypothesisEntry,
     PauseCommand,
+    PerformanceContext,
     PerformanceQuery,
     PerformanceRound,
     ProtocolRequest,
@@ -25,50 +39,56 @@ from vibesys.server.protocol import (
     RunSnapshot,
     SnapshotQuery,
     SteerCommand,
+    TuiDefaultsQuery,
 )
-from vibesys.server.supervisor import ProjectRunState, RunSupervisor  # noqa: TC001  # tracked: #288
+from vibesys.server.supervisor import RunSupervisor  # noqa: TC001  # tracked: #288
+from vs_project import ProjectStateError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from vibesys.loops.agent.model import AgentRunState
+    from vibesys.repository import InteractiveSetupDefaults
 
 
 class SupervisionService:
     """Authoritative message API consumed by every presentation client."""
 
-    def __init__(self, supervisor: RunSupervisor):  # noqa: ANN204, D107  # tracked: #288
+    def __init__(  # noqa: D107  # tracked: #288
+        self,
+        supervisor: RunSupervisor,
+        *,
+        tui_defaults: Callable[[], InteractiveSetupDefaults] | None = None,
+    ) -> None:
         self.supervisor = supervisor
         self.inspector = RunInspector(supervisor)
+        # The server outlives configuration parsing, so defaults are resolved
+        # on the first request and then reused.
+        self._tui_defaults_provider = tui_defaults
+        self._tui_defaults: InteractiveSetupDefaults | None = None
+        self._tui_defaults_lock = threading.Lock()
 
-    def execute(self, request: ProtocolRequest) -> Response:  # noqa: D102, PLR0911  # tracked: #288
-        if isinstance(request, PauseCommand):
-            self.supervisor.pause_after_call()
-            return Response(
-                request_id=request.request_id,
-                ack=CommandAck(action="pause", status="pending"),
-            )
-        if isinstance(request, ResumeCommand):
-            self.supervisor.resume()
-            return Response(
-                request_id=request.request_id,
-                ack=CommandAck(action="resume", status="consumed"),
-            )
-        if isinstance(request, SteerCommand):
-            self.supervisor.steer(request.text)
-            return Response(
-                request_id=request.request_id,
-                ack=CommandAck(action="steer", status="pending"),
-            )
+    def execute(self, request: ProtocolRequest) -> Response:  # noqa: C901, D102, PLR0911  # tracked: #288
+        if isinstance(request, (PauseCommand, ResumeCommand, SteerCommand)):
+            return self._execute_command(request)
         if isinstance(request, ChatQuery):
-            sequence = self.supervisor.snapshot().sequence
-            answer = self.supervisor.chat(request.text)
-            return Response(
-                request_id=request.request_id,
-                chat=ChatResult(question=request.text, answer=answer),
-                events=self.supervisor.read_events(sequence),
-            )
+            return self._execute_chat(request)
+        if isinstance(request, ChatThreadCreateQuery):
+            return self._execute_chat_thread_create(request)
+        if isinstance(request, ChatOptionsQuery):
+            return Response(request_id=request.request_id, chat_options=self.chat_options())
+        if isinstance(request, TuiDefaultsQuery):
+            return Response(request_id=request.request_id, tui_defaults=self.tui_defaults())
         if isinstance(request, HistoryQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/history")
             return Response(request_id=request.request_id, events=self.history_events())
         if isinstance(request, PerformanceQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/perf")
-            return Response(request_id=request.request_id, performance=self.performance_rounds())
+            return Response(
+                request_id=request.request_id,
+                performance=self.performance_rounds(),
+                performance_context=self.performance_context(),
+            )
         if isinstance(request, ExperimentQuery):
             self.supervisor.record(EventType.STATUS_QUERY, "/experiments")
             ready = self.supervisor.project_run is not None
@@ -83,37 +103,92 @@ class SupervisionService:
         if isinstance(request, EventsQuery):
             timeout = request.timeout_ms / 1000 if request.timeout_ms else None
             events = (
-                self.wait_for_events(request.after_sequence, timeout)
+                self.wait_for_events(request.after_sequence, timeout, request.before_sequence)
                 if timeout is not None
-                else self.events(request.after_sequence)
+                else self.events(request.after_sequence, request.before_sequence)
             )
             return Response(request_id=request.request_id, events=events)
         raise TypeError(f"Unsupported protocol request: {type(request).__name__}")  # noqa: TRY003  # tracked: #288
 
+    def _execute_command(self, request: PauseCommand | ResumeCommand | SteerCommand) -> Response:
+        if isinstance(request, PauseCommand):
+            self.supervisor.pause_after_call()
+            ack = CommandAck(action="pause", status="pending")
+        elif isinstance(request, ResumeCommand):
+            self.supervisor.resume()
+            ack = CommandAck(action="resume", status="consumed")
+        else:
+            self.supervisor.steer(request.text)
+            ack = CommandAck(action="steer", status="pending")
+        return Response(request_id=request.request_id, ack=ack)
+
+    def _execute_chat(self, request: ChatQuery) -> Response:
+        sequence = self.supervisor.snapshot().sequence
+        answer = self.supervisor.chat(request.text, thread_id=request.thread_id)
+        return Response(
+            request_id=request.request_id,
+            chat=ChatResult(question=request.text, answer=answer, thread_id=request.thread_id),
+            events=self.supervisor.read_events(sequence),
+        )
+
+    def _execute_chat_thread_create(self, request: ChatThreadCreateQuery) -> Response:
+        sequence = self.supervisor.snapshot().sequence
+        spec = self.supervisor.create_chat_thread(
+            driver=request.driver,
+            provider=request.provider,
+            model=request.model,
+            title=request.title,
+        )
+        return Response(
+            request_id=request.request_id,
+            chat_thread=ChatThreadInfo(
+                thread_id=spec.thread_id,
+                title=spec.title,
+                driver=spec.driver,
+                provider=spec.provider,
+                model=spec.model,
+            ),
+            events=self.supervisor.read_events(sequence),
+        )
+
+    def chat_options(self) -> ChatOptions | None:
+        """Enumerate the run's chat agent selections, or None before attach."""
+        settings = self.supervisor.chat_run_settings
+        return None if settings is None else build_chat_options(settings)
+
+    def tui_defaults(self) -> InteractiveSetupDefaults | None:
+        """Resolve the run's TUI defaults once, or None without a provider."""
+        if self._tui_defaults_provider is None:
+            return None
+        with self._tui_defaults_lock:
+            if self._tui_defaults is None:
+                self._tui_defaults = self._tui_defaults_provider()
+            return self._tui_defaults
+
     def snapshot(self) -> RunSnapshot:  # noqa: D102  # tracked: #288
         return self.supervisor.snapshot()
 
-    def events(self, after_sequence: int = 0) -> list[RunEvent]:  # noqa: D102  # tracked: #288
-        return self.supervisor.read_events(after_sequence)
+    def events(self, after_sequence: int = 0, before_sequence: int | None = None) -> list[RunEvent]:
+        """Read the events in the half-open window after a client's cursor."""
+        return self.supervisor.read_events(after_sequence, before_sequence)
 
     def subscription_checkpoint(
-        self, after_sequence: int
+        self, after_sequence: int, *, bootstrap_spine: bool = False
     ) -> tuple[int, list[RunEvent], list[ActiveAgentExecution]]:
         """Return one sequence-consistent replay and activity checkpoint."""
-        return self.supervisor.subscription_checkpoint(after_sequence)
+        return self.supervisor.subscription_checkpoint(
+            after_sequence, bootstrap_spine=bootstrap_spine
+        )
 
     def history_events(self) -> list[RunEvent]:  # noqa: D102  # tracked: #288
         return self.supervisor.read_history_events()
 
     def performance_rounds(self) -> list[PerformanceRound]:  # noqa: D102  # tracked: #288
-        project_run = self.supervisor.project_run
-        if project_run is None:
-            return []
-        manifest = project_run.project.state.load_run(project_run.run_id)
-        if manifest.configuration.outer_loop != "agent":
+        state = self._agent_run_state()
+        if state is None:
             return []
         rounds: list[PerformanceRound] = []
-        for record in project_run.project.state.load_rounds(project_run.run_id):
+        for record in state.rounds:
             if record.perf_metric is None or record.perf_unit is None:
                 continue
             rounds.append(
@@ -127,40 +202,82 @@ class SupervisionService:
             )
         return rounds
 
-    def experiments(self) -> list[HypothesisEntry]:
-        """Group persisted round state into one entry per hypothesis.
-
-        Both inputs come from the project store rather than from files this
-        module names itself, so a change to the on-disk layout is absorbed by
-        the store and its typed adapters. This mirrors ``performance_rounds``.
-        """
+    def performance_context(self) -> PerformanceContext | None:
+        """Describe what the performance plot measures, for presentation clients."""
         project_run = self.supervisor.project_run
         if project_run is None:
-            return []
+            return None
         manifest = project_run.project.state.load_run(project_run.run_id)
         if manifest.configuration.outer_loop != "agent":
-            return []
-        rounds = project_run.project.state.load_rounds(project_run.run_id)
-        entries = build_experiment_log(rounds, self._active_hypothesis(project_run))
-        apply_baselines(entries, rounds)
-        return entries
-
-    @staticmethod
-    def _active_hypothesis(project_run: ProjectRunState) -> ActiveHypothesis | None:
-        """Load the live plan, or ``None`` when no hypothesis is open.
-
-        The active plan is machine-local rather than portable, and
-        ``AgentStateStore`` owns where it lives, so the file is never named
-        here.
-        """
-        # Deferred: ``vibesys.run`` re-enters this module through its logger,
-        # so importing the namespace enum at module scope is a cycle.
-        from vibesys.run.state import RunStateNamespace  # noqa: PLC0415  # tracked: #288
-
-        namespace = project_run.project.state.local_namespace(
-            project_run.run_id, RunStateNamespace.AGENT
+            return None
+        return build_performance_context(
+            self._agent_run_state(),
+            objectives=manifest.configuration.objectives,
+            objective_description=self._objective_description(),
         )
-        return AgentStateStore(namespace).load_active()
 
-    def wait_for_events(self, after_sequence: int, timeout: float | None = None) -> list[RunEvent]:  # noqa: D102  # tracked: #288
-        return self.supervisor.wait_for_events(after_sequence, timeout)
+    def _objective_description(self) -> str | None:
+        """Read the bounded summary of the run's recorded objective prose."""
+        project_run = self.supervisor.project_run
+        if project_run is None:
+            return None
+        try:
+            runtime = project_run.project.state.portable_namespace(project_run.run_id, "runtime")
+            document = runtime.external_directory() / "effective-objective.md"
+            if not document.is_file():
+                return None
+            text = document.read_text(encoding="utf-8")
+        except (OSError, ProjectStateError):
+            return None
+        return summarize_objective(text)
+
+    def experiments(self) -> list[HypothesisEntry]:
+        """Project the run's authoritative hypothesis aggregate for clients."""
+        state = self._agent_run_state()
+        return [] if state is None else build_experiment_log(state)
+
+    def _agent_run_state(self) -> AgentRunState | None:
+        """Load the authoritative agent state, adapting legacy runs in memory."""
+        project_run = self.supervisor.project_run
+        if project_run is None:
+            return None
+        manifest = project_run.project.state.load_run(project_run.run_id)
+        if manifest.configuration.outer_loop != "agent":
+            return None
+        portable = project_run.project.state.portable_namespace(project_run.run_id, "agent")
+        store = AgentRunStateStore(portable)
+        state = store.load_optional()
+        if state is None:
+            # Old runs are adapted once at the persistence boundary. The
+            # server remains a read-only consumer of AgentRunState.
+            from vibesys.run.state import RunStateNamespace  # noqa: PLC0415  # tracked: #288
+
+            local = project_run.project.state.local_namespace(
+                project_run.run_id, RunStateNamespace.AGENT
+            )
+            return store.migrate_legacy(
+                rounds=project_run.project.state.load_rounds(project_run.run_id),
+                local_namespace=local,
+                legacy_directions=metric_directions(manifest.configuration.objectives),
+            )
+        return reproject_run_evidence(
+            state, legacy_directions=metric_directions(manifest.configuration.objectives)
+        )
+
+    def wait_for_events(
+        self,
+        after_sequence: int,
+        timeout: float | None = None,
+        before_sequence: int | None = None,
+    ) -> list[RunEvent]:
+        """Block for new events after the cursor, bounded by ``before_sequence``."""
+        return self.supervisor.wait_for_events(after_sequence, timeout, before_sequence)
+
+    def wait_for_change(self, after_sequence: int, timeout: float | None = None) -> bool:
+        """Block until the stream advances past the cursor, parsing no events."""
+        return self.supervisor.wait_for_change(after_sequence, timeout)
+
+    @property
+    def latest_sequence(self) -> int:
+        """The newest sequence in the run's log, without a snapshot's copies."""
+        return self.supervisor.latest_sequence

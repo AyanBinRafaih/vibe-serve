@@ -17,8 +17,26 @@ graft libs/vs-loop-state/src
 graft libs/vs-project/src
 graft libs/vs-sandbox/src
 
-# Include the TypeScript TUI sources in the sdist for development source builds.
+# Include every TypeScript client package in the sdist for development source builds.
 # Exclude generated and installed artifacts.
+include package.json
+include pnpm-lock.yaml
+include pnpm-workspace.yaml
+include biome.json
+include tsconfig.architecture.json
+include .dependency-cruiser.cjs
+include scripts/check_ts_architecture.test.mjs
+include scripts/check_ts_package_manifests.mjs
+graft clients/backend-client/src
+include clients/backend-client/package.json
+include clients/backend-client/tsconfig.json
+include clients/backend-client/tsconfig.check.json
+include clients/backend-client/README.md
+graft clients/core-state/src
+include clients/core-state/package.json
+include clients/core-state/tsconfig.json
+include clients/core-state/tsconfig.check.json
+include clients/core-state/README.md
 graft clients/tui/src
 include clients/tui/package.json
 include clients/tui/tsconfig.json
@@ -26,6 +44,10 @@ include clients/tui/tsconfig.check.json
 include clients/tui/README.md
 prune clients/tui/dist
 prune clients/tui/node_modules
+prune clients/backend-client/dist
+prune clients/backend-client/node_modules
+prune clients/core-state/dist
+prune clients/core-state/node_modules
 prune src/*.egg-info
 prune libs/*/src/*.egg-info
 

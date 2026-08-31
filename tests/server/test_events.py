@@ -7,7 +7,9 @@ from vibesys.server.events import (
     AgentOutputChunkData,
     AgentStatusData,
     BenchmarkResultData,
+    CommandResultPayload,
     EventType,
+    JsonResultPayload,
     RoundFinishedData,
     RunEvent,
     TodoItemData,
@@ -50,6 +52,49 @@ class TestNewEventDataRoundTrip:
         restored = _round_trip(event)
         assert isinstance(restored.data, ToolResultData)
         assert restored.data.is_error is True
+        assert restored.data.payload is None
+
+    def test_tool_result_with_command_payload(self):  # noqa: ANN201  # tracked: #288
+        payload = CommandResultPayload(stdout="out", stderr="warn", exit_code=2, duration=1.5)
+        event = make_event(
+            EventType.TOOL_RESULT,
+            data=ToolResultData(tool="shell", content="out", payload=payload),
+        )
+        restored = _round_trip(event)
+        assert isinstance(restored.data, ToolResultData)
+        assert isinstance(restored.data.payload, CommandResultPayload)
+        assert restored.data.payload == payload
+        assert restored.data.content == "out"
+
+    def test_tool_result_with_json_payload(self):  # noqa: ANN201  # tracked: #288
+        payload = JsonResultPayload(value={"rows": [1, 2], "ok": True})
+        event = make_event(
+            EventType.TOOL_RESULT,
+            data=ToolResultData(
+                tool="query", content='{"rows": [1, 2], "ok": true}', payload=payload
+            ),
+        )
+        restored = _round_trip(event)
+        assert isinstance(restored.data, ToolResultData)
+        assert isinstance(restored.data.payload, JsonResultPayload)
+        assert restored.data.payload.value == {"rows": [1, 2], "ok": True}
+
+    def test_tool_result_payload_rejects_unknown_kind(self):  # noqa: ANN201  # tracked: #288
+        with pytest.raises(ValidationError):
+            ToolResultData.model_validate(
+                {"tool": "shell", "content": "out", "payload": {"kind": "mystery"}}
+            )
+
+    def test_json_payload_rejects_scalar_value(self):  # noqa: ANN201  # tracked: #288
+        with pytest.raises(ValidationError):
+            JsonResultPayload.model_validate({"value": 42})
+
+    def test_tool_result_without_payload_field_still_validates(self):  # noqa: ANN201  # tracked: #288
+        # Old event logs predate the payload field and must keep replaying.
+        restored = ToolResultData.model_validate(
+            {"kind": "tool_result", "tool": "t", "content": "c"}
+        )
+        assert restored.payload is None
 
     def test_todo_update(self):  # noqa: ANN201  # tracked: #288
         event = make_event(

@@ -1,12 +1,15 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
-import type {HypothesisEntry} from '../protocol.js';
+import type {HypothesisEntry, HypothesisRound} from '@vibesys/backend-client';
 import type {SessionController} from '../session-controller.js';
 import {
-  entryKey,
+  detailedHypothesis,
+  type ExperimentIndexItem,
   experimentIndexItems,
   experimentLogVisible,
+  focusedPane,
   type HypothesisPlanningActivity,
   hypothesisPlanningActivity,
+  hypothesisRoundNumbers,
   type SessionState,
   selectedExperimentIndexItem,
   unownedExperimentRounds,
@@ -39,13 +42,12 @@ const KEPT_MIN_WIDTH = 104;
  * rather than restating the threshold.
  */
 export const LOG_CLAIM_PANEL_WIDTH = CLAIM_MIN_WIDTH + PANEL_CHROME_COLUMNS;
-/** Panel width that still carries the measured and verdict columns. */
+/** Panel width that still carries the measured column. */
 export const LOG_COMPACT_PANEL_WIDTH = MEASURED_MIN_WIDTH + PANEL_CHROME_COLUMNS;
 
 interface Columns {
   claim: boolean;
   measured: boolean;
-  verdict: boolean;
   kept: boolean;
   claimWidth: number;
 }
@@ -77,10 +79,11 @@ export class ExperimentLogView {
       paddingRight: 1,
       border: true,
       borderStyle: 'rounded',
-      borderColor: theme.accent,
+      borderColor: theme.border,
       backgroundColor: theme.elevatedSurface,
       visible: false,
       title: ' Experiments ',
+      onMouseUp: () => this.controller.focusPane('left'),
     });
     this.#header = new TextRenderable(renderer, {
       content: '',
@@ -103,6 +106,7 @@ export class ExperimentLogView {
       stickyScroll: false,
       viewportCulling: true,
       verticalScrollbarOptions: {showArrows: false},
+      onMouseUp: () => this.controller.focusPane('left'),
     });
     this.#footerLine = new TextRenderable(renderer, {
       content: '',
@@ -129,7 +133,7 @@ export class ExperimentLogView {
 
   applyTheme(theme: Theme): void {
     this.#theme = theme;
-    this.output.borderColor = theme.accent;
+    this.output.borderColor = theme.border;
     this.output.backgroundColor = theme.elevatedSurface;
     this.#header.fg = theme.textSubtle;
     this.#footerLine.fg = theme.textSubtle;
@@ -148,11 +152,22 @@ export class ExperimentLogView {
       return;
     }
     this.output.visible = true;
+    const focused = focusedPane(state) === 'experiments';
+    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
+    this.output.title = focused ? ' ▸ Experiments ' : ' Experiments ';
     const width = this.#availableWidth ?? this.renderer.terminalWidth;
     if (state === this.#renderedState && width === this.#renderedWidth) return;
+    const previousDetailKey = this.#renderedState?.hypothesisDetail?.entryKey ?? null;
     this.#renderedState = state;
     this.#renderedWidth = width;
     this.#clear();
+
+    const detail = detailedHypothesis(state);
+    if (detail !== null) {
+      this.#renderDetail(detail, state);
+      if (previousDetailKey !== state.hypothesisDetail?.entryKey) this.#rows.scrollTo(0);
+      return;
+    }
 
     if (log.error !== null) {
       this.#header.content = '';
@@ -168,18 +183,12 @@ export class ExperimentLogView {
     }
     const activity = hypothesisPlanningActivity(state);
     if (log.entries.length === 0) {
-      if (activity !== null) {
+      if (activity !== null && unownedExperimentRounds(state).length === 0) {
         this.#renderKickoff(activity, state);
         return;
       }
       if (unownedExperimentRounds(state).length > 0) {
-        this.#renderTable(
-          log.entries,
-          log.selectedId,
-          log.selectedUnownedRound ?? null,
-          null,
-          state,
-        );
+        this.#renderTable(state);
         return;
       }
       this.#header.content = '';
@@ -187,13 +196,7 @@ export class ExperimentLogView {
       this.#footerLine.content = 'The first one appears once the orchestrator has planned a round.';
       return;
     }
-    this.#renderTable(
-      log.entries,
-      log.selectedId,
-      log.selectedUnownedRound ?? null,
-      activity,
-      state,
-    );
+    this.#renderTable(state);
   }
 
   #renderKickoff(activity: HypothesisPlanningActivity, state: SessionState): void {
@@ -224,96 +227,113 @@ export class ExperimentLogView {
         : '↑↓: select activity or recorded round · Enter: open';
   }
 
-  #renderTable(
-    entries: HypothesisEntry[],
-    selectedId: string | null,
-    selectedUnownedRound: number | null,
-    activity: HypothesisPlanningActivity | null,
-    state: SessionState,
-  ): void {
+  #renderTable(state: SessionState): void {
+    const log = state.experimentLog;
+    if (log === null) return;
     const columns = resolveColumns(this.#bodyWidth());
-    const keys = entries.map(entryKey);
-    const selected = selectedId === null ? 0 : Math.max(0, keys.indexOf(selectedId));
-    const activitySelected =
-      activity !== null && this.#renderedState?.experimentLog?.selectedActivity === true;
-
-    this.#header.content = headerRow(columns);
-    const activityRows =
-      activity === null ? 0 : this.#renderActivity(activity, entries.length, activitySelected);
-    for (const [index, entry] of entries.entries()) {
-      this.#row(
-        entry,
-        columns,
-        keys[index] === selectedId && !activitySelected,
-        index,
-        activity === null ? 0 : 1,
-      );
-    }
-    const unowned = unownedExperimentRounds(state);
-    if (unowned.length > 0) {
-      this.#line('UNASSOCIATED ROUNDS', this.#theme.textSubtle);
-      for (const [index, roundNumber] of unowned.entries()) {
-        this.#roundRow(
-          roundNumber,
-          selectedUnownedRound === roundNumber,
-          (activity === null ? 0 : 1) + entries.length + index,
-        );
+    const items = experimentIndexItems(state);
+    const selected = selectedExperimentIndexItem(state);
+    this.#header.content = headerRow(columns, measuredDirection(log.entries));
+    let selectedRenderIndex = 0;
+    let renderedRows = 0;
+    for (const [navigationIndex, item] of items.entries()) {
+      const isSelected = item.key === selected?.key;
+      if (item.kind === 'hypothesis') {
+        const entryIndex = log.entries.indexOf(item.entry);
+        this.#row(item.entry, item.key, columns, isSelected, entryIndex);
+        if (isSelected) selectedRenderIndex = renderedRows;
+        renderedRows += 1;
+      } else if (item.kind === 'round') {
+        this.#roundRow(item.roundNumber, isSelected, navigationIndex);
+        if (isSelected) selectedRenderIndex = renderedRows;
+        renderedRows += 1;
+      } else {
+        this.#line('CURRENT ACTIVITY', this.#theme.textSubtle);
+        renderedRows += 1;
+        this.#renderActivity(item, log.entries.length, isSelected);
+        if (isSelected) selectedRenderIndex = renderedRows;
+        renderedRows += 1;
       }
     }
     // Keyboard selection nudges the scroll position only when the row would
     // otherwise be off screen, so the wheel stays in charge the rest of the
     // time. Computed rather than deferred to scrollChildIntoView, which needs
     // a layout pass the freshly added rows have not had yet.
-    this.#followSelection(
-      this.#selectedRenderIndex(
-        entries.length,
-        activity,
-        selected,
-        activitySelected,
-        selectedUnownedRound,
-        unowned,
-      ),
-      entries.length + activityRows + (unowned.length === 0 ? 0 : unowned.length + 1),
-    );
-    const selectedUnownedIndex =
-      selectedUnownedRound === null ? -1 : unowned.indexOf(selectedUnownedRound);
-    const totalIndexItems = entries.length + unowned.length + (activity === null ? 0 : 1);
-    const positionIndex = activitySelected
-      ? 1
-      : selectedUnownedIndex === -1
-        ? selected + (activity === null ? 1 : 2)
-        : entries.length + selectedUnownedIndex + (activity === null ? 1 : 2);
-    const position = `${positionIndex}/${totalIndexItems}`;
+    this.#followSelection(selectedRenderIndex, renderedRows);
+    const selectedNavigationIndex =
+      selected === null ? 0 : items.findIndex(item => item.key === selected.key);
+    const position = `${Math.max(0, selectedNavigationIndex) + 1}/${items.length}`;
     // The hint is the first thing to give up room; truncating it mid-word
     // reads as breakage rather than as a narrow terminal.
     const hint =
       this.#bodyWidth() >= HINT_MIN_WIDTH
-        ? '↑↓ or scroll: select · Enter or /open-round: open its rounds'
+        ? '↑↓ or scroll: select · Enter or click: open hypothesis'
         : '↑↓ · Enter';
     this.#footerLine.content = `${position} · ${hint}`;
   }
 
+  #renderDetail(entry: HypothesisEntry, state: SessionState): void {
+    const selectedRound = state.hypothesisDetail?.selectedRound ?? null;
+    this.output.title = ` ${focusedTitlePrefix(state)}Hypothesis ${entry.hypothesis_id} `;
+    this.#header.content = hypothesisMetadata(entry);
+    const title = entry.title?.trim();
+    if (title) this.#line(title, this.#theme.textStrong);
+    this.#line('HYPOTHESIS', this.#theme.textSubtle);
+    this.#wrappedLine(
+      entry.claim?.trim() || 'No hypothesis text was recorded.',
+      this.#theme.textPrimary,
+    );
+    this.#line('', this.#theme.textPrimary);
+    this.#line('ROUNDS', this.#theme.textSubtle);
+    const rounds = hypothesisRoundNumbers(entry);
+    if (rounds.length === 0) {
+      this.#line('No recorded rounds.', this.#theme.textSubtle);
+    } else {
+      for (const roundNumber of rounds) {
+        const round = entry.rounds?.find(candidate => candidate.round === roundNumber);
+        const selected = roundNumber === selectedRound;
+        const row = new BoxRenderable(this.renderer, {
+          id: `hypothesis-round-${roundNumber}`,
+          width: '100%',
+          height: 1,
+          flexShrink: 0,
+          ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
+          onMouseUp: () => this.controller.openRound(roundNumber),
+        });
+        row.add(
+          this.#cell(
+            `${selected ? '›' : ' '} ${roundMetadata(roundNumber, round)}`,
+            this.#theme.textPrimary,
+            selected,
+          ),
+        );
+        this.#rows.add(row);
+      }
+    }
+    this.#footerLine.content =
+      '↑↓: select round · Enter or click: open trajectory · Esc: hypotheses';
+  }
+
   #renderActivity(
-    activity: HypothesisPlanningActivity,
+    item: Extract<ExperimentIndexItem, {kind: 'activity'}>,
     existingHypotheses: number,
     selected: boolean,
-  ): number {
+  ): void {
+    const {activity} = item;
     const hypothesis = planningHypothesisLabel(existingHypotheses);
-    this.#line('CURRENT ACTIVITY', this.#theme.textSubtle);
     this.#activityLine(
       `● Planning ${hypothesis} · ${planningStageSummary(activity.stage)} · Round ${activity.roundNumber}`,
       activity,
       selected,
     );
-    return 2;
   }
 
   #row(
     entry: HypothesisEntry,
+    entryKey: string,
     columns: Columns,
     isSelected: boolean,
     index: number,
-    activityOffset: number,
   ): void {
     const cells = entryCells(entry, columns);
     // The active hypothesis is called out on its own, so it stays visible
@@ -328,9 +348,8 @@ export class ExperimentLogView {
       flexDirection: 'row',
       ...selection,
       onMouseUp: () => {
-        this.controller.moveExperimentSelection(
-          index + activityOffset - this.#selectedNavigationIndex(),
-        );
+        this.controller.focusPane('left');
+        this.controller.openHypothesisDetail(entryKey);
       },
     });
     // The outcome is its own renderable so the resolution can carry a color of
@@ -342,15 +361,17 @@ export class ExperimentLogView {
     this.#rows.add(row);
   }
 
-  #roundRow(roundNumber: number, isSelected: boolean, index: number): void {
+  #roundRow(roundNumber: number, isSelected: boolean, navigationIndex: number): void {
     const row = new BoxRenderable(this.renderer, {
       id: `unowned-round-${roundNumber}`,
       width: '100%',
       height: 1,
       flexShrink: 0,
       ...(isSelected ? {backgroundColor: this.#theme.selectedSurface} : {}),
-      onMouseUp: () =>
-        this.controller.moveExperimentSelection(index - this.#selectedNavigationIndex()),
+      onMouseUp: () => {
+        this.controller.focusPane('left');
+        this.controller.moveExperimentSelection(navigationIndex - this.#selectedNavigationIndex());
+      },
     });
     row.add(
       this.#cell(
@@ -398,20 +419,6 @@ export class ExperimentLogView {
     return Math.max(0, index);
   }
 
-  #selectedRenderIndex(
-    entriesLength: number,
-    activity: HypothesisPlanningActivity | null,
-    selectedHypothesis: number,
-    activitySelected: boolean,
-    selectedUnownedRound: number | null,
-    unowned: number[],
-  ): number {
-    if (activitySelected) return 1;
-    const unownedIndex = selectedUnownedRound === null ? -1 : unowned.indexOf(selectedUnownedRound);
-    if (unownedIndex !== -1) return (activity === null ? 1 : 3) + entriesLength + unownedIndex;
-    return selectedHypothesis + (activity === null ? 0 : 2);
-  }
-
   #activityLine(content: string, activity: HypothesisPlanningActivity, selected: boolean): void {
     const row = new BoxRenderable(this.renderer, {
       id: 'planning-activity',
@@ -419,7 +426,10 @@ export class ExperimentLogView {
       height: 1,
       flexShrink: 0,
       ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
-      onMouseUp: () => this.controller.selectExperimentActivity(),
+      onMouseUp: () => {
+        this.controller.focusPane('left');
+        this.controller.selectExperimentActivity();
+      },
     });
     const text = new TextRenderable(this.renderer, {
       content,
@@ -448,6 +458,23 @@ export class ExperimentLogView {
     });
     this.#rows.add(text);
     return text;
+  }
+
+  #wrappedLine(content: string, fg: string): TextRenderable {
+    const text = new TextRenderable(this.renderer, {
+      content,
+      fg,
+      width: '100%',
+      flexShrink: 0,
+      wrapMode: 'word',
+    });
+    this.#rows.add(text);
+    return text;
+  }
+
+  /** Scroll hypothesis prose without moving the round selection. */
+  scrollBy(delta: number): void {
+    this.#rows.scrollBy(delta, 'viewport');
   }
 
   #bodyWidth(): number {
@@ -485,12 +512,15 @@ export class ExperimentLogView {
 }
 
 /** Widths of every column except the claim, which absorbs what is left over. */
-const ID_WIDTH = 16;
-const ROUNDS_WIDTH = 9;
-const MEASURED_WIDTH = 12;
-const VERDICT_WIDTH = 9;
-const OUTCOME_WIDTH = 12;
+const ID_WIDTH = 15;
+const ROUNDS_WIDTH = 8;
+// Room for a trimmed value plus a short unit ("55434.2 ops/s"). A longer unit
+// truncates here and reads in full from the hypothesis drill-down. Growing
+// this further would push the fixed row past MEASURED_MIN_WIDTH.
+const MEASURED_WIDTH = 20;
+const OUTCOME_WIDTH = 11;
 const KEPT_WIDTH = 4;
+const COLUMN_GAP = '  ';
 
 export function resolveColumns(width: number): Columns {
   const claim = width >= CLAIM_MIN_WIDTH;
@@ -500,27 +530,33 @@ export function resolveColumns(width: number): Columns {
     ID_WIDTH +
     ROUNDS_WIDTH +
     OUTCOME_WIDTH +
-    (measured ? MEASURED_WIDTH + VERDICT_WIDTH : 0) +
+    (measured ? MEASURED_WIDTH : 0) +
     (kept ? KEPT_WIDTH : 0);
+  const visibleColumns = 3 + (claim ? 1 : 0) + (measured ? 1 : 0) + (kept ? 1 : 0);
+  const gutterWidth = (visibleColumns - 1) * COLUMN_GAP.length;
   return {
     claim,
     measured,
-    verdict: measured,
     kept,
     // Exactly the remaining width, so the row fills the panel without
     // overflowing it and losing the trailing columns to truncation.
-    claimWidth: claim ? Math.max(20, width - fixed) : 0,
+    claimWidth: claim ? Math.max(20, width - fixed - gutterWidth) : 0,
   };
 }
 
-export function headerRow(columns: Columns): string {
+export function headerRow(columns: Columns, direction: 'max' | 'min' | null = null): string {
   const parts = [' Hypothesis'.padEnd(ID_WIDTH), 'Rounds'.padEnd(ROUNDS_WIDTH)];
   if (columns.claim) parts.push('Implementation Details'.padEnd(columns.claimWidth));
-  if (columns.measured) parts.push('Measured'.padEnd(MEASURED_WIDTH));
-  if (columns.verdict) parts.push('Verdict'.padEnd(VERDICT_WIDTH));
+  if (columns.measured) {
+    // The glyph is the way improvement points, so a signed delta below reads
+    // as good or bad without task knowledge. A glyph rather than color, which
+    // the outcome column already spends; the drill-down spells out the word.
+    const label = direction === null ? 'Measured' : `Measured ${direction === 'max' ? '↑' : '↓'}`;
+    parts.push(label.padEnd(MEASURED_WIDTH));
+  }
   parts.push('Outcome'.padEnd(OUTCOME_WIDTH));
-  if (columns.kept) parts.push('Kept');
-  return parts.join('');
+  if (columns.kept) parts.push('Kept'.padEnd(KEPT_WIDTH));
+  return parts.join(COLUMN_GAP);
 }
 
 /**
@@ -536,27 +572,35 @@ export interface EntryCells {
 export function entryCells(entry: HypothesisEntry, columns: Columns): EntryCells {
   const marker = entry.active === true ? '▸' : ' ';
   const leading = [
-    `${marker}${truncate(entry.hypothesis_id, ID_WIDTH - 1)}`.padEnd(ID_WIDTH),
-    formatRounds(entry).padEnd(ROUNDS_WIDTH),
+    fitColumn(`${marker}${truncate(entry.hypothesis_id, ID_WIDTH - 1)}`, ID_WIDTH),
+    fitColumn(formatRounds(entry), ROUNDS_WIDTH),
   ];
   if (columns.claim) {
     leading.push(
-      truncate(sentenceCase(entry.claim ?? entry.action ?? '—'), columns.claimWidth - 1).padEnd(
+      fitColumn(
+        sentenceCase(entry.title ?? entry.claim ?? entry.action ?? '—'),
         columns.claimWidth,
       ),
     );
   }
-  if (columns.measured) leading.push(formatMeasured(entry).padEnd(MEASURED_WIDTH));
-  if (columns.verdict) {
-    leading.push(sentenceCase(entry.judge_verdict ?? '—').padEnd(VERDICT_WIDTH));
-  }
+  if (columns.measured) leading.push(fitColumn(formatMeasured(entry), MEASURED_WIDTH));
   return {
-    leading: leading.join(''),
-    outcome: truncate(sentenceCase(entry.resolved_outcome ?? 'active'), OUTCOME_WIDTH - 1).padEnd(
-      OUTCOME_WIDTH,
-    ),
-    trailing: columns.kept ? (entry.kept === true ? 'Yes' : 'No') : '',
+    leading: leading.join(COLUMN_GAP),
+    // These are separate renderables so outcome can carry semantic color.
+    // Put gutters on the following segment rather than relying on trailing
+    // padding surviving across renderable boundaries.
+    outcome: `${COLUMN_GAP}${fitColumn(outcomeLabel(entry), OUTCOME_WIDTH)}`,
+    trailing: columns.kept
+      ? `${COLUMN_GAP}${fitColumn(
+          entry.kept === true ? 'Yes' : entry.kept === false ? 'No' : '—',
+          KEPT_WIDTH,
+        )}`
+      : '',
   };
+}
+
+function fitColumn(value: string, width: number): string {
+  return truncate(value, width).padEnd(width);
 }
 
 export function entryRow(entry: HypothesisEntry, columns: Columns): string {
@@ -571,10 +615,19 @@ export function entryRow(entry: HypothesisEntry, columns: Columns): string {
  */
 export function outcomeColor(theme: Theme, entry: HypothesisEntry): string {
   const outcome = entry.resolved_outcome ?? null;
-  if (entry.active === true || outcome === null) return theme.warning;
+  if (entry.active === true) return theme.warning;
+  if (outcome === null) return theme.textPrimary;
   if (outcome === 'proven') return theme.success;
   if (outcome === 'disproven' || outcome === 'rejected') return theme.error;
   return theme.textPrimary;
+}
+
+/** Map backend resolution terms to concise operator-facing hypothesis decisions. */
+export function outcomeLabel(entry: HypothesisEntry): string {
+  if (entry.active === true) return 'Active';
+  if (entry.resolved_outcome === 'proven') return 'Accepted';
+  if (entry.resolved_outcome === 'disproven') return 'Rejected';
+  return sentenceCase(entry.resolved_outcome ?? '—');
 }
 
 /** Capitalises a wire value for display without touching the rest of it. */
@@ -592,12 +645,90 @@ export function formatRounds(entry: HypothesisEntry): string {
 
 export function formatMeasured(entry: HypothesisEntry): string {
   const delta = entry.perf_delta_pct;
-  if (typeof delta === 'number') {
-    const sign = delta > 0 ? '+' : '';
-    return `${sign}${delta.toFixed(delta >= 10 || delta <= -10 ? 0 : 1)}%`;
+  if (typeof delta === 'number') return formatDelta(delta);
+  if (typeof entry.perf_metric === 'number') {
+    return `${trimNumber(entry.perf_metric)}${entry.perf_unit ? ` ${entry.perf_unit}` : ''}`;
   }
-  if (typeof entry.perf_metric === 'number') return trimNumber(entry.perf_metric);
   return '—';
+}
+
+function formatDelta(delta: number): string {
+  const sign = delta > 0 ? '+' : '';
+  return `${sign}${delta.toFixed(delta >= 10 || delta <= -10 ? 0 : 1)}%`;
+}
+
+/**
+ * The one improvement direction the header can honestly carry. Null when no
+ * entry recorded a direction, or when entries disagree, where a single glyph
+ * would mislabel some rows.
+ */
+export function measuredDirection(entries: readonly HypothesisEntry[]): 'max' | 'min' | null {
+  let direction: 'max' | 'min' | null = null;
+  for (const entry of entries) {
+    const candidate = entry.perf_direction ?? null;
+    if (candidate === null) continue;
+    if (direction === null) direction = candidate;
+    else if (direction !== candidate) return null;
+  }
+  return direction;
+}
+
+function focusedTitlePrefix(state: SessionState): string {
+  return focusedPane(state) === 'experiments' ? '▸ ' : '';
+}
+
+export function hypothesisMetadata(entry: HypothesisEntry): string {
+  const parts = [`Rounds ${formatRounds(entry)}`];
+  if (entry.judge_verdict !== null && entry.judge_verdict !== undefined) {
+    parts.push(`Judge ${sentenceCase(entry.judge_verdict)}`);
+  }
+  parts.push(`Decision ${outcomeLabel(entry)}`);
+  if (entry.kept === true) parts.push('Candidate kept');
+  else if (entry.kept === false) parts.push('Candidate reverted');
+  parts.push(...measurementMetadata(entry));
+  return parts.join(' · ');
+}
+
+/**
+ * The measurement spelled out where width is unbounded: metric identity and
+ * direction as words, then the absolute value, its baseline, and the causal
+ * delta the table compresses into one cell.
+ */
+function measurementMetadata(entry: HypothesisEntry): string[] {
+  const parts: string[] = [];
+  const name = entry.perf_metric_name ?? null;
+  const direction =
+    entry.perf_direction === 'max'
+      ? 'maximize'
+      : entry.perf_direction === 'min'
+        ? 'minimize'
+        : null;
+  if (name !== null) parts.push(`Metric ${name}${direction === null ? '' : ` (${direction})`}`);
+  else if (direction !== null) parts.push(`Direction ${direction}`);
+  // Legacy rounds recorded the metric name as the unit; once the name clause
+  // carries that identity, repeating it after each number is noise.
+  const unit = entry.perf_unit && entry.perf_unit !== name ? ` ${entry.perf_unit}` : '';
+  if (typeof entry.perf_metric === 'number') {
+    parts.push(`Measured ${trimNumber(entry.perf_metric)}${unit}`);
+  }
+  if (typeof entry.perf_baseline_value === 'number') {
+    parts.push(`Baseline ${trimNumber(entry.perf_baseline_value)}${unit}`);
+  }
+  if (typeof entry.perf_delta_pct === 'number') {
+    parts.push(`Delta ${formatDelta(entry.perf_delta_pct)}`);
+  }
+  return parts;
+}
+
+function roundMetadata(roundNumber: number, round: HypothesisRound | undefined): string {
+  const parts = [`Round ${roundNumber}`];
+  if (round !== undefined) {
+    parts.push(round.reviewed ? `Judge ${round.passed ? 'pass' : 'fail'}` : 'Judge pending');
+  }
+  if (typeof round?.perf_metric === 'number') {
+    parts.push(`${trimNumber(round.perf_metric)}${round.perf_unit ? ` ${round.perf_unit}` : ''}`);
+  }
+  return parts.join(' · ');
 }
 
 function planningHypothesisLabel(existingHypotheses: number): string {

@@ -1,26 +1,40 @@
-import type {Diagnostic, HypothesisEntry, RunEvent, RunSnapshot} from './protocol.js';
+import type {
+  ChatOptions,
+  Diagnostic,
+  HypothesisEntry,
+  RunEvent,
+  RunSnapshot,
+} from '@vibesys/backend-client';
 import {
+  type ActiveAgentExecution,
+  type ActiveExecutionCheckpoint,
   type AgentPhase,
-  applyRunMapEvent,
+  type ChatThread,
+  type CoreDiagnostic,
+  type CoreState,
+  DEFAULT_CHAT_THREAD_ID,
+  type ExecutionTodos,
+  initialCoreState,
+  latestDiagnosticChange,
+  phasesForRound,
   type RoundSummary,
-  roundNumberFromLabel,
-  visiblePhases as visibleRunMapPhases,
-  visibleRoundNumber as visibleRunMapRoundNumber,
-} from './run-map.js';
+  reconcileActiveExecutions,
+  reduceEvent,
+  reduceEventBatch,
+  reduceEventPrefix,
+  reduceEventRebootstrap,
+  reduceSnapshot,
+  type TodoItem,
+  type TranscriptEntry,
+} from '@vibesys/core-state';
+import {agentRuntimeLabel} from './ui/agent-runtime-label.js';
 import {DEFAULT_THEME_NAME, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
 export interface SessionState {
-  sequence: number;
-  status: string;
-  agentKind: string | null;
-  roundLabel: string | null;
-  outerLoop: string | null;
-  rounds: RoundSummary[];
-  /** Rounds the run intends to reach, from ``run_started``; null until it arrives. */
-  maxRounds: number | null;
-  phases: AgentPhase[];
-  /** Backend-authoritative agent executions that have started but not finished. */
-  activeExecutions: Record<string, ActiveAgentExecution>;
+  /** Pure projection of backend snapshots, events, and execution checkpoints. */
+  readonly core: CoreState;
+  /** False after the frontend loses a trustworthy backend event stream. */
+  eventStreamAvailable: boolean;
   selectedRound: number | null;
   selectedAgentKind: string | null;
   /** Transcript entry the arrow keys are on, so a trace is readable without a mouse. */
@@ -33,18 +47,24 @@ export interface SessionState {
    * one of them at a time.
    */
   roundFocus: RoundFocus;
-  conversation: ConversationEntry[];
   overlay: OverlayPanel | null;
   chatOpen: boolean;
+  /** The thread the chat surfaces show and the composer submits to. */
+  activeChatThreadId: string;
+  /** The active thread's conversation, derived from `chatConversations`. */
   chatConversation: ConversationEntry[];
+  /** Every thread's conversation (local user entries merged with replay). */
+  chatConversations: Record<string, ConversationEntry[]>;
+  /** True while the active thread awaits an answer; from `chatPendingThreads`. */
   chatPending: boolean;
-  chatTypedToolEvents: boolean;
-  terminal: boolean;
-  todoPhases: PhaseTodos[];
+  chatPendingThreads: Record<string, boolean>;
+  /** Non-null while the composer's inline command menu is open. */
+  chatMenu: ChatMenu | null;
   todosExpanded: boolean;
-  usage: UsageMeter | null;
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
+  /** Hypothesis summary between the experiment index and a round trajectory. */
+  hypothesisDetail: HypothesisDetail | null;
   hypothesisScope: HypothesisScope | null;
   layout: LayoutState;
   /**
@@ -56,35 +76,8 @@ export interface SessionState {
   chatDockFits: boolean;
   /** Non-null while the theme list is open as a keyboard selection. */
   themePicker: ThemePicker | null;
-  /**
-   * Set once a typed tool_call/tool_result event is seen. From then on the
-   * legacy tool-channel text chunks (still present in event files recorded
-   * by older backends) are ignored so tool turns never render twice.
-   */
-  typedToolEvents: boolean;
   /** Root-level error state, independent of the active transcript or log view. */
   errorBanner: ErrorBannerState | null;
-}
-
-export type AgentExecutionMode = 'thinking' | 'responding' | 'tool' | 'waiting';
-
-export interface AgentExecutionActivity {
-  mode: AgentExecutionMode;
-  summary: string;
-  tool?: string | null;
-}
-
-/** Semantic execution state. Spinner frames and elapsed-time formatting stay in the UI. */
-export interface ActiveAgentExecution {
-  executionId: string;
-  agentKind: string;
-  roundLabel: string | null;
-  roundNumber: number | null;
-  stage: string;
-  attempt: number | null;
-  assignment: string;
-  startedAt: string;
-  activity: AgentExecutionActivity;
 }
 
 export type ErrorSeverity = 'recoverable' | 'fatal';
@@ -117,22 +110,6 @@ export interface ErrorBannerState {
 /** The agent graph on the left, or the transcript on the right. */
 export type RoundFocus = 'agents' | 'transcript';
 
-export interface TodoItem {
-  content: string;
-  status: string;
-}
-
-/**
- * One agent execution's latest todo-list snapshot. Canonical events are keyed
- * by execution ID; legacy streams without one retain their round/agent scope.
- */
-export interface PhaseTodos {
-  executionId?: string | null;
-  agentKind: string | null;
-  roundNumber: number | null;
-  items: TodoItem[];
-}
-
 /**
  * The experiment log is open when this is non-null. Selection is held as a
  * hypothesis id rather than a row index so a refresh that inserts rows keeps
@@ -143,10 +120,18 @@ export interface ExperimentLogState {
   selectedId: string | null;
   /** The transient planning activity is selected instead of a recorded claim. */
   selectedActivity?: boolean;
+  /** Round anchor retained while selected planning becomes a persisted hypothesis. */
+  selectedActivityRound?: number | null;
   /** A recorded round that has no hypothesis entry is selected. */
   selectedUnownedRound?: number | null;
   pending: boolean;
   error: string | null;
+}
+
+/** UI-only navigation state for the selected hypothesis summary. */
+export interface HypothesisDetail {
+  entryKey: string;
+  selectedRound: number | null;
 }
 
 /** A planning phase that has not produced a hypothesis record yet. */
@@ -201,16 +186,53 @@ export interface LayoutState {
   /** null means no visualization pane: the left side has the rest of the row. */
   right: RightPane | null;
   focus: PaneFocus;
+  /** The pane temporarily occupying the full content row, or null for the split layout. */
+  zoomedPane: PaneId | null;
 }
+
+/** Semantic pane identities, independent of their current screen position. */
+export type PaneId = 'agents' | 'chat' | 'experiments' | 'performance' | 'transcript';
 
 export interface ThemePicker {
   selected: ThemeName;
 }
 
-export interface UsageMeter {
-  inputTokens: number;
-  contextWindow: number | null;
-  model: string | null;
+/**
+ * One row of the inline menu anchored to the chat composer. Only `model`,
+ * `custom`, and `thread` rows are selectable; headers and notes are structure.
+ */
+export type ChatMenuRow =
+  | {kind: 'header'; label: string}
+  | {kind: 'note'; label: string}
+  | {kind: 'model'; label: string; provider: string; model: string; isDefault: boolean}
+  | {kind: 'custom'; label: string; provider: string}
+  | {kind: 'thread'; label: string; detail: string; threadId: string; active: boolean};
+
+/**
+ * The chat composer's own selection surface, rendered adjacent to the composer
+ * rather than as a dialog over the view. Rows are computed once when the menu
+ * opens, so the renderer stays a projection of state and a frame test can read
+ * exactly what an operator sees.
+ *
+ * The client enumerates nothing: `model` rows come from the backend's
+ * `query.chat_options` response verbatim.
+ */
+export interface ChatMenu {
+  kind: 'model' | 'resume';
+  title: string;
+  rows: ChatMenuRow[];
+  /** Index of the highlighted row, or -1 while there is nothing to select. */
+  selected: number;
+  pending: boolean;
+  error: string | null;
+  /** Free text typed into each provider's custom entry, keyed by provider. */
+  customModels: Record<string, string>;
+}
+
+/** The agent selection a new thread should inherit, or null for the run's. */
+export interface ChatThreadSettings {
+  provider: string;
+  model: string;
 }
 
 export interface OverlayPanel {
@@ -243,53 +265,47 @@ export interface ConversationEntry {
   toolResponse?: string;
   toolName?: string;
   toolCallId?: string;
+  toolArguments?: Record<string, unknown>;
+  toolResult?: TranscriptEntry['toolResult'];
 }
 
 export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): SessionState {
   return {
-    sequence: 0,
-    status: 'connecting',
-    agentKind: null,
-    roundLabel: null,
-    outerLoop: null,
-    rounds: [],
-    maxRounds: null,
-    phases: [],
-    activeExecutions: {},
+    core: initialCoreState(),
+    eventStreamAvailable: true,
     selectedRound: null,
     selectedAgentKind: null,
     selectedEntryId: null,
     selectedTodoIndex: null,
     roundFocus: 'transcript',
-    conversation: [],
     overlay: null,
     chatOpen: false,
+    activeChatThreadId: DEFAULT_CHAT_THREAD_ID,
     chatConversation: [],
+    chatConversations: {},
     chatPending: false,
-    chatTypedToolEvents: false,
-    terminal: false,
-    todoPhases: [],
+    chatPendingThreads: {},
+    chatMenu: null,
     todosExpanded: false,
-    usage: null,
     themeName,
     // The experiment log is the landing view: a run's history reads as a short
     // list of claims before it reads as a long list of rounds.
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
+    hypothesisDetail: null,
     hypothesisScope: null,
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
     // Docked until the renderer measures otherwise, so the landing view carries
     // the chat from the first frame rather than after a resize.
     chatDockFits: true,
     themePicker: null,
-    typedToolEvents: false,
     errorBanner: null,
   };
 }
 
 /**
- * Rows are keyed by hypothesis id, which the server orders by first round and
- * never reshuffles. Selection therefore survives a refresh even when a new
- * hypothesis lands above the current one.
+ * Rows are keyed by hypothesis identity rather than response position, so
+ * selection survives refreshes even when the backend returns a different
+ * order. The canonical index sorts the rows before presenting them.
  */
 export function entryKey(entry: HypothesisEntry, index: number): string {
   return entry.identified === false
@@ -314,7 +330,12 @@ export function experimentLogVisible(state: SessionState): boolean {
  * it was.
  */
 export function chatDocked(state: SessionState): boolean {
-  return state.chatDockFits && state.experimentLog !== null && state.hypothesisScope === null;
+  return (
+    state.chatDockFits &&
+    state.experimentLog !== null &&
+    state.hypothesisDetail === null &&
+    state.hypothesisScope === null
+  );
 }
 
 /** True when the docked chat is the thing on screen rather than the modal. */
@@ -350,12 +371,258 @@ export function openChat(state: SessionState): SessionState {
   return {...state, overlay: null, chatOpen: true};
 }
 
+/** Keeps the singular chat fields pointing at the active thread. */
+function deriveActiveChat(state: SessionState): SessionState {
+  const chatConversation = state.chatConversations[state.activeChatThreadId] ?? [];
+  const chatPending = state.chatPendingThreads[state.activeChatThreadId] === true;
+  if (state.chatConversation === chatConversation && state.chatPending === chatPending) {
+    return state;
+  }
+  return {...state, chatConversation, chatPending};
+}
+
+/** Every thread the run knows about, the implicit default first. */
+export function chatThreads(state: SessionState): ChatThread[] {
+  return state.core.chatThreads;
+}
+
+/**
+ * What the chat surfaces call one thread. Titles are backend-owned and arrive
+ * through events; an untitled created thread reads as its harness and model.
+ * The agent driver never appears: which driver backs a run is a deployment
+ * detail, and every thread inherits the run's.
+ */
+export function chatThreadLabel(
+  state: SessionState,
+  threadId: string = state.activeChatThreadId,
+): string {
+  const thread = state.core.chatThreads.find(candidate => candidate.id === threadId);
+  if (thread === undefined) return 'Experiment chat';
+  if (thread.title) return thread.title;
+  return agentRuntimeLabel(thread.provider, thread.model) ?? 'Experiment chat';
+}
+
+/**
+ * What a chat surface puts in its header: the thread's name, and its runtime
+ * when the name does not already spell one out. An operator switching threads
+ * needs to see both which conversation this is and which agent answers it.
+ */
+export function chatThreadHeading(
+  state: SessionState,
+  threadId: string = state.activeChatThreadId,
+): string {
+  const label = chatThreadLabel(state, threadId);
+  const runtime = chatThreadRuntimeLabel(state, threadId);
+  return runtime === null || runtime === label ? label : `${label} · ${runtime}`;
+}
+
+/**
+ * The active thread's runtime, e.g. `"Codex (GPT 5.5)"`. Null for a thread the
+ * backend has not described, which is the default thread before any answer.
+ */
+export function chatThreadRuntimeLabel(
+  state: SessionState,
+  threadId: string = state.activeChatThreadId,
+): string | null {
+  const thread = state.core.chatThreads.find(candidate => candidate.id === threadId);
+  if (thread === undefined) return null;
+  return agentRuntimeLabel(thread.provider, thread.model);
+}
+
+/**
+ * What a thread started from this one should inherit. Null means the thread
+ * carries no selection of its own, so the backend resolves the run's.
+ */
+export function activeChatThreadSettings(state: SessionState): ChatThreadSettings | null {
+  const thread = state.core.chatThreads.find(
+    candidate => candidate.id === state.activeChatThreadId,
+  );
+  if (thread === undefined || thread.provider === null || thread.model === null) return null;
+  return {provider: thread.provider, model: thread.model};
+}
+
+/** Makes one thread the chat surface's subject and puts the keys on the chat. */
+export function switchChatThread(state: SessionState, threadId: string): SessionState {
+  return openChat(deriveActiveChat({...state, activeChatThreadId: threadId, chatMenu: null}));
+}
+
+/** Applies one thread's conversation change and refreshes the derived fields. */
+export function updateChatConversation(
+  state: SessionState,
+  threadId: string,
+  update: (entries: ConversationEntry[]) => ConversationEntry[],
+): SessionState {
+  const entries = update(state.chatConversations[threadId] ?? []).slice(-500);
+  return deriveActiveChat({
+    ...state,
+    chatConversations: {...state.chatConversations, [threadId]: entries},
+  });
+}
+
+export function setChatThreadPending(
+  state: SessionState,
+  threadId: string,
+  pending: boolean,
+): SessionState {
+  return deriveActiveChat({
+    ...state,
+    chatPendingThreads: {...state.chatPendingThreads, [threadId]: pending},
+  });
+}
+
+/** `/resume`: the thread list, as an inline selection on the active thread. */
+export function openChatResumeMenu(state: SessionState): SessionState {
+  const rows: ChatMenuRow[] = state.core.chatThreads.map(thread => ({
+    kind: 'thread' as const,
+    label: chatThreadLabel(state, thread.id),
+    detail: agentRuntimeLabel(thread.provider, thread.model) ?? 'run agent',
+    threadId: thread.id,
+    active: thread.id === state.activeChatThreadId,
+  }));
+  const active = rows.findIndex(row => row.kind === 'thread' && row.active);
+  return {
+    ...state,
+    overlay: null,
+    themePicker: null,
+    chatMenu: {
+      kind: 'resume',
+      title: 'Chat threads',
+      rows,
+      selected: active === -1 ? firstSelectable(rows) : active,
+      pending: false,
+      error: null,
+      customModels: {},
+    },
+  };
+}
+
+/** `/model`: opened empty, then filled by the backend's chat options. */
+export function openChatModelMenu(state: SessionState): SessionState {
+  return {
+    ...state,
+    overlay: null,
+    themePicker: null,
+    chatMenu: {
+      kind: 'model',
+      title: 'Harness and model',
+      rows: [{kind: 'note', label: 'Loading options…'}],
+      selected: -1,
+      pending: true,
+      error: null,
+      customModels: {},
+    },
+  };
+}
+
+/**
+ * Renders exactly what the backend returned: one group per provider it says is
+ * valid, its models beneath, and a free-text entry per group for a model the
+ * suggestion list does not carry.
+ */
+export function setChatModelMenuOptions(state: SessionState, options: ChatOptions): SessionState {
+  const menu = state.chatMenu;
+  if (menu === null || menu.kind !== 'model') return state;
+  const rows: ChatMenuRow[] = [];
+  for (const group of options.providers ?? []) {
+    rows.push({kind: 'header', label: agentRuntimeLabel(group.provider, null) ?? group.provider});
+    for (const option of group.models ?? []) {
+      rows.push({
+        kind: 'model',
+        label: option.default ? `${option.model}  · run default` : option.model,
+        provider: group.provider,
+        model: option.model,
+        isDefault: option.default === true,
+      });
+    }
+    rows.push({kind: 'custom', label: 'custom model…', provider: group.provider});
+  }
+  if (rows.length === 0) rows.push({kind: 'note', label: 'This run offers no chat harness.'});
+  return {...state, chatMenu: {...menu, rows, selected: firstSelectable(rows), pending: false}};
+}
+
+export function failChatMenu(state: SessionState, message: string): SessionState {
+  const menu = state.chatMenu;
+  if (menu === null) return state;
+  return {
+    ...state,
+    chatMenu: {
+      ...menu,
+      rows: [{kind: 'note', label: message}],
+      selected: -1,
+      pending: false,
+      error: message,
+    },
+  };
+}
+
+export function moveChatMenuSelection(state: SessionState, delta: number): SessionState {
+  const menu = state.chatMenu;
+  if (menu === null || delta === 0) return state;
+  const step = delta > 0 ? 1 : -1;
+  let selected = menu.selected;
+  for (let remaining = Math.abs(delta); remaining > 0; remaining -= 1) {
+    const next = nextSelectable(menu.rows, selected, step);
+    if (next === selected) break;
+    selected = next;
+  }
+  if (selected === menu.selected) return state;
+  return {...state, chatMenu: {...menu, selected}};
+}
+
+export function closeChatMenu(state: SessionState): SessionState {
+  if (state.chatMenu === null) return state;
+  return {...state, chatMenu: null};
+}
+
+/** The row Enter acts on, or null while nothing selectable is highlighted. */
+export function selectedChatMenuRow(state: SessionState): ChatMenuRow | null {
+  const menu = state.chatMenu;
+  if (menu === null || menu.selected < 0) return null;
+  return menu.rows[menu.selected] ?? null;
+}
+
+/** Text typed into the highlighted custom entry, empty when none is. */
+export function chatMenuCustomModel(state: SessionState): string {
+  const row = selectedChatMenuRow(state);
+  if (row === null || row.kind !== 'custom') return '';
+  return state.chatMenu?.customModels[row.provider] ?? '';
+}
+
+export function setChatMenuCustomModel(state: SessionState, model: string): SessionState {
+  const menu = state.chatMenu;
+  const row = selectedChatMenuRow(state);
+  if (menu === null || row === null || row.kind !== 'custom') return state;
+  return {
+    ...state,
+    chatMenu: {...menu, customModels: {...menu.customModels, [row.provider]: model}},
+  };
+}
+
+function isSelectable(row: ChatMenuRow): boolean {
+  return row.kind === 'model' || row.kind === 'custom' || row.kind === 'thread';
+}
+
+function firstSelectable(rows: readonly ChatMenuRow[]): number {
+  const index = rows.findIndex(isSelectable);
+  return index;
+}
+
+/** The next selectable index in `step` direction, or `from` when there is none. */
+function nextSelectable(rows: readonly ChatMenuRow[], from: number, step: number): number {
+  for (let index = from + step; index >= 0 && index < rows.length; index += step) {
+    const row = rows[index];
+    if (row !== undefined && isSelectable(row)) return index;
+  }
+  return from < 0 ? firstSelectable(rows) : from;
+}
+
 export function openExperimentLog(state: SessionState): SessionState {
   const existing = state.experimentLog;
   return {
     ...state,
     overlay: null,
     chatOpen: false,
+    hypothesisDetail: null,
     hypothesisScope: null,
     selectedRound: null,
     selectedAgentKind: null,
@@ -366,30 +633,61 @@ export function openExperimentLog(state: SessionState): SessionState {
 export function setExperiments(state: SessionState, entries: HypothesisEntry[]): SessionState {
   const log = state.experimentLog;
   if (log === null) return state;
-  const keys = entries.map(entryKey);
+  const activity = hypothesisPlanningActivity(state);
+  const selectedActivityRound =
+    log.selectedActivity === true
+      ? (log.selectedActivityRound ?? activity?.roundNumber ?? null)
+      : null;
+  const orderedEntries = [...entries].sort(compareHypothesisEntries);
+  const keys = orderedEntries.map(entryKey);
+  const materializedActivity =
+    selectedActivityRound === null
+      ? undefined
+      : orderedEntries.find(entry => scopeRounds(entry).includes(selectedActivityRound));
   // Keep the operator's row when it still exists; otherwise fall back to the
   // active hypothesis, then to the first row.
   const selectedId =
-    log.selectedId !== null && keys.includes(log.selectedId)
-      ? log.selectedId
-      : (keys[entries.findIndex(entry => entry.active === true)] ?? keys[0] ?? null);
-  const unownedRounds = unownedExperimentRounds(state, entries);
+    materializedActivity !== undefined
+      ? entryKeyFor(orderedEntries, materializedActivity)
+      : log.selectedId !== null && keys.includes(log.selectedId)
+        ? log.selectedId
+        : (keys[orderedEntries.findIndex(entry => entry.active === true)] ?? keys[0] ?? null);
+  const unownedRounds = unownedExperimentRounds(state, orderedEntries);
   const currentUnownedRound = log.selectedUnownedRound;
   const selectedUnownedRound =
     currentUnownedRound !== undefined &&
     currentUnownedRound !== null &&
     unownedRounds.includes(currentUnownedRound)
       ? currentUnownedRound
-      : entries.length === 0
+      : orderedEntries.length === 0
         ? (unownedRounds[0] ?? null)
         : null;
+  const currentDetail = state.hypothesisDetail;
+  const detailEntry =
+    currentDetail === null
+      ? undefined
+      : orderedEntries.find((entry, index) => entryKey(entry, index) === currentDetail.entryKey);
+  const detailRounds = detailEntry === undefined ? [] : scopeRounds(detailEntry);
+  const hypothesisDetail =
+    currentDetail === null || detailEntry === undefined
+      ? null
+      : {
+          entryKey: currentDetail.entryKey,
+          selectedRound:
+            currentDetail.selectedRound !== null &&
+            detailRounds.includes(currentDetail.selectedRound)
+              ? currentDetail.selectedRound
+              : (detailRounds.at(-1) ?? null),
+        };
   return {
     ...state,
+    hypothesisDetail,
     experimentLog: {
       ...log,
-      entries,
+      entries: orderedEntries,
       selectedId,
-      selectedActivity: hypothesisPlanningActivity(state) !== null && log.selectedActivity === true,
+      selectedActivity: materializedActivity === undefined && log.selectedActivity === true,
+      selectedActivityRound: materializedActivity === undefined ? selectedActivityRound : null,
       selectedUnownedRound,
       pending: false,
       error: null,
@@ -405,7 +703,8 @@ export function failExperiments(state: SessionState, error: string): SessionStat
 
 export function moveExperimentSelection(state: SessionState, delta: number): SessionState {
   const log = state.experimentLog;
-  if (log === null || state.hypothesisScope !== null) return state;
+  if (log === null || state.hypothesisDetail !== null || state.hypothesisScope !== null)
+    return state;
   const items = experimentIndexItems(state);
   if (items.length === 0) return state;
   const selected = selectedExperimentIndexItem(state);
@@ -414,24 +713,89 @@ export function moveExperimentSelection(state: SessionState, delta: number): Ses
   return selectExperimentIndexItem(state, items[index]);
 }
 
+/** Open one hypothesis summary without entering any of its round trajectories. */
+export function openHypothesisDetail(state: SessionState, requestedKey?: string): SessionState {
+  const log = state.experimentLog;
+  if (log === null || state.hypothesisScope !== null) return state;
+  const key = requestedKey ?? log.selectedId;
+  if (key === null) return state;
+  const entry = log.entries.find((candidate, index) => entryKey(candidate, index) === key);
+  if (entry === undefined) return state;
+  const rounds = scopeRounds(entry);
+  return {
+    ...state,
+    overlay: null,
+    chatOpen: false,
+    layout: {right: null, focus: 'left', zoomedPane: null},
+    experimentLog: {
+      ...log,
+      selectedId: key,
+      selectedActivity: false,
+      selectedActivityRound: null,
+      selectedUnownedRound: null,
+    },
+    hypothesisDetail: {entryKey: key, selectedRound: rounds.at(-1) ?? null},
+  };
+}
+
+/** The durable hypothesis selected for the summary view. */
+export function detailedHypothesis(state: SessionState): HypothesisEntry | null {
+  const detail = state.hypothesisDetail;
+  const entries = state.experimentLog?.entries ?? [];
+  if (detail === null) return null;
+  return entries.find((entry, index) => entryKey(entry, index) === detail.entryKey) ?? null;
+}
+
+/** Move the round cursor within the open hypothesis summary. */
+export function moveHypothesisRoundSelection(state: SessionState, delta: number): SessionState {
+  const detail = state.hypothesisDetail;
+  const entry = detailedHypothesis(state);
+  if (detail === null || entry === null || state.hypothesisScope !== null) return state;
+  const rounds = scopeRounds(entry);
+  if (rounds.length === 0) return state;
+  const current = detail.selectedRound === null ? -1 : rounds.indexOf(detail.selectedRound);
+  const index = current === -1 ? 0 : Math.min(rounds.length - 1, Math.max(0, current + delta));
+  return {...state, hypothesisDetail: {...detail, selectedRound: rounds[index] ?? null}};
+}
+
+/** Return from a hypothesis summary to the experiment index. */
+export function leaveHypothesisDetail(state: SessionState): SessionState {
+  if (state.hypothesisDetail === null || state.hypothesisScope !== null) return state;
+  return {...state, hypothesisDetail: null};
+}
+
 /** Selects the current planning work so Enter opens its live agent turns. */
 export function selectExperimentActivity(state: SessionState): SessionState {
   const log = state.experimentLog;
   if (
     log === null ||
+    state.hypothesisDetail !== null ||
     state.hypothesisScope !== null ||
     hypothesisPlanningActivity(state) === null
   ) {
     return state;
   }
-  return {...state, experimentLog: {...log, selectedActivity: true, selectedUnownedRound: null}};
+  const activity = hypothesisPlanningActivity(state);
+  return {
+    ...state,
+    experimentLog: {
+      ...log,
+      selectedActivity: true,
+      selectedActivityRound: activity?.roundNumber ?? null,
+      selectedUnownedRound: null,
+    },
+  };
 }
 
 /**
- * Opens the rounds behind the selected hypothesis. The log keeps its selection
- * so leaving the trajectory lands the operator back on the same row.
+ * Advances the experiment navigation by one level: index to hypothesis
+ * summary, then hypothesis summary to its selected round trajectory.
  */
 export function enterExperimentDrilldown(state: SessionState): SessionState {
+  if (state.hypothesisDetail !== null) {
+    const roundNumber = state.hypothesisDetail.selectedRound;
+    return roundNumber === null ? state : (enterExperimentRound(state, roundNumber) ?? state);
+  }
   const activity = hypothesisPlanningActivity(state);
   if (
     activity !== null &&
@@ -449,33 +813,10 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
   }
   const entry = selectedExperiment(state);
   if (entry === null || state.hypothesisScope !== null) return state;
-  const rounds = scopeRounds(entry);
-  if (rounds.length === 0) return state;
-  return {
-    ...state,
-    overlay: null,
-    // A visualization opened from the log belongs to the log. Carrying it into
-    // the round view would leave the operator reading one view's answer beside
-    // another view's transcript.
-    layout: {right: null, focus: 'left'},
-    hypothesisScope: {
-      id: entry.hypothesis_id,
-      label: hypothesisLabel(entry),
-      rounds,
-      source: 'hypothesis',
-    },
-    // Land on the hypothesis's latest round rather than on "no round". The
-    // round view is built around one round: the strip marks it, the agent graph
-    // draws its phases, the transcript carries its turns. Leaving the round
-    // unset drew an empty strip and an empty graph, and `[` walks back through
-    // the earlier rounds from here anyway.
-    selectedRound: rounds.at(-1) ?? null,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-  };
+  return openHypothesisDetail(state);
 }
 
-/** Leaves the trajectory and returns to the table with the selection intact. */
+/** Leaves a trajectory for its hypothesis summary, preserving the round cursor. */
 export function leaveExperimentDrilldown(state: SessionState): SessionState {
   if (state.hypothesisScope === null) return state;
   return {...state, hypothesisScope: null, selectedRound: null, selectedAgentKind: null};
@@ -490,15 +831,16 @@ export function enterExperimentRound(
   state: SessionState,
   roundNumber: number,
 ): SessionState | null {
-  const entry = (state.experimentLog?.entries ?? []).find(candidate =>
-    scopeRounds(candidate).includes(roundNumber),
-  );
+  const entries = state.experimentLog?.entries ?? [];
+  const entryIndex = entries.findIndex(candidate => scopeRounds(candidate).includes(roundNumber));
+  const entry = entries[entryIndex];
   if (entry === undefined) return null;
+  const entryKeyValue = entryKey(entry, entryIndex);
   const scoped: SessionState = {
     ...state,
     overlay: null,
     chatOpen: false,
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
     hypothesisScope: {
       id: entry.hypothesis_id,
       label: hypothesisLabel(entry),
@@ -508,10 +850,9 @@ export function enterExperimentRound(
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
+    hypothesisDetail: {entryKey: entryKeyValue, selectedRound: roundNumber},
     experimentLog:
-      state.experimentLog === null
-        ? null
-        : {...state.experimentLog, selectedId: entryKeyFor(state.experimentLog.entries, entry)},
+      state.experimentLog === null ? null : {...state.experimentLog, selectedId: entryKeyValue},
   };
   return scoped;
 }
@@ -525,12 +866,13 @@ export function enterUnownedExperimentRound(
   state: SessionState,
   roundNumber: number,
 ): SessionState | null {
-  if (!state.rounds.some(round => round.number === roundNumber)) return null;
+  if (!state.core.rounds.some(round => round.number === roundNumber)) return null;
   return {
     ...state,
     overlay: null,
     chatOpen: false,
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
+    hypothesisDetail: null,
     hypothesisScope: {
       id: `round-${roundNumber}`,
       label: `Round ${roundNumber}`,
@@ -560,12 +902,17 @@ function scopeRounds(entry: HypothesisEntry): number[] {
   );
 }
 
+/** Ordered round identities owned by a hypothesis, including legacy range-only records. */
+export function hypothesisRoundNumbers(entry: HypothesisEntry): number[] {
+  return scopeRounds(entry);
+}
+
 function hypothesisLabel(entry: HypothesisEntry): string {
   const range =
     entry.first_round === entry.last_round
       ? `r${entry.first_round}`
       : `r${entry.first_round}-${entry.last_round}`;
-  return `${entry.hypothesis_id} · ${range}`;
+  return `${entry.title ?? entry.hypothesis_id} · ${range}`;
 }
 
 export function selectedExperiment(state: SessionState): HypothesisEntry | null {
@@ -586,33 +933,54 @@ export function unownedExperimentRounds(
 ): number[] {
   const owned = new Set(entries.flatMap(scopeRounds));
   const planningRound = hypothesisPlanningActivity(state)?.roundNumber;
-  return state.rounds
+  return state.core.rounds
     .filter(
       round =>
         !owned.has(round.number) && round.number !== planningRound && round.status !== 'planned',
     )
-    .map(round => round.number);
+    .map(round => round.number)
+    .sort((left, right) => left - right);
 }
 
-/** The visual index: live planning, hypotheses, then observed unowned rounds. */
+/**
+ * The canonical visual index. Historical work is chronological regardless of
+ * server response order, and transient planning is always the newest item.
+ */
 export function experimentIndexItems(state: SessionState): ExperimentIndexItem[] {
-  const items: ExperimentIndexItem[] = [];
-  const activity = hypothesisPlanningActivity(state);
-  if (activity !== null) items.push({kind: 'activity', key: 'activity', activity});
+  const history: ExperimentIndexItem[] = [];
   for (const [index, entry] of (state.experimentLog?.entries ?? []).entries()) {
-    items.push({kind: 'hypothesis', key: entryKey(entry, index), entry});
+    history.push({kind: 'hypothesis', key: entryKey(entry, index), entry});
   }
   for (const roundNumber of unownedExperimentRounds(state)) {
-    items.push({kind: 'round', key: `round-${roundNumber}`, roundNumber});
+    history.push({kind: 'round', key: `round-${roundNumber}`, roundNumber});
   }
-  return items;
+  history.sort((left, right) => experimentItemRound(left) - experimentItemRound(right));
+  const activity = hypothesisPlanningActivity(state);
+  return activity === null ? history : [...history, {kind: 'activity', key: 'activity', activity}];
+}
+
+function experimentItemRound(item: ExperimentIndexItem): number {
+  if (item.kind === 'hypothesis') return item.entry.first_round;
+  if (item.kind === 'round') return item.roundNumber;
+  return item.activity.roundNumber;
+}
+
+function compareHypothesisEntries(left: HypothesisEntry, right: HypothesisEntry): number {
+  return (
+    left.first_round - right.first_round ||
+    left.last_round - right.last_round ||
+    left.hypothesis_id.localeCompare(right.hypothesis_id)
+  );
 }
 
 export function selectedExperimentIndexItem(state: SessionState): ExperimentIndexItem | null {
   const log = state.experimentLog;
   if (log === null) return null;
   const items = experimentIndexItems(state);
-  if (log.selectedActivity === true) return items.find(item => item.kind === 'activity') ?? null;
+  if (log.selectedActivity === true) {
+    const activity = items.find(item => item.kind === 'activity');
+    if (activity !== undefined) return activity;
+  }
   if (log.selectedUnownedRound !== undefined && log.selectedUnownedRound !== null) {
     return (
       items.find(item => item.kind === 'round' && item.roundNumber === log.selectedUnownedRound) ??
@@ -631,11 +999,24 @@ function selectExperimentIndexItem(
   const log = state.experimentLog;
   if (log === null || item === undefined) return state;
   if (item.kind === 'activity')
-    return {...state, experimentLog: {...log, selectedActivity: true, selectedUnownedRound: null}};
+    return {
+      ...state,
+      experimentLog: {
+        ...log,
+        selectedActivity: true,
+        selectedActivityRound: item.activity.roundNumber,
+        selectedUnownedRound: null,
+      },
+    };
   if (item.kind === 'round') {
     return {
       ...state,
-      experimentLog: {...log, selectedActivity: false, selectedUnownedRound: item.roundNumber},
+      experimentLog: {
+        ...log,
+        selectedActivity: false,
+        selectedActivityRound: null,
+        selectedUnownedRound: item.roundNumber,
+      },
     };
   }
   return {
@@ -644,6 +1025,7 @@ function selectExperimentIndexItem(
       ...log,
       selectedId: item.key,
       selectedActivity: false,
+      selectedActivityRound: null,
       selectedUnownedRound: null,
     },
   };
@@ -656,8 +1038,8 @@ function selectExperimentIndexItem(
  * as hypothesis planning.
  */
 export function hypothesisPlanningActivity(state: SessionState): HypothesisPlanningActivity | null {
-  if (state.terminal || state.experimentLog === null) return null;
-  const phase = [...state.phases]
+  if (state.core.terminal || state.experimentLog === null) return null;
+  const phase = [...state.core.phases]
     .reverse()
     .find(
       candidate =>
@@ -669,7 +1051,7 @@ export function hypothesisPlanningActivity(state: SessionState): HypothesisPlann
     return null;
   const stage = planningStage(phase.kind, phase.roundLabel);
   if (stage === null) return null;
-  const startedAt = earliestPlanningStartedAt(state.phases, roundNumber);
+  const startedAt = earliestPlanningStartedAt(state.core.phases, roundNumber);
   return {
     stage,
     roundNumber,
@@ -731,6 +1113,7 @@ export function openPane(state: SessionState, view: PaneView): SessionState {
         error: null,
       },
       focus: 'right',
+      zoomedPane: state.layout.zoomedPane,
     },
   };
 }
@@ -754,7 +1137,7 @@ export function failPane(state: SessionState, view: PaneView, error: string): Se
 
 export function closePane(state: SessionState): SessionState {
   if (state.layout.right === null) return state;
-  return {...state, layout: {right: null, focus: 'left'}};
+  return {...state, layout: {right: null, focus: 'left', zoomedPane: null}};
 }
 
 /**
@@ -763,6 +1146,7 @@ export function closePane(state: SessionState): SessionState {
  * cannot see.
  */
 export function cyclePaneFocus(state: SessionState): SessionState {
+  if (state.layout.zoomedPane !== null) return state;
   const order = visiblePaneOrder(state);
   if (order.length < 2) return state;
   const next = order[(order.indexOf(state.layout.focus) + 1) % order.length] ?? 'left';
@@ -777,8 +1161,14 @@ export function cyclePaneFocus(state: SessionState): SessionState {
  */
 export function normalizeFocus(state: SessionState): SessionState {
   const order = visiblePaneOrder(state);
-  if (order.includes(state.layout.focus)) return state;
-  return {...state, layout: {...state.layout, focus: 'left'}};
+  const focus = order.includes(state.layout.focus) ? state.layout.focus : 'left';
+  const zoomedPane =
+    state.layout.zoomedPane === null ||
+    visiblePaneIds({...state, layout: {...state.layout, focus}}).includes(state.layout.zoomedPane)
+      ? state.layout.zoomedPane
+      : null;
+  if (focus === state.layout.focus && zoomedPane === state.layout.zoomedPane) return state;
+  return {...state, layout: {...state.layout, focus, zoomedPane}};
 }
 
 /** Escape from a round view: close whatever is layered over it, all of it. */
@@ -788,7 +1178,7 @@ export function closeOverlays(state: SessionState): SessionState {
     ...state,
     overlay: null,
     chatOpen: false,
-    layout: {right: null, focus: 'left'},
+    layout: {right: null, focus: 'left', zoomedPane: null},
   };
 }
 
@@ -796,6 +1186,49 @@ export function focusPane(state: SessionState, focus: PaneFocus): SessionState {
   if (state.layout.focus === focus) return state;
   if (!visiblePaneOrder(state).includes(focus)) return state;
   return {...state, layout: {...state.layout, focus}};
+}
+
+/** The semantic pane currently receiving pane navigation keys. */
+export function focusedPane(state: SessionState): PaneId {
+  if (experimentLogVisible(state)) {
+    if (state.layout.focus === 'chat' && chatPaneVisible(state)) return 'chat';
+    if (state.layout.focus === 'right' && state.layout.right !== null) return 'performance';
+    return 'experiments';
+  }
+  // Opening a visualization replaces the agent summary in the left column
+  // with the transcript. Keep roundFocus intact so closing the visualization
+  // can restore it, but never report the hidden Agents pane as focused.
+  if (state.layout.right !== null) {
+    return state.layout.focus === 'right' ? 'performance' : 'transcript';
+  }
+  return state.roundFocus;
+}
+
+/**
+ * Gives the focused pane the content row, or restores the existing split.
+ * Pane content and selection stay in their owning models; zoom only changes
+ * presentation, so toggling cannot replace or reconstruct pane state.
+ */
+export function togglePaneZoom(state: SessionState): SessionState {
+  return {
+    ...state,
+    layout: {
+      ...state.layout,
+      zoomedPane: state.layout.zoomedPane === null ? focusedPane(state) : null,
+    },
+  };
+}
+
+/** Every pane currently available to focus or zoom in the active view. */
+export function visiblePaneIds(state: SessionState): PaneId[] {
+  if (experimentLogVisible(state)) {
+    return [
+      ...(chatPaneVisible(state) ? (['chat'] as const) : []),
+      'experiments',
+      ...(state.layout.right !== null ? (['performance'] as const) : []),
+    ];
+  }
+  return state.layout.right === null ? ['agents', 'transcript'] : ['transcript', 'performance'];
 }
 
 function visiblePaneOrder(state: SessionState): PaneFocus[] {
@@ -841,17 +1274,25 @@ export function closeThemePicker(state: SessionState): SessionState {
 }
 
 export function applySnapshot(state: SessionState, snapshot: RunSnapshot): SessionState {
-  return {
-    ...state,
-    status: snapshot.status,
-    agentKind: snapshot.agent_kind ?? null,
-    roundLabel: snapshot.round_label ?? null,
-    terminal: snapshot.status === 'completed' || snapshot.status === 'failed',
-    activeExecutions: activeExecutionsFromCheckpoint(snapshot.active_executions ?? []),
-  };
+  const core = reduceSnapshot(state.core, snapshot);
+  return core === state.core ? state : {...state, core};
 }
 
-type ActiveExecutionCheckpoint = NonNullable<RunSnapshot['active_executions']>;
+/** Record transport health as frontend state without rewriting backend-derived facts. */
+export function markEventStreamUnavailable(state: SessionState): SessionState {
+  return state.eventStreamAvailable ? {...state, eventStreamAvailable: false} : state;
+}
+
+/** Active work is presentable only while its source stream remains trustworthy. */
+export function visibleActiveExecutions(state: SessionState): ActiveAgentExecution[] {
+  if (!state.eventStreamAvailable) return [];
+  const roundNumber = visibleRoundNumber(state);
+  return Object.values(state.core.activeExecutions).filter(
+    execution =>
+      (roundNumber === null || execution.roundNumber === roundNumber) &&
+      (state.selectedAgentKind === null || execution.agentKind === state.selectedAgentKind),
+  );
+}
 
 /** Replace activity with the backend checkpoint without advancing the event replay cursor. */
 export function applyActiveExecutionCheckpoint(
@@ -859,191 +1300,137 @@ export function applyActiveExecutionCheckpoint(
   executions: ActiveExecutionCheckpoint,
   throughSequence?: number,
 ): SessionState {
-  if (throughSequence !== undefined && throughSequence < state.sequence) return state;
-  return {
-    ...state,
-    activeExecutions: activeExecutionsFromCheckpoint(executions),
-  };
-}
-
-function activeExecutionsFromCheckpoint(
-  executions: ActiveExecutionCheckpoint,
-): Record<string, ActiveAgentExecution> {
-  return Object.fromEntries(
-    executions.map(execution => [
-      execution.execution_id,
-      {
-        executionId: execution.execution_id,
-        agentKind: execution.agent_kind,
-        roundLabel: execution.round_label ?? null,
-        roundNumber: roundNumberFromLabel(execution.round_label),
-        stage: execution.stage,
-        attempt: execution.attempt ?? null,
-        assignment: execution.assignment,
-        startedAt: execution.started_at,
-        activity: {
-          mode: execution.activity.mode,
-          summary: execution.activity.summary,
-          tool: execution.activity.tool ?? null,
-        },
-      },
-    ]),
-  );
+  const core = reconcileActiveExecutions(state.core, executions, throughSequence);
+  return core === state.core ? state : {...state, core};
 }
 
 export function applyEvent(state: SessionState, event: RunEvent): SessionState {
-  const sequence = event.sequence ?? 0;
-  if (sequence > 0 && sequence <= state.sequence) return state;
-  let next = {...state, sequence: Math.max(state.sequence, sequence)};
-  next = applyFailureEvent(next, event);
-  next = applyAgentExecutionEvent(next, event);
-  if (event.agent_kind === 'chat') return applyChatEvent(next, event);
-  if (event.agent_kind) next.agentKind = event.agent_kind;
-  if (event.round_label) next.roundLabel = event.round_label;
-  const runMap = applyRunMapEvent(
-    {outerLoop: next.outerLoop, rounds: next.rounds, phases: next.phases},
-    event,
-  );
-  next.outerLoop = runMap.outerLoop;
-  next.rounds = runMap.rounds;
-  next.phases = runMap.phases;
-
-  const data = event.data;
-  if (data?.kind === 'tool_call' || data?.kind === 'tool_result') {
-    next.typedToolEvents = true;
-  }
-  if (data?.kind === 'todo_update') {
-    const items = (data.todos ?? []).map(todo => ({
-      content: String(todo.content),
-      status: String(todo.status),
-    }));
-    const agentKind = event.agent_kind ?? null;
-    const roundNumber = roundNumberFromLabel(event.round_label);
-    const todoExecutionId = event.execution_id ?? event.invocation_id ?? null;
-    next.todoPhases = [
-      ...next.todoPhases.filter(phase =>
-        todoExecutionId === null
-          ? phase.executionId != null ||
-            phase.agentKind !== agentKind ||
-            phase.roundNumber !== roundNumber
-          : phase.executionId !== todoExecutionId,
-      ),
-      {executionId: todoExecutionId, agentKind, roundNumber, items},
-    ].slice(-100);
-  }
-  if (data?.kind === 'usage_update') {
-    next.usage = {
-      inputTokens: data.input_tokens,
-      contextWindow: data.context_window ?? null,
-      model: data.model ?? null,
-    };
-  }
-
-  // Prefer typed tool events; fall back to legacy tool-channel chunks only
-  // for streams that never produce typed events (old event files / replays).
-  const suppressed =
-    data?.kind === 'agent_output_chunk' && data.channel === 'tool' && next.typedToolEvents;
-  if (!suppressed) {
-    const entry = eventToConversationEntry(event);
-    if (entry !== null) next.conversation = appendConversation(next.conversation, entry);
-  }
-
-  if (event.type === 'run_started') {
-    next.status = 'running';
-    if (event.data?.kind === 'run_started') next.maxRounds = event.data.max_rounds;
-  }
-  if (event.type === 'configuration_failed') {
-    next.status = 'failed';
-    next.terminal = true;
-    next.activeExecutions = {};
-  }
-  if (event.type === 'run_finished') {
-    next.status = 'completed';
-    next.terminal = true;
-    next.activeExecutions = {};
-  }
-  if (event.type === 'run_failed' || event.type === 'run_interrupted') {
-    next.status = 'failed';
-    next.terminal = true;
-    next.activeExecutions = {};
-  }
+  const core = reduceEvent(state.core, event);
+  if (core === state.core) return state;
+  const diagnostic = latestDiagnosticChange(state.core, core);
+  let next: SessionState = deriveActiveChat({
+    ...state,
+    core,
+    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+  });
+  if (diagnostic !== null) next = reportProjectedDiagnostic(next, diagnostic);
   return next;
-}
-
-/** Reduce canonical execution lifecycle before agent-specific transcript routing. */
-function applyAgentExecutionEvent(state: SessionState, event: RunEvent): SessionState {
-  const data = event.data;
-  const executionId = event.execution_id;
-  if (executionId == null) return state;
-  if (data?.kind === 'agent_execution_started') {
-    return {
-      ...state,
-      activeExecutions: {
-        ...state.activeExecutions,
-        [executionId]: {
-          executionId,
-          agentKind: event.agent_kind ?? 'agent',
-          roundLabel: event.round_label ?? null,
-          roundNumber: roundNumberFromLabel(event.round_label),
-          stage: data.stage,
-          attempt: data.attempt ?? null,
-          assignment: data.user_prompt ?? '',
-          startedAt: event.timestamp,
-          activity: {
-            mode: data.activity.mode,
-            summary: data.activity.summary,
-            tool: data.activity.tool ?? null,
-          },
-        },
-      },
-    };
-  }
-  if (data?.kind === 'agent_execution_activity_changed') {
-    const current = state.activeExecutions[executionId];
-    if (current === undefined) return state;
-    return {
-      ...state,
-      activeExecutions: {
-        ...state.activeExecutions,
-        [executionId]: {
-          ...current,
-          activity: {mode: data.mode, summary: data.summary, tool: data.tool ?? null},
-        },
-      },
-    };
-  }
-  if (data?.kind === 'agent_execution_finished') {
-    const {[executionId]: _finished, ...remaining} = state.activeExecutions;
-    return {...state, activeExecutions: remaining};
-  }
-  return state;
 }
 
 /**
- * The chat shows the exchange: what was asked, and what came back. The chat
- * agent's narration, tool turns, and phase markers are run plumbing; they
- * belong in the transcript, and here they only bury the answer.
+ * Fold a backend checkpoint as one UI transition.
+ *
+ * Resumed runs can replay failures from an older process before their current
+ * ``run_started`` event. Those diagnostics remain in core history, but should
+ * not open a stale banner over the newly running session. A batch that ends in
+ * failure still reports its terminal diagnostic.
  */
-const CHAT_KINDS: ReadonlySet<ConversationEntry['kind']> = new Set(['user', 'assistant', 'result']);
+export function applyEventBatch(
+  state: SessionState,
+  events: readonly RunEvent[],
+  activeExecutions?: ActiveExecutionCheckpoint,
+  throughSequence?: number,
+  historyAfterSequence?: number,
+): SessionState {
+  return applyReducedCore(
+    state,
+    reduceEventBatch(state.core, events, activeExecutions, throughSequence, historyAfterSequence),
+  );
+}
 
-function applyChatEvent(state: SessionState, event: RunEvent): SessionState {
-  const next = {...state};
-  const data = event.data;
-  if (data?.kind === 'tool_call' || data?.kind === 'tool_result') {
-    next.chatTypedToolEvents = true;
-  }
-  const suppressed =
-    data?.kind === 'agent_output_chunk' && data.channel === 'tool' && next.chatTypedToolEvents;
-  if (suppressed) return next;
-  const entry = eventToConversationEntry(event);
-  // The chat is a question and its answer. The chat agent's own diagnostics and
-  // phase markers are run plumbing: they belong in the transcript, and in the
-  // chat they only bury the answer the operator asked for.
-  if (entry !== null && !CHAT_KINDS.has(entry.kind)) return next;
-  if (entry !== null) {
-    next.chatConversation = appendConversation(next.chatConversation, entry);
+/**
+ * Fold a batch that re-bootstraps the stream at a raised history floor, which
+ * happens when the run's durable event log is attached after the client
+ * subscribed. The batch supersedes the pre-attach state instead of extending
+ * it; see `reduceEventRebootstrap`.
+ */
+export function applyEventRebootstrap(
+  state: SessionState,
+  events: readonly RunEvent[],
+  activeExecutions: ActiveExecutionCheckpoint | undefined,
+  throughSequence: number | undefined,
+  historyAfterSequence: number,
+): SessionState {
+  return applyReducedCore(
+    state,
+    reduceEventRebootstrap(
+      state.core,
+      events,
+      activeExecutions,
+      throughSequence,
+      historyAfterSequence,
+    ),
+  );
+}
+
+/** The UI transition shared by both ways of folding a backend checkpoint. */
+function applyReducedCore(state: SessionState, core: CoreState): SessionState {
+  if (core === state.core) return state;
+  let next: SessionState = deriveActiveChat({
+    ...state,
+    core,
+    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+  });
+  if (core.status === 'failed') {
+    const finalDiagnostic = core.diagnostics.at(-1);
+    if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
   }
   return next;
+}
+
+/**
+ * Fold history older than everything already loaded, lowering the floor below
+ * which nothing has been read yet.
+ *
+ * No diagnostic is projected. A backfilled event is by construction older than
+ * every event on screen, so its failure is not news: reporting it would reopen
+ * the banner for something the operator has already scrolled past, or already
+ * dismissed.
+ */
+export function applyEventPrefix(
+  state: SessionState,
+  events: readonly RunEvent[],
+  historyAfterSequence: number,
+): SessionState {
+  const core = reduceEventPrefix(state.core, events, historyAfterSequence);
+  if (core === state.core) return state;
+  return deriveActiveChat({
+    ...state,
+    core,
+    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+  });
+}
+
+/** Folds every thread's replayed transcript into its local conversation. */
+function reconcileChatConversations(
+  conversations: Record<string, ConversationEntry[]>,
+  transcripts: Record<string, TranscriptEntry[]>,
+): Record<string, ConversationEntry[]> {
+  const next = {...conversations};
+  for (const [threadId, transcript] of Object.entries(transcripts)) {
+    next[threadId] = reconcileChatTranscript(next[threadId] ?? [], transcript);
+  }
+  return next;
+}
+
+function reconcileChatTranscript(
+  conversation: ConversationEntry[],
+  transcript: TranscriptEntry[],
+): ConversationEntry[] {
+  const byId = new Map(transcript.map(entry => [entry.id, entry]));
+  const present = new Set<string>();
+  const updated = conversation.map(entry => {
+    const replacement = byId.get(entry.id);
+    if (replacement === undefined) return entry;
+    present.add(entry.id);
+    return replacement;
+  });
+  for (const entry of transcript) {
+    if (!present.has(entry.id) && !conversation.some(existing => existing.id === entry.id)) {
+      updated.push(entry);
+    }
+  }
+  return updated.slice(-500);
 }
 
 export function selectNextAgent(state: SessionState): SessionState {
@@ -1197,9 +1584,18 @@ export interface ErrorReport {
   severity?: ErrorSeverity;
   title?: string;
   diagnostic?: Diagnostic | null;
+  diagnosticId?: string | null;
+  detail?: string | null;
+  hint?: string | null;
   agentKind?: string | null;
   roundLabel?: string | null;
   invocationId?: string | null;
+}
+
+/** Acknowledges the visible diagnostic without changing any run or view state. */
+export function dismissErrorBanner(state: SessionState): SessionState {
+  if (state.errorBanner === null) return state;
+  return {...state, errorBanner: null};
 }
 
 /**
@@ -1218,9 +1614,9 @@ export function reportError(
   const banner: ErrorBannerState = {
     title: report.title ?? errorTitle(scope),
     message: diagnostic?.summary || message || 'An unknown error occurred.',
-    detail: diagnostic?.detail ?? null,
-    hint: diagnostic?.hint ?? null,
-    diagnosticId: diagnostic?.id ?? null,
+    detail: diagnostic?.detail ?? report.detail ?? null,
+    hint: diagnostic?.hint ?? report.hint ?? null,
+    diagnosticId: diagnostic?.id ?? report.diagnosticId ?? null,
     severity,
     scope,
     agentKind: report.agentKind ?? null,
@@ -1252,53 +1648,23 @@ export function reportError(
   };
 }
 
-function applyFailureEvent(state: SessionState, event: RunEvent): SessionState {
-  const data = event.data;
-  if (event.diagnostic !== null && event.diagnostic !== undefined) {
-    return reportError(state, event.text ?? '', {
-      scope: 'protocol',
-      diagnostic: event.diagnostic,
-      ...(event.type === 'run_interrupted' ? {title: 'Run interrupted'} : {}),
-      agentKind: event.agent_kind ?? null,
-      roundLabel: event.round_label ?? null,
-      invocationId: event.invocation_id ?? null,
-    });
-  }
-  if (data?.kind === 'configuration_failed') {
-    return reportError(state, formatConfigurationFailure(event), {
-      scope: 'configuration',
-      severity: 'fatal',
-      title: 'Configuration failed',
-    });
-  }
-  if (
-    data?.kind === 'invocation_finished' &&
-    ((data.error !== null && data.error !== undefined) || event.status === 'failed')
-  ) {
-    return reportError(state, data.error || event.text || 'Agent invocation failed.', {
-      scope: 'invocation',
-      title: 'Invocation failed',
-      agentKind: event.agent_kind ?? null,
-      roundLabel: event.round_label ?? null,
-      invocationId: event.invocation_id ?? null,
-    });
-  }
-  if (event.type === 'run_failed' || event.type === 'run_interrupted') {
-    const interruption =
-      data?.kind === 'run_interrupted'
-        ? `${data.reason}${data.signal === null ? '' : ` (${data.signal})`}`
-        : '';
-    const fallback = event.type === 'run_failed' ? 'Run failed.' : 'Run interrupted.';
-    return reportError(state, event.text || interruption || fallback, {
-      scope: 'run',
-      severity: 'fatal',
-      title: event.type === 'run_interrupted' ? 'Run interrupted' : 'Run failed',
-      agentKind: event.agent_kind ?? null,
-      roundLabel: event.round_label ?? null,
-      invocationId: event.invocation_id ?? null,
-    });
-  }
-  return state;
+function reportProjectedDiagnostic(state: SessionState, diagnostic: CoreDiagnostic): SessionState {
+  return reportError(state, diagnostic.summary, {
+    scope: diagnostic.scope,
+    severity: diagnostic.severity === 'fatal' ? 'fatal' : 'recoverable',
+    title: projectedDiagnosticTitle(diagnostic.failureKind),
+    diagnosticId: diagnostic.id,
+    detail: diagnostic.detail,
+    hint: diagnostic.hint,
+    agentKind: diagnostic.agentKind,
+    roundLabel: diagnostic.roundLabel,
+    invocationId: diagnostic.invocationId,
+  });
+}
+
+function projectedDiagnosticTitle(kind: CoreDiagnostic['failureKind']): string {
+  if (kind === 'run_interruption') return 'Run interrupted';
+  return errorTitle(kind);
 }
 
 /** Keep a terminal wrapper's extra context when it repeats an invocation error. */
@@ -1344,268 +1710,6 @@ function diagnosticSeverity(
   return severity === 'fatal' ? 'fatal' : 'recoverable';
 }
 
-function formatConfigurationFailure(event: RunEvent): string {
-  const data = event.data;
-  if (data?.kind !== 'configuration_failed') return event.text || 'Configuration failed.';
-  const sections = [data.message];
-  if (data.usage) sections.push(data.usage);
-  sections.push(`Code: ${data.code} · Stage: ${data.stage}`);
-  return sections.join('\n\n');
-}
-
-function eventToConversationEntry(event: RunEvent): ConversationEntry | null {
-  const data = event.data;
-  const id = String(event.sequence ?? `${event.timestamp}-${event.type}`);
-  const agentKind = event.agent_kind ? {agentKind: event.agent_kind} : {};
-  const roundLabel = event.round_label ? {roundLabel: event.round_label} : {};
-  const roundNumber = roundNumberFromLabel(event.round_label);
-  const roundFields = {
-    ...roundLabel,
-    ...(roundNumber === null ? {} : {roundNumber}),
-  };
-  if (data?.kind === 'configuration_failed') {
-    return {
-      id,
-      kind: 'result',
-      content: formatConfigurationFailure(event),
-      label: 'Configuration failed',
-      tone: 'failure',
-    };
-  }
-  if (data?.kind === 'chat') {
-    return {
-      id,
-      kind: 'assistant',
-      content: data.answer,
-      label: 'Answer',
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (data?.kind === 'agent_output_chunk') {
-    const kind =
-      data.channel === 'assistant'
-        ? 'assistant'
-        : data.channel === 'prompt'
-          ? 'prompt'
-          : data.channel === 'analysis'
-            ? 'analysis'
-            : data.channel === 'tool'
-              ? 'tool'
-              : 'diagnostic';
-    const invocationId = event.invocation_id ?? undefined;
-    return {
-      id,
-      kind,
-      content: data.content,
-      label: labelFor(event, data.channel),
-      ...agentKind,
-      ...roundFields,
-      turnId: invocationId ?? id,
-      ...(invocationId === undefined ? {} : {invocationId}),
-      startsTurn:
-        kind === 'tool' && data.channel === 'tool' && data.content.trimStart().startsWith('→ '),
-      ...(kind === 'tool' && data.channel === 'tool' && data.content.trimStart().startsWith('→ ')
-        ? {toolCall: data.content}
-        : {}),
-    };
-  }
-  if (data?.kind === 'tool_call') {
-    const call = formatToolCall(data.tool, data.args ?? {});
-    const invocationId = event.invocation_id ?? undefined;
-    return {
-      id,
-      kind: 'tool',
-      content: call,
-      label: labelFor(event, 'tool'),
-      ...agentKind,
-      ...roundFields,
-      turnId: invocationId ?? id,
-      ...(invocationId === undefined ? {} : {invocationId}),
-      startsTurn: true,
-      toolCall: call,
-      toolName: data.tool,
-      ...(data.call_id === null || data.call_id === undefined ? {} : {toolCallId: data.call_id}),
-    };
-  }
-  if (data?.kind === 'tool_result') {
-    const invocationId = event.invocation_id ?? undefined;
-    return {
-      id,
-      kind: 'tool',
-      content: data.content,
-      label: labelFor(event, 'tool'),
-      ...(data.is_error ? {tone: 'failure' as const} : {}),
-      ...agentKind,
-      ...roundFields,
-      turnId: invocationId ?? id,
-      toolName: data.tool,
-      ...(data.call_id === null || data.call_id === undefined ? {} : {toolCallId: data.call_id}),
-      ...(invocationId === undefined ? {} : {invocationId}),
-    };
-  }
-  if (data?.kind === 'subprocess_output') {
-    return {
-      id,
-      kind: 'subprocess',
-      content: data.content,
-      label: `${data.process_kind} · ${data.stream}`,
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (event.type === 'phase_started') {
-    return {
-      id,
-      kind: 'status',
-      content: 'started',
-      label: labelFor(event, 'phase'),
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (data?.kind === 'judge_result') {
-    return {
-      id,
-      kind: 'result',
-      content: data.feedback || `Judge returned ${data.verdict}.`,
-      label: `Judge · ${data.verdict.toUpperCase()}`,
-      tone: data.verdict === 'pass' ? 'success' : 'failure',
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (data?.kind === 'benchmark_result') {
-    return {
-      id,
-      kind: 'result',
-      content: `${data.metric}: ${data.value} ${data.unit}`,
-      label: 'Benchmark',
-      tone: 'success',
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (data?.kind === 'round_finished') {
-    const tone =
-      data.judge_verdict === 'pass'
-        ? ('success' as const)
-        : data.judge_verdict === 'fail'
-          ? ('failure' as const)
-          : ('normal' as const);
-    return {
-      id,
-      kind: 'result',
-      content: `${data.attempts} attempt(s)`,
-      label: `${event.round_label ?? 'Round'} · ${data.judge_verdict.toUpperCase()}`,
-      tone,
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  if (event.type === 'run_failed' || event.type === 'run_interrupted') {
-    return {
-      id,
-      kind: 'result',
-      content: event.text || 'Run interrupted.',
-      label: 'Run failed',
-      tone: 'failure',
-      ...agentKind,
-      ...roundFields,
-    };
-  }
-  return null;
-}
-
-function labelFor(event: RunEvent, fallback: string): string {
-  const phase = event.agent_kind ?? fallback;
-  return event.round_label ? `${phase} · ${event.round_label}` : phase;
-}
-
-function appendConversation(
-  previous: ConversationEntry[],
-  incoming: ConversationEntry,
-): ConversationEntry[] {
-  if (incoming.kind === 'tool' && !incoming.startsTurn && incoming.toolName !== undefined) {
-    const target = findToolCall(previous, incoming);
-    if (target !== -1) {
-      return previous.map((entry, index) =>
-        index === target ? mergeToolResult(entry, incoming) : entry,
-      );
-    }
-  }
-  const last = previous.at(-1);
-  if (
-    last &&
-    incoming.kind === 'tool' &&
-    last.kind === 'tool' &&
-    last.invocationId === incoming.invocationId &&
-    !incoming.startsTurn
-  ) {
-    return [...previous.slice(0, -1), mergeToolResult(last, incoming)];
-  }
-  if (
-    last &&
-    last.kind === incoming.kind &&
-    last.turnId === incoming.turnId &&
-    (incoming.kind === 'assistant' || incoming.kind === 'prompt' || incoming.kind === 'analysis')
-  ) {
-    return [...previous.slice(0, -1), {...last, content: last.content + incoming.content}];
-  }
-  return capConversation([...previous, incoming]);
-}
-
-/**
- * A run can outlive any fixed number of entries, but a round the operator can
- * still open must keep all of its turns: a half-evicted round reads as a round
- * that never ran. So the cap is generous, and when it is reached the oldest
- * round goes as a whole rather than the oldest few lines.
- */
-const MAX_CONVERSATION_ENTRIES = 20_000;
-
-function capConversation(entries: ConversationEntry[]): ConversationEntry[] {
-  if (entries.length <= MAX_CONVERSATION_ENTRIES) return entries;
-  const oldestRound = entries.find(entry => entry.roundNumber !== undefined)?.roundNumber;
-  if (oldestRound === undefined) return entries.slice(-MAX_CONVERSATION_ENTRIES);
-  const kept = entries.filter(
-    entry => entry.roundNumber === undefined || entry.roundNumber > oldestRound,
-  );
-  // Nothing to drop by round (one huge round): fall back to trimming the front.
-  return kept.length === entries.length ? entries.slice(-MAX_CONVERSATION_ENTRIES) : kept;
-}
-
-function findToolCall(previous: ConversationEntry[], result: ConversationEntry): number {
-  const indices = Array.from(previous.keys());
-  if (result.toolCallId !== undefined) indices.reverse();
-  for (const index of indices) {
-    const candidate = previous[index];
-    if (
-      candidate?.kind !== 'tool' ||
-      candidate.toolCall === undefined ||
-      candidate.toolResponse !== undefined ||
-      candidate.invocationId !== result.invocationId
-    ) {
-      continue;
-    }
-    if (result.toolCallId !== undefined) {
-      if (candidate.toolCallId === result.toolCallId) return index;
-      continue;
-    }
-    if (candidate.toolName === result.toolName) return index;
-  }
-  return -1;
-}
-
-function mergeToolResult(call: ConversationEntry, result: ConversationEntry): ConversationEntry {
-  const separator = call.content.endsWith('\n') || result.content.startsWith('\n') ? '' : '\n';
-  return {
-    ...call,
-    content: call.content + separator + result.content,
-    toolResponse: (call.toolResponse ?? '') + (call.toolResponse ? separator : '') + result.content,
-    ...(result.tone === undefined ? {} : {tone: result.tone}),
-  };
-}
-
 /**
  * Returns to the experiment log. Per-round output is reachable only by opening
  * a hypothesis, so there is no unfiltered live view to fall back to and the
@@ -1616,6 +1720,7 @@ export function showLive(state: SessionState): SessionState {
     ...state,
     overlay: null,
     chatOpen: false,
+    hypothesisDetail: null,
     hypothesisScope: null,
     selectedRound: null,
     selectedAgentKind: null,
@@ -1637,13 +1742,13 @@ export function showDetail(
 }
 
 export function statusText(state: SessionState): string {
-  const base = `${state.status} · ${state.agentKind ?? 'starting'} · ${state.roundLabel ?? 'no round yet'}`;
-  if (state.usage === null) return base;
-  const used = formatTokenCount(state.usage.inputTokens);
+  const base = `${state.core.status} · ${state.core.agentKind ?? 'starting'} · ${state.core.roundLabel ?? 'no round yet'}`;
+  if (state.core.usage === null) return base;
+  const used = formatTokenCount(state.core.usage.inputTokens);
   const meter =
-    state.usage.contextWindow === null
+    state.core.usage.contextWindow === null
       ? used
-      : `${used}/${formatTokenCount(state.usage.contextWindow)}`;
+      : `${used}/${formatTokenCount(state.core.usage.contextWindow)}`;
   return `${base} · ${meter} tokens`;
 }
 
@@ -1655,7 +1760,7 @@ function formatTokenCount(count: number): string {
 
 export function visibleConversation(state: SessionState): ConversationEntry[] {
   const roundNumber = visibleRoundNumber(state);
-  return state.conversation.filter(entry => {
+  return state.core.transcript.filter(entry => {
     if (roundNumber !== null && entry.roundNumber !== roundNumber) return false;
     if (state.selectedAgentKind !== null && entry.agentKind !== state.selectedAgentKind) {
       return false;
@@ -1665,7 +1770,7 @@ export function visibleConversation(state: SessionState): ConversationEntry[] {
 }
 
 export function visiblePhases(state: SessionState): AgentPhase[] {
-  return visibleRunMapPhases(state.phases, visibleRoundNumber(state));
+  return phasesForRound(state.core.phases, visibleRoundNumber(state));
 }
 
 export function toggleTodos(state: SessionState): SessionState {
@@ -1679,9 +1784,9 @@ export function toggleTodos(state: SessionState): SessionState {
  */
 export function visibleTodos(state: SessionState): TodoItem[] {
   const roundNumber = visibleRoundNumber(state);
-  const matchesRound = (phase: PhaseTodos): boolean =>
+  const matchesRound = (phase: ExecutionTodos): boolean =>
     roundNumber === null || phase.roundNumber === roundNumber || phase.roundNumber === null;
-  const latestFirst = [...state.todoPhases].reverse();
+  const latestFirst = [...state.core.todos].reverse();
   if (state.selectedAgentKind !== null) {
     const selected = state.selectedAgentKind;
     return (
@@ -1700,7 +1805,8 @@ export function visibleTodos(state: SessionState): TodoItem[] {
   return (
     latestFirst.find(
       phase =>
-        (phase.agentKind === state.agentKind || phase.agentKind === null) && matchesRound(phase),
+        (phase.agentKind === state.core.agentKind || phase.agentKind === null) &&
+        matchesRound(phase),
     )?.items ?? []
   );
 }
@@ -1712,18 +1818,21 @@ export function visibleRoundNumber(state: SessionState): number | null {
     // Leaving the round unset used to mean "the whole trajectory", which drew an
     // empty agent strip and an empty transcript for any run whose events are not
     // all round-stamped: a blank view where a round was asked for.
-    const rounds = state.rounds.filter(round => scope.rounds.includes(round.number));
+    const rounds = state.core.rounds.filter(round => scope.rounds.includes(round.number));
     const active = [...rounds].reverse().find(round => round.status === 'active');
     return active?.number ?? rounds.at(-1)?.number ?? scope.rounds.at(-1) ?? null;
   }
-  return visibleRunMapRoundNumber(stripRounds(state), state.selectedRound);
+  if (state.selectedRound !== null) return state.selectedRound;
+  const rounds = stripRounds(state);
+  const active = [...rounds].reverse().find(round => round.status === 'active');
+  return active?.number ?? rounds.at(-1)?.number ?? null;
 }
 
 /** The rounds owned by the hypothesis on screen, or every round outside one. */
 export function scopedRounds(state: SessionState): RoundSummary[] {
   const scope = state.hypothesisScope;
-  if (scope === null) return state.rounds;
-  return state.rounds.filter(round => scope.rounds.includes(round.number));
+  if (scope === null) return state.core.rounds;
+  return state.core.rounds.filter(round => scope.rounds.includes(round.number));
 }
 
 /**
@@ -1735,26 +1844,16 @@ export function scopedRounds(state: SessionState): RoundSummary[] {
  * honest thing to show for a round that has not run.
  */
 export function stripRounds(state: SessionState): RoundSummary[] {
-  const highest = Math.max(state.maxRounds ?? 0, ...state.rounds.map(round => round.number), 0);
-  if (highest === 0) return state.rounds;
-  const known = new Map(state.rounds.map(round => [round.number, round]));
+  const highest = Math.max(
+    state.core.maxRounds ?? 0,
+    ...state.core.rounds.map(round => round.number),
+    0,
+  );
+  if (highest === 0) return state.core.rounds;
+  const known = new Map(state.core.rounds.map(round => [round.number, round]));
   const rounds: RoundSummary[] = [];
   for (let number = 1; number <= highest; number += 1) {
     rounds.push(known.get(number) ?? {number, status: 'planned'});
   }
   return rounds;
-}
-
-const MAX_TOOL_ARG_LEN = 80;
-
-function formatToolCall(tool: string, args: Record<string, unknown>): string {
-  const parts = Object.entries(args).map(([key, value]) => {
-    const isString = typeof value === 'string';
-    let rendered = isString ? value : (JSON.stringify(value) ?? String(value));
-    if (rendered.length > MAX_TOOL_ARG_LEN) {
-      rendered = `${rendered.slice(0, MAX_TOOL_ARG_LEN)}...`;
-    }
-    return isString ? `${key}="${rendered}"` : `${key}=${rendered}`;
-  });
-  return `→ ${tool}(${parts.join(', ')})\n`;
 }

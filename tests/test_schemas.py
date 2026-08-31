@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from vibesys.schemas import (
+    HYPOTHESIS_TITLE_MAX_LEN,
     ImplementerResponse,
     JudgeResponse,
     LatencyStats,
@@ -14,6 +15,8 @@ from vibesys.schemas import (
     SkillResourceSelection,
     ThroughputStats,
     Verdict,
+    derive_hypothesis_title,
+    normalize_hypothesis_title,
 )
 from vibesys.server.protocol import PerformanceRound
 
@@ -33,12 +36,13 @@ def _profiler_summary(
 
 
 def test_skill_resource_selection_forbids_unknown_fields():  # noqa: ANN201  # tracked: #288
+    unknown_field = {"unexpected": True}
     with pytest.raises(ValidationError, match="unexpected"):
         SkillResourceSelection(
             skill="portable",
             resource_paths=[],
             purpose="Useful for this task.",
-            unexpected=True,  # pyright: ignore[reportCallIssue]  # tracked: #297
+            **unknown_field,
         )
 
 
@@ -48,7 +52,7 @@ def test_skill_resource_selection_rejects_whitespace_required_fields(field):  # 
     values[field] = "   "
 
     with pytest.raises(ValidationError, match="non-whitespace"):
-        SkillResourceSelection(**values)  # pyright: ignore[reportArgumentType]  # tracked: #297
+        SkillResourceSelection(**values)
 
 
 def test_agent_skill_selection_fields_are_zero_to_many_by_default():  # noqa: ANN201  # tracked: #288
@@ -133,3 +137,84 @@ def test_performance_stats_reject_non_finite_values(value):  # noqa: ANN001, ANN
             perf_unit="req/s",
             passed=True,
         )
+
+
+def test_orchestrator_plan_title_defaults_to_empty_string():  # noqa: ANN201  # tracked: #288
+    plan = OrchestratorPlan(task="work", pass_criteria="passes", reasoning="reason")  # noqa: S106  # tracked: #288
+
+    assert plan.title == ""
+
+
+def test_orchestrator_plan_loads_old_shaped_data_without_a_title_key():  # noqa: ANN201  # tracked: #288
+    """A state file persisted before the title field existed has no ``title`` key."""
+    legacy_payload = {
+        "hypothesis_id": "legacy",
+        "hypothesis": "old claim",
+        "task": "work",
+        "pass_criteria": "passes",
+        "reasoning": "reason",
+    }
+
+    plan = OrchestratorPlan.model_validate(legacy_payload)
+
+    assert plan.title == ""
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "\n\t "])
+def test_normalize_hypothesis_title_passes_through_empty_input(raw):  # noqa: ANN001, ANN201  # tracked: #288
+    assert normalize_hypothesis_title(raw) == ""
+
+
+def test_normalize_hypothesis_title_strips_and_collapses_whitespace():  # noqa: ANN201  # tracked: #288
+    assert normalize_hypothesis_title("  Batch   the\n\tdecode   path  ") == "Batch the decode path"
+
+
+def test_normalize_hypothesis_title_truncates_on_a_word_boundary_with_ellipsis():  # noqa: ANN201  # tracked: #288
+    title = "A" * 50 + " " + "B" * 20
+
+    result = normalize_hypothesis_title(title)
+
+    assert result == "A" * 50 + "…"
+    assert len(result) <= HYPOTHESIS_TITLE_MAX_LEN
+
+
+def test_normalize_hypothesis_title_truncates_without_a_boundary():  # noqa: ANN201  # tracked: #288
+    title = "A" * 65
+
+    result = normalize_hypothesis_title(title)
+
+    assert result == "A" * 59 + "…"
+    assert len(result) == HYPOTHESIS_TITLE_MAX_LEN
+
+
+def test_normalize_hypothesis_title_leaves_a_title_within_budget_untouched():  # noqa: ANN201  # tracked: #288
+    title = "Batch decode requests by KV-cache page"
+
+    assert normalize_hypothesis_title(title) == title
+
+
+@pytest.mark.parametrize("claim", ["", "   ", "\n\t "])
+def test_derive_hypothesis_title_returns_none_for_empty_claim(claim):  # noqa: ANN001, ANN201  # tracked: #288
+    assert derive_hypothesis_title(claim) is None
+
+
+def test_derive_hypothesis_title_takes_the_first_sentence():  # noqa: ANN201  # tracked: #288
+    claim = "Batching decode requests reduces overhead. It also raises latency variance."
+
+    assert derive_hypothesis_title(claim) == "Batching decode requests reduces overhead"
+
+
+def test_derive_hypothesis_title_takes_the_first_line_when_there_is_no_sentence_break():  # noqa: ANN201  # tracked: #288
+    claim = "Batching decode requests reduces overhead\nfurther detail on the mechanism"
+
+    assert derive_hypothesis_title(claim) == "Batching decode requests reduces overhead"
+
+
+def test_derive_hypothesis_title_truncates_long_claims():  # noqa: ANN201  # tracked: #288
+    claim = ("A" * 50 + " " + "B" * 20) + "."
+
+    result = derive_hypothesis_title(claim)
+
+    assert result == "A" * 50 + "…"
+    assert result is not None
+    assert len(result) <= HYPOTHESIS_TITLE_MAX_LEN

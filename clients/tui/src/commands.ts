@@ -1,8 +1,10 @@
-import type {RequestInput} from './protocol.js';
+import type {RequestInput} from '@vibesys/backend-client';
 import type {PaneView} from './session-model.js';
 import {isThemeName, THEME_NAMES, type ThemeName} from './ui/theme.js';
 
-export type ParsedInput = {
+type CommandRequest = Exclude<RequestInput, {type: 'query.chat'}>;
+
+export type ParsedCommand = {
   localView?: 'chat' | 'help' | 'theme';
   /**
    * Surfaces that also have a key. macOS reserves the function keys for system
@@ -12,7 +14,7 @@ export type ParsedInput = {
   toggle?: 'todos' | 'prompt';
   chatMessage?: string;
   themeName?: ThemeName;
-  request?: RequestInput;
+  request?: CommandRequest;
   responseView?: 'perf';
   /** Opens a hypothesis trajectory: the selected row, or the given round. */
   openRound?: {round?: number};
@@ -88,7 +90,64 @@ export function slashCommandRange(text: string): {start: number; end: number} | 
   return {start: 0, end: match[0].length};
 }
 
-export function parseInput(text: string): ParsedInput {
+/**
+ * The chat composer's own command set. Chat is controlled from the chat, so
+ * these live here rather than in the global registry above, and the composer
+ * resolves them before anything else it might otherwise forward.
+ */
+export const CHAT_SLASH_COMMANDS: readonly SlashCommand[] = [
+  {name: '/clear', description: 'Start a fresh thread with this thread’s agent and model'},
+  {name: '/model', description: 'Pick a harness and model, and start a thread on it'},
+  {name: '/resume', description: 'Switch to another chat thread'},
+];
+
+export type ChatCommandName = 'clear' | 'model' | 'resume';
+
+export type ParsedChatCommand = {
+  command?: ChatCommandName;
+  /**
+   * The text names a global command instead, e.g. `/pause`. The composer has
+   * always forwarded those, so it still does.
+   */
+  global?: boolean;
+  /** Unknown slash input: the chat answers with its own help, not the global. */
+  help?: string;
+};
+
+export function chatHelpText(): string {
+  return [
+    'Chat commands',
+    ...CHAT_SLASH_COMMANDS.map(command => `  ${command.name.padEnd(10)} ${command.description}`),
+    '',
+    'Anything else you type is a question for the chat agent.',
+  ].join('\n');
+}
+
+export function suggestChatSlashCommands(text: string): readonly SlashCommand[] {
+  if (!text.startsWith('/') || /\s/.test(text)) return [];
+  return CHAT_SLASH_COMMANDS.filter(command => command.name.startsWith(text));
+}
+
+/**
+ * Resolves slash input typed into the chat composer.
+ *
+ * `/resume` is deliberately shadowed here: in the chat it resumes a *thread*,
+ * while the global input keeps it for resuming a paused run. Chat commands are
+ * matched first, so the two never compete for the same surface.
+ */
+export function parseChatCommand(text: string): ParsedChatCommand {
+  if (text === '/clear') return {command: 'clear'};
+  if (text === '/model') return {command: 'model'};
+  if (text === '/resume') return {command: 'resume'};
+  const name = /^\/[a-z][a-z0-9-]*/i.exec(text)?.[0];
+  if (name !== undefined && SLASH_COMMANDS.some(command => command.name === name)) {
+    return {global: true};
+  }
+  return {help: chatHelpText()};
+}
+
+/** Parses the command surface. Ordinary questions belong to Experiment chat. */
+export function parseCommand(text: string): ParsedCommand {
   if (text === '/help') return {localView: 'help'};
   const chat = text.match(/^\/chat(?:\s+(.*))?$/);
   if (chat) {
@@ -130,6 +189,6 @@ export function parseInput(text: string): ParsedInput {
     return {request: {type: 'query.performance'}, responseView: 'perf', paneView: 'perf'};
   }
   if (text.startsWith('/')) return {error: `Unknown command: ${text}. Use /help.`};
-  if (text === '') return {error: 'Enter a question or use /help.'};
-  return {request: {type: 'query.chat', text}};
+  if (text === '') return {error: 'Enter a slash command. Use /help.'};
+  return {error: 'Commands start with /. Use Experiment chat for questions.'};
 }

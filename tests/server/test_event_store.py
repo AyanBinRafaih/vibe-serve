@@ -3,11 +3,13 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from vibesys.server.events import EventStore, EventType, RunEvent, make_event
+from vibesys.server.events import EventStore, EventType, RunEvent, ToolCallData, make_event
 
 
 def _persisted_event(sequence: int, text: str = "") -> RunEvent:
@@ -18,6 +20,11 @@ def _persisted_event(sequence: int, text: str = "") -> RunEvent:
         type=EventType.OUTPUT,
         text=text,
     )
+
+
+def _assign(target: object, field: str, value: object) -> None:
+    """Assign a frozen model field, whose rejection is a runtime contract."""
+    setattr(target, field, value)
 
 
 def _write_events(path: Path, events: list[RunEvent]) -> None:
@@ -39,18 +46,81 @@ class TestEventStore:
         assert appended.run_id == "active-run"
         assert [event.sequence for event in store.read(after_sequence=1)] == [2, 3]
 
-    def test_legacy_out_of_order_sequences_keep_file_order_filtering(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_legacy_out_of_order_sequences_get_stable_monotonic_cursors(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"
         _write_events(
             path,
             [_persisted_event(2, "two"), _persisted_event(1, "one"), _persisted_event(3, "three")],
         )
+        original = path.read_bytes()
 
         store = EventStore(path, run_id="active-run")
 
-        assert [event.text for event in store.read(after_sequence=1)] == ["two", "three"]
-        assert store.append(make_event(EventType.OUTPUT, "four")).sequence == 4
-        assert [event.text for event in store.read(after_sequence=2)] == ["three", "four"]
+        assert [(event.sequence, event.text) for event in store.read()] == [
+            (2, "two"),
+            (3, "one"),
+            (4, "three"),
+        ]
+        assert path.read_bytes() == original
+        assert [event.text for event in store.read(after_sequence=2)] == ["one", "three"]
+        assert store.append(make_event(EventType.OUTPUT, "four")).sequence == 5
+
+        reopened = EventStore(path, run_id="reopened-run")
+        assert [(event.sequence, event.text) for event in reopened.read()] == [
+            (2, "two"),
+            (3, "one"),
+            (4, "three"),
+            (5, "four"),
+        ]
+
+    def test_legacy_duplicate_sequences_preserve_every_payload(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        _write_events(
+            path,
+            [
+                _persisted_event(1, "one"),
+                _persisted_event(2, "first two"),
+                _persisted_event(2, "second two"),
+                _persisted_event(3, "three"),
+            ],
+        )
+
+        store = EventStore(path, run_id="active-run")
+
+        assert [(event.sequence, event.text) for event in store.read()] == [
+            (1, "one"),
+            (2, "first two"),
+            (3, "second two"),
+            (4, "three"),
+        ]
+        assert [event.text for event in store.read(after_sequence=2)] == [
+            "second two",
+            "three",
+        ]
+
+    def test_legacy_sequence_resets_replay_every_payload_across_cursors(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        raw_sequences = [*range(7690, 7711), *range(7690, 7715), *range(7711, 7738)]
+        _write_events(
+            path,
+            [
+                _persisted_event(sequence, f"payload-{index}")
+                for index, sequence in enumerate(raw_sequences)
+            ],
+        )
+        store = EventStore(path, run_id="active-run")
+
+        replayed: list[RunEvent] = []
+        cursor = 0
+        while batch := store.read(after_sequence=cursor)[:7]:
+            replayed.extend(batch)
+            cursor = batch[-1].sequence
+
+        assert [event.text for event in replayed] == [
+            f"payload-{index}" for index in range(len(raw_sequences))
+        ]
+        assert all(previous.sequence < current.sequence for previous, current in pairwise(replayed))
+        assert store.last_sequence == replayed[-1].sequence
 
     def test_repeated_tail_reads_do_not_reparse_history(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"
@@ -123,17 +193,43 @@ class TestEventStore:
         batches = [reader.result() for reader in readers]
         assert [[event.sequence for event in batch] for batch in batches] == [[1], [1]]
         assert all(batch[0] == appended for batch in batches)
-        assert batches[0][0] is not batches[1][0]
+        # Readers share the stored event rather than each getting a copy: it is
+        # frozen, so sharing is what keeps replay from copying whole histories.
+        assert batches[0][0] is batches[1][0]
+        assert batches[0] is not batches[1]
 
     def test_cached_events_are_isolated_from_reader_mutation(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
         appended = store.append(make_event(EventType.OUTPUT, "durable"))
 
         first_read = store.read()
-        first_read[0].text = "mutated"
+        with pytest.raises(ValidationError):
+            _assign(first_read[0], "text", "mutated")
 
         assert appended.text == "durable"
         assert store.read()[0].text == "durable"
+
+    def test_reader_projections_do_not_disturb_stored_history(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        """The read path builds variants by copy, which the store never sees."""
+        store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
+        store.append(make_event(EventType.OUTPUT, "durable"))
+
+        projected = store.read()[0].model_copy(update={"text": "projected"})
+
+        assert projected.text == "projected"
+        assert store.read()[0].text == "durable"
+
+    def test_appended_events_are_immutable(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
+        appended = store.append(
+            make_event(EventType.TOOL_CALL, data=ToolCallData(tool="Bash", call_id="c1"))
+        )
+
+        with pytest.raises(ValidationError):
+            _assign(appended, "sequence", 99)
+        assert isinstance(appended.data, ToolCallData)
+        with pytest.raises(ValidationError):
+            _assign(appended.data, "tool", "Write")
 
     def test_append_does_not_publish_cache_state_when_file_close_fails(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"

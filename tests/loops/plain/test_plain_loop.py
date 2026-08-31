@@ -163,7 +163,7 @@ command = ["python", "-c", "print('ok')"]
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_bootstrap_creates_initial_feature_issue_on_first_run(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -210,7 +210,7 @@ def test_bootstrap_creates_initial_feature_issue_on_first_run(  # noqa: ANN201  
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_bootstrap_idempotent_on_resume(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -278,7 +278,7 @@ def test_bootstrap_idempotent_on_resume(  # noqa: ANN201  # tracked: #288
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_judge_pass_closes_issue(mock_build_runner, mock_backend, mock_build, ref_file, tmp_path):  # noqa: ANN001, ANN201, ARG001  # tracked: #288
     mock_build.return_value = "anthropic:claude-sonnet-4-6"
@@ -309,7 +309,7 @@ def test_judge_pass_closes_issue(mock_build_runner, mock_backend, mock_build, re
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_judge_fail_increments_attempts_and_keeps_open(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -353,7 +353,7 @@ def test_judge_fail_increments_attempts_and_keeps_open(  # noqa: ANN201  # track
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_issue_blocks_after_max_attempts_exhausted(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -431,7 +431,7 @@ _EXPECTED_TRACKER_TOOL_NAMES = {
 
 @pytest.mark.parametrize("backend_name", ["deepagents", "cli"])
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_judge_invoke_receives_tracker_kwargs(  # noqa: ANN201, PLR0913  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -497,7 +497,7 @@ def test_judge_invoke_receives_tracker_kwargs(  # noqa: ANN201, PLR0913  # track
 
 @pytest.mark.parametrize("backend_name", ["deepagents", "cli"])
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_perf_eval_invoke_receives_tracker_kwargs(  # noqa: ANN201, PLR0913  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -560,7 +560,7 @@ def test_perf_eval_invoke_receives_tracker_kwargs(  # noqa: ANN201, PLR0913  # t
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_judge_phase_calls_store_reload_after_invoke(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -630,7 +630,7 @@ def test_judge_phase_calls_store_reload_after_invoke(  # noqa: ANN201  # tracked
 
 @pytest.mark.parametrize("backend_name", ["deepagents", "cli"])
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_implementer_invoke_has_no_tracker_kwargs(  # noqa: ANN201, PLR0913  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -696,7 +696,7 @@ def test_implementer_invoke_has_no_tracker_kwargs(  # noqa: ANN201, PLR0913  # t
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_perf_eval_runs_after_drain_complete(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -750,7 +750,7 @@ def test_perf_eval_runs_after_drain_complete(  # noqa: ANN201  # tracked: #288
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_resume_with_bootstrap_done_skips_bootstrap_creation(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -814,7 +814,7 @@ def test_resume_with_bootstrap_done_skips_bootstrap_creation(  # noqa: ANN201  #
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_resume_retries_previously_blocked_issue(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -853,8 +853,9 @@ def test_resume_retries_previously_blocked_issue(  # noqa: ANN201  # tracked: #2
 
     exp_dir = _run_exp_dir(tmp_path)
     pre_resume = IssueBoard(_store_path(exp_dir)).get(1)
-    assert pre_resume.status == IssueStatus.BLOCKED  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
-    assert pre_resume.attempts == 2  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert pre_resume is not None
+    assert pre_resume.status == IssueStatus.BLOCKED
+    assert pre_resume.attempts == 2
 
     # Phase 2: resume. The blocked issue should be reopened with a fresh
     # attempt budget; this time the implementer/judge cycle passes.
@@ -882,11 +883,12 @@ def test_resume_retries_previously_blocked_issue(  # noqa: ANN201  # tracked: #2
     assert result2 is True
 
     post_resume = IssueBoard(_store_path(exp_dir)).get(1)
-    assert post_resume.status == IssueStatus.CLOSED  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert post_resume is not None
+    assert post_resume.status == IssueStatus.CLOSED
     # Reopen reset attempts to 0; the successful retry counts as attempt 1.
-    assert post_resume.attempts == 1  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    assert post_resume.attempts == 1
     # The blocked->open transition is recorded in history.
-    actions = [evt.action for evt in post_resume.history]  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+    actions = [evt.action for evt in post_resume.history]
     assert "blocked->open" in actions
 
 
@@ -896,7 +898,7 @@ def test_resume_retries_previously_blocked_issue(  # noqa: ANN201  # tracked: #2
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_run_returns_true_when_perf_eval_files_no_issues_after_clean_drain(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -937,7 +939,7 @@ def test_run_returns_true_when_perf_eval_files_no_issues_after_clean_drain(  # n
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_state_json_written_with_bootstrap_done_after_run(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -985,7 +987,7 @@ def test_state_json_written_with_bootstrap_done_after_run(  # noqa: ANN201  # tr
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_issue_loop_writes_per_issue_markdown_via_callback(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288
@@ -1048,7 +1050,7 @@ def test_issue_loop_writes_per_issue_markdown_via_callback(  # noqa: ANN201  # t
 
 
 @patch("vibesys.context.build_model")
-@patch("vibesys.backends.cuda.LocalShellBackend")
+@patch("vibesys.backends.cuda.make_local_shell_sandbox")
 @patch("vibesys.context.build_agent_client")
 def test_implementer_retry_user_prompt_includes_prior_judge_feedback(  # noqa: ANN201  # tracked: #288
     mock_build_runner,  # noqa: ANN001  # tracked: #288

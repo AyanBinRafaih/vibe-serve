@@ -43,6 +43,42 @@
         },
         "activity": {
           "$ref": "#/$defs/AgentExecutionActivityData"
+        },
+        "driver": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Driver"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
         }
       },
       "required": [
@@ -166,6 +202,42 @@
         },
         "activity": {
           "$ref": "#/$defs/AgentExecutionActivityData"
+        },
+        "driver": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Driver"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
         }
       },
       "required": [
@@ -310,12 +382,120 @@
         "answer": {
           "title": "Answer",
           "type": "string"
+        },
+        "thread_title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Title"
         }
       },
       "required": [
         "answer"
       ],
       "title": "ChatData",
+      "type": "object"
+    },
+    "ChatModelOption": {
+      "additionalProperties": false,
+      "description": "One model a chat thread can be started with, and where it came from.\n\n``source`` is provenance, not presentation: ``run`` is the run's own\nconfigured model, ``role`` an ``[agent.outer]``/``[agent.inner]``\noverride, ``suggested`` an entry from the backend's short curated list.",
+      "properties": {
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "run",
+            "role",
+            "suggested"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "default": {
+          "type": "boolean",
+          "default": false,
+          "title": "Default"
+        }
+      },
+      "required": [
+        "model",
+        "source"
+      ],
+      "title": "ChatModelOption",
+      "type": "object"
+    },
+    "ChatOptions": {
+      "additionalProperties": false,
+      "description": "Every chat agent selection this run offers, grouped by provider.\n\nThe agent driver is absent by design. Threads inherit the run's driver, so\na client never chooses one and never enumerates them.",
+      "properties": {
+        "providers": {
+          "items": {
+            "$ref": "#/$defs/ChatProviderOptions"
+          },
+          "title": "Providers",
+          "type": "array"
+        }
+      },
+      "title": "ChatOptions",
+      "type": "object"
+    },
+    "ChatOptionsQuery": {
+      "additionalProperties": false,
+      "description": "Request the agent selections this run's experiment chat offers.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.chat_options",
+          "default": "query.chat_options",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "ChatOptionsQuery",
+      "type": "object"
+    },
+    "ChatProviderOptions": {
+      "additionalProperties": false,
+      "description": "One CLI provider the run's configured driver supports, with models.",
+      "properties": {
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "models": {
+          "items": {
+            "$ref": "#/$defs/ChatModelOption"
+          },
+          "title": "Models",
+          "type": "array"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "title": "ChatProviderOptions",
       "type": "object"
     },
     "ChatQuery": {
@@ -345,6 +525,18 @@
         "text": {
           "title": "Text",
           "type": "string"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
         }
       },
       "required": [
@@ -369,6 +561,18 @@
           "default": "none",
           "title": "Effect",
           "type": "string"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
         }
       },
       "required": [
@@ -376,6 +580,168 @@
         "answer"
       ],
       "title": "ChatResult",
+      "type": "object"
+    },
+    "ChatThreadCreateQuery": {
+      "additionalProperties": false,
+      "description": "Create a new experiment-chat thread with its own agent selection.\n\nOmitted fields resolve to the run's configured driver, provider, and\nmodel. The response carries the resolved settings and thread identity.\n``driver`` exists for completeness and stays validated when supplied, but\nwhich driver backs a run is a deployment detail: clients omit it so every\nthread inherits the run's.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.chat_thread_create",
+          "default": "query.chat_thread_create",
+          "title": "Type",
+          "type": "string"
+        },
+        "driver": {
+          "anyOf": [
+            {
+              "enum": [
+                "agentshim",
+                "omnigent"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Driver"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "title": "ChatThreadCreateQuery",
+      "type": "object"
+    },
+    "ChatThreadCreatedData": {
+      "description": "Identity and resolved agent settings for one experiment-chat thread.\n\nReplayed by clients to rebuild the thread list; the default thread is\nimplicit and never records one of these.",
+      "properties": {
+        "kind": {
+          "const": "chat_thread_created",
+          "default": "chat_thread_created",
+          "title": "Kind",
+          "type": "string"
+        },
+        "thread_id": {
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        },
+        "driver": {
+          "title": "Driver",
+          "type": "string"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "driver",
+        "provider",
+        "model",
+        "created_at"
+      ],
+      "title": "ChatThreadCreatedData",
+      "type": "object"
+    },
+    "ChatThreadInfo": {
+      "additionalProperties": false,
+      "description": "Resolved identity and agent settings of one experiment-chat thread.",
+      "properties": {
+        "thread_id": {
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        },
+        "driver": {
+          "title": "Driver",
+          "type": "string"
+        },
+        "provider": {
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "driver",
+        "provider",
+        "model"
+      ],
+      "title": "ChatThreadInfo",
       "type": "object"
     },
     "CommandAck": {
@@ -404,6 +770,55 @@
         "status"
       ],
       "title": "CommandAck",
+      "type": "object"
+    },
+    "CommandResultPayload": {
+      "description": "Structured result of a command-style tool execution.",
+      "properties": {
+        "kind": {
+          "const": "command",
+          "default": "command",
+          "title": "Kind",
+          "type": "string"
+        },
+        "stdout": {
+          "title": "Stdout",
+          "type": "string"
+        },
+        "stderr": {
+          "title": "Stderr",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration"
+        }
+      },
+      "required": [
+        "stdout",
+        "stderr"
+      ],
+      "title": "CommandResultPayload",
       "type": "object"
     },
     "ConfigurationFailedData": {
@@ -454,7 +869,7 @@
     },
     "Diagnostic": {
       "additionalProperties": false,
-      "description": "Structured, provider-neutral description of an operator diagnostic.",
+      "description": "Structured, provider-neutral description of an operator diagnostic.\n\nFrozen for the same reason as ``RunEvent``: diagnostics ride along on\nreplayed events, which readers share rather than copy.",
       "properties": {
         "id": {
           "title": "Id",
@@ -599,6 +1014,12 @@
           },
           "title": "Active Executions",
           "type": "array"
+        },
+        "history_after_sequence": {
+          "default": 0,
+          "minimum": 0,
+          "title": "History After Sequence",
+          "type": "integer"
         }
       },
       "required": [
@@ -649,6 +1070,7 @@
         "experiments_changed",
         "run_interrupted",
         "chat",
+        "chat_thread_created",
         "status_query",
         "control",
         "invocation_started",
@@ -703,6 +1125,19 @@
           "minimum": 0,
           "title": "After Sequence",
           "type": "integer"
+        },
+        "before_sequence": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Before Sequence"
         },
         "timeout_ms": {
           "default": 0,
@@ -798,7 +1233,7 @@
     },
     "HypothesisEntry": {
       "additionalProperties": false,
-      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is the terminal value the agent loop itself recorded\nfor the closing round (``proven``, ``rejected``, or a ``HypothesisOutcome``\nmember). It is copied, never recomputed, so the client cannot drift from\nthe framework's resolution semantics.",
+      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is copied from the backend's typed hypothesis state,\nnever recomputed by the server or client.",
       "properties": {
         "hypothesis_id": {
           "title": "Hypothesis Id",
@@ -808,6 +1243,18 @@
           "default": true,
           "title": "Identified",
           "type": "boolean"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
         },
         "claim": {
           "anyOf": [
@@ -912,10 +1359,86 @@
           "default": null,
           "title": "Perf Delta Pct"
         },
+        "perf_metric_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Metric Name"
+        },
+        "perf_direction": {
+          "anyOf": [
+            {
+              "enum": [
+                "max",
+                "min"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Direction"
+        },
+        "perf_baseline_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Baseline Value"
+        },
         "kept": {
-          "default": false,
-          "title": "Kept",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kept"
+        },
+        "strategy_disposition": {
+          "anyOf": [
+            {
+              "enum": [
+                "available",
+                "parked",
+                "abandoned"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Disposition"
+        },
+        "strategy_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Strategy Reason"
         },
         "active": {
           "default": false,
@@ -1021,6 +1544,56 @@
       "title": "HypothesisRound",
       "type": "object"
     },
+    "InteractiveSetupDefaults": {
+      "additionalProperties": false,
+      "description": "JSON contract passed from Python configuration to the pre-launch TUI.",
+      "properties": {
+        "runs_dir": {
+          "title": "Runs Dir",
+          "type": "string"
+        },
+        "input_path": {
+          "title": "Input Path",
+          "type": "string"
+        },
+        "experiment_name": {
+          "title": "Experiment Name",
+          "type": "string"
+        },
+        "repository_owner": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Repository Owner"
+        },
+        "repository_name": {
+          "title": "Repository Name",
+          "type": "string"
+        },
+        "visibility": {
+          "$ref": "#/$defs/RepositoryVisibility"
+        },
+        "theme": {
+          "$ref": "#/$defs/TuiTheme"
+        }
+      },
+      "required": [
+        "runs_dir",
+        "input_path",
+        "experiment_name",
+        "repository_owner",
+        "repository_name",
+        "visibility",
+        "theme"
+      ],
+      "title": "InteractiveSetupDefaults",
+      "type": "object"
+    },
     "InvocationFinishedData": {
       "properties": {
         "kind": {
@@ -1071,6 +1644,35 @@
         "user_prompt"
       ],
       "title": "InvocationStartedData",
+      "type": "object"
+    },
+    "JsonResultPayload": {
+      "description": "A tool result that is a JSON object or array, already parsed.",
+      "properties": {
+        "kind": {
+          "const": "json",
+          "default": "json",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "items": {},
+              "type": "array"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "JsonResultPayload",
       "type": "object"
     },
     "JudgeResultData": {
@@ -1171,6 +1773,102 @@
         }
       },
       "title": "PauseCommand",
+      "type": "object"
+    },
+    "PerformanceContext": {
+      "additionalProperties": false,
+      "description": "What the performance plot measures and how to read it.\n\nCopied from recorded run state and the run manifest, never recomputed.\nEvery field is optional so the section can describe the objective before\nthe first measurement and omit facts a run never recorded; a run whose\nprose is known before its metric still gets a description-only context.",
+      "properties": {
+        "objective_metric": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Metric"
+        },
+        "objective_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Unit"
+        },
+        "objective_direction": {
+          "anyOf": [
+            {
+              "enum": [
+                "max",
+                "min"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Direction"
+        },
+        "objective_baseline_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Baseline Value"
+        },
+        "objective_baseline_round": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Baseline Round"
+        },
+        "objective_baseline_commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Baseline Commit"
+        },
+        "objective_description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Description"
+        }
+      },
+      "title": "PerformanceContext",
       "type": "object"
     },
     "PerformanceQuery": {
@@ -1314,6 +2012,16 @@
       "title": "ProtocolErrorMessage",
       "type": "object"
     },
+    "RepositoryVisibility": {
+      "description": "Supported GitHub repository visibility values.",
+      "enum": [
+        "private",
+        "public",
+        "internal"
+      ],
+      "title": "RepositoryVisibility",
+      "type": "string"
+    },
     "Response": {
       "additionalProperties": false,
       "properties": {
@@ -1382,6 +2090,39 @@
           ],
           "default": null
         },
+        "chat_thread": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatThreadInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "chat_options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatOptions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tui_defaults": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InteractiveSetupDefaults"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "snapshot": {
           "anyOf": [
             {
@@ -1406,6 +2147,17 @@
           },
           "title": "Performance",
           "type": "array"
+        },
+        "performance_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PerformanceContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "experiments": {
           "items": {
@@ -1516,7 +2268,7 @@
     },
     "RunEvent": {
       "additionalProperties": false,
-      "description": "One reproducible human, control, or invocation event.",
+      "description": "One reproducible human, control, or invocation event.\n\nFrozen: a recorded event is a durable fact. Readers that need a variant\nbuild one with ``model_copy(update=...)`` rather than mutating a shared\nobject, which lets ``EventStore`` replay history without copying it.",
       "properties": {
         "protocol_version": {
           "const": 1,
@@ -1618,6 +2370,18 @@
           "default": null,
           "title": "Execution Id"
         },
+        "chat_thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chat Thread Id"
+        },
         "data": {
           "anyOf": [
             {
@@ -1629,6 +2393,7 @@
                   "agent_output_chunk": "#/$defs/AgentOutputChunkData",
                   "benchmark_result": "#/$defs/BenchmarkResultData",
                   "chat": "#/$defs/ChatData",
+                  "chat_thread_created": "#/$defs/ChatThreadCreatedData",
                   "configuration_failed": "#/$defs/ConfigurationFailedData",
                   "experiments_changed": "#/$defs/ExperimentsChangedData",
                   "invocation_finished": "#/$defs/InvocationFinishedData",
@@ -1651,6 +2416,9 @@
               "oneOf": [
                 {
                   "$ref": "#/$defs/ChatData"
+                },
+                {
+                  "$ref": "#/$defs/ChatThreadCreatedData"
                 },
                 {
                   "$ref": "#/$defs/InvocationStartedData"
@@ -1813,6 +2581,13 @@
             "$ref": "#/$defs/ActiveAgentExecution"
           },
           "title": "Active Executions",
+          "type": "array"
+        },
+        "chat_threads": {
+          "items": {
+            "$ref": "#/$defs/ChatThreadInfo"
+          },
+          "title": "Chat Threads",
           "type": "array"
         }
       },
@@ -2002,6 +2777,19 @@
           "minimum": 0,
           "title": "After Sequence",
           "type": "integer"
+        },
+        "tail": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tail"
         }
       },
       "title": "SubscribeRequest",
@@ -2153,6 +2941,32 @@
           "default": false,
           "title": "Is Error",
           "type": "boolean"
+        },
+        "payload": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "command": "#/$defs/CommandResultPayload",
+                  "json": "#/$defs/JsonResultPayload"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/CommandResultPayload"
+                },
+                {
+                  "$ref": "#/$defs/JsonResultPayload"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payload"
         }
       },
       "required": [
@@ -2161,6 +2975,50 @@
       ],
       "title": "ToolResultData",
       "type": "object"
+    },
+    "TuiDefaultsQuery": {
+      "additionalProperties": false,
+      "description": "Request the launch-directory configuration defaults a TUI applies.\n\nA terminal client resolves its theme from the run's configuration. Asking\nover the control channel keeps TOML parsing in the backend and saves the\nlauncher an extra Python process on the boot path.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.tui_defaults",
+          "default": "query.tui_defaults",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "TuiDefaultsQuery",
+      "type": "object"
+    },
+    "TuiTheme": {
+      "description": "Selectable TUI themes, as light/dark pairs.",
+      "enum": [
+        "dark",
+        "light",
+        "solarized-dark",
+        "solarized-light",
+        "catppuccin-mocha",
+        "catppuccin-latte",
+        "high-contrast-dark",
+        "high-contrast-light"
+      ],
+      "title": "TuiTheme",
+      "type": "string"
     },
     "UsageUpdateData": {
       "properties": {
@@ -2214,11 +3072,14 @@
           "command.resume": "#/$defs/ResumeCommand",
           "command.steer": "#/$defs/SteerCommand",
           "query.chat": "#/$defs/ChatQuery",
+          "query.chat_options": "#/$defs/ChatOptionsQuery",
+          "query.chat_thread_create": "#/$defs/ChatThreadCreateQuery",
           "query.events": "#/$defs/EventsQuery",
           "query.experiments": "#/$defs/ExperimentQuery",
           "query.history": "#/$defs/HistoryQuery",
           "query.performance": "#/$defs/PerformanceQuery",
           "query.snapshot": "#/$defs/SnapshotQuery",
+          "query.tui_defaults": "#/$defs/TuiDefaultsQuery",
           "subscribe": "#/$defs/SubscribeRequest"
         },
         "propertyName": "type"
@@ -2238,6 +3099,15 @@
         },
         {
           "$ref": "#/$defs/ChatQuery"
+        },
+        {
+          "$ref": "#/$defs/ChatThreadCreateQuery"
+        },
+        {
+          "$ref": "#/$defs/ChatOptionsQuery"
+        },
+        {
+          "$ref": "#/$defs/TuiDefaultsQuery"
         },
         {
           "$ref": "#/$defs/HistoryQuery"

@@ -1,6 +1,5 @@
 import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
-import {hasActiveAgentTiming} from '../round-timing.js';
-import {type RoundSummary, roundAgentElapsedMs} from '../run-map.js';
+import {hasActiveAgentTiming, type RoundSummary, roundAgentElapsedMs} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {stripRounds, visibleRoundNumber} from '../session-model.js';
@@ -259,7 +258,8 @@ export class RoundStripView {
 
   #roundLabel(round: RoundSummary, selected: number | null): string {
     const isSelected = round.number === selected;
-    const elapsed = round.status === 'active' ? ` ${elapsedLabel(roundAgentElapsedMs(round))}` : '';
+    const elapsed =
+      round.status === 'active' ? ` ${elapsedLabel(roundAgentElapsedMs(round, new Date()))}` : '';
     return `${isSelected ? '[' : ' '} r${round.number}${elapsed} ${isSelected ? ']' : ' '}`;
   }
 

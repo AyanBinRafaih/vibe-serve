@@ -251,7 +251,8 @@ class TestMonitorLifecycle:
         mon.start()
         time.sleep(0.15)
         mon.stop()
-        assert not mon._thread.is_alive()  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297  # noqa: SLF001  # tracked: #288
+        assert mon._thread is not None  # noqa: SLF001  # tracked: #288
+        assert not mon._thread.is_alive()  # noqa: SLF001  # tracked: #288
 
     def test_stop_without_start(self):  # noqa: ANN201  # tracked: #288
         mon = GpuContentionMonitor(log_dir=Path("/tmp"), gpu_uuid=GPU_A)  # noqa: S108  # tracked: #288
@@ -281,7 +282,6 @@ class TestReselectGpu:
             run_log_path=tmp_path / "run.log",
         )
         ctx.log_dir.mkdir(parents=True, exist_ok=True)
-        ctx._docker_symlinks = []  # noqa: SLF001  # tracked: #288
 
         # Real CudaBackend so reselect_gpu's delegation hits the actual logic;
         # tests patch pick_gpu / query_gpu_info to control device selection.
@@ -332,7 +332,7 @@ class TestReselectGpu:
     def test_noop_when_no_gpus(self, mock_pick, tmp_path):  # noqa: ANN001, ANN201, ARG002  # tracked: #288
         ctx = self._make_ctx(tmp_path, selected_gpu=_gpu(0, GPU_A))
         ctx.reselect_gpu()
-        assert ctx.selected_gpu.index == 0  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297  # unchanged
+        assert ctx.selected_gpu.index == 0  # unchanged
 
     @patch("vibesys.backends.cuda.pick_gpu")
     def test_noop_when_same_gpu(self, mock_pick, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -404,7 +404,7 @@ class TestReselectGpu:
         ctx.implementer_backend.start.assert_called_once()
         ctx.judge_backend.start.assert_called_once()
         # Clean up
-        ctx.gpu_monitor.stop()  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+        ctx.gpu_monitor.stop()
 
     # Note: symlink replay on restart is now the sandbox class's
     # responsibility (it runs setup_fns at the end of start()).  That
@@ -425,4 +425,4 @@ class TestReselectGpu:
         assert ctx.selected_gpu is gpu1
         assert ctx.implementer_backend._env["CUDA_VISIBLE_DEVICES"] == "1"  # noqa: SLF001  # tracked: #288
         # Clean up
-        ctx.gpu_monitor.stop()  # pyright: ignore[reportOptionalMemberAccess]  # tracked: #297
+        ctx.gpu_monitor.stop()

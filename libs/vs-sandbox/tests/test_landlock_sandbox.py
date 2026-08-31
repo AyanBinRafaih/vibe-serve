@@ -18,6 +18,7 @@ import runpy
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -49,7 +50,13 @@ def _policy() -> ProjectPathPolicy:
     )
 
 
-def _confined(workspace: Path, **kwargs: object) -> LandlockSandbox:
+def _confined(
+    workspace: Path,
+    *,
+    read_paths: tuple[Path, ...] = (),
+    project_path_policy: ProjectPathPolicy | None = None,
+    system_read_roots: tuple[str, ...] = LandlockSandbox.system_read_roots,
+) -> LandlockSandbox:
     """Build a sandbox whose granted scratch roots exclude the fixture's tree.
 
     ``tmp_path`` lives under ``/tmp``, which the production scratch roots grant
@@ -61,7 +68,11 @@ def _confined(workspace: Path, **kwargs: object) -> LandlockSandbox:
     return LandlockSandbox(
         workspace=workspace,
         scratch_write_roots=("/dev", "/proc"),
-        **kwargs,  # pyright: ignore[reportArgumentType]
+        read_paths=read_paths,
+        project_path_policy=(
+            ProjectPathPolicy() if project_path_policy is None else project_path_policy
+        ),
+        system_read_roots=system_read_roots,
     )
 
 
@@ -376,8 +387,11 @@ class TestLinuxBackendSelection:
         with pytest.raises(host_sandbox.SandboxUnavailableError, match="user namespace"):
             host_sandbox.build(workspace, env={}, require_enforcement=True)
 
-    def test_unknown_backend_value_is_rejected(self, tmp_path: Path) -> None:
+    def test_unknown_backend_value_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         workspace = _workspace(tmp_path)
+        monkeypatch.setattr(host_sandbox.sys, "platform", "linux")
 
         with pytest.raises(host_sandbox.SandboxUnavailableError, match="unknown"):
             host_sandbox.build(
@@ -415,7 +429,7 @@ class _FakeLibc:
     def prctl(self, *_args: object) -> int:
         return self.prctl_result
 
-    def syscall(self, number: ctypes.c_long, *args: object) -> int:
+    def syscall(self, number: ctypes.c_long, *args: Any) -> int:  # noqa: ANN401
         create, add_rule, restrict_self = landlock._syscall_numbers()  # noqa: SLF001
         if number.value == create:
             if self.create_result is not None:

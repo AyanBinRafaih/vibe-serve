@@ -13,7 +13,8 @@ function context(banner: ErrorBannerState): string {
 
 /**
  * A single, always-rooted, fixed-height error surface. It does not take input
- * focus, while Ctrl+PgUp/Ctrl+PgDn scroll a long diagnostic.
+ * focus. Its footer owns explicit pointer dismissal, while global keybindings
+ * own Escape and Ctrl+PgUp/Ctrl+PgDn.
  */
 export class ErrorBannerView {
   readonly output: BoxRenderable;
@@ -24,6 +25,7 @@ export class ErrorBannerView {
   constructor(
     private readonly renderer: CliRenderer,
     theme: Theme,
+    private readonly onDismiss: () => void,
   ) {
     this.#theme = theme;
     this.output = new BoxRenderable(renderer, {
@@ -79,7 +81,7 @@ export class ErrorBannerView {
   #renderContent(banner: ErrorBannerState): void {
     const where = context(banner);
     const count = banner.count > 1 ? ` · ${banner.count} reports` : '';
-    this.output.title = ` × ${banner.title}${where ? ` · ${where}` : ''}${count} `;
+    this.output.title = ` ${banner.title}${where ? ` · ${where}` : ''}${count} `;
     this.output.add(this.#scroll);
     this.#scroll.add(
       new TextRenderable(this.renderer, {
@@ -114,12 +116,13 @@ export class ErrorBannerView {
     }
     this.output.add(
       new TextRenderable(this.renderer, {
-        content: 'Ctrl+PgUp/PgDn: scroll',
+        content: '[× Dismiss] · Esc: dismiss · Ctrl+PgUp/PgDn: scroll',
         fg: this.#theme.textSubtle,
         width: '100%',
         height: 1,
         wrapMode: 'none',
         truncate: true,
+        onMouseUp: this.onDismiss,
       }),
     );
     this.#scroll.scrollTo(0);

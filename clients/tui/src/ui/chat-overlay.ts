@@ -1,14 +1,12 @@
 import {
   BoxRenderable,
   type CliRenderer,
-  InputRenderable,
-  InputRenderableEvents,
   ScrollBoxRenderable,
   type SyntaxStyle,
-  TextRenderable,
 } from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
-import type {SessionState} from '../session-model.js';
+import {chatThreadHeading, type SessionState} from '../session-model.js';
+import {ChatComposerView, type ChatDraft} from './chat-composer.js';
 import {ConversationView} from './conversation.js';
 import type {Theme} from './theme.js';
 
@@ -34,16 +32,15 @@ export class ChatOverlayView {
   readonly output: BoxRenderable;
   readonly #transcript: ScrollBoxRenderable;
   readonly #conversation: ConversationView;
-  readonly #input: InputRenderable;
-  readonly #inputBox: BoxRenderable;
-  readonly #hint: TextRenderable;
+  readonly #composer: ChatComposerView;
   #bounds: PaneBounds | null = null;
 
   constructor(
     renderer: CliRenderer,
-    private readonly controller: SessionController,
+    controller: SessionController,
     markdownStyle: SyntaxStyle,
     theme: Theme,
+    draft: ChatDraft,
   ) {
     this.output = new BoxRenderable(renderer, {
       id: 'chat-overlay',
@@ -75,38 +72,26 @@ export class ChatOverlayView {
     this.#conversation = new ConversationView(renderer, controller, markdownStyle, theme, {
       selectConversation: state => state.chatConversation,
       emptyContent: 'Ask a question about the current experiment, its progress, or a failure.',
-      renderMarkdown: false,
+      // Answers are agent-authored markdown; the operator's own messages stay
+      // verbatim so typed ** or # is never concealed as markup. The chat keeps
+      // answering after the run turns terminal, so it never switches to the
+      // finalized parse that would leave a fresh answer blank until a redraw.
+      markdownKinds: ['assistant'],
+      markdownStreaming: true,
     });
-    this.#inputBox = new BoxRenderable(renderer, {
-      id: 'chat-input-box',
-      height: 3,
-      width: '100%',
-      border: true,
-      borderStyle: 'rounded',
-      borderColor: theme.conversation.analysis.label,
-      title: ' Message ',
-      paddingLeft: 1,
-      paddingRight: 1,
-    });
-    this.#input = new InputRenderable(renderer, {
-      id: 'chat-input',
-      width: '100%',
-      placeholder: 'Ask about this experiment',
-      textColor: theme.textStrong,
-      focusedTextColor: theme.textStrong,
-    });
-    this.#input.on(InputRenderableEvents.ENTER, this.#submit);
-    this.#inputBox.add(this.#input);
+    this.#composer = new ChatComposerView(
+      renderer,
+      draft,
+      value => void controller.submitChat(value),
+      theme,
+      'chat-modal',
+    );
     this.#transcript.add(this.#conversation.output);
     this.output.add(this.#transcript);
-    this.output.add(this.#inputBox);
-    this.#hint = new TextRenderable(renderer, {
-      content: 'Enter to send · /perf and other commands work here · Esc to close',
-      fg: theme.textSubtle,
-      height: 1,
-      width: '100%',
-    });
-    this.output.add(this.#hint);
+    // Anchored to the composer, matching the docked pane: the same commands
+    // read the same way whichever presentation the chat is in.
+    this.output.add(this.#composer.menu);
+    this.output.add(this.#composer.output);
   }
 
   /**
@@ -133,31 +118,33 @@ export class ChatOverlayView {
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.output.borderColor = theme.conversation.analysis.label;
     this.output.backgroundColor = theme.elevatedSurface;
-    this.#inputBox.borderColor = theme.conversation.analysis.label;
-    this.#input.textColor = theme.textStrong;
-    this.#input.focusedTextColor = theme.textStrong;
-    this.#hint.fg = theme.textSubtle;
+    this.#composer.applyTheme(theme);
     this.#conversation.applyTheme(theme, markdownStyle);
   }
 
   render(state: SessionState): void {
     this.output.visible = state.chatOpen;
     if (!state.chatOpen) return;
+    this.output.title = ` ${chatThreadHeading(state)} `;
+    this.#composer.activate(Math.max(1, this.output.width - 4), true, state.chatPending);
+    this.#composer.renderMenu(state);
     this.#conversation.render(state);
     this.#transcript.scrollTo(this.#transcript.scrollHeight);
   }
 
   focus(): void {
-    this.#input.focus();
+    this.#composer.focus();
   }
 
-  destroy(): void {
-    this.#input.off(InputRenderableEvents.ENTER, this.#submit);
+  isComposerEmpty(): boolean {
+    return this.#composer.isEmpty();
   }
 
-  readonly #submit = (value: string): void => {
-    if (!value.trim()) return;
-    this.#input.value = '';
-    void this.controller.submitChat(value);
-  };
+  navigateSuggestions(direction: 1 | -1): boolean {
+    return this.#composer.navigateSuggestions(direction);
+  }
+
+  completeSuggestion(): boolean {
+    return this.#composer.completeSuggestion();
+  }
 }

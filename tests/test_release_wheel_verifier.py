@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -12,8 +13,8 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from scripts import verify_release_wheel as verifier  # pyright: ignore[reportMissingImports]
-from wheel_targets import TARGETS  # pyright: ignore[reportMissingImports]
+from scripts import verify_release_wheel as verifier
+from wheel_targets import TARGETS
 
 FRAMEWORK_PACKAGES = (
     "vibesys",
@@ -113,6 +114,10 @@ def _wheel_files(source_root: Path) -> dict[str, bytes]:
         "app/dist/launcher.js": b"// launcher\n",
         "app/dist/self-test.js": b"// self-test\n",
         "app/package.json": b'{"name":"@vibesys/tui","version":"0.1.0"}\n',
+        "app/node_modules/@vibesys/backend-client/package.json": b'{"name":"@vibesys/backend-client"}\n',
+        "app/node_modules/@vibesys/backend-client/dist/index.js": b"// backend client\n",
+        "app/node_modules/@vibesys/core-state/package.json": b'{"name":"@vibesys/core-state"}\n',
+        "app/node_modules/@vibesys/core-state/dist/index.js": b"// core state\n",
         "app/node_modules/@opentui/core/index.js": b"// core\n",
         "app/node_modules/@opentui/core-linux-x64/index.js": b"// native\n",
         "licenses/BUN-LICENSE.md": b"Bun license\n",
@@ -376,6 +381,23 @@ def test_rejects_a_wrong_target_payload(release_fixture: tuple[Path, Path]) -> N
         _verify(source_root, wheel)
 
 
+def test_rejects_checkout_specific_tui_dependencies(
+    release_fixture: tuple[Path, Path],
+) -> None:
+    source_root, wheel = release_fixture
+    files = _wheel_files(source_root)
+    package_path = f"{PLATLIB}vibesys/_tui/app/package.json"
+    package = json.loads(files[package_path])
+    package["dependencies"] = {
+        "@vibesys/core-state": "@vibesys/core-state@file:///build/clients/core-state"
+    }
+    files[package_path] = json.dumps(package).encode()
+    _write_wheel(wheel, source_root, extra={package_path: files[package_path]})
+
+    with pytest.raises(verifier.ReleaseWheelError, match="local path"):
+        _verify(source_root, wheel)
+
+
 def test_rejects_multiple_native_packages(release_fixture: tuple[Path, Path]) -> None:
     source_root, wheel = release_fixture
     extra_native = f"{PLATLIB}vibesys/_tui/app/node_modules/@opentui/core-darwin-arm64/index.js"
@@ -568,11 +590,15 @@ def test_rejects_symlinks_and_source_maps(release_fixture: tuple[Path, Path]) ->
 
 
 def test_bdist_wheel_revalidates_the_native_host(tmp_path: Path) -> None:
-    env = {
-        **os.environ,
-        "VIBESYS_WHEEL_TARGET": "macos-arm64",
-        "VIBESYS_TUI_BUNDLE": str(tmp_path / "missing"),
-    }
+    # The guard can only fire for a target the build host is not, so pick one
+    # rather than naming a fixed target that happens to be foreign to CI. In
+    # reverse declaration order the first non-native target is ``macos-arm64``
+    # everywhere except an Apple Silicon Mac, so CI keeps its existing case.
+    host = (platform.system(), platform.machine())
+    target_key = next(
+        key for key, target in reversed(TARGETS.items()) if (target.system, target.machine) != host
+    )
+    env = {**os.environ, "VIBESYS_WHEEL_TARGET": target_key}
 
     uv = shutil.which("uv")
     assert uv is not None
@@ -585,5 +611,7 @@ def test_bdist_wheel_revalidates_the_native_host(tmp_path: Path) -> None:
         check=False,
     )
 
+    # Name the target as well: a bare "nonzero exit" also matches unrelated
+    # build failures, which is how this assertion stayed green off-target.
     assert result.returncode != 0
-    assert "must be built natively" in result.stderr
+    assert f"{target_key} must be built natively" in result.stderr

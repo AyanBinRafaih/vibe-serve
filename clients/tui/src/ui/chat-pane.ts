@@ -5,7 +5,13 @@ import {
   type SyntaxStyle,
 } from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
-import {chatPaneFocused, type SessionState} from '../session-model.js';
+import {
+  type ConversationEntry,
+  chatPaneFocused,
+  chatThreadHeading,
+  type SessionState,
+} from '../session-model.js';
+import {ChatComposerView, type ChatDraft} from './chat-composer.js';
 import {ConversationView} from './conversation.js';
 import {LOG_CLAIM_PANEL_WIDTH, LOG_COMPACT_PANEL_WIDTH} from './experiment-log.js';
 import type {Theme} from './theme.js';
@@ -45,22 +51,23 @@ export function chatPaneWidth(terminalWidth: number, rightPaneWidth = 0): number
 
 /**
  * The experiment chat as a column of the landing view rather than a dialog over
- * it. It has no input of its own: the client already has one, and plain text
- * typed there is a question for the agent, so a second box would only split the
- * operator's attention.
+ * it. Its composer is the only surface where ordinary text becomes a question;
+ * slash-prefixed text delegates to the shared command path.
  */
 export class ChatPaneView {
   readonly output: BoxRenderable;
   readonly #scroll: ScrollBoxRenderable;
   readonly #conversation: ConversationView;
+  readonly #composer: ChatComposerView;
   #theme: Theme;
-  #renderedState: SessionState | null = null;
+  #renderedConversation: ConversationEntry[] | null = null;
 
   constructor(
     renderer: CliRenderer,
     controller: SessionController,
     markdownStyle: SyntaxStyle,
     theme: Theme,
+    draft: ChatDraft,
   ) {
     this.#theme = theme;
     this.output = new BoxRenderable(renderer, {
@@ -72,7 +79,7 @@ export class ChatPaneView {
       paddingRight: 1,
       border: true,
       borderStyle: 'rounded',
-      borderColor: theme.info,
+      borderColor: theme.border,
       title: ' Experiment chat ',
       visible: false,
       // Clicking into the chat gives it the keys, the same thing Ctrl+W does.
@@ -96,17 +103,36 @@ export class ChatPaneView {
     this.#conversation = new ConversationView(renderer, controller, markdownStyle, theme, {
       selectConversation: state => state.chatConversation,
       emptyContent: 'Ask about this run: progress, a failure, or what a hypothesis changed.',
-      renderMarkdown: false,
+      // Answers are agent-authored markdown; the operator's own messages stay
+      // verbatim so typed ** or # is never concealed as markup. The chat keeps
+      // answering after the run turns terminal, so it never switches to the
+      // finalized parse that would leave a fresh answer blank until a redraw.
+      markdownKinds: ['assistant'],
+      markdownStreaming: true,
+      onFocusRequest: () => controller.focusPane('chat'),
     });
+    this.#composer = new ChatComposerView(
+      renderer,
+      draft,
+      value => void controller.submitChat(value),
+      theme,
+      'chat-dock',
+      () => controller.focusPane('chat'),
+    );
     this.#scroll.add(this.#conversation.output);
     this.output.add(this.#scroll);
+    // Absolute inside the pane rather than over the screen, so the menu rises
+    // out of the composer it belongs to instead of covering the whole view.
+    this.output.add(this.#composer.menu);
+    this.output.add(this.#composer.output);
   }
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.#theme = theme;
-    this.output.borderColor = theme.info;
+    this.output.borderColor = theme.border;
     this.#conversation.applyTheme(theme, markdownStyle);
-    this.#renderedState = null;
+    this.#composer.applyTheme(theme);
+    this.#renderedConversation = null;
   }
 
   /** Scrolled by Page Up/Page Down while this pane holds focus. */
@@ -114,24 +140,41 @@ export class ChatPaneView {
     this.#scroll.scrollBy(delta, 'viewport');
   }
 
+  isComposerEmpty(): boolean {
+    return this.#composer.isEmpty();
+  }
+
+  focusComposer(): void {
+    this.#composer.focus();
+  }
+
+  navigateSuggestions(direction: 1 | -1): boolean {
+    return this.#composer.navigateSuggestions(direction);
+  }
+
+  completeSuggestion(): boolean {
+    return this.#composer.completeSuggestion();
+  }
+
   render(state: SessionState, visible: boolean, width: number): void {
     this.output.visible = visible;
     if (!visible) {
-      this.#renderedState = null;
       return;
     }
     this.output.width = width;
     const focused = chatPaneFocused(state);
-    // The chat keeps a colour of its own at rest, the way the command input
-    // keeps green: which box a keystroke lands in should be readable without
-    // moving focus around to find out.
-    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.info;
+    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
     // The column can be as narrow as its minimum, where a spelled-out "focused"
     // costs the title itself: a box with no title reads as nothing at all. The
     // marker is the one the table already uses for the row that has the keys.
-    this.output.title = focused ? ' ▸ Experiment chat ' : ' Experiment chat ';
-    if (state === this.#renderedState) return;
-    this.#renderedState = state;
+    // The title names the active thread so switching is visible at a glance,
+    // and its runtime so the operator can tell which agent is answering.
+    const label = chatThreadHeading(state);
+    this.output.title = focused ? ` ▸ ${label} ` : ` ${label} `;
+    this.#composer.activate(Math.max(1, width - 4), focused, state.chatPending);
+    this.#composer.renderMenu(state);
+    if (state.chatConversation === this.#renderedConversation) return;
+    this.#renderedConversation = state.chatConversation;
     this.#conversation.render(state);
     this.#scroll.scrollTo(this.#scroll.scrollHeight);
   }

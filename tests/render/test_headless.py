@@ -4,6 +4,7 @@ from io import StringIO
 
 from vibesys.render import HeadlessRenderer, TodoDisplay
 from vibesys.server.events import (
+    AgentOutputChannel,
     AgentOutputChunkData,
     AgentStatusData,
     EventData,
@@ -25,10 +26,14 @@ def _render(*payloads: tuple[EventType, EventData], **kwargs) -> str:  # noqa: A
     return out.getvalue()
 
 
-def _chunk(content: str, channel: str = "assistant", status: AgentStatusData | None = None):  # noqa: ANN202  # tracked: #288
+def _chunk(  # noqa: ANN202  # tracked: #288
+    content: str,
+    channel: AgentOutputChannel = "assistant",
+    status: AgentStatusData | None = None,
+):
     return (
         EventType.AGENT_OUTPUT_CHUNK,
-        AgentOutputChunkData(channel=channel, content=content, status=status),  # type: ignore[arg-type]
+        AgentOutputChunkData(channel=channel, content=content, status=status),
     )
 
 

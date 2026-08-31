@@ -38,6 +38,10 @@ class _TeeWriter:
     def isatty(self):  # noqa: ANN202  # tracked: #288
         return False
 
+    def fileno(self) -> int:
+        """Expose the real stream descriptor to subprocess launchers."""
+        return self._primary.fileno()
+
 
 class _CurrentLogWriter:
     """Stable writer that follows a :class:`RunLogger` across file switches."""

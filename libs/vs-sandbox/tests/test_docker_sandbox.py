@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from deepagents.backends.sandbox import BaseSandbox
 
 from vs_sandbox.docker_sandbox import DockerSandbox
 
@@ -315,15 +316,15 @@ class TestSetupFns:
             stdout="abc123container\n",
             stderr="",
         )
-        invocations: list[DockerSandbox] = []
+        invocations: list[BaseSandbox] = []
 
-        def fn(sb: DockerSandbox) -> None:
+        def fn(sb: BaseSandbox) -> None:
             invocations.append(sb)
 
         s = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
-            setup_fns=[fn],  # pyright: ignore[reportArgumentType]  # tracked: #297
+            setup_fns=[fn],
         )
         s.start()
         assert invocations == [s]
@@ -339,14 +340,14 @@ class TestSetupFns:
         )
         calls = 0
 
-        def fn(_sb: DockerSandbox) -> None:
+        def fn(_sb: BaseSandbox) -> None:
             nonlocal calls
             calls += 1
 
         s = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
-            setup_fns=[fn],  # pyright: ignore[reportArgumentType]  # tracked: #297
+            setup_fns=[fn],
         )
         s.start()
         s.start()
@@ -356,7 +357,7 @@ class TestSetupFns:
     def test_setup_failure_preserves_error_when_stop_fails(self, mock_run, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         from vs_sandbox.docker_sandbox import _live_containers  # noqa: PLC0415  # tracked: #288
 
-        def fail_setup(_sandbox: DockerSandbox) -> None:
+        def fail_setup(_sandbox: BaseSandbox) -> None:
             raise ValueError("setup exploded")  # noqa: TRY003  # tracked: #288
 
         def run(cmd, **_kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
@@ -372,7 +373,7 @@ class TestSetupFns:
         sandbox = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="test-image",
-            setup_fns=[fail_setup],  # pyright: ignore[reportArgumentType]  # tracked: #297
+            setup_fns=[fail_setup],
         )
 
         try:
@@ -397,7 +398,7 @@ class TestSetupFns:
     ):
         from vs_sandbox.docker_sandbox import _live_containers  # noqa: PLC0415  # tracked: #288
 
-        def fail_setup(_sandbox: DockerSandbox) -> None:
+        def fail_setup(_sandbox: BaseSandbox) -> None:
             raise ValueError("setup exploded")  # noqa: TRY003  # tracked: #288
 
         def run(cmd, **_kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
@@ -417,7 +418,7 @@ class TestSetupFns:
         sandbox = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="test-image",
-            setup_fns=[fail_setup],  # pyright: ignore[reportArgumentType]  # tracked: #297
+            setup_fns=[fail_setup],
         )
 
         try:

@@ -3,27 +3,64 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+from vibesys.constants import ComputeBackend
+from vibesys.profilers import ProfilerKind
 from vibesys.run import DeviceLease
+from vibesys.sandbox.run_environment import AgentPaths, RunEnvironmentView
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from deepagents.backends.protocol import SandboxBackendProtocol
+
+    from vibesys.backends.base import ContentionMonitor, SandboxKind
+
+
+class _FakeDevice:
+    """Device stand-in; the lease only reads ``index``."""
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+        self.name = f"device-{index}"
+
+
+class _FakeBackend:
+    """``ComputeBackendImpl`` stand-in that selects no sandbox and no monitor."""
+
+    name = ComputeBackend.CPU
+    profiler_kind = ProfilerKind.NONE
+
+    def __init__(self, selected_device: _FakeDevice | None = None) -> None:
+        self.selected_device = selected_device
+
+    def make_sandbox(self, kind: SandboxKind, **kwargs: Any) -> SandboxBackendProtocol:  # noqa: ANN401  # tracked: #288
+        raise NotImplementedError
+
+    def make_monitor(self, log_dir: Path) -> ContentionMonitor | None:  # noqa: ARG002  # tracked: #288
+        return None
+
+    def reselect_device(self) -> None:
+        return
 
 
 def test_gpu_env_pins_selected_device(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    backend = SimpleNamespace(selected_device=SimpleNamespace(index=3))
-    lease = DeviceLease(backend, log_dir=tmp_path)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    backend = _FakeBackend(_FakeDevice(3))
+    lease = DeviceLease(backend, log_dir=tmp_path)
     assert lease.gpu_env() == {"CUDA_VISIBLE_DEVICES": "3"}
 
 
 def test_gpu_env_empty_without_device(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    lease = DeviceLease(SimpleNamespace(), log_dir=tmp_path)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    lease = DeviceLease(_FakeBackend(), log_dir=tmp_path)
     assert lease.gpu_env() == {}
 
 
 def test_reselect_skipped_when_view_disallows_host_reselect(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
     backend = MagicMock()
-    view = SimpleNamespace(host_device_reselect=False)
-    lease = DeviceLease(backend, log_dir=tmp_path, run_environment_view=view)  # pyright: ignore[reportArgumentType]  # tracked: #297
+    view = RunEnvironmentView(paths=AgentPaths(), host_device_reselect=False)
+    lease = DeviceLease(backend, log_dir=tmp_path, run_environment_view=view)
     lease.reselect()
     backend.reselect_device.assert_not_called()
 

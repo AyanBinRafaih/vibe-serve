@@ -5,8 +5,7 @@ owns session reuse, skill setup, response parsing, logging, usage records, and
 lifecycle. A driver owns native executor setup, policy translation, turns,
 events, and cleanup. Unsupported requirements fail before a session starts.
 
-Omitting `driver` selects `agentshim`. Select the optional Omnigent driver
-directly:
+Omitting `driver` selects `agentshim`. Select the Omnigent driver directly:
 
 ```toml
 [agent]
@@ -14,12 +13,35 @@ backend = "cli"
 driver = "omnigent"
 ```
 
-Contributors get the dependency from `uv sync --dev`. End-user installations
-need the optional extra:
+The `omnigent` package is a base dependency (pinned exactly in
+`pyproject.toml`), so every install carries it; `uv sync` is enough.
 
-```bash
-uv sync --extra omnigent
+## Mock driver
+
+`driver = "mock"` is test infrastructure. It satisfies the same driver
+contract while streaming a deterministic playbook, so tests exercise the real
+`AgentClient` -> `OutputSink` -> supervisor -> transport path without an agent
+CLI, a model, or a network. It never writes events, state, or files itself.
+
+```toml
+[agent]
+backend = "cli"
+driver = "mock"
 ```
+
+Two playbooks, both in `vibesys.agents.drivers.mock`:
+
+- `ScriptedPlaybook` synthesizes a turn from configurable counts: assistant
+  text chunks, thinking chunks, tool call/result pairs of a chosen payload
+  size, todo snapshots, and usage updates, with optional per-event pacing.
+- `ReplayPlaybook` re-emits a recorded run's `run-events.jsonl` at a
+  configurable speed (`0` replays as fast as the consumer accepts events).
+
+Structured turns are answered from `vibesys.agents.scripted_rounds`, which the
+stub agent client shares, so a scripted run completes loop rounds on the happy
+path. A response schema with no scripted artifact raises rather than being
+faked. The mock is not offered through the client protocol: driver choice
+stays an implementation detail.
 
 ## Omnigent constraints
 
@@ -27,8 +49,19 @@ uv sync --extra omnigent
   Gemini harness, and its `opencode-native` executor cannot run a headless
   VibeSys turn.
 - `--docker` is rejected because the integration has no container launcher.
-- MCP server setup is rejected because the driver does not translate VibeSys
-  MCP specifications.
+- Session-scoped stdio MCP servers use Omnigent's native MCP manager. VibeSys
+  translates its provider-independent server declarations into Omnigent
+  `MCPServerConfig` values, discovers namespaced tools before the first turn,
+  and owns each session's MCP connections and subprocess cleanup.
+  These generated specs declare no Omnigent guardrails; VibeSys remains the
+  authority for which session-scoped servers are supplied to each role.
+  Omnigent 0.10 launches stdio MCP subprocesses directly as children of the
+  VibeSys process, outside the agent's OS-tool sandbox. Session MCP specs must
+  therefore remain trusted framework configuration, not candidate input. With
+  an explicit server `env`, the subprocess inherits the VibeSys process
+  environment after Omnigent removes runner authentication secrets, then
+  overlays those values. Without an explicit `env`, Omnigent delegates to the
+  MCP SDK's restricted default environment.
 - Extra host resource grants are rejected. The Omnigent path imports only the
   installed Rust toolchain automatically.
 - Hidden project paths become explicit Omnigent masks. Read-only declarations

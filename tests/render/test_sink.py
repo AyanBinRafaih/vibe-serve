@@ -1,13 +1,16 @@
 """Tests for the process-global OutputSink emission point."""
 
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from vibesys.agents.callbacks import AgentLogger
 from vibesys.render.sink import OutputSink
 from vibesys.server.events import (
     AgentOutputChunkData,
+    CommandResultPayload,
     EventType,
+    JsonResultPayload,
     RunEvent,
     TodoItemData,
     TodoUpdateData,
@@ -19,7 +22,7 @@ from vibesys.server.registry import REGISTRY
 from vibesys.server.supervisor import RunSupervisor
 
 
-def _collect(sink: OutputSink) -> tuple[list[RunEvent], object]:
+def _collect(sink: OutputSink) -> tuple[list[RunEvent], Callable[[], None]]:
     seen: list[RunEvent] = []
     unsubscribe = sink.subscribe(seen.append)
     return seen, unsubscribe
@@ -41,7 +44,7 @@ class TestSubscription:
         sink = OutputSink()
         seen, unsubscribe = _collect(sink)
         sink.agent_output("one")
-        unsubscribe()  # pyright: ignore[reportCallIssue]  # tracked: #297
+        unsubscribe()
         sink.agent_output("two")
         assert [e.data.content for e in seen if isinstance(e.data, AgentOutputChunkData)] == ["one"]
 
@@ -85,6 +88,28 @@ class TestTypedEmitters:
         assert data.call_id == "call-1"
         assert data.content == "output text"
         assert data.is_error is True
+        assert data.payload is None
+
+    def test_tool_result_classifies_json_content_when_no_payload_given(self):  # noqa: ANN201  # tracked: #288
+        sink = OutputSink()
+        seen, _ = _collect(sink)
+        sink.tool_result("query", '{"count": 3}')
+        data = seen[0].data
+        assert isinstance(data, ToolResultData)
+        assert data.content == '{"count": 3}'
+        assert isinstance(data.payload, JsonResultPayload)
+        assert data.payload.value == {"count": 3}
+
+    def test_tool_result_provided_payload_preempts_classifier(self):  # noqa: ANN201  # tracked: #288
+        sink = OutputSink()
+        seen, _ = _collect(sink)
+        provided = CommandResultPayload(stdout='{"count": 3}', stderr="", exit_code=0, duration=0.2)
+        # JSON-looking content must not be re-guessed when the producer
+        # already attached real structure.
+        sink.tool_result("shell", '{"count": 3}', payload=provided)
+        data = seen[0].data
+        assert isinstance(data, ToolResultData)
+        assert data.payload == provided
 
     def test_todo_update_event(self):  # noqa: ANN201  # tracked: #288
         sink = OutputSink()

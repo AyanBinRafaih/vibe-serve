@@ -20,7 +20,7 @@ def registered_domains() -> list[str]:
 
 def resolve_domain(name: DomainName) -> DomainDefinition:
     """Resolve a registered domain enum to its definition."""
-    if not isinstance(name, DomainName):  # pyright: ignore[reportUnnecessaryIsInstance]
+    if not isinstance(name, DomainName):
         raise TypeError(f"domain must be a DomainName, got {type(name).__name__}.")  # noqa: TRY003  # tracked: #288
 
     domain = DOMAINS[name]

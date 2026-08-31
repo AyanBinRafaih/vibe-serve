@@ -6,23 +6,21 @@ import {
   SyntaxStyle,
   TextRenderable,
 } from '@opentui/core';
-import {
-  type CommandContext,
-  type SlashCommand,
-  slashCommandRange,
-  suggestSlashCommands,
-} from '../commands.js';
+import {type CommandContext, slashCommandRange, suggestSlashCommands} from '../commands.js';
+import {SuggestionMenu} from './suggestion-menu.js';
 import type {Theme} from './theme.js';
 
-export interface InputPanel {
+export interface CommandInputPanel {
   box: BoxRenderable;
   suggestions: BoxRenderable;
   /** Narrows the completions to the commands the current view offers. */
   setCommandContext(context: CommandContext): void;
   completeSuggestion(): boolean;
+  navigateSuggestions(direction: 1 | -1): boolean;
   /** True when nothing is typed, so Enter belongs to whatever pane is behind. */
   isEmpty(): boolean;
   focus(): void;
+  setFocused(focused: boolean): void;
   applyTheme(theme: Theme): void;
   destroy(): void;
 }
@@ -31,100 +29,21 @@ function commandSyntaxStyle(theme: Theme): SyntaxStyle {
   return SyntaxStyle.fromStyles({'slash-command': {fg: theme.accent, bold: true}});
 }
 
-/**
- * The docked chat's own input. It carries no command suggestions: the command
- * list belongs to the client's input, and this box is for questions about the
- * experiment on screen. A slash command typed here still runs, through the same
- * path as anywhere else.
- */
-export interface ChatInputPanel {
-  box: BoxRenderable;
-  isEmpty(): boolean;
-  focus(): void;
-  setFocused(focused: boolean): void;
-  applyTheme(theme: Theme): void;
-  destroy(): void;
-}
-
-export function createChatInputPanel(
-  renderer: CliRenderer,
-  onSubmit: (value: string) => void,
-  theme: Theme,
-  /**
-   * Called when the box is clicked. Clicking an input hands it the cursor at
-   * the renderer level, and that is invisible on its own: without telling the
-   * model, the pane focus stays where it was, the border and the hint keep
-   * pointing at the other box, and the operator types into a box that looks
-   * inert.
-   */
-  onFocusRequest: () => void = () => {},
-): ChatInputPanel {
-  const box = new BoxRenderable(renderer, {
-    // The modal chat owns 'chat-input-box'; this is the docked one.
-    id: 'chat-dock-input-box',
-    height: 3,
-    width: '100%',
-    border: true,
-    borderStyle: 'rounded',
-    borderColor: theme.border,
-    title: ' Chat ',
-    paddingLeft: 1,
-    paddingRight: 1,
-    onMouseUp: onFocusRequest,
-  });
-  const input = new InputRenderable(renderer, {
-    id: 'chat-dock-input',
-    width: '100%',
-    placeholder: 'Type a question',
-    textColor: theme.textStrong,
-    focusedTextColor: theme.textStrong,
-    onMouseUp: onFocusRequest,
-  });
-  const submit = (value: string): void => {
-    input.value = '';
-    onSubmit(value);
-  };
-  input.on(InputRenderableEvents.ENTER, submit);
-  box.add(input);
-  let focused = false;
-  let current = theme;
-  return {
-    box,
-    isEmpty: () => input.value.trim() === '',
-    focus: () => input.focus(),
-    // Which box the keystrokes land in is the one thing two inputs must never
-    // leave ambiguous, so the focused one carries the focus border.
-    setFocused(next: boolean): void {
-      focused = next;
-      box.borderColor = next ? current.borderFocus : current.border;
-    },
-    applyTheme(next: Theme): void {
-      current = next;
-      box.borderColor = focused ? next.borderFocus : next.border;
-      input.textColor = next.textStrong;
-      input.focusedTextColor = next.textStrong;
-    },
-    destroy(): void {
-      input.off(InputRenderableEvents.ENTER, submit);
-    },
-  };
-}
-
-export function createInputPanel(
+export function createCommandInputPanel(
   renderer: CliRenderer,
   onSubmit: (value: string) => void,
   theme: Theme,
   /** Called when the box is clicked, so the pane focus follows the cursor. */
   onFocusRequest: () => void = () => {},
-): InputPanel {
+): CommandInputPanel {
   const box = new BoxRenderable(renderer, {
-    id: 'input-box',
+    id: 'command-input-box',
     height: 3,
     width: '100%',
     border: true,
     borderStyle: 'rounded',
-    borderColor: theme.success,
-    title: ' Ask or command ',
+    borderColor: theme.borderFocus,
+    title: ' Command ',
     paddingLeft: 1,
     paddingRight: 1,
     onMouseUp: onFocusRequest,
@@ -132,16 +51,16 @@ export function createInputPanel(
   let syntaxStyle = commandSyntaxStyle(theme);
   let commandStyleId = syntaxStyle.getStyleId('slash-command');
   const input = new InputRenderable(renderer, {
-    id: 'input',
+    id: 'command-input',
     width: '100%',
-    placeholder: 'Type a question or /help',
+    placeholder: 'Type /help for commands',
     textColor: theme.textStrong,
     focusedTextColor: theme.textStrong,
     syntaxStyle,
     onMouseUp: onFocusRequest,
   });
   const suggestions = new BoxRenderable(renderer, {
-    id: 'input-suggestions',
+    id: 'command-input-suggestions',
     position: 'absolute',
     bottom: 3,
     left: 0,
@@ -157,7 +76,7 @@ export function createInputPanel(
     paddingRight: 1,
   });
   const suggestionList = new TextRenderable(renderer, {
-    id: 'input-suggestion-list',
+    id: 'command-input-suggestion-list',
     width: '100%',
     height: 1,
     fg: theme.textMuted,
@@ -166,7 +85,7 @@ export function createInputPanel(
     content: '',
   });
   suggestions.add(suggestionList);
-  let matches: readonly SlashCommand[] = [];
+  const menu = new SuggestionMenu();
   let context: CommandContext = {};
 
   const updateDecorations = (value: string): void => {
@@ -176,19 +95,11 @@ export function createInputPanel(
       input.addHighlightByCharRange({...range, styleId: commandStyleId});
     }
 
-    matches = suggestSlashCommands(value, context);
-    const visible = matches.length > 0;
-    suggestions.visible = visible;
-    suggestions.height = matches.length + 2;
-    suggestionList.height = Math.max(1, matches.length);
-    suggestionList.content = matches
-      .map(
-        (command, index) =>
-          `${index === 0 ? '›' : ' '} ${command.name.padEnd(10)} ${command.description}${
-            index === 0 && command.name !== value ? '  [Tab]' : ''
-          }`,
-      )
-      .join('\n');
+    menu.setMatches(suggestSlashCommands(value, context));
+    suggestions.visible = menu.visible;
+    suggestions.height = menu.matches.length + 2;
+    suggestionList.height = Math.max(1, menu.matches.length);
+    suggestionList.content = menu.renderLines(value).join('\n');
   };
   const submit = (value: string): void => {
     input.value = '';
@@ -197,6 +108,8 @@ export function createInputPanel(
   input.on(InputRenderableEvents.INPUT, updateDecorations);
   input.on(InputRenderableEvents.ENTER, submit);
   box.add(input);
+  let focused = true;
+  let current = theme;
   return {
     box,
     suggestions,
@@ -206,15 +119,25 @@ export function createInputPanel(
       updateDecorations(input.value);
     },
     completeSuggestion(): boolean {
-      const suggestion = matches[0];
-      if (suggestion === undefined || suggestion.name === input.value) return false;
-      input.value = suggestion.name;
+      const value = menu.complete(input.value);
+      if (value === null) return false;
+      input.value = value;
+      return true;
+    },
+    navigateSuggestions(direction: 1 | -1): boolean {
+      if (!menu.navigate(direction)) return false;
+      suggestionList.content = menu.renderLines(input.value).join('\n');
       return true;
     },
     isEmpty: () => input.value.trim() === '',
     focus: () => input.focus(),
+    setFocused(next: boolean): void {
+      focused = next;
+      box.borderColor = next ? current.borderFocus : current.border;
+    },
     applyTheme(next: Theme): void {
-      box.borderColor = next.success;
+      current = next;
+      box.borderColor = focused ? next.borderFocus : next.border;
       input.textColor = next.textStrong;
       input.focusedTextColor = next.textStrong;
       suggestions.borderColor = next.border;

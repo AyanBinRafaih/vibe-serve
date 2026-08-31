@@ -1,7 +1,10 @@
 import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
-import {hasActiveAgentTiming} from '../round-timing.js';
-import type {AgentPhase, RoundSummary} from '../run-map.js';
-import {roundAgentElapsedMs} from '../run-map.js';
+import {
+  type AgentPhase,
+  hasActiveAgentTiming,
+  type RoundSummary,
+  roundAgentElapsedMs,
+} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {scopedRounds, stripRounds, visiblePhases, visibleRoundNumber} from '../session-model.js';
@@ -13,6 +16,7 @@ import {
   NODE_HEIGHT,
   stageKinds,
 } from './agent-graph.js';
+import {agentRuntimeLabel} from './agent-runtime-label.js';
 import {elapsedLabel} from './previews.js';
 import type {Theme} from './theme.js';
 
@@ -90,6 +94,7 @@ export class AgentMapView {
       borderStyle: 'rounded',
       borderColor: theme.border,
       title: ' Agents ',
+      onMouseUp: () => this.controller.focusRound('agents'),
     });
   }
 
@@ -99,11 +104,12 @@ export class AgentMapView {
     this.#renderedState = null;
   }
 
-  render(state: SessionState): void {
+  render(state: SessionState, widthOverride?: number): void {
     const phases = visiblePhases(state);
     // The pane's width follows the terminal, so a resize has to redraw even
     // when the state is unchanged.
-    const width = agentPaneWidth(this.renderer.terminalWidth, stageKinds(phases).length);
+    const width =
+      widthOverride ?? agentPaneWidth(this.renderer.terminalWidth, stageKinds(phases).length);
     const paneWidth = width ?? STACKED_WIDTH;
     if (state === this.#renderedState && paneWidth === this.#renderedWidth) return;
     // Selection and focus are drawn into the nodes, so a change to either is a
@@ -198,12 +204,14 @@ export class AgentMapView {
       flexShrink: 1,
       flexDirection: 'column',
       justifyContent: 'center',
+      onMouseUp: () => this.controller.focusRound('agents'),
     });
     const canvas = new BoxRenderable(this.renderer, {
       id: 'agent-graph-canvas',
       width: '100%',
       height: graph.height,
       flexShrink: 0,
+      onMouseUp: () => this.controller.focusRound('agents'),
     });
     this.output.add(area);
     area.add(canvas);
@@ -266,6 +274,15 @@ export class AgentMapView {
         width: '100%',
       }),
     );
+    // Always drawn, even when empty, so every node keeps the same height
+    // (`NODE_HEIGHT`) whether or not it carries a runtime label.
+    box.add(
+      new TextRenderable(this.renderer, {
+        content: truncate(agentRuntimeLabel(phase.provider, phase.model) ?? '', inner),
+        fg: this.#theme.textMuted,
+        width: '100%',
+      }),
+    );
     return box;
   }
 
@@ -303,6 +320,7 @@ export class AgentMapView {
           }
         : {}),
       ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
+      onMouseUp: () => this.controller.selectAgent(phase.kind),
     });
     const color = statusColor(this.#theme, phase.status);
     row.add(
@@ -323,6 +341,16 @@ export class AgentMapView {
       row.add(
         new TextRenderable(this.renderer, {
           content: phase.roundLabel,
+          fg: this.#theme.textMuted,
+          width: '100%',
+        }),
+      );
+    }
+    const runtimeLabel = agentRuntimeLabel(phase.provider, phase.model);
+    if (runtimeLabel !== null) {
+      row.add(
+        new TextRenderable(this.renderer, {
+          content: runtimeLabel,
           fg: this.#theme.textMuted,
           width: '100%',
         }),
@@ -410,7 +438,7 @@ function truncate(text: string, width: number): string {
  */
 function headingLabel(roundNumber: number | null, round: RoundSummary | null): string {
   if (roundNumber === null) return 'Run flow';
-  const elapsedMs = round === null ? 0 : roundAgentElapsedMs(round);
+  const elapsedMs = round === null ? 0 : roundAgentElapsedMs(round, new Date());
   if (elapsedMs <= 0) return `Round ${roundNumber} flow`;
   return `Round ${roundNumber} flow · ${elapsedLabel(elapsedMs)}`;
 }

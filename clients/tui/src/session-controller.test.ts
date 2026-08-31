@@ -1,6 +1,14 @@
 import {describe, expect, it} from 'bun:test';
-import {type EventSubscription, SupervisionError} from './client.js';
-import type {ProtocolResponse, RequestInput, RunEvent, ServerMessage} from './protocol.js';
+import {
+  type EventSubscription,
+  type ProtocolResponse,
+  type RequestInput,
+  type RunEvent,
+  type ServerMessage,
+  type SubscribeOptions,
+  SupervisionError,
+} from '@vibesys/backend-client';
+import {resolveStartupTrace} from './boot-trace.js';
 import {SocketSessionController, type SupervisionTransport} from './session-controller.js';
 import {chatPaneVisible, experimentLogVisible} from './session-model.js';
 
@@ -9,7 +17,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/help');
+    await controller.submitCommand('/help');
 
     expect(controller.state.overlay?.kind).toBe('help');
     expect(controller.state.overlay?.content).toContain('/open-round');
@@ -17,11 +25,18 @@ describe('session controller', () => {
     expect(transport.requests).toEqual([]);
   });
 
-  it('sends ordinary text to the chat docked beside the log', async () => {
+  it('keeps ordinary text out of commands and accepts it from Experiment chat', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('what is happening?');
+    await controller.submitCommand('what is happening?');
+
+    expect(transport.requests).toEqual([]);
+    expect(controller.state.chatConversation).toEqual([]);
+    expect(controller.state.errorBanner?.message).toContain('Commands start with /');
+
+    controller.dismissErrorBanner();
+    await controller.submitChat('what is happening?');
 
     expect(transport.requests).toEqual([{type: 'query.chat', text: 'what is happening?'}]);
     // The pane is part of the landing view, so nothing opens over the table.
@@ -42,10 +57,48 @@ describe('session controller', () => {
     transport.emit({type: 'event_batch', events: [event(1, 'agent_output_chunk', 'one\n')]});
     transport.emit({type: 'event', event: event(2, 'agent_output_chunk', 'two\n')});
 
-    expect(controller.state.conversation.map(entry => entry.content).join('')).toBe('one\ntwo\n');
-    expect(controller.state.sequence).toBe(2);
+    expect(controller.state.core.transcript.map(entry => entry.content).join('')).toBe(
+      'one\ntwo\n',
+    );
+    expect(controller.state.core.sequence).toBe(2);
     await controller.stop();
     expect(transport.closed).toBe(true);
+  });
+
+  it('issues every boot request concurrently', async () => {
+    const started: string[] = [];
+    const pending: Array<() => void> = [];
+    const transport: SupervisionTransport = {
+      request(input: RequestInput): Promise<ProtocolResponse> {
+        started.push(input.type ?? 'untyped');
+        return new Promise(resolve => {
+          pending.push(() =>
+            resolve({
+              protocol_version: 1,
+              request_id: 'request',
+              timestamp: '2026-01-01T00:00:00Z',
+              ok: true,
+            }),
+          );
+        });
+      },
+      subscribe(): Promise<EventSubscription> {
+        started.push('subscribe');
+        return new Promise(resolve => {
+          pending.push(() => resolve({close: () => Promise.resolve()}));
+        });
+      },
+      close: () => Promise.resolve(),
+    };
+    const controller = new SocketSessionController(transport);
+
+    const boot = controller.start();
+
+    // The event replay is the long pole; nothing waits behind it, and nothing
+    // waits behind the two independent queries either.
+    expect([...started].sort()).toEqual(['query.experiments', 'query.snapshot', 'subscribe']);
+    for (const resolve of pending) resolve();
+    await boot;
   });
 
   it('applies a replay batch before reconciling its active execution checkpoint', async () => {
@@ -83,9 +136,67 @@ describe('session controller', () => {
       active_executions: [],
     });
 
-    expect(controller.state.sequence).toBe(2);
-    expect(controller.state.conversation.at(-1)?.content).toBe('persisted output\n');
-    expect(controller.state.activeExecutions).toEqual({});
+    expect(controller.state.core.sequence).toBe(2);
+    expect(controller.state.core.transcript.at(-1)?.content).toBe('persisted output\n');
+    expect(controller.state.core.activeExecutions).toEqual({});
+  });
+
+  it('does not surface an old failure banner when a replay batch resumes running', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emit({
+      type: 'event_batch',
+      events: [
+        {
+          ...event(1, 'run_failed'),
+          diagnostic: {
+            code: 'interrupted',
+            summary: 'A previous process was interrupted.',
+            scope: 'run',
+            severity: 'fatal',
+            retryability: 'never',
+          },
+        },
+        {
+          ...event(2, 'run_started'),
+          data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+        },
+      ],
+      through_sequence: 2,
+      active_executions: [],
+    });
+
+    expect(controller.state.core.status).toBe('running');
+    expect(controller.state.errorBanner).toBeNull();
+  });
+
+  it('shows the final failure from a terminal event batch', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emit({
+      type: 'event_batch',
+      events: [
+        {
+          ...event(1, 'run_failed'),
+          diagnostic: {
+            code: 'run_failed',
+            summary: 'The current run failed.',
+            scope: 'run',
+            severity: 'fatal',
+            retryability: 'never',
+          },
+        },
+      ],
+      through_sequence: 1,
+      active_executions: [],
+    });
+
+    expect(controller.state.core.status).toBe('failed');
+    expect(controller.state.errorBanner).toMatchObject({message: 'The current run failed.'});
   });
 
   it('keeps terminal state when the stream closes after completion', async () => {
@@ -95,12 +206,12 @@ describe('session controller', () => {
     transport.emit({type: 'event', event: event(1, 'run_finished')});
     transport.disconnect(new Error('closed'));
 
-    expect(controller.state.status).toBe('completed');
+    expect(controller.state.core.status).toBe('completed');
     expect(controller.state.overlay).toBeNull();
     expect(controller.state.errorBanner).toBeNull();
   });
 
-  it('clears active executions when the event stream disconnects unexpectedly', async () => {
+  it('preserves backend execution state but suppresses live activity after a disconnect', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
@@ -128,11 +239,12 @@ describe('session controller', () => {
         },
       },
     });
-    expect(controller.state.activeExecutions['impl-1']).toBeDefined();
+    expect(controller.state.core.activeExecutions['impl-1']).toBeDefined();
 
     transport.disconnect(new Error('Supervision event stream disconnected'));
 
-    expect(controller.state.activeExecutions).toEqual({});
+    expect(controller.state.core.activeExecutions['impl-1']).toBeDefined();
+    expect(controller.state.eventStreamAvailable).toBe(false);
     expect(controller.state.errorBanner).toMatchObject({scope: 'transport'});
   });
 
@@ -155,7 +267,7 @@ describe('session controller', () => {
     );
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/resume');
+    await controller.submitCommand('/resume');
 
     expect(controller.state.errorBanner).toMatchObject({
       message: diagnostic.summary,
@@ -211,7 +323,7 @@ describe('session controller', () => {
     );
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
 
     expect(transport.requests).toEqual([{type: 'query.performance'}]);
     // The chart lands beside the transcript, not over it.
@@ -251,7 +363,7 @@ describe('session controller', () => {
     );
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/chat');
+    await controller.submitCommand('/chat');
 
     // Already on screen: /chat puts the pane keys on it instead of opening a
     // modal over the log.
@@ -281,7 +393,7 @@ describe('session controller', () => {
     // A terminal too narrow for two columns, reported by the renderer.
     controller.setChatDockFits(false);
 
-    await controller.submit('what is happening?');
+    await controller.submitChat('what is happening?');
 
     expect(controller.state.chatOpen).toBe(true);
     expect(chatPaneVisible(controller.state)).toBe(false);
@@ -314,13 +426,13 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
 
-    await controller.submit('/help');
-    expect(controller.state.overlay?.content).not.toContain('/chat');
+    await controller.submitCommand('/help');
+    expect(controller.state.overlay?.content).not.toMatch(/\/chat\s/);
 
     // Inside a hypothesis the chat is a dialog again, so the command returns.
     controller.enterExperimentDrilldown();
-    await controller.submit('/help');
-    expect(controller.state.overlay?.content).toContain('/chat');
+    await controller.submitCommand('/help');
+    expect(controller.state.overlay?.content).toMatch(/\/chat\s/);
   });
 
   it('carries the modal conversation back into the docked pane', async () => {
@@ -333,7 +445,7 @@ describe('session controller', () => {
     controller.enterExperimentDrilldown();
 
     // Asked from the trajectory view, where the chat is a pop-up.
-    await controller.submit('/chat why did r1 fail?');
+    await controller.submitCommand('/chat why did r1 fail?');
     expect(controller.state.chatOpen).toBe(true);
 
     controller.live();
@@ -376,7 +488,7 @@ describe('session controller', () => {
     });
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/chat why?');
+    await controller.submitCommand('/chat why?');
 
     expect(controller.state.chatOpen).toBe(false);
     expect(controller.state.layout.focus).toBe('chat');
@@ -450,7 +562,7 @@ describe('session controller', () => {
     const transport = new FakeTransport([], [], undefined, new Error('Codex exited with code 1'));
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/chat');
+    await controller.submitCommand('/chat');
     await controller.sendChat('what happened?');
 
     expect(controller.state.chatPending).toBe(false);
@@ -473,7 +585,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport, 'solarized-dark');
 
-    await controller.submit('/theme');
+    await controller.submitCommand('/theme');
 
     expect(controller.state.themePicker?.selected).toBe('solarized-dark');
     // The list is a selection, not a text overlay.
@@ -486,7 +598,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/theme');
+    await controller.submitCommand('/theme');
     controller.moveThemeSelection(2);
     controller.applySelectedTheme();
 
@@ -498,7 +610,7 @@ describe('session controller', () => {
   it('closes the picker without switching when it is dismissed', async () => {
     const controller = new SocketSessionController(new FakeTransport(), 'light');
 
-    await controller.submit('/theme');
+    await controller.submitCommand('/theme');
     controller.moveThemeSelection(1);
     controller.closeThemePicker();
 
@@ -509,7 +621,7 @@ describe('session controller', () => {
   it('closes the picker when the selection is the theme already in use', async () => {
     const controller = new SocketSessionController(new FakeTransport(), 'light');
 
-    await controller.submit('/theme');
+    await controller.submitCommand('/theme');
     controller.applySelectedTheme();
 
     expect(controller.state.themeName).toBe('light');
@@ -520,8 +632,8 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/theme');
-    await controller.submit('/theme high-contrast-dark');
+    await controller.submitCommand('/theme');
+    await controller.submitCommand('/theme high-contrast-dark');
 
     expect(controller.state.themeName).toBe('high-contrast-dark');
     expect(controller.state.themePicker).toBeNull();
@@ -546,15 +658,21 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/history');
+    await controller.submitCommand('/history');
     expect(controller.state.errorBanner?.scope).toBe('input');
     expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
 
-    await controller.submit('/history rounds');
+    await controller.submitCommand('/history rounds');
     expect(controller.state.errorBanner?.message).toContain('Unknown command: /history rounds');
 
-    await controller.submit('/experiments');
+    await controller.submitCommand('/experiments');
     expect(controller.state.errorBanner?.message).toContain('Unknown command: /experiments');
+
+    controller.dismissErrorBanner();
+    expect(controller.state.errorBanner).toBeNull();
+
+    await controller.submitCommand('/history');
+    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
 
     expect(transport.requests).toEqual([]);
   });
@@ -566,6 +684,8 @@ describe('session controller', () => {
     ];
     const controller = new SocketSessionController(transport);
     await controller.start();
+    controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).not.toBeNull();
     controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).not.toBeNull();
 
@@ -635,6 +755,8 @@ describe('session controller', () => {
 
     // Per-round output is reachable only by opening a hypothesis.
     controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).not.toBeNull();
+    controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).not.toBeNull();
 
     // live() is the Ctrl+L path; it returns to the table rather than to an
@@ -664,11 +786,16 @@ describe('session controller', () => {
     controller.moveExperimentSelection(1);
 
     controller.enterExperimentDrilldown();
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-02', selectedRound: 3});
+    expect(controller.state.hypothesisScope).toBeNull();
+
+    controller.enterExperimentDrilldown();
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
     expect(controller.state.hypothesisScope?.label).toBe('H-02 · r2-3');
 
     controller.leaveExperimentDrilldown();
     expect(controller.state.hypothesisScope).toBeNull();
+    expect(controller.state.hypothesisDetail).toEqual({entryKey: 'H-02', selectedRound: 3});
     expect(controller.state.experimentLog?.selectedId).toBe('H-02');
   });
 
@@ -702,6 +829,96 @@ describe('session controller', () => {
 
     expect(controller.state.experimentLog?.pending).toBe(false);
     expect(controller.state.experimentLog?.selectedId).toBe('H-resumed');
+  });
+
+  it('reports how long the landing view waited for experiments', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const traced: string[] = [];
+    const controller = new SocketSessionController(transport, undefined, line => traced.push(line));
+
+    await controller.start();
+
+    expect(traced).toHaveLength(1);
+    expect(traced[0]).toMatch(/^experiments loaded in \d+ms \(1 entries\)$/);
+  });
+
+  it('times the whole wait across a closed gate, and reports it once', async () => {
+    const transport = new FakeTransport();
+    transport.experimentsReady = false;
+    const traced: string[] = [];
+    const controller = new SocketSessionController(transport, undefined, line => traced.push(line));
+
+    await controller.start();
+    expect(traced).toEqual([]);
+
+    transport.experiments = [entry('H-resumed', 1, 1, {active: true}), entry('H-02', 2, 2, {})];
+    transport.experimentsReady = true;
+    transport.emit({type: 'event', event: event(1, 'experiments_changed')});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(traced).toEqual([expect.stringMatching(/^experiments loaded in \d+ms \(2 entries\)$/)]);
+
+    // A later refresh is not a boot cost, so it does not report again.
+    transport.emit({type: 'event', event: event(2, 'experiments_changed')});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(traced).toHaveLength(1);
+  });
+
+  it('stays silent through the real sink unless the boot trace is switched on', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const written: string[] = [];
+    const controller = new SocketSessionController(
+      transport,
+      undefined,
+      resolveStartupTrace({VIBESYS_LAUNCH_START_MS: String(Date.now() - 25)}, line =>
+        written.push(line),
+      ),
+    );
+
+    await controller.start();
+
+    expect(written).toEqual([]);
+  });
+
+  it('writes one anchored line through the real sink when the boot trace is on', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const written: string[] = [];
+    const controller = new SocketSessionController(
+      transport,
+      undefined,
+      resolveStartupTrace(
+        {VIBESYS_BOOT_TRACE: '1', VIBESYS_LAUNCH_START_MS: String(Date.now() - 25)},
+        line => written.push(line),
+      ),
+    );
+
+    await controller.start();
+
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatch(/^experiments loaded in \d+ms \(1 entries\); \d+ms since launch$/);
+  });
+
+  it('omits the since-launch suffix when the launch anchor is absent', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [entry('H-01', 1, 1, {resolved_outcome: 'proven'})];
+    const written: string[] = [];
+    const controller = new SocketSessionController(
+      transport,
+      undefined,
+      resolveStartupTrace({VIBESYS_BOOT_TRACE: '1'}, line => written.push(line)),
+    );
+
+    await controller.start();
+
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatch(/^experiments loaded in \d+ms \(1 entries\)$/);
+    expect(written[0]).not.toContain('since launch');
   });
 
   it('coalesces refetches when a burst of experiment changes lands', async () => {
@@ -758,7 +975,7 @@ describe('session controller', () => {
     await controller.start();
     controller.moveExperimentSelection(1);
 
-    await controller.submit('/open-round');
+    await controller.submitCommand('/open-round');
 
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-02', rounds: [2, 3]});
     // Lands on the hypothesis's latest round: the round view is built around
@@ -780,7 +997,7 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
 
-    await controller.submit('/open-round --3');
+    await controller.submitCommand('/open-round --3');
 
     // Lands on the requested round, inside the hypothesis that owns it, and
     // moves the table selection to match.
@@ -802,7 +1019,7 @@ describe('session controller', () => {
       event: {...event(1, 'phase_started'), agent_kind: 'orchestrator', round_label: 'round-9-pre'},
     });
 
-    await controller.submit('/open-round --9');
+    await controller.submitCommand('/open-round --9');
 
     expect(controller.state.hypothesisScope).toMatchObject({id: 'round-9', rounds: [9]});
     expect(controller.state.selectedRound).toBe(9);
@@ -826,7 +1043,7 @@ describe('session controller', () => {
   it('reports a round that has not been observed', async () => {
     const controller = new SocketSessionController(new FakeTransport());
 
-    await controller.submit('/open-round --9');
+    await controller.submitCommand('/open-round --9');
 
     expect(controller.state.overlay?.content).toContain('Round 9 has not been recorded.');
     expect(controller.state.hypothesisScope).toBeNull();
@@ -839,9 +1056,9 @@ describe('session controller', () => {
     ];
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submit('/open-round');
+    await controller.submitCommand('/open-round');
 
-    await controller.submit('/open-round');
+    await controller.submitCommand('/open-round');
 
     expect(controller.state.overlay?.content).toContain('Already inside H-01');
     expect(controller.state.hypothesisScope).toMatchObject({id: 'H-01'});
@@ -854,7 +1071,7 @@ describe('session controller', () => {
     );
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
     const before = perfRequests(transport);
 
     transport.emit({type: 'event', event: event(9, 'round_finished')});
@@ -869,7 +1086,7 @@ describe('session controller', () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
     controller.closePane();
     const before = perfRequests(transport);
 
@@ -889,7 +1106,7 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
     await controller.sendChat('why?');
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
 
     controller.closePane();
 
@@ -909,7 +1126,7 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
     await controller.start();
 
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
     await controller.sendChat('what changed in r1?');
 
     // Three columns: chat, log, pane. None of them replaced another.
@@ -927,7 +1144,7 @@ describe('session controller', () => {
     });
     const controller = new SocketSessionController(transport);
     await controller.start();
-    await controller.submit('/perf');
+    await controller.submitCommand('/perf');
     const pane = controller.state.layout.right;
 
     await controller.sendChat('what regressed?');
@@ -950,7 +1167,7 @@ describe('session controller', () => {
   it('runs a slash command typed in the chat through the main input path', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
-    await controller.submit('/chat');
+    await controller.submitCommand('/chat');
     const before = transport.requests.length;
 
     // The performance plot, which is the command that answers in the right
@@ -964,14 +1181,15 @@ describe('session controller', () => {
     expect(controller.state.chatConversation).toHaveLength(0);
   });
 
-  it('reports an unknown slash command in the chat instead of asking the agent', async () => {
+  it('shows the chat help for an unknown slash command instead of asking the agent', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
     await controller.submitChat('/nope');
 
-    expect(controller.state.errorBanner).toMatchObject({scope: 'input'});
-    expect(controller.state.errorBanner?.message).toContain('Unknown command');
+    // Chat-scoped help, not the global surface's "unknown command" banner.
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.chatConversation.at(-1)?.content).toContain('/clear');
     expect(transport.requests).toEqual([]);
   });
 
@@ -992,16 +1210,502 @@ describe('session controller', () => {
     expect(controller.state.chatConversation.at(-1)?.content).toBe('Nothing yet.');
   });
 
+  it('renders /model from the backend options, grouped by harness', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+
+    expect(transport.requests.at(-1)).toEqual({type: 'query.chat_options'});
+    const menu = controller.state.chatMenu;
+    expect(menu?.kind).toBe('model');
+    expect(menu?.pending).toBe(false);
+    // Exactly what the backend returned: harness groups, their models, and one
+    // free-text entry per group. The client enumerates nothing of its own.
+    expect(menu?.rows.map(row => [row.kind, row.label])).toEqual([
+      ['header', 'Codex'],
+      ['model', 'gpt-run  \u00b7 run default'],
+      ['model', 'gpt-5.6-sol'],
+      ['custom', 'custom model\u2026'],
+      ['header', 'Claude Code'],
+      ['model', 'claude-opus-5'],
+      ['custom', 'custom model\u2026'],
+    ]);
+    // Headers are structure, so the highlight starts on the first real choice.
+    expect(menu?.selected).toBe(1);
+  });
+
+  it('starts a thread on the selected model, sending no driver', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+    controller.moveChatMenuSelection(1);
+    await controller.confirmChatMenu();
+
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat_thread_create',
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+    });
+    expect(controller.state.chatMenu).toBeNull();
+    // The thread record comes from the replayed backend event, and the
+    // client switches the chat surfaces to it.
+    expect(controller.state.core.chatThreads.map(thread => thread.id)).toEqual([
+      'default',
+      'thread-1',
+    ]);
+    expect(controller.state.activeChatThreadId).toBe('thread-1');
+  });
+
+  it('accepts a typed model from a group\u2019s custom entry', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+    // Down to the Claude group's custom entry, skipping the group headers.
+    controller.moveChatMenuSelection(4);
+    expect(controller.state.chatMenu?.rows[controller.state.chatMenu.selected]).toMatchObject({
+      kind: 'custom',
+      provider: 'claude',
+    });
+    for (const character of 'claude-sonnet-5') controller.typeChatMenuCustomModel(character);
+    controller.backspaceChatMenuCustomModel();
+    controller.typeChatMenuCustomModel('5');
+    await controller.confirmChatMenu();
+
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat_thread_create',
+      provider: 'claude',
+      model: 'claude-sonnet-5',
+    });
+    expect(controller.state.activeChatThreadId).toBe('thread-1');
+  });
+
+  it('leaves an empty custom entry alone rather than guessing a model', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+    controller.moveChatMenuSelection(2);
+    await controller.confirmChatMenu();
+
+    expect(transport.requests.at(-1)).toEqual({type: 'query.chat_options'});
+    expect(controller.state.chatMenu?.kind).toBe('model');
+  });
+
+  it('reports a chat-options failure in the menu instead of an empty list', async () => {
+    const transport = new ThreadTransport();
+    transport.chatOptions = null;
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/model');
+
+    expect(controller.state.chatMenu?.error).toContain('has not reported its chat options');
+    expect(controller.state.chatMenu?.selected).toBe(-1);
+  });
+
+  it('/clear starts a fresh thread on the current thread\u2019s settings', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submitChat('/model');
+    controller.moveChatMenuSelection(1);
+    await controller.confirmChatMenu();
+    await controller.sendChat('what changed?');
+
+    await controller.submitChat('/clear');
+
+    // Same harness and model, a new thread, and the old one still listed.
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat_thread_create',
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+    });
+    expect(controller.state.activeChatThreadId).toBe('thread-2');
+    expect(controller.state.core.chatThreads.map(thread => thread.id)).toEqual([
+      'default',
+      'thread-1',
+      'thread-2',
+    ]);
+    // The cleared thread keeps its transcript, so /resume gets it back intact.
+    expect(controller.state.chatConversations['thread-1']?.map(item => item.content)).toEqual([
+      'what changed?',
+      'Thread answer.',
+    ]);
+    expect(controller.state.chatConversation).toEqual([]);
+  });
+
+  it('/clear on the default thread lets the backend resolve the run settings', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/clear');
+
+    expect(transport.requests.at(-1)).toEqual({type: 'query.chat_thread_create'});
+  });
+
+  it('answers unknown slash input in the composer with the chat help', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    const before = transport.requests.length;
+
+    await controller.submitChat('/threads');
+
+    // No request at all, and no global "unknown command" error banner.
+    expect(transport.requests.length).toBe(before);
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.chatConversation.at(-1)?.content).toContain('/model');
+  });
+
+  it('still forwards a global command typed into the composer', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/pause');
+
+    expect(transport.requests.at(-1)).toEqual({type: 'command.pause'});
+  });
+
+  it('sends chat to the active thread and keeps transcripts apart', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submitChat('/model');
+    await controller.confirmChatMenu();
+    expect(controller.state.activeChatThreadId).toBe('thread-1');
+
+    await controller.sendChat('which kernel changed?');
+
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat',
+      text: 'which kernel changed?',
+      thread_id: 'thread-1',
+    });
+    expect(controller.state.chatConversations['thread-1']?.map(entry => entry.content)).toEqual([
+      'which kernel changed?',
+      'Thread answer.',
+    ]);
+    expect(controller.state.chatConversations['default'] ?? []).toEqual([]);
+
+    // Switching swaps what the singular selectors show; nothing is lost.
+    controller.switchChatThread('default');
+    expect(controller.state.chatConversation).toEqual([]);
+    await controller.sendChat('and the default thread?');
+    expect(transport.requests.at(-1)).toEqual({
+      type: 'query.chat',
+      text: 'and the default thread?',
+    });
+    controller.switchChatThread('thread-1');
+    expect(controller.state.chatConversation.map(entry => entry.content)).toEqual([
+      'which kernel changed?',
+      'Thread answer.',
+    ]);
+  });
+
+  it('/resume lists the threads with their runtime and switches', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await controller.submitChat('/model');
+    await controller.confirmChatMenu();
+    controller.switchChatThread('default');
+
+    await controller.submitChat('/resume');
+
+    const menu = controller.state.chatMenu;
+    expect(menu?.kind).toBe('resume');
+    expect(menu?.rows.map(row => [row.kind, row.label])).toEqual([
+      ['thread', 'Experiment chat'],
+      ['thread', 'Codex (GPT Run)'],
+    ]);
+    // The runtime is spelled out beside each thread, harness and model only.
+    expect(menu?.rows.map(row => (row.kind === 'thread' ? row.detail : null))).toEqual([
+      'run agent',
+      'Codex (GPT Run)',
+    ]);
+    // The highlight starts on the thread that is currently on screen.
+    expect(menu?.selected).toBe(0);
+
+    controller.moveChatMenuSelection(1);
+    await controller.confirmChatMenu();
+
+    expect(controller.state.chatMenu).toBeNull();
+    expect(controller.state.activeChatThreadId).toBe('thread-1');
+  });
+
   it('reports an unknown theme as an error without switching', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
-    await controller.submit('/theme monokai');
+    await controller.submitCommand('/theme monokai');
 
     expect(controller.state.errorBanner).toMatchObject({scope: 'input'});
     expect(controller.state.errorBanner?.message).toContain('Unknown theme: monokai');
     expect(controller.state.themeName).toBe('dark');
     expect(transport.requests).toEqual([]);
+  });
+
+  it('boots against the tail of the stream rather than the whole history', async () => {
+    const transport = new HistoryTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+
+    expect(transport.subscribeTails).toEqual([1_000]);
+  });
+
+  it('falls back once to a full subscription when the tail is rejected', async () => {
+    const history = [
+      event(1, 'agent_output_chunk', 'one\n'),
+      event(2, 'agent_output_chunk', 'two\n'),
+    ];
+    const transport = new HistoryTransport(history);
+    transport.rejectTail = true;
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+
+    // The rejection is the capability probe, so there is exactly one retry and
+    // it carries no tail.
+    expect(transport.subscribeTails).toEqual([1_000, undefined]);
+
+    transport.emitBatch(history, 0);
+
+    expect(controller.state.core.transcript.map(item => item.content).join('')).toBe('one\ntwo\n');
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    // A boot that recovered is not a boot that failed.
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.eventStreamAvailable).toBe(true);
+  });
+
+  it('reports the transport error when the full subscription fails too', async () => {
+    const transport = new HistoryTransport();
+    transport.rejectTail = true;
+    transport.subscribeError = new Error('Supervision server is disconnected');
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+
+    expect(transport.subscribeTails).toEqual([1_000, undefined]);
+    expect(controller.state.eventStreamAvailable).toBe(false);
+    expect(controller.state.errorBanner).toMatchObject({scope: 'transport'});
+  });
+
+  it('loads older history on demand while the fold is only a suffix', async () => {
+    const history = longHistory(2_000);
+    const transport = new HistoryTransport(history);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emitBatch(history.slice(1_500), 1_500);
+
+    expect(controller.state.core.historyAfterSequence).toBe(1_500);
+    expect(controller.state.core.transcript).toHaveLength(500);
+
+    await expect(controller.loadOlderHistory()).resolves.toBe(true);
+
+    expect(eventsQueries(transport)).toEqual([
+      {type: 'query.events', after_sequence: 500, before_sequence: 1_501},
+    ]);
+    expect(controller.state.core.historyAfterSequence).toBe(500);
+    expect(controller.state.core.transcript).toHaveLength(1_500);
+  });
+
+  it('stops asking once the history floor reaches the start of the run', async () => {
+    const history = longHistory(2_000);
+    const transport = new HistoryTransport(history);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(history.slice(1_500), 1_500);
+
+    await controller.loadOlderHistory();
+    await expect(controller.loadOlderHistory()).resolves.toBe(true);
+
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    expect(controller.state.core.transcript).toHaveLength(2_000);
+    const issued = eventsQueries(transport).length;
+
+    await expect(controller.loadOlderHistory()).resolves.toBe(false);
+
+    expect(eventsQueries(transport)).toHaveLength(issued);
+
+    // Every batch of the subscription repeats the floor it bootstrapped with,
+    // which must not undo the backfill and send the client back for history it
+    // already holds.
+    transport.emitBatch([event(2_001, 'agent_output_chunk', 'live\n')], 1_500);
+
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    await expect(controller.loadOlderHistory()).resolves.toBe(false);
+    expect(eventsQueries(transport)).toHaveLength(issued);
+  });
+
+  it('leaves the history floor where it was when a backfill fails', async () => {
+    const history = longHistory(2_000);
+    const transport = new HistoryTransport(history);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(history.slice(1_500), 1_500);
+    transport.eventsError = new Error('The event store is unavailable');
+
+    await expect(controller.loadOlderHistory()).resolves.toBe(false);
+
+    expect(controller.state.core.historyAfterSequence).toBe(1_500);
+    expect(controller.state.errorBanner).toMatchObject({scope: 'request'});
+    expect(controller.state.errorBanner?.message).toContain('The event store is unavailable');
+
+    // The unchanged floor is what makes the same range retryable.
+    transport.eventsError = null;
+    await expect(controller.loadOlderHistory()).resolves.toBe(true);
+    expect(controller.state.core.historyAfterSequence).toBe(500);
+  });
+
+  it('backfills once under concurrent requests', async () => {
+    const history = longHistory(2_000);
+    const transport = new HistoryTransport(history);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(history.slice(1_500), 1_500);
+    transport.deferEvents = true;
+
+    const first = controller.loadOlderHistory();
+    const second = controller.loadOlderHistory();
+
+    expect(eventsQueries(transport)).toHaveLength(1);
+
+    transport.releaseEvents();
+
+    await expect(first).resolves.toBe(true);
+    await expect(second).resolves.toBe(true);
+    expect(controller.state.core.historyAfterSequence).toBe(500);
+  });
+
+  it('folds a spine event re-delivered by a backfill exactly once', async () => {
+    // A tail subscription replays the run-level spine from below the floor, so
+    // the backfill covering that range delivers those events a second time.
+    const firstRound = roundFinished(2, 1);
+    const secondRound = roundFinished(4, 2);
+    const tail = event(5, 'agent_output_chunk', 'five\n');
+    const history = [
+      event(1, 'agent_output_chunk', 'one\n'),
+      firstRound,
+      event(3, 'agent_output_chunk', 'three\n'),
+      secondRound,
+      tail,
+    ];
+    const replayedTransport = new HistoryTransport(history);
+    const replayed = new SocketSessionController(replayedTransport);
+    await replayed.start();
+    replayedTransport.emitBatch(history, 0);
+
+    const tailedTransport = new HistoryTransport(history);
+    const tailed = new SocketSessionController(tailedTransport);
+    await tailed.start();
+    // The spine (both `round_finished` events) below the floor, then the tail.
+    tailedTransport.emitBatch([firstRound, secondRound, tail], 4);
+    await tailed.loadOlderHistory();
+
+    expect(tailed.state.core.historyAfterSequence).toBe(0);
+    expect(tailed.state.core.transcript).toEqual(replayed.state.core.transcript);
+    expect(tailed.state.core.rounds).toEqual(replayed.state.core.rounds);
+  });
+});
+
+/**
+ * The run's durable event log is attached after the client subscribes, so the
+ * subscription's first batch comes from the server's own short log and the
+ * stream then re-bootstraps at a tail of the run log. The two batches number
+ * different logs, and the second declares a floor above the first.
+ */
+describe('a stream that re-bootstraps at a raised floor', () => {
+  /** The run log, whose last event is the pre-attach one carried into it. */
+  const runLog: RunEvent[] = [
+    {
+      ...event(1, 'run_started'),
+      data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+    },
+    event(2, 'agent_output_chunk', 'two\n'),
+    roundFinished(3, 1),
+    event(4, 'agent_output_chunk', 'four\n'),
+    event(5, 'agent_output_chunk', 'five\n'),
+    event(6, 'agent_output_chunk', 'server started\n'),
+  ];
+  /** What the stream sends once the run log is attached: spine, then tail. */
+  const rebootstrap = [runLog[0], runLog[2], runLog[4], runLog[5]] as RunEvent[];
+  const preAttach = [event(1, 'agent_output_chunk', 'server started\n')];
+
+  async function rebootstrapped(transport: HistoryTransport): Promise<SocketSessionController> {
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(preAttach, 0);
+    transport.emitBatch(rebootstrap, 4);
+    return controller;
+  }
+
+  it('keeps the raised floor so the skipped history is still backfillable', async () => {
+    const transport = new HistoryTransport(runLog);
+
+    const controller = await rebootstrapped(transport);
+
+    expect(controller.state.core.historyAfterSequence).toBe(4);
+    await expect(controller.loadOlderHistory()).resolves.toBe(true);
+    expect(eventsQueries(transport)).toEqual([
+      {type: 'query.events', after_sequence: 0, before_sequence: 5},
+    ]);
+  });
+
+  it('folds the spine the pre-attach cursor would otherwise have swallowed', async () => {
+    const controller = await rebootstrapped(new HistoryTransport(runLog));
+
+    // `run_started` and `round_finished` sit at or below the cursor the
+    // superseded log left behind, in a sequence space that no longer applies.
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.outerLoop).toBe('agent');
+    expect(controller.state.core.rounds.map(round => round.number)).toEqual([1]);
+  });
+
+  it('reaches the state a full replay of the run log would have built', async () => {
+    const replayedTransport = new HistoryTransport(runLog);
+    const replayed = new SocketSessionController(replayedTransport);
+    await replayed.start();
+    replayedTransport.emitBatch(runLog, 0);
+
+    const controller = await rebootstrapped(new HistoryTransport(runLog));
+    await controller.loadOlderHistory();
+
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    expect(controller.state.core.transcript).toEqual(replayed.state.core.transcript);
+    expect(controller.state.core.rounds).toEqual(replayed.state.core.rounds);
+    expect(controller.state.core.sequence).toBe(replayed.state.core.sequence);
+  });
+
+  it('refreshes experiments from a change buried in the re-bootstrap batch', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emit({type: 'event_batch', events: preAttach, history_after_sequence: 0});
+    const before = transport.requests.length;
+
+    transport.emit({
+      type: 'event_batch',
+      events: [...rebootstrap, event(7, 'experiments_changed')],
+      history_after_sequence: 4,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(controller.state.core.historyAfterSequence).toBe(4);
+    expect(transport.requests.slice(before).map(request => request.type)).toEqual([
+      'query.experiments',
+    ]);
   });
 });
 
@@ -1163,6 +1867,206 @@ class DeferredChatTransport implements SupervisionTransport {
   close(): Promise<void> {
     return Promise.resolve();
   }
+}
+
+/** A backend that creates one thread and answers threaded chat. */
+class ThreadTransport implements SupervisionTransport {
+  readonly requests: RequestInput[] = [];
+  #sequence = 0;
+  #threads = 0;
+  /** Providers and models the backend says this run offers. */
+  chatOptions: NonNullable<ProtocolResponse['chat_options']> | null = {
+    providers: [
+      {
+        provider: 'codex',
+        models: [
+          {model: 'gpt-run', source: 'run', default: true},
+          {model: 'gpt-5.6-sol', source: 'suggested', default: false},
+        ],
+      },
+      {provider: 'claude', models: [{model: 'claude-opus-5', source: 'suggested', default: false}]},
+    ],
+  };
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    this.requests.push(input);
+    const base = {
+      protocol_version: 1 as const,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true,
+    };
+    if (input.type === 'query.snapshot') {
+      return Promise.resolve({...base, snapshot: {run_id: 'run', status: 'running', sequence: 0}});
+    }
+    if (input.type === 'query.experiments') {
+      return Promise.resolve({...base, experiments: [], experiments_ready: true});
+    }
+    if (input.type === 'query.chat_options') {
+      return Promise.resolve({...base, chat_options: this.chatOptions});
+    }
+    if (input.type === 'query.chat_thread_create') {
+      const threadId = `thread-${++this.#threads}`;
+      // The backend resolves the run's own driver; the client never sends one.
+      const settings = {
+        driver: 'agentshim',
+        provider: input.provider ?? 'codex',
+        model: input.model ?? 'gpt-run',
+      };
+      return Promise.resolve({
+        ...base,
+        chat_thread: {thread_id: threadId, title: '', ...settings},
+        events: [
+          {
+            sequence: ++this.#sequence,
+            timestamp: '2026-01-01T00:00:01Z',
+            type: 'chat_thread_created' as const,
+            agent_kind: 'chat',
+            round_label: 'experiment-chat',
+            chat_thread_id: threadId,
+            data: {
+              kind: 'chat_thread_created' as const,
+              thread_id: threadId,
+              title: '',
+              ...settings,
+              created_at: '2026-01-01T00:00:01Z',
+            },
+          },
+        ],
+      });
+    }
+    if (input.type === 'query.chat') {
+      const threadId = input.thread_id ?? null;
+      return Promise.resolve({
+        ...base,
+        chat: {question: input.text, answer: 'Thread answer.', effect: 'none' as const},
+        events: [
+          {
+            sequence: ++this.#sequence,
+            timestamp: '2026-01-01T00:00:02Z',
+            type: 'chat' as const,
+            agent_kind: 'chat',
+            round_label: 'experiment-chat',
+            text: input.text,
+            ...(threadId === null ? {} : {chat_thread_id: threadId}),
+            data: {kind: 'chat' as const, answer: 'Thread answer.'},
+          },
+        ],
+      });
+    }
+    return Promise.resolve(base);
+  }
+
+  subscribe(
+    _afterSequence: number,
+    _onMessage: (message: ServerMessage) => void,
+    _onDisconnect: (error: Error) => void,
+  ): Promise<EventSubscription> {
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/**
+ * A tail-capable backend holding one run's whole history. The subscription
+ * delivers whatever a test emits, and `query.events` answers out of the same
+ * history, so a backfill returns exactly the range the controller asked for.
+ */
+class HistoryTransport implements SupervisionTransport {
+  readonly requests: RequestInput[] = [];
+  /** The `tail` each subscribe carried, in order; `undefined` for a plain one. */
+  readonly subscribeTails: Array<number | undefined> = [];
+  /** Rejects a subscribe carrying `tail`, the way a server without the field does. */
+  rejectTail = false;
+  /** Fails every subscribe, tail or not. */
+  subscribeError: Error | null = null;
+  /** Fails `query.events` instead of answering it. */
+  eventsError: Error | null = null;
+  /** Holds `query.events` answers until the test releases them. */
+  deferEvents = false;
+  readonly #pendingEvents: Array<() => void> = [];
+  #message: ((message: ServerMessage) => void) | null = null;
+
+  constructor(private readonly history: readonly RunEvent[] = []) {}
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    this.requests.push(input);
+    const base = {
+      protocol_version: 1 as const,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true as const,
+    };
+    if (input.type !== 'query.events') return Promise.resolve(base);
+    if (this.eventsError !== null) return Promise.reject(this.eventsError);
+    const after = input.after_sequence ?? 0;
+    const before = input.before_sequence ?? Number.MAX_SAFE_INTEGER;
+    const response = {
+      ...base,
+      events: this.history.filter(
+        item => (item.sequence ?? 0) > after && (item.sequence ?? 0) < before,
+      ),
+    };
+    if (!this.deferEvents) return Promise.resolve(response);
+    return new Promise(resolve => this.#pendingEvents.push(() => resolve(response)));
+  }
+
+  subscribe(
+    _afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    _onDisconnect: (error: Error) => void,
+    options?: SubscribeOptions,
+  ): Promise<EventSubscription> {
+    this.subscribeTails.push(options?.tail);
+    if (this.subscribeError !== null) return Promise.reject(this.subscribeError);
+    if (this.rejectTail && options?.tail !== undefined) {
+      return Promise.reject(new SupervisionError('Extra inputs are not permitted: tail'));
+    }
+    this.#message = onMessage;
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  /** One bootstrap batch: the spine below the floor, then the tail. */
+  emitBatch(events: readonly RunEvent[], historyAfterSequence: number): void {
+    this.#message?.({
+      type: 'event_batch',
+      events: [...events],
+      history_after_sequence: historyAfterSequence,
+    });
+  }
+
+  releaseEvents(): void {
+    const pending = this.#pendingEvents.shift();
+    if (!pending) throw new Error('No pending query.events request');
+    pending();
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+function eventsQueries(transport: HistoryTransport): RequestInput[] {
+  return transport.requests.filter(request => request.type === 'query.events');
+}
+
+function longHistory(length: number): RunEvent[] {
+  return Array.from({length}, (_, index) =>
+    event(index + 1, 'agent_output_chunk', `event ${index + 1}\n`),
+  );
+}
+
+function roundFinished(sequence: number, round: number): RunEvent {
+  return {
+    sequence,
+    timestamp: '2026-01-01T00:00:00Z',
+    type: 'round_finished',
+    round_label: `round-${round}`,
+    data: {kind: 'round_finished', attempts: 1, judge_verdict: 'pass'},
+  };
 }
 
 function perfRequests(transport: FakeTransport): number {

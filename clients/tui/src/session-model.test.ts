@@ -1,27 +1,36 @@
 import {describe, expect, it, test} from 'bun:test';
-import type {RunEvent} from './protocol.js';
+import type {RunEvent} from '@vibesys/backend-client';
 import type {SessionState} from './session-model.js';
 import {
   applyActiveExecutionCheckpoint,
   applyEvent,
+  applyEventBatch,
   chatDocked,
   chatPaneVisible,
   closePane,
   closeThemePicker,
   cyclePaneFocus,
+  dismissErrorBanner,
   enterExperimentDrilldown,
   enterExperimentRound,
   enterUnownedExperimentRound,
+  experimentIndexItems,
   failPane,
+  focusedPane,
   focusPane,
+  focusRound,
   hypothesisPlanningActivity,
   initialSessionState,
   leaveExperimentDrilldown,
+  leaveHypothesisDetail,
+  markEventStreamUnavailable,
   moveExperimentSelection,
+  moveHypothesisRoundSelection,
   moveThemeSelection,
   openChat,
   openPane,
   openThemePicker,
+  reportError,
   selectExperimentActivity,
   selectNextAgent,
   selectNextRound,
@@ -32,12 +41,67 @@ import {
   setTheme,
   showDetail,
   statusText,
+  togglePaneZoom,
   toggleTodos,
   unownedExperimentRounds,
+  visibleActiveExecutions,
   visibleConversation,
   visiblePhases,
   visibleTodos,
 } from './session-model.js';
+
+describe('event batch projection', () => {
+  it('keeps the existing banner while resumed history ends in a running session', () => {
+    const before = reportError(initialSessionState(), 'Local input problem', {scope: 'input'});
+
+    const state = applyEventBatch(before, [
+      {
+        ...event(1, 'run_failed'),
+        diagnostic: {
+          code: 'interrupted',
+          summary: 'Previous process was interrupted.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+      event(2, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+    ]);
+
+    expect(state.core.status).toBe('running');
+    expect(state.core.diagnostics).toHaveLength(1);
+    expect(state.errorBanner).toEqual(before.errorBanner);
+  });
+
+  it('surfaces the final diagnostic when a batch ends in failure', () => {
+    const state = applyEventBatch(initialSessionState(), [
+      event(1, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+      {
+        ...event(2, 'run_failed'),
+        diagnostic: {
+          code: 'run_failed',
+          summary: 'The current run failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+    ]);
+
+    expect(state.core.status).toBe('failed');
+    expect(state.errorBanner).toMatchObject({message: 'The current run failed.', scope: 'run'});
+  });
+});
 
 describe('hypothesis planning activity', () => {
   function stateFor(
@@ -48,15 +112,18 @@ describe('hypothesis planning activity', () => {
     return setExperiments(
       {
         ...initialSessionState(),
-        phases: [
-          {
-            kind,
-            status: 'active',
-            roundNumber: 3,
-            roundLabel,
-            startedAt: '2026-01-01T00:00:00Z',
-          },
-        ],
+        core: {
+          ...initialSessionState().core,
+          phases: [
+            {
+              kind,
+              status: 'active',
+              roundNumber: 3,
+              roundLabel,
+              startedAt: '2026-01-01T00:00:00Z',
+            },
+          ],
+        },
       },
       entries,
     );
@@ -97,7 +164,7 @@ describe('hypothesis planning activity', () => {
 
   it('keeps elapsed planning time from the earliest observed planning phase', () => {
     const state = stateFor('orchestrator', 'round-3-plan');
-    state.phases = [
+    state.core.phases = [
       {
         kind: 'orchestrator',
         status: 'completed',
@@ -121,11 +188,14 @@ describe('hypothesis planning activity', () => {
     expect(hypothesisPlanningActivity(stateFor('profiler', 'round-3-profile-retry'))).toBeNull();
   });
 
-  it('selects planning activity ahead of existing hypotheses and opens its recorded round', () => {
+  it('selects planning activity after existing hypotheses and opens its recorded round', () => {
     let state = setExperiments(
       {
         ...stateFor('orchestrator', 'round-3-plan'),
-        rounds: [{number: 3, status: 'active' as const}],
+        core: {
+          ...stateFor('orchestrator', 'round-3-plan').core,
+          rounds: [{number: 3, status: 'active' as const}],
+        },
       },
       [
         {
@@ -140,7 +210,7 @@ describe('hypothesis planning activity', () => {
       ],
     );
 
-    state = moveExperimentSelection(state, -1);
+    state = moveExperimentSelection(state, 1);
     expect(state.experimentLog?.selectedActivity).toBe(true);
 
     const opened = enterExperimentDrilldown(state);
@@ -151,7 +221,10 @@ describe('hypothesis planning activity', () => {
   it('opens the first planning activity without a synthetic hypothesis row', () => {
     const state = {
       ...stateFor('orchestrator', 'round-3-pre'),
-      rounds: [{number: 3, status: 'active' as const}],
+      core: {
+        ...stateFor('orchestrator', 'round-3-pre').core,
+        rounds: [{number: 3, status: 'active' as const}],
+      },
     };
 
     const opened = enterExperimentDrilldown(selectExperimentActivity(state));
@@ -161,10 +234,149 @@ describe('hypothesis planning activity', () => {
   it('does not duplicate the planning round as an unowned index item', () => {
     const state = {
       ...stateFor('orchestrator', 'round-3-plan'),
-      rounds: [{number: 3, status: 'active' as const}],
+      core: {
+        ...stateFor('orchestrator', 'round-3-plan').core,
+        rounds: [{number: 3, status: 'active' as const}],
+      },
     };
 
     expect(unownedExperimentRounds(state)).toEqual([]);
+  });
+
+  it('orders mixed history by round and keeps live planning last', () => {
+    const state = setExperiments(
+      {
+        ...initialSessionState(),
+        core: {
+          ...initialSessionState().core,
+          phases: [
+            {
+              kind: 'orchestrator',
+              status: 'active' as const,
+              roundNumber: 5,
+              roundLabel: 'round-5-plan',
+            },
+          ],
+          rounds: [
+            {number: 4, status: 'completed' as const},
+            {number: 2, status: 'completed' as const},
+            {number: 5, status: 'active' as const},
+          ],
+        },
+      },
+      [
+        {
+          hypothesis_id: 'H-03',
+          identified: true,
+          first_round: 3,
+          last_round: 3,
+          rounds: [],
+          kept: false,
+          active: false,
+        },
+        {
+          hypothesis_id: 'H-01',
+          identified: true,
+          first_round: 1,
+          last_round: 1,
+          rounds: [],
+          kept: true,
+          active: false,
+        },
+      ],
+    );
+
+    expect(
+      experimentIndexItems(state).map(item =>
+        item.kind === 'hypothesis'
+          ? item.entry.hypothesis_id
+          : item.kind === 'round'
+            ? `round-${item.roundNumber}`
+            : `planning-${item.activity.roundNumber}`,
+      ),
+    ).toEqual(['H-01', 'round-2', 'H-03', 'round-4', 'planning-5']);
+  });
+
+  it('moves a selected planning row onto the hypothesis that materializes from it', () => {
+    let state = selectExperimentActivity(
+      setExperiments(
+        {
+          ...stateFor('orchestrator', 'round-3-plan'),
+          core: {
+            ...stateFor('orchestrator', 'round-3-plan').core,
+            rounds: [{number: 3, status: 'active' as const}],
+          },
+        },
+        [],
+      ),
+    );
+    // Phase completion may arrive before the refreshed experiment response.
+    state = {
+      ...state,
+      core: {
+        ...state.core,
+        phases: state.core.phases.map(phase => ({...phase, status: 'completed' as const})),
+      },
+    };
+    state = setExperiments(state, [
+      {
+        hypothesis_id: 'H-03',
+        identified: true,
+        first_round: 3,
+        last_round: 3,
+        rounds: [],
+        kept: false,
+        active: true,
+      },
+    ]);
+
+    expect(state.experimentLog).toMatchObject({
+      selectedId: 'H-03',
+      selectedActivity: false,
+      selectedActivityRound: null,
+    });
+  });
+});
+
+describe('hypothesis scope label', () => {
+  it('prefers the backend-supplied title over the hypothesis id', () => {
+    const state = setExperiments(initialSessionState(), [
+      {
+        hypothesis_id: 'H-01',
+        identified: true,
+        title: 'Batch decode requests',
+        first_round: 1,
+        last_round: 1,
+        rounds: [{round: 1, passed: true, reviewed: true}],
+        kept: false,
+        active: false,
+      },
+    ]);
+
+    const opened = enterExperimentRound(state, 1);
+
+    expect(opened?.hypothesisScope).toMatchObject({
+      id: 'H-01',
+      label: 'Batch decode requests · r1',
+    });
+  });
+
+  it('falls back to the hypothesis id when there is no title', () => {
+    const state = setExperiments(initialSessionState(), [
+      {
+        hypothesis_id: 'H-01',
+        identified: true,
+        first_round: 1,
+        last_round: 1,
+        rounds: [{round: 1, passed: true, reviewed: true}],
+        kept: false,
+        active: false,
+      },
+    ]);
+
+    const opened = enterExperimentRound(state, 1);
+
+    expect(opened?.hypothesisScope).toMatchObject({id: 'H-01', label: 'H-01 · r1'});
   });
 });
 
@@ -172,11 +384,14 @@ describe('unowned rounds', () => {
   it('opens an observed round and keeps its turns scoped to that round', () => {
     const state = {
       ...initialSessionState(),
-      rounds: [{number: 9, status: 'completed' as const}],
-      conversation: [
-        {id: 'r8', kind: 'assistant' as const, content: 'old', roundNumber: 8},
-        {id: 'r9', kind: 'assistant' as const, content: 'kept', roundNumber: 9},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 9, status: 'completed' as const}],
+        transcript: [
+          {id: 'r8', kind: 'assistant' as const, content: 'old', roundNumber: 8},
+          {id: 'r9', kind: 'assistant' as const, content: 'kept', roundNumber: 9},
+        ],
+      },
     };
     const opened = enterUnownedExperimentRound(state, 9);
 
@@ -185,7 +400,13 @@ describe('unowned rounds', () => {
   });
 
   it('does not turn an announced but unobserved round into historical work', () => {
-    const state = {...initialSessionState(), maxRounds: 9};
+    const state = {
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        maxRounds: 9,
+      },
+    };
     expect(enterUnownedExperimentRound(state, 9)).toBeNull();
   });
 
@@ -269,13 +490,13 @@ describe('session event model', () => {
       ),
     );
 
-    expect(Object.keys(state.activeExecutions)).toEqual(['impl-1', 'review-1']);
-    expect(state.activeExecutions['impl-1']?.activity).toEqual({
+    expect(Object.keys(state.core.activeExecutions)).toEqual(['impl-1', 'review-1']);
+    expect(state.core.activeExecutions['impl-1']?.activity).toEqual({
       mode: 'tool',
       summary: 'Running queue tests',
       tool: 'Bash',
     });
-    expect(state.activeExecutions['review-1']?.activity.summary).toBe(
+    expect(state.core.activeExecutions['review-1']?.activity.summary).toBe(
       'Waiting for the implementation',
     );
 
@@ -292,7 +513,38 @@ describe('session event model', () => {
         'implementer',
       ),
     );
-    expect(Object.keys(state.activeExecutions)).toEqual(['review-1']);
+    expect(Object.keys(state.core.activeExecutions)).toEqual(['review-1']);
+  });
+
+  it('keeps last-known executions but stops presenting them after the event stream is lost', () => {
+    const active = applyEvent(
+      initialSessionState(),
+      executionEvent(
+        1,
+        'agent_execution_started',
+        'impl-1',
+        {
+          kind: 'agent_execution_started',
+          stage: 'implementation',
+          attempt: 1,
+          system_prompt: '',
+          user_prompt: 'Implement the queue',
+          activity: {
+            kind: 'agent_execution_activity_changed',
+            mode: 'thinking',
+            summary: 'Inspecting the queue',
+            tool: null,
+          },
+        },
+        'implementer',
+      ),
+    );
+
+    const disconnected = markEventStreamUnavailable(active);
+
+    expect(disconnected.core).toBe(active.core);
+    expect(disconnected.core.activeExecutions['impl-1']).toBeDefined();
+    expect(visibleActiveExecutions(disconnected)).toEqual([]);
   });
 
   it('reconciles from a checkpoint without advancing the replay cursor', () => {
@@ -314,16 +566,22 @@ describe('session event model', () => {
       },
     ]);
 
-    expect(state.sequence).toBe(0);
-    expect(state.activeExecutions['judge-2']).toMatchObject({
+    expect(state.core.sequence).toBe(0);
+    expect(state.core.activeExecutions['judge-2']).toMatchObject({
       agentKind: 'judge',
       roundNumber: 2,
       activity: {summary: 'Inspecting the diff'},
     });
 
-    const newer = {...state, sequence: 5};
-    expect(applyActiveExecutionCheckpoint(newer, [], 4).activeExecutions).toEqual(
-      state.activeExecutions,
+    const newer = {
+      ...state,
+      core: {
+        ...state.core,
+        sequence: 5,
+      },
+    };
+    expect(applyActiveExecutionCheckpoint(newer, [], 4).core.activeExecutions).toEqual(
+      state.core.activeExecutions,
     );
   });
 
@@ -357,7 +615,7 @@ describe('session event model', () => {
       data: {kind: 'run_interrupted', reason: 'SIGINT', signal: 'SIGINT'},
     });
 
-    expect(interrupted.activeExecutions).toEqual({});
+    expect(interrupted.core.activeExecutions).toEqual({});
   });
 
   it('tracks and finishes chat executions before routing their transcript', () => {
@@ -384,7 +642,9 @@ describe('session event model', () => {
       ),
     );
 
-    expect(state.activeExecutions['chat-execution']?.activity.summary).toBe('Inspecting the run');
+    expect(state.core.activeExecutions['chat-execution']?.activity.summary).toBe(
+      'Inspecting the run',
+    );
     state = applyEvent(
       state,
       executionEvent(
@@ -395,7 +655,7 @@ describe('session event model', () => {
         'chat',
       ),
     );
-    expect(state.activeExecutions).toEqual({});
+    expect(state.core.activeExecutions).toEqual({});
   });
 
   it('reduces semantic events into a presentation-neutral transcript', () => {
@@ -426,8 +686,12 @@ describe('session event model', () => {
       }),
     );
 
-    expect(state.conversation.map(entry => entry.kind)).toEqual(['status', 'assistant', 'result']);
-    expect(state.conversation[1]?.content).toBe('checking accuracy\n');
+    expect(state.core.transcript.map(entry => entry.kind)).toEqual([
+      'status',
+      'assistant',
+      'result',
+    ]);
+    expect(state.core.transcript[1]?.content).toBe('checking accuracy\n');
   });
 
   it('renders a deferred round as provisional rather than failed', () => {
@@ -442,7 +706,7 @@ describe('session event model', () => {
       }),
     );
 
-    expect(state.conversation[0]).toMatchObject({
+    expect(state.core.transcript[0]).toMatchObject({
       label: 'round-1 · SKIPPED',
       tone: 'normal',
     });
@@ -452,9 +716,9 @@ describe('session event model', () => {
     let state = applyEvent(initialSessionState(), event(4, 'run_finished'));
     state = applyEvent(state, event(3, 'run_failed'));
 
-    expect(state.status).toBe('completed');
-    expect(state.sequence).toBe(4);
-    expect(state.terminal).toBe(true);
+    expect(state.core.status).toBe('completed');
+    expect(state.core.sequence).toBe(4);
+    expect(state.core.terminal).toBe(true);
   });
 
   it('shows structured configuration failures as terminal conversation entries', () => {
@@ -470,17 +734,17 @@ describe('session event model', () => {
       }),
     );
 
-    expect(state.status).toBe('failed');
-    expect(state.terminal).toBe(true);
+    expect(state.core.status).toBe('failed');
+    expect(state.core.terminal).toBe(true);
     expect(state.overlay).toBeNull();
     expect(state.errorBanner).toMatchObject({
       title: 'Configuration failed',
       severity: 'fatal',
     });
     expect(state.errorBanner?.message).toContain('This run has completed 30 rounds.');
-    expect(state.conversation[0]?.content).toContain('This run has completed 30 rounds.');
-    expect(state.conversation[0]?.content).toContain('resume_limit_exhausted');
-    expect(state.conversation[0]?.tone).toBe('failure');
+    expect(state.core.transcript[0]?.content).toContain('This run has completed 30 rounds.');
+    expect(state.core.transcript[0]?.content).toContain('resume_limit_exhausted');
+    expect(state.core.transcript[0]?.tone).toBe('failure');
   });
 
   it('promotes an invocation failure to one terminal error banner', () => {
@@ -507,6 +771,56 @@ describe('session event model', () => {
       title: 'Run failed',
       severity: 'fatal',
       count: 2,
+    });
+  });
+
+  it('dismisses an error without changing session state or suppressing later errors', () => {
+    const state = reportError({...initialSessionState(), selectedRound: 2}, 'The request failed.', {
+      scope: 'request',
+    });
+    const dismissed = dismissErrorBanner(state);
+
+    expect(dismissed.errorBanner).toBeNull();
+    expect(dismissed.selectedRound).toBe(2);
+    expect(dismissErrorBanner(dismissed)).toBe(dismissed);
+    expect(
+      reportError(dismissed, 'A later failure.', {scope: 'transport'}).errorBanner,
+    ).toMatchObject({message: 'A later failure.', scope: 'transport'});
+  });
+
+  it('resurfaces a dismissed diagnostic when core projects its terminal promotion', () => {
+    let state = applyEvent(initialSessionState(), {
+      ...event(1, 'invocation_finished'),
+      invocation_id: 'invocation-1',
+      diagnostic: {
+        id: 'failure-1',
+        code: 'agent_failed',
+        summary: 'The worker failed.',
+        detail: null,
+        scope: 'invocation',
+        severity: 'error',
+        retryability: 'manual',
+      },
+    });
+    state = dismissErrorBanner(state);
+    state = applyEvent(state, {
+      ...event(2, 'run_failed'),
+      diagnostic: {
+        id: 'failure-1',
+        code: 'agent_failed',
+        summary: 'The worker failed.',
+        detail: 'Exit code: 2',
+        scope: 'invocation',
+        severity: 'fatal',
+        retryability: 'manual',
+      },
+    });
+
+    expect(state.errorBanner).toMatchObject({
+      diagnosticId: 'failure-1',
+      detail: 'Exit code: 2',
+      severity: 'fatal',
+      count: 1,
     });
   });
 
@@ -654,8 +968,8 @@ describe('session event model', () => {
       }),
     );
 
-    expect(state.conversation).toEqual([]);
-    expect(state.agentKind).toBeNull();
+    expect(state.core.transcript).toEqual([]);
+    expect(state.core.agentKind).toBeNull();
     // Routed to the chat, and filtered there to the answer itself.
     expect(state.chatConversation.map(entry => entry.kind)).toEqual(['assistant']);
     expect(state.chatConversation.at(-1)?.content).toBe('Round 2 improved throughput.');
@@ -742,12 +1056,12 @@ describe('session event model', () => {
       ),
     );
 
-    expect(state.conversation.map(entry => entry.content)).toEqual([
+    expect(state.core.transcript.map(entry => entry.content)).toEqual([
       'hello world',
       '→ Bash(command="first")\nfirst result',
       '→ Bash(command="second")\nsecond result',
     ]);
-    expect(state.conversation[1]).toMatchObject({
+    expect(state.core.transcript[1]).toMatchObject({
       toolCall: '→ Bash(command="first")\n',
       toolResponse: 'first result',
     });
@@ -782,14 +1096,15 @@ describe('session event model', () => {
       ),
     );
 
-    expect(state.conversation.map(entry => entry.content)).toEqual([
-      '→ Bash(command="first")\nfirst result',
-      '→ Bash(command="second")\nsecond result',
+    expect(state.core.transcript.map(entry => entry.content)).toEqual([
+      'first result',
+      'second result',
     ]);
-    expect(state.conversation[0]).toMatchObject({
+    expect(state.core.transcript[0]).toMatchObject({
       kind: 'tool',
-      toolCall: '→ Bash(command="first")\n',
-      toolResponse: 'first result',
+      toolName: 'Bash',
+      toolArguments: {command: 'first'},
+      toolResult: {kind: 'tool_result', tool: 'Bash', content: 'first result'},
     });
   });
 
@@ -832,19 +1147,21 @@ describe('session event model', () => {
       ),
     );
 
-    expect(state.conversation.map(entry => entry.toolResponse)).toEqual(['result a', 'result b']);
+    expect(state.core.transcript.map(entry => entry.toolResult?.content)).toEqual([
+      'result a',
+      'result b',
+    ]);
   });
 
-  it('truncates long typed tool-call arguments and renders non-string args as JSON', () => {
+  it('retains long typed tool-call arguments for presentation', () => {
     const longArg = 'x'.repeat(200);
     const state = applyEvent(
       initialSessionState(),
       event(1, 'tool_call', {kind: 'tool_call', tool: 'Edit', args: {text: longArg, count: 3}}),
     );
 
-    expect(state.conversation[0]?.toolCall).toContain(`text="${'x'.repeat(80)}..."`);
-    expect(state.conversation[0]?.toolCall).toContain('count=3');
-    expect(state.conversation[0]?.toolCall).not.toContain(longArg);
+    expect(state.core.transcript[0]?.toolArguments).toEqual({text: longArg, count: 3});
+    expect(state.core.transcript[0]?.toolCall).toBeUndefined();
   });
 
   it('prefers typed tool events over legacy tool-channel chunks', () => {
@@ -864,9 +1181,9 @@ describe('session event model', () => {
       ),
     );
 
-    expect(state.typedToolEvents).toBe(true);
-    expect(state.conversation).toHaveLength(1);
-    expect(state.conversation[0]?.toolCall).toBe('→ Bash(command="ls")\n');
+    expect(state.core.typedToolEvents).toBe(true);
+    expect(state.core.transcript).toHaveLength(1);
+    expect(state.core.transcript[0]?.toolArguments).toEqual({command: 'ls'});
   });
 
   it('stores todo updates as per-phase data instead of transcript text', () => {
@@ -881,7 +1198,7 @@ describe('session event model', () => {
       }),
     );
 
-    expect(state.todoPhases).toEqual([
+    expect(state.core.todos).toEqual([
       {
         executionId: null,
         agentKind: 'judge',
@@ -892,7 +1209,7 @@ describe('session event model', () => {
         ],
       },
     ]);
-    expect(state.conversation).toHaveLength(0);
+    expect(state.core.transcript).toHaveLength(0);
   });
 
   it('keeps each phase’s todo list separate so agents never clobber each other', () => {
@@ -961,8 +1278,8 @@ describe('session event model', () => {
       ),
     );
 
-    expect(state.todoPhases).toHaveLength(2);
-    expect(state.todoPhases.map(phase => phase.executionId)).toEqual(['impl-a', 'impl-b']);
+    expect(state.core.todos).toHaveLength(2);
+    expect(state.core.todos.map(phase => phase.executionId)).toEqual(['impl-a', 'impl-b']);
     expect(visibleTodos({...state, selectedRound: 1, selectedAgentKind: 'implementer'})).toEqual([
       {content: 'Edit implementation B', status: 'in_progress'},
     ]);
@@ -1000,7 +1317,7 @@ describe('session event model', () => {
       }),
     );
 
-    expect(state.todoPhases[0]?.items).toEqual([{content: 'Mystery step', status: 'deferred'}]);
+    expect(state.core.todos[0]?.items).toEqual([{content: 'Mystery step', status: 'deferred'}]);
   });
 
   it('toggles the todo strip between collapsed and expanded', () => {
@@ -1023,13 +1340,13 @@ describe('session event model', () => {
       }),
     );
 
-    expect(state.usage).toEqual({
+    expect(state.core.usage).toEqual({
       inputTokens: 20_100,
       contextWindow: 1_000_000,
       model: 'claude-sonnet-4-6',
     });
     expect(statusText(state)).toContain('20k/1.0M tokens');
-    expect(state.conversation).toHaveLength(0);
+    expect(state.core.transcript).toHaveLength(0);
   });
 
   it('classifies prompt events as distinct markdown turns', () => {
@@ -1047,7 +1364,7 @@ describe('session event model', () => {
       ),
     );
 
-    expect(state.conversation).toMatchObject([
+    expect(state.core.transcript).toMatchObject([
       {
         kind: 'prompt',
         content: '# Task\n\nUse `pytest`.',
@@ -1065,7 +1382,7 @@ describe('session event model', () => {
         max_rounds: 5,
       }),
     );
-    expect(state.phases).toEqual([]);
+    expect(state.core.phases).toEqual([]);
 
     state = applyEvent(state, {
       ...event(2, 'phase_started', {kind: 'phase', phase: 'orchestrator', attempt: null}),
@@ -1076,7 +1393,7 @@ describe('session event model', () => {
       agent_kind: 'orchestrator',
     });
 
-    expect(state.rounds).toMatchObject([{number: 1, status: 'active'}]);
+    expect(state.core.rounds).toMatchObject([{number: 1, status: 'active'}]);
     expect(visiblePhases(state).map(phase => `${phase.kind}:${phase.status}`)).toEqual([
       'orchestrator:completed',
       'implementer:pending',
@@ -1149,6 +1466,47 @@ describe('session event model', () => {
   });
 });
 
+describe('hypothesis detail navigation', () => {
+  const hypothesis = {
+    hypothesis_id: 'H-01',
+    identified: true,
+    claim: 'A complete causal hypothesis that must never be truncated in its detail view.',
+    first_round: 1,
+    last_round: 2,
+    rounds: [
+      {round: 1, passed: true, reviewed: true},
+      {round: 2, passed: false, reviewed: true},
+    ],
+    kept: false,
+    active: false,
+  };
+
+  it('moves from index to hypothesis to round and unwinds one level at a time', () => {
+    const landing = setExperiments(initialSessionState(), [hypothesis]);
+    const detail = enterExperimentDrilldown(landing);
+
+    expect(detail.hypothesisDetail).toEqual({entryKey: 'H-01', selectedRound: 2});
+    expect(detail.hypothesisScope).toBeNull();
+
+    const earlier = moveHypothesisRoundSelection(detail, -1);
+    expect(earlier.hypothesisDetail?.selectedRound).toBe(1);
+
+    const round = enterExperimentDrilldown(earlier);
+    expect(round.hypothesisScope).toMatchObject({id: 'H-01', rounds: [1, 2]});
+    expect(round.selectedRound).toBe(1);
+
+    const backToDetail = leaveExperimentDrilldown(round);
+    expect(backToDetail.hypothesisDetail?.selectedRound).toBe(1);
+    expect(leaveHypothesisDetail(backToDetail).hypothesisDetail).toBeNull();
+  });
+
+  it('closes a detail whose hypothesis disappears during refresh', () => {
+    const detail = enterExperimentDrilldown(setExperiments(initialSessionState(), [hypothesis]));
+
+    expect(setExperiments(detail, []).hypothesisDetail).toBeNull();
+  });
+});
+
 describe('docked experiment chat', () => {
   const entry = {
     hypothesis_id: 'H-01',
@@ -1165,8 +1523,12 @@ describe('docked experiment chat', () => {
     expect(chatDocked(landing)).toBe(true);
     expect(chatPaneVisible(landing)).toBe(true);
 
-    // Inside a hypothesis the row belongs to the transcript.
-    const scoped = enterExperimentDrilldown(landing);
+    // The hypothesis summary and its trajectories both use the full content
+    // column rather than competing with experiment chat.
+    const detail = enterExperimentDrilldown(landing);
+    expect(detail.hypothesisDetail).not.toBeNull();
+    expect(chatDocked(detail)).toBe(false);
+    const scoped = enterExperimentDrilldown(detail);
     expect(scoped.hypothesisScope).not.toBeNull();
     expect(chatDocked(scoped)).toBe(false);
   });
@@ -1292,6 +1654,39 @@ describe('right pane layout', () => {
     expect(closed.chatOpen).toBe(true);
     expect(closed.chatConversation).toEqual(withChat.chatConversation);
   });
+
+  it('zooms the semantic focused pane and restores the unchanged split state', () => {
+    const split = setPaneContent(openPane(initialSessionState(), 'perf'), 'perf', 'chart');
+    const chat = focusPane(split, 'chat');
+    const zoomed = togglePaneZoom(chat);
+
+    expect(focusedPane(zoomed)).toBe('chat');
+    expect(zoomed.layout.zoomedPane).toBe('chat');
+    expect(zoomed.layout.right).toBe(split.layout.right);
+    expect(zoomed.chatConversation).toBe(split.chatConversation);
+    expect(cyclePaneFocus(zoomed)).toBe(zoomed);
+
+    const restored = togglePaneZoom(zoomed);
+    expect(restored.layout).toEqual(chat.layout);
+  });
+
+  it('uses round focus to zoom agents and transcript', () => {
+    const round = {...initialSessionState(), experimentLog: null};
+    const agents = focusRound(round, 'agents');
+
+    expect(togglePaneZoom(agents).layout.zoomedPane).toBe('agents');
+    expect(togglePaneZoom(round).layout.zoomedPane).toBe('transcript');
+  });
+
+  it('never reports the hidden agents pane as focused beside a visualization', () => {
+    const agents = focusRound({...initialSessionState(), experimentLog: null}, 'agents');
+    const split = focusPane(openPane(agents, 'perf'), 'left');
+
+    expect(split.roundFocus).toBe('agents');
+    expect(focusedPane(split)).toBe('transcript');
+    expect(togglePaneZoom(split).layout.zoomedPane).toBe('transcript');
+    expect(focusedPane(closePane(split))).toBe('agents');
+  });
 });
 
 function event(
@@ -1394,22 +1789,25 @@ describe('re-entering a round after leaving it', () => {
   function scoped() {
     const base: SessionState = {
       ...initialSessionState(),
-      rounds: [
-        {number: 1, status: 'completed'},
-        {number: 2, status: 'active'},
-      ],
-      phases: [
-        {
-          kind: 'implementer',
-          status: 'completed',
-          roundNumber: 1,
-          roundLabel: 'round-1-implementer',
-        },
-        {kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'},
-      ],
-      conversation: [
-        {id: 'a', kind: 'assistant', label: 'implementer', content: 'patched', roundNumber: 1},
-      ],
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'active'},
+        ],
+        phases: [
+          {
+            kind: 'implementer',
+            status: 'completed',
+            roundNumber: 1,
+            roundLabel: 'round-1-implementer',
+          },
+          {kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {id: 'a', kind: 'assistant', label: 'implementer', content: 'patched', roundNumber: 1},
+        ],
+      },
     };
     return setExperiments(base, [hypothesis]);
   }

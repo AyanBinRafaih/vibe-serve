@@ -40,9 +40,13 @@ class DiagnosticRetryability(StrEnum):
 
 
 class Diagnostic(BaseModel):
-    """Structured, provider-neutral description of an operator diagnostic."""
+    """Structured, provider-neutral description of an operator diagnostic.
 
-    model_config = ConfigDict(extra="forbid")
+    Frozen for the same reason as ``RunEvent``: diagnostics ride along on
+    replayed events, which readers share rather than copy.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     code: str

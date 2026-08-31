@@ -1,0 +1,92 @@
+# TUI architecture
+
+The TypeScript frontend has three packages with one allowed dependency direction:
+
+```text
+@vibesys/backend-client <- @vibesys/core-state <- @vibesys/tui
+                         \_______________________^
+```
+
+`@vibesys/tui` may depend on both packages. Reverse imports and cross-package relative imports are
+forbidden and checked by `pnpm check:ts-architecture`.
+
+Dependency-cruiser parses and resolves the TypeScript graph for dependency direction, cycles,
+unresolvable or undeclared imports, public package entry points, and the runtime-independence rules
+for `core-state`. `tsconfig.architecture.json` maps workspace package names to their public source
+entry points, so the check does not depend on prior builds. A small manifest check covers forbidden
+workspace dependencies that are declared but unused, because they do not appear in a source
+dependency graph. Rule regressions run as part of `pnpm test:clients`.
+
+## Ownership
+
+| State or behavior | Owner |
+| --- | --- |
+| Generated protocol types, socket framing, connection lifecycle, requests, event subscription | `backend-client` |
+| Status, rounds, phases, executions, transcripts, todos, usage, benchmarks, diagnostics | `core-state` |
+| Focus, selection, layout, zoom, theme, modals, drafts, query progress | `tui` |
+| Terminal widgets, rendering, keyboard and mouse events | `tui` |
+
+The backend client performs I/O and exposes validated protocol messages. Core state is a pure fold
+over snapshots, ordered events, and active-execution checkpoints. The TUI owns all interaction and
+presentation state, renders the combined state, and sends user intents through the backend client.
+
+Only backend messages change core state. A frontend action may send a command, but the command does
+not optimistically change backend-authoritative state. The resulting backend event does.
+
+`core-state` has no Node runtime, OpenTUI, theme, layout, focus, or query-result dependencies. Its
+time-dependent selectors require an explicit clock value so tests remain deterministic. Transcript
+labels and tones are semantic annotations derived from event fields; the TUI decides whether and how
+to display them.
+
+Experiment entries currently come from `query.experiments`. The event stream supplies an
+`experiments_changed` invalidation, not the entries themselves. Query progress and results therefore
+remain outside core state until the backend event contract becomes complete enough to project them.
+
+## Launch sequence
+
+`vs` spawns the headless backend and the frontend concurrently. The launcher does not wait for the
+control socket: the backend client retries `ENOENT` and `ECONNREFUSED` until its connect deadline,
+so the frontend pays its own startup while the backend is still coming up. The launcher still
+watches for the socket appearing, which is what distinguishes a backend that died before it ever
+listened (report its log tail) from a run that failed later (the frontend already shows the
+diagnostic).
+
+Configuration stays in the backend. Without `--theme`, the frontend asks `query.tui_defaults` while
+the renderer starts and applies the answer before the first frame, falling back to the default theme
+if the backend does not answer in time. `--theme` skips the query and reaches the frontend as
+`VIBESYS_THEME`.
+
+### Boot trace
+
+Boot timings are always recorded and never narrated. The backend times its boot in spans
+(`src/vibesys/boot_trace.py`): the dispatch preamble in `main.py`, then run-context assembly in
+`context.py`. Every span lands in the run's `run-*.log` as
+`boot span <qualified.name>: <ms>ms`, with the preamble's spans ahead of assembly's and each
+enclosing span reporting its region's total after its children.
+
+Nothing reaches stderr unless you ask:
+
+```bash
+VIBESYS_BOOT_TRACE=1 vibesys --input ... 2>trace.log
+```
+
+The CLI passes the request to every process it spawns, so the same variable also switches on the
+frontend's own measurement of how long the landing view waits for experiments
+(`clients/tui/src/boot-trace.ts`), which spans the request, the backend gate, and the reply. Those
+client lines are anchored to `VIBESYS_LAUNCH_START_MS`, which the CLI always sets, so they report
+wall time since the user ran the command rather than since the frontend process started.
+
+## Validation
+
+Run all package checks from the repository root:
+
+```bash
+pnpm check:ts-architecture
+pnpm check:clients
+pnpm test:clients
+pnpm build:clients
+```
+
+Each package also supports its own `check`, `test`, and `build` scripts. Package builds consume only
+public workspace exports. The release build uses the same dependency-aware build chain before pnpm
+deploys the self-contained TUI payload.

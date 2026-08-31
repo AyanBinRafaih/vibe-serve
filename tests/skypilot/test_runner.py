@@ -159,8 +159,12 @@ def test_inspect_cluster_parses_json_and_unknown_states() -> None:
     )
     runner = SkyPilotJobRunner(fake)
 
-    assert runner.inspect_cluster("lease").status is ClusterStatus.UP  # type: ignore[union-attr]
-    assert runner.inspect_cluster("lease").status is ClusterStatus.UNKNOWN  # type: ignore[union-attr]
+    active = runner.inspect_cluster("lease")
+    assert active is not None
+    assert active.status is ClusterStatus.UP
+    unknown = runner.inspect_cluster("lease")
+    assert unknown is not None
+    assert unknown.status is ClusterStatus.UNKNOWN
     assert runner.inspect_cluster("lease") is None
     assert fake.calls[0] == (
         "sky",

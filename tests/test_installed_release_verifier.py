@@ -6,9 +6,10 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from scripts import verify_installed_release as verifier  # pyright: ignore[reportMissingImports]
+from scripts import verify_installed_release as verifier
 
 from vibesys.cli import BundledTui
 
@@ -294,3 +295,51 @@ def test_project_smoke_requires_exactly_one_run(
     monkeypatch.setattr(verifier, "Project", _ProjectWithoutRuns)
     with pytest.raises(verifier.InstalledReleaseError, match="exactly one run"):
         verifier._verify_project_state(tmp_path)  # noqa: SLF001
+
+
+def test_project_smoke_reads_rounds_from_authoritative_agent_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "test-installed-release-smoke"
+    namespace = object()
+    log_directory = tmp_path / "logs"
+    log_directory.mkdir()
+    (tmp_path / ".git").mkdir()
+
+    class _State:
+        def load_project(self) -> object:
+            return object()
+
+        def list_runs(self) -> list[object]:
+            return [SimpleNamespace(run_id=run_id)]
+
+        def portable_namespace(self, actual_run_id: str, name: str) -> object:
+            assert (actual_run_id, name) == (run_id, "agent")
+            return namespace
+
+        def current_run_id(self) -> str:
+            return run_id
+
+        def log_directory(self, actual_run_id: str) -> Path:
+            assert actual_run_id == run_id
+            return log_directory
+
+    class _Project:
+        state = _State()
+
+        @classmethod
+        def open(cls, _root: Path) -> _Project:
+            return cls()
+
+    class _AgentStateStore:
+        def __init__(self, actual_namespace: object) -> None:
+            assert actual_namespace is namespace
+
+        def load(self) -> object:
+            return SimpleNamespace(rounds=[SimpleNamespace(round_number=1)])
+
+    monkeypatch.setattr(verifier, "Project", _Project)
+    monkeypatch.setattr(verifier, "AgentRunStateStore", _AgentStateStore)
+
+    verifier._verify_project_state(tmp_path)  # noqa: SLF001

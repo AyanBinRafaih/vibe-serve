@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import IO, TYPE_CHECKING, Protocol
 
 import yaml
 
@@ -144,12 +144,11 @@ class SubprocessCommandRunner:
         sink_errors_lock = threading.Lock()
 
         def forward(
-            stream: object,
+            stream: IO[str],
             parts: list[str],
             sink: Callable[[str], None] | None,
         ) -> None:
-            assert hasattr(stream, "readline")  # noqa: S101  # subprocess pipe contract
-            while line := stream.readline():  # type: ignore[attr-defined]
+            while line := stream.readline():
                 parts.append(line)
                 if sink is not None:
                     try:

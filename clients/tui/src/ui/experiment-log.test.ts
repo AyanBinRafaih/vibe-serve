@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'bun:test';
-import type {HypothesisEntry} from '../protocol.js';
+import type {HypothesisEntry} from '@vibesys/backend-client';
 import {
   entryKey,
   initialSessionState,
@@ -9,11 +9,15 @@ import {
   setExperiments,
 } from '../session-model.js';
 import {
+  entryCells,
   entryRow,
   formatMeasured,
   formatRounds,
   headerRow,
+  hypothesisMetadata,
+  measuredDirection,
   outcomeColor,
+  outcomeLabel,
   resolveColumns,
   sentenceCase,
 } from './experiment-log.js';
@@ -55,7 +59,6 @@ describe('experiment log rows', () => {
       'Rounds',
       'Implementation Details',
       'Measured',
-      'Verdict',
       'Outcome',
       'Kept',
     ]) {
@@ -65,9 +68,27 @@ describe('experiment log rows', () => {
     expect(row).toContain('41');
     expect(row).toContain('Batch the prefill step');
     expect(row).toContain('+12%');
-    expect(row).toContain('Pass');
-    expect(row).toContain('Proven');
+    expect(row).toContain('Accepted');
+    expect(row).not.toContain('Pass');
     expect(row.trimEnd().endsWith('Yes')).toBe(true);
+  });
+
+  it('shows hypothesis resolution without rendering the judge verdict', () => {
+    const columns = resolveColumns(WIDE);
+
+    const disproven = entryRow(
+      entry({judge_verdict: 'pass', resolved_outcome: 'disproven'}),
+      columns,
+    );
+    const rejected = entryRow(
+      entry({judge_verdict: 'fail', resolved_outcome: 'rejected'}),
+      columns,
+    );
+
+    expect(disproven).toContain('Rejected');
+    expect(disproven).not.toContain('Pass');
+    expect(rejected).toContain('Rejected');
+    expect(rejected).not.toContain('Fail');
   });
 
   it('keeps hypothesis, rounds, and outcome when the terminal is narrow', () => {
@@ -78,7 +99,7 @@ describe('experiment log rows', () => {
     const row = entryRow(entry(), columns);
     expect(row).toContain('H-07');
     expect(row).toContain('41');
-    expect(row).toContain('Proven');
+    expect(row).toContain('Accepted');
     expect(row).not.toContain('Batch the prefill step');
   });
 
@@ -103,6 +124,65 @@ describe('experiment log rows', () => {
     expect(formatMeasured(entry({perf_delta_pct: null, perf_metric: null}))).toBe('—');
   });
 
+  it('labels an absolute metric with its unit and keeps the delta unitless', () => {
+    expect(
+      formatMeasured(entry({perf_delta_pct: null, perf_metric: 55434.2, perf_unit: 'ops/s'})),
+    ).toBe('55434.2 ops/s');
+    expect(formatMeasured(entry({perf_delta_pct: -2, perf_unit: 'ops/s'}))).toBe('-2.0%');
+  });
+
+  it('points the header the way improvement goes when the log agrees on one', () => {
+    const columns = resolveColumns(WIDE);
+
+    expect(headerRow(columns, 'max')).toContain('Measured ↑');
+    expect(headerRow(columns, 'min')).toContain('Measured ↓');
+    expect(headerRow(columns)).not.toContain('↑');
+  });
+
+  it('finds the direction shared by every measured entry', () => {
+    expect(measuredDirection([entry(), entry({perf_direction: 'max'})])).toBe('max');
+    expect(measuredDirection([entry()])).toBe(null);
+    expect(
+      measuredDirection([entry({perf_direction: 'max'}), entry({perf_direction: 'min'})]),
+    ).toBe(null);
+  });
+
+  it('spells out the measurement in the drill-down metadata', () => {
+    const metadata = hypothesisMetadata(
+      entry({
+        perf_metric: 55434.2,
+        perf_unit: 'total_ops_per_sec',
+        perf_metric_name: 'total_ops_per_sec',
+        perf_direction: 'max',
+        perf_baseline_value: 52340.1,
+        perf_delta_pct: 5.9,
+      }),
+    );
+
+    expect(metadata).toContain('Metric total_ops_per_sec (maximize)');
+    expect(metadata).toContain('Measured 55434.2');
+    expect(metadata).toContain('Baseline 52340.1');
+    expect(metadata).toContain('Delta +5.9%');
+    // The unit here is the metric name; the identity clause already carries
+    // it, so the numbers stay bare instead of repeating it twice.
+    expect(metadata).not.toContain('55434.2 total_ops_per_sec');
+  });
+
+  it('keeps a distinct unit next to the numbers in the metadata', () => {
+    const metadata = hypothesisMetadata(
+      entry({
+        perf_metric: 2412.5,
+        perf_unit: 'ops/s',
+        perf_metric_name: 'throughput',
+        perf_direction: 'min',
+        perf_delta_pct: null,
+      }),
+    );
+
+    expect(metadata).toContain('Metric throughput (minimize)');
+    expect(metadata).toContain('Measured 2412.5 ops/s');
+  });
+
   it('renders a record with no hypothesis id as an explicit placeholder', () => {
     const row = entryRow(
       entry({
@@ -118,12 +198,59 @@ describe('experiment log rows', () => {
 
     expect(row).toContain('(unidentified)');
     expect(row).toContain('—');
+    expect(row).not.toContain('Active');
+  });
+
+  it('keeps an explicit gutter after a hypothesis id that fills its column', () => {
+    const columns = resolveColumns(WIDE);
+    const header = headerRow(columns);
+    const row = entryRow(entry({hypothesis_id: 'm1-preallocated-spsc-ring'}), columns);
+    const roundsStart = header.indexOf('Rounds');
+
+    expect(row).toContain('m1-preallocat…  41');
+    expect(row[roundsStart - 1]).toBe(' ');
+    expect(row.slice(roundsStart).startsWith('41')).toBe(true);
+  });
+
+  it('keeps gutters across the separately colored outcome segments', () => {
+    const cells = entryCells(entry(), resolveColumns(WIDE));
+
+    expect(cells.outcome.startsWith('  ')).toBe(true);
+    expect(cells.trailing.startsWith('  ')).toBe(true);
+  });
+
+  it('prefers the backend-supplied title over the claim and action', () => {
+    const cells = entryCells(
+      entry({
+        title: 'Batch decode requests',
+        claim: 'batch the prefill step',
+        action: 'batch prefill',
+      }),
+      resolveColumns(WIDE),
+    );
+
+    expect(cells.leading).toContain('Batch decode requests');
+    expect(cells.leading).not.toContain('batch the prefill step');
+  });
+
+  it('falls back to the claim, then the action, when there is no title', () => {
+    const withClaim = entryCells(
+      entry({title: null, claim: 'batch the prefill step', action: 'batch prefill'}),
+      resolveColumns(WIDE),
+    );
+    expect(withClaim.leading).toContain('Batch the prefill step');
+
+    const withActionOnly = entryCells(
+      entry({title: null, claim: null, action: 'batch prefill'}),
+      resolveColumns(WIDE),
+    );
+    expect(withActionOnly.leading).toContain('Batch prefill');
   });
 });
 
 describe('experiment log layout', () => {
   it('fits the panel exactly at every width it degrades through', () => {
-    for (const width of [120, 104, 90, 72, 62, 54, 40]) {
+    for (const width of [120, 104, 103, 90, 89, 72, 62, 61, 54, 40]) {
       const columns = resolveColumns(width);
       const header = headerRow(columns);
       const row = entryRow(entry(), columns);
@@ -147,6 +274,7 @@ describe('experiment log outcome color', () => {
 
     expect(outcomeColor(theme, entry({resolved_outcome: 'continue'}))).toBe(theme.textPrimary);
     expect(outcomeColor(theme, entry({resolved_outcome: 'inconclusive'}))).toBe(theme.textPrimary);
+    expect(outcomeColor(theme, entry({resolved_outcome: null}))).toBe(theme.textPrimary);
   });
 
   it('uses the active accent while a hypothesis is still open', () => {
@@ -164,11 +292,13 @@ describe('experiment log outcome color', () => {
     }
   });
 
-  it('spells the outcome out so color is never the only signal', () => {
+  it('maps backend resolutions to operator-facing acceptance labels', () => {
     const columns = resolveColumns(WIDE);
 
-    expect(entryRow(entry({resolved_outcome: 'proven'}), columns)).toContain('Proven');
-    expect(entryRow(entry({resolved_outcome: 'disproven'}), columns)).toContain('Disproven');
+    expect(entryRow(entry({resolved_outcome: 'proven'}), columns)).toContain('Accepted');
+    expect(entryRow(entry({resolved_outcome: 'disproven'}), columns)).toContain('Rejected');
+    expect(outcomeLabel(entry({resolved_outcome: 'rejected'}))).toBe('Rejected');
+    expect(outcomeLabel(entry({resolved_outcome: 'inconclusive'}))).toBe('Inconclusive');
   });
 });
 

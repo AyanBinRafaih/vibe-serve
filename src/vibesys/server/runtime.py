@@ -6,7 +6,7 @@ import signal
 from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from contextlib import suppress
 from pathlib import Path  # noqa: TC003  # tracked: #288
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vibesys.errors import ConfigurationError
 from vibesys.server.diagnostics import (
@@ -28,13 +28,22 @@ from vibesys.server.service import SupervisionService
 from vibesys.server.supervisor import RunSupervisor
 from vibesys.server.transport import SupervisionSocketServer
 
+if TYPE_CHECKING:
+    from vibesys.repository import InteractiveSetupDefaults
+
 
 def run_server(  # noqa: PLR0915
     run: Callable[[], Any],
     *,
     socket_path: Path,
+    tui_defaults: Callable[[], InteractiveSetupDefaults] | None = None,
 ) -> Any:  # noqa: ANN401  # tracked: #288
-    """Run a headless backend that exposes supervision over a Unix socket."""
+    """Run a headless backend that exposes supervision over a Unix socket.
+
+    ``tui_defaults`` resolves launcher-facing configuration defaults on
+    demand. The service is built before ``run`` parses configuration, so the
+    caller supplies a provider rather than resolved values.
+    """
     supervisor = RunSupervisor()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -43,7 +52,7 @@ def run_server(  # noqa: PLR0915
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupt_from_launcher)
-    service = SupervisionService(supervisor)
+    service = SupervisionService(supervisor, tui_defaults=tui_defaults)
     supervisor.enable_terminal_chat_retention()
     REGISTRY.activate(supervisor)
     supervisor.attach(socket_path.parent)

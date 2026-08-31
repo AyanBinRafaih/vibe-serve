@@ -245,7 +245,7 @@ function buildMarkdown(spec: ThemeSpec): MarkdownColors {
   const derived: MarkdownColors = {
     default: ensureContrast(spec.textPrimary, spec.canvas, spec.minContrast),
     heading: ensureContrast(spec.accent, spec.canvas, spec.minContrast),
-    strong: spec.textStrong,
+    strong: ensureContrast(spec.textStrong, spec.canvas, spec.minContrast),
     em: ensureContrast(spec.textMuted, spec.canvas, spec.minContrast),
     code: ensureContrast(spec.accent, codeBackground, spec.minContrast),
     codeBackground,

@@ -1,14 +1,23 @@
 import type {CliRenderer, KeyEvent, ScrollBoxRenderable} from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
 import {chatPaneFocused, chatPaneVisible, experimentLogVisible} from '../session-model.js';
+import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 
 export interface KeybindingActions {
   completeInput(): boolean;
+  navigateSuggestions(direction: 1 | -1): boolean;
+  /** Navigates the chat composer's own typed-command suggestions, docked or modal. */
+  navigateChatSuggestions(direction: 1 | -1): boolean;
+  /** Tab-completes the chat composer's highlighted typed-command suggestion. */
+  completeChatInput(): boolean;
   inputIsEmpty(): boolean;
   closeChat(): void;
   toggleLatestPrompt(): void;
+  toggleSelectedTool(): boolean;
   /** Brings the entry the cursor moved to into view. */
   revealSelectedEntry(): void;
+  /** Materializes the next block of conversation history above the window. */
+  revealOlderEntries(): void;
   selectNextAgent(): void;
   selectPreviousAgent(): void;
   selectNextRound(): void;
@@ -16,19 +25,37 @@ export interface KeybindingActions {
   toggleTodos(): void;
   scrollRightPane(delta: number): void;
   scrollChatPane(delta: number): void;
+  scrollExperimentDetail(delta: number): void;
   scrollErrorBanner(delta: number): void;
+  clearTransientStatus(): void;
+  showClipboardStatus(result: Exclude<ClipboardCopyResult, 'no-selection'>): void;
 }
 
 export function bindKeybindings(
   renderer: CliRenderer,
   controller: SessionController,
   viewport: ScrollBoxRenderable,
+  clipboard: SelectionClipboard,
   actions: KeybindingActions,
 ): () => void {
   const onKey = (key: KeyEvent): void => {
-    if (key.ctrl && key.name === 'c') {
+    if (key.ctrl && !key.shift && key.name === 'c') {
       key.preventDefault();
-      renderer.destroy();
+      const result = clipboard.copySelection();
+      if (result === 'no-selection') renderer.destroy();
+      else actions.showClipboardStatus(result);
+      return;
+    }
+    actions.clearTransientStatus();
+    if (
+      key.name === 'f4' &&
+      controller.state.chatOpen === false &&
+      controller.state.overlay === null &&
+      controller.state.themePicker === null &&
+      controller.state.chatMenu === null
+    ) {
+      controller.togglePaneZoom();
+      key.preventDefault();
       return;
     }
     if (
@@ -40,15 +67,40 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // Pane switching works from anywhere a second column is on screen, which
-    // on the landing view includes the docked chat, so the operator never has
-    // to leave the table to scroll back through an answer.
+    if (controller.state.errorBanner !== null && key.name === 'escape') {
+      controller.dismissErrorBanner();
+      key.preventDefault();
+      return;
+    }
     if (
       key.ctrl &&
       key.name === 'w' &&
       (controller.state.layout.right !== null || chatPaneVisible(controller.state))
     ) {
       controller.cyclePaneFocus();
+      key.preventDefault();
+      return;
+    }
+    // The composer's inline menu owns the keys while it is open. On a custom
+    // model entry that includes ordinary typing, which must never leak into
+    // the composer underneath; anywhere else typing dismisses the menu and
+    // goes back to writing a question, so the keystroke is left alone.
+    const chatMenu = controller.state.chatMenu;
+    if (chatMenu !== null) {
+      const onCustomEntry = chatMenu.rows[chatMenu.selected]?.kind === 'custom';
+      if (key.name === 'up') controller.moveChatMenuSelection(-1);
+      else if (key.name === 'down') controller.moveChatMenuSelection(1);
+      else if (key.name === 'escape') controller.closeChatMenu();
+      else if (key.name === 'return' || key.name === 'enter' || key.name === 'kpenter') {
+        void controller.confirmChatMenu();
+      } else if (onCustomEntry && key.name === 'backspace') {
+        controller.backspaceChatMenuCustomModel();
+      } else if (onCustomEntry && isPrintable(key)) {
+        controller.typeChatMenuCustomModel(key.sequence);
+      } else {
+        if (isPrintable(key)) controller.closeChatMenu();
+        return;
+      }
       key.preventDefault();
       return;
     }
@@ -59,30 +111,31 @@ export function bindKeybindings(
       controller.state.layout.right !== null &&
       (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape')
     ) {
-      // Escape leaves the view the operator was in, not one layer of it: a
-      // visualization and a chat opened over a round both go at once, rather
-      // than the chat being left behind as a pop-up over the round.
       if (key.name === 'escape') controller.closeOverlays();
       else actions.scrollRightPane(key.name === 'pageup' ? -1 : 1);
       key.preventDefault();
       return;
     }
-    // The docked chat takes the scroll keys while it holds focus, so Page Up
-    // reads the conversation back instead of moving the table's selection.
-    // Escape hands the keys back to the table rather than closing anything:
-    // the pane is part of the view, not a dialog over it.
-    if (
-      chatPaneFocused(controller.state) &&
-      (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape')
-    ) {
-      if (key.name === 'escape') controller.focusPane('left');
-      else actions.scrollChatPane(key.name === 'pageup' ? -1 : 1);
-      key.preventDefault();
+    if (chatPaneFocused(controller.state)) {
+      if (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape') {
+        if (key.name === 'escape') controller.focusPane('left');
+        else actions.scrollChatPane(key.name === 'pageup' ? -1 : 1);
+        key.preventDefault();
+        return;
+      }
+      // The typed-command suggestions take Up/Down/Tab only while they are
+      // showing; otherwise the keys fall through to the editor underneath
+      // (multiline cursor movement, and Tab's ordinary no-op).
+      if (key.name === 'up' || key.name === 'down') {
+        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
+        return;
+      }
+      if (key.name === 'tab' && !key.shift) {
+        if (actions.completeChatInput()) key.preventDefault();
+        return;
+      }
       return;
     }
-    // The theme picker owns its navigation keys wherever it was opened from,
-    // so arrows never reach the view behind it. A typed command still belongs
-    // to the input, which is why Enter is claimed only on an empty line.
     if (controller.state.themePicker !== null) {
       if (key.name === 'up') controller.moveThemeSelection(-1);
       else if (key.name === 'down') controller.moveThemeSelection(1);
@@ -98,36 +151,51 @@ export function bindKeybindings(
     }
     if (controller.state.chatOpen) {
       if (key.name === 'escape') {
-        // The chat may be sitting over a round that also has a pane open.
-        // One Escape puts the operator back on the round, not part way.
         if (controller.state.layout.right !== null) controller.closeOverlays();
         else actions.closeChat();
         key.preventDefault();
+        return;
+      }
+      // Same suggestion-menu priority as the docked chat above.
+      if (key.name === 'up' || key.name === 'down') {
+        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
+        return;
+      }
+      if (key.name === 'tab' && !key.shift) {
+        if (actions.completeChatInput()) key.preventDefault();
+        return;
       }
       return;
     }
-    // An overlay floats above whatever pane is behind it, so it takes Escape
-    // first whether that pane is the transcript or the experiment log.
     if (key.name === 'escape' && controller.state.overlay !== null) {
       controller.live();
       viewport.scrollTo(viewport.scrollHeight);
       key.preventDefault();
       return;
     }
-    // The experiment log owns navigation while the table is on screen: arrows
-    // move the selection instead of the input cursor, and Enter opens the
-    // rounds behind the selected hypothesis. The input keeps priority over the
-    // table, so a typed command runs on its own Enter and its result opens over
-    // the log rather than the log swallowing the keystroke.
+    // The experiment surface owns navigation while it is on screen. The index
+    // opens a hypothesis summary; that summary selects and opens one round.
+    // The input keeps priority over Enter so a typed command is never lost.
     if (experimentLogVisible(controller.state)) {
-      // Escape has nowhere to go from the root view: the log is the root.
-      // Arrows move the table's selection from the moment the log is on screen:
-      // the table is the view, so it should not need to be clicked into first.
-      if (key.name === 'up') controller.moveExperimentSelection(-1);
-      else if (key.name === 'down') controller.moveExperimentSelection(1);
-      else if (key.name === 'pageup') controller.moveExperimentSelection(-10);
-      else if (key.name === 'pagedown') controller.moveExperimentSelection(10);
-      else if (key.name === 'return' || key.name === 'enter') {
+      const detailOpen = controller.state.hypothesisDetail !== null;
+      if (key.name === 'escape' && detailOpen) controller.leaveHypothesisDetail();
+      else if (key.name === 'up') {
+        if (detailOpen) controller.moveHypothesisRoundSelection(-1);
+        else if (!actions.navigateSuggestions(-1)) controller.moveExperimentSelection(-1);
+      } else if (key.name === 'down') {
+        if (detailOpen) controller.moveHypothesisRoundSelection(1);
+        else if (!actions.navigateSuggestions(1)) controller.moveExperimentSelection(1);
+      } else if (key.name === 'pageup') {
+        if (detailOpen) actions.scrollExperimentDetail(-1);
+        else controller.moveExperimentSelection(-10);
+      } else if (key.name === 'pagedown') {
+        if (detailOpen) actions.scrollExperimentDetail(1);
+        else controller.moveExperimentSelection(10);
+      } else if (key.name === 'tab' && !key.shift) {
+        // The table has no agent strip to cycle through, so Tab belongs to the
+        // suggestion it would otherwise complete, or nothing at all.
+        if (!actions.completeInput()) return;
+      } else if (key.name === 'return' || key.name === 'enter') {
         // A typed command belongs to the input; let its own handler run it so
         // one Enter is enough. An overlay is in front of the table, so Enter
         // behind it must not move the operator somewhere they cannot see.
@@ -137,9 +205,6 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // Escape unwinds the round view one step at a time: the entry cursor, then
-    // the agent filter, then the hypothesis itself. Leaving outright would throw
-    // away a selection the operator may have spent a while arriving at.
     if (key.name === 'escape' && controller.state.hypothesisScope !== null) {
       if (controller.state.selectedEntryId !== null) controller.clearEntrySelection();
       else if (controller.state.selectedAgentKind !== null) controller.clearAgentSelection();
@@ -147,9 +212,6 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // F2 and F3 alongside Ctrl+T and Ctrl+P: a terminal is free to keep a
-    // Control chord for itself, and on macOS several do, but function keys
-    // reach the application everywhere.
     if ((key.ctrl && key.name === 'p') || key.name === 'f3') {
       actions.toggleLatestPrompt();
       key.preventDefault();
@@ -160,10 +222,6 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // While the todo box is open it owns the arrows, and it is drawn focused so
-    // the operator can see where the keys are going. Escape closes it and hands
-    // them straight back to the transcript. Every other key falls through: a
-    // surface that claims keys it does not act on reads as a frozen client.
     if (controller.state.todosExpanded) {
       if (key.name === 'up' || key.name === 'down') {
         controller.selectNextTodo(key.name === 'down' ? 1 : -1);
@@ -176,24 +234,31 @@ export function bindKeybindings(
         return;
       }
     }
-    // Left and right move between the round view's two panes. The agent graph
-    // is on the left and the transcript on the right, so the arrow points at
-    // the pane it moves to, and each pane then owns the up and down keys.
     if (key.name === 'left' || key.name === 'right') {
       controller.focusRound(key.name === 'left' ? 'agents' : 'transcript');
       key.preventDefault();
       return;
     }
-    // Up and down belong to whichever pane holds the round view's keys: agents
-    // within a stage on the left, entries on the right.
     if (key.name === 'up' || key.name === 'down') {
-      if (controller.state.roundFocus === 'agents') {
-        if (key.name === 'down') controller.selectNextAgent();
-        else controller.selectPreviousAgent();
-      } else {
-        controller.selectNextEntry(key.name === 'down' ? 1 : -1);
-        actions.revealSelectedEntry();
+      if (!actions.navigateSuggestions(key.name === 'up' ? -1 : 1)) {
+        if (controller.state.roundFocus === 'agents') {
+          if (key.name === 'down') controller.selectNextAgent();
+          else controller.selectPreviousAgent();
+        } else {
+          controller.selectNextEntry(key.name === 'down' ? 1 : -1);
+          actions.revealSelectedEntry();
+        }
       }
+      key.preventDefault();
+      return;
+    }
+    if (
+      (key.name === 'return' || key.name === 'enter') &&
+      controller.state.roundFocus === 'transcript' &&
+      actions.inputIsEmpty() &&
+      actions.toggleSelectedTool()
+    ) {
+      actions.revealSelectedEntry();
       key.preventDefault();
       return;
     }
@@ -226,16 +291,37 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    if (key.name === 'pageup') viewport.scrollBy(-1, 'viewport');
-    else if (key.name === 'pagedown') viewport.scrollBy(1, 'viewport');
-    else if (key.ctrl && key.name === 'up') viewport.scrollBy(-1);
-    else if (key.ctrl && key.name === 'down') viewport.scrollBy(1);
-    else if (key.name === 'home') viewport.scrollTo(0);
-    else if (key.name === 'end') viewport.scrollTo(viewport.scrollHeight);
+    if (key.name === 'pageup') {
+      actions.revealOlderEntries();
+      viewport.scrollBy(-1, 'viewport');
+    } else if (key.name === 'pagedown') viewport.scrollBy(1, 'viewport');
+    else if (key.ctrl && key.name === 'up') {
+      actions.revealOlderEntries();
+      viewport.scrollBy(-1);
+    } else if (key.ctrl && key.name === 'down') viewport.scrollBy(1);
+    else if (key.name === 'home') {
+      // Home reaches the top of what is rendered. On a windowed transcript that
+      // is one further block of history per press, rather than one press
+      // building every card a 20k-entry run has.
+      actions.revealOlderEntries();
+      viewport.scrollTo(0);
+    } else if (key.name === 'end') viewport.scrollTo(viewport.scrollHeight);
     else return;
     key.preventDefault();
   };
 
   renderer.keyInput.on('keypress', onKey);
   return () => renderer.keyInput.off('keypress', onKey);
+}
+
+/** One typed character, as opposed to a chord or a control key. */
+function isPrintable(key: KeyEvent): boolean {
+  return (
+    !key.ctrl &&
+    !key.meta &&
+    typeof key.sequence === 'string' &&
+    key.sequence.length === 1 &&
+    key.sequence >= ' ' &&
+    key.sequence !== ''
+  );
 }
