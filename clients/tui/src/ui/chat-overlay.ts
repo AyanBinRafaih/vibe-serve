@@ -72,7 +72,12 @@ export class ChatOverlayView {
     this.#conversation = new ConversationView(renderer, controller, markdownStyle, theme, {
       selectConversation: state => state.chatConversation,
       emptyContent: 'Ask a question about the current experiment, its progress, or a failure.',
-      renderMarkdown: false,
+      // Answers are agent-authored markdown; the operator's own messages stay
+      // verbatim so typed ** or # is never concealed as markup. The chat keeps
+      // answering after the run turns terminal, so it never switches to the
+      // finalized parse that would leave a fresh answer blank until a redraw.
+      markdownKinds: ['assistant'],
+      markdownStreaming: true,
     });
     this.#composer = new ChatComposerView(
       renderer,

@@ -17,7 +17,21 @@ import type {Theme} from './theme.js';
 export interface ConversationViewOptions {
   selectConversation?: (state: SessionState) => ConversationEntry[];
   emptyContent?: string;
-  renderMarkdown?: boolean;
+  /**
+   * Entry kinds drawn through the markdown pipeline; every other kind draws
+   * its content verbatim. Defaults to all prose-bearing kinds, which is what
+   * the main transcript wants; the chat narrows this to assistant answers so
+   * the operator's own typed markers are never concealed as markup.
+   */
+  markdownKinds?: readonly ConversationEntry['kind'][];
+  /**
+   * Forces the markdown parser's incremental mode. By default cards finalize
+   * once the run is terminal, but finalized parsing is asynchronous and draws
+   * nothing until a later redraw; a view that still receives entries after the
+   * run ends (the chat answering a post-mortem question) sets this so a fresh
+   * answer is never an invisible card waiting on a keypress.
+   */
+  markdownStreaming?: boolean;
   /** Whether this view draws the entry cursor. */
   showsSelection?: boolean;
   /** Gives the containing semantic pane focus when any conversation surface is clicked. */
@@ -48,7 +62,8 @@ export class ConversationView {
   readonly #expandedTools = new Set<string>();
   readonly #selectConversation: (state: SessionState) => ConversationEntry[];
   #emptyContent: string;
-  readonly #renderMarkdown: boolean;
+  readonly #markdownKinds: ReadonlySet<ConversationEntry['kind']>;
+  readonly #markdownStreaming: boolean | undefined;
   readonly #showsSelection: boolean;
   readonly #onFocusRequest: (() => void) | undefined;
   #renderedConversation: ConversationEntry[] = [];
@@ -75,7 +90,8 @@ export class ConversationView {
     this.#theme = theme;
     this.#selectConversation = options.selectConversation ?? visibleConversation;
     this.#emptyContent = options.emptyContent ?? 'Waiting for run events…';
-    this.#renderMarkdown = options.renderMarkdown ?? true;
+    this.#markdownKinds = new Set(options.markdownKinds ?? ['assistant', 'prompt', 'user']);
+    this.#markdownStreaming = options.markdownStreaming;
     this.#showsSelection = options.showsSelection ?? false;
     this.#onFocusRequest = options.onFocusRequest;
     const onRevealOlder = options.onRevealOlder;
@@ -358,10 +374,7 @@ export class ConversationView {
       }),
     );
     card.add(heading);
-    if (
-      this.#renderMarkdown &&
-      (entry.kind === 'assistant' || entry.kind === 'prompt' || entry.kind === 'user')
-    ) {
+    if (this.#markdownKinds.has(entry.kind)) {
       this.#renderMarkdownEntry(card, entry);
     } else if (
       entry.kind === 'tool' &&
@@ -420,7 +433,7 @@ export class ConversationView {
         content: preview.content,
         syntaxStyle: this.#markdownStyle,
         conceal: true,
-        streaming: !this.controller.state.core.terminal,
+        streaming: this.#markdownStreaming ?? !this.controller.state.core.terminal,
         width: '100%',
       }),
     );

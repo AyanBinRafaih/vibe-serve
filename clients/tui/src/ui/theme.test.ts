@@ -115,6 +115,9 @@ describe('semantic roles', () => {
     expect(contrastRatio(theme.textPrimary, theme.canvas)).toBeGreaterThanOrEqual(minimum);
     expect(contrastRatio(theme.textStrong, theme.canvas)).toBeGreaterThanOrEqual(minimum);
     expect(contrastRatio(theme.markdown.default, theme.canvas)).toBeGreaterThanOrEqual(minimum);
+    expect(contrastRatio(theme.markdown.strong, theme.canvas)).toBeGreaterThanOrEqual(minimum);
+    expect(contrastRatio(theme.markdown.heading, theme.canvas)).toBeGreaterThanOrEqual(minimum);
+    expect(contrastRatio(theme.markdown.em, theme.canvas)).toBeGreaterThanOrEqual(minimum);
     expect(contrastRatio(theme.textMuted, theme.canvas)).toBeGreaterThanOrEqual(3);
     expect(contrastRatio(theme.textSubtle, theme.canvas)).toBeGreaterThanOrEqual(3);
   });
