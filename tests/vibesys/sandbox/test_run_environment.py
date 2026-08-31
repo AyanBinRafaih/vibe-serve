@@ -366,9 +366,17 @@ def test_local_environment_prepares_and_translates_evaluator_tool(
     prepare.assert_called_once_with(package.metadata.tools, tools_root)
     tool = package.metadata.tools["request-factory"]
     benchmark = shlex.split(session.view.paths.benchmark_command or "")
-    assert benchmark[benchmark.index("--engine") + 1] == str(
-        tool_install_root(tools_root, "request-factory", tool) / "bin" / "session_runner"
-    )
+    engine = tool_install_root(tools_root, "request-factory", tool) / "bin" / "session_runner"
+    assert benchmark == [
+        str(engine),
+        "--trace",
+        "trace.jsonl",
+        "--model",
+        "m",
+        "--input-file-format",
+        "multimodal-independent-v1",
+        "--dry-run",
+    ]
     assert "${TOOL:" not in (session.view.paths.benchmark_command or "")
 
 

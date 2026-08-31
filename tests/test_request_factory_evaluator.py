@@ -1,4 +1,4 @@
-"""Tests for the bundled Request Factory process adapters."""
+"""Tests for the bundled Request Factory evaluator entrypoints."""
 
 from __future__ import annotations
 
@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+
+from vibesys.evaluators import (
+    EvaluatorPackageRequirement,
+    resolve_evaluator_package,
+    tool_token,
+)
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -24,13 +30,13 @@ def _load_script(name: str) -> ModuleType:
     return module
 
 
-def test_engine_runner_execs_binary_after_explicit_separator(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = _load_script("runner.py")
-    captured: list[tuple[str, list[str]]] = []
-    monkeypatch.setattr(runner.os, "execv", lambda path, argv: captured.append((path, argv)))
-
+def test_engine_entrypoint_is_the_direct_tool_command() -> None:
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
     engine_arguments = [
         "--trace",
         "trace.jsonl",
@@ -40,13 +46,10 @@ def test_engine_runner_execs_binary_after_explicit_separator(
         "multimodal-independent-v1",
         "--dry-run",
     ]
-    assert runner.main(["--engine", "/trusted/session_runner", "--", *engine_arguments]) == 0
-    assert captured == [
-        (
-            "/trusted/session_runner",
-            ["/trusted/session_runner", *engine_arguments],
-        )
-    ]
+    assert package.command("request-factory-engine", *engine_arguments) == (
+        tool_token("request-factory", "session_runner"),
+        *engine_arguments,
+    )
 
 
 def test_task_adapter_injects_engine_before_task_arguments(

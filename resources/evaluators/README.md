@@ -65,8 +65,8 @@ environments; those environments reject the package before starting external
 resources.
 
 The bundled Request Factory evaluator exposes two entrypoints. The low-level
-`request-factory-engine` entrypoint forwards arguments directly to the pinned
-binary. Experiments normally use `request-factory-adapter` and pass a
-task-owned Python script as the first argument; the evaluator invokes that
+`request-factory-engine` entrypoint resolves directly to the pinned binary.
+Experiments that need task-owned orchestration use `request-factory-adapter`
+and pass a Python script as the first argument; the evaluator invokes that
 script with `--request-factory-engine <trusted-path>` before the task's
 remaining arguments.

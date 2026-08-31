@@ -11,13 +11,7 @@ package = "req-frontend"
 bins = ["session_runner"]
 
 [entrypoints]
-request-factory-engine = [
-  "python3",
-  "${PACKAGE_ROOT}/runner.py",
-  "--engine",
-  "${TOOL:request-factory/session_runner}",
-  "--",
-]
+request-factory-engine = ["${TOOL:request-factory/session_runner}"]
 request-factory-adapter = [
   "python3",
   "${PACKAGE_ROOT}/adapter.py",
