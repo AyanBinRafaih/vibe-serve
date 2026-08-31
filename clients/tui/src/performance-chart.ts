@@ -8,18 +8,28 @@ interface PerfPoint {
   unit: string;
 }
 
+type PerformanceContext = NonNullable<ProtocolResponse['performance_context']>;
+
 const PLOT_HEIGHT = 8;
 const PLOT_WIDTH = 48;
+const CONTEXT_LABEL_WIDTH = 10;
 
 export function renderPerformanceCurve(
   performance: ProtocolResponse['performance'] | undefined,
   events?: RunEvent[],
+  context?: ProtocolResponse['performance_context'],
 ): string {
   const points = performancePoints(performance, events);
-  if (points.length === 0) return 'No performance data yet.';
+  const contextLines = contextSection(context ?? null);
+  if (points.length === 0) {
+    return [...contextLines, 'No performance data yet.'].join('\n');
+  }
 
-  const metric = latestMetric(points);
-  const visible = points.filter(point => point.metric === metric);
+  // Points are still keyed by the recorded unit string; the backend context
+  // only names the series, so it must not change which points are plotted.
+  const series = latestMetric(points);
+  const metric = context?.objective_metric ?? series;
+  const visible = points.filter(point => point.metric === series);
   const values = visible.map(point => point.value);
   const minValue = Math.min(...values);
   const maxValue = Math.max(...values);
@@ -35,7 +45,7 @@ export function renderPerformanceCurve(
     if (row) row[x] = '●';
   }
 
-  const lines = [`Performance · ${metric}`];
+  const lines = [`Performance · ${metric}`, ...contextLines];
   for (let row = 0; row < PLOT_HEIGHT; row += 1) {
     const value = maxValue - ((maxValue - minValue) * row) / Math.max(1, PLOT_HEIGHT - 1);
     lines.push(`${formatAxis(value).padStart(8)} ┤${(grid[row] ?? []).join('')}`);
@@ -92,6 +102,54 @@ function performancePoints(
 
 function latestMetric(points: PerfPoint[]): string {
   return points.at(-1)?.metric ?? 'performance';
+}
+
+/**
+ * The objective facts above the plot: metric, unit, direction, baseline, and
+ * how the benchmark measures. Direction is words plus a glyph, never color,
+ * and absent facts drop their line rather than render a placeholder.
+ */
+function contextSection(context: PerformanceContext | null): string[] {
+  if (context === null) return [];
+  const lines: string[] = [];
+  if (context.objective_metric) {
+    lines.push(contextLine('Metric', metricSummary(context.objective_metric, context)));
+  }
+  const baseline = baselineSummary(context);
+  if (baseline !== null) lines.push(contextLine('Baseline', baseline));
+  if (context.objective_description) {
+    lines.push(contextLine('Measures', context.objective_description));
+  }
+  if (lines.length === 0) return [];
+  lines.push('');
+  return lines;
+}
+
+function contextLine(label: string, value: string): string {
+  return `${label.padEnd(CONTEXT_LABEL_WIDTH)}${value}`;
+}
+
+function metricSummary(metric: string, context: PerformanceContext): string {
+  const parts = [metric];
+  // Legacy rounds record the metric name in the unit slot; repeating it as a
+  // parenthesized unit would read as noise.
+  if (context.objective_unit && context.objective_unit !== metric) {
+    parts.push(`(${context.objective_unit})`);
+  }
+  const summary = parts.join(' ');
+  if (context.objective_direction === 'max') return `${summary} · maximize ↑`;
+  if (context.objective_direction === 'min') return `${summary} · minimize ↓`;
+  return summary;
+}
+
+function baselineSummary(context: PerformanceContext): string | null {
+  const parts: string[] = [];
+  if (context.objective_baseline_value != null) parts.push(trim(context.objective_baseline_value));
+  if (context.objective_baseline_round != null) parts.push(`r${context.objective_baseline_round}`);
+  if (context.objective_baseline_commit) {
+    parts.push(`commit ${context.objective_baseline_commit.slice(0, 7)}`);
+  }
+  return parts.length > 0 ? parts.join(' · ') : null;
 }
 
 function scale(

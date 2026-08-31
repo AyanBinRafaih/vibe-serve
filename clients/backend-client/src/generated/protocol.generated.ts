@@ -342,6 +342,13 @@ export type PerfUnit1 = string;
 export type Passed = boolean;
 export type ProfileSkipped = boolean;
 export type Performance = PerformanceRound[];
+export type ObjectiveMetric = string | null;
+export type ObjectiveUnit = string | null;
+export type ObjectiveDirection = ("max" | "min") | null;
+export type ObjectiveBaselineValue = number | null;
+export type ObjectiveBaselineRound = number | null;
+export type ObjectiveBaselineCommit = string | null;
+export type ObjectiveDescription = string | null;
 export type HypothesisId = string;
 export type Identified = boolean;
 export type Title3 = string | null;
@@ -525,6 +532,7 @@ export interface Response {
   snapshot?: RunSnapshot | null;
   events?: Events;
   performance?: Performance;
+  performance_context?: PerformanceContext | null;
   experiments?: Experiments;
   experiments_ready?: ExperimentsReady;
 }
@@ -888,6 +896,23 @@ export interface PerformanceRound {
   perf_unit: PerfUnit1;
   passed: Passed;
   profile_skipped?: ProfileSkipped;
+}
+/**
+ * What the performance plot measures and how to read it.
+ *
+ * Copied from recorded run state and the run manifest, never recomputed.
+ * Every field is optional so the section can describe the objective before
+ * the first measurement and omit facts a run never recorded; a run whose
+ * prose is known before its metric still gets a description-only context.
+ */
+export interface PerformanceContext {
+  objective_metric?: ObjectiveMetric;
+  objective_unit?: ObjectiveUnit;
+  objective_direction?: ObjectiveDirection;
+  objective_baseline_value?: ObjectiveBaselineValue;
+  objective_baseline_round?: ObjectiveBaselineRound;
+  objective_baseline_commit?: ObjectiveBaselineCommit;
+  objective_description?: ObjectiveDescription;
 }
 /**
  * One unit of investigation: a hypothesis and every round it spans.

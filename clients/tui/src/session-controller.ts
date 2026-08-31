@@ -633,7 +633,11 @@ export class SocketSessionController implements SessionController {
   async #requestPane(view: PaneView): Promise<void> {
     try {
       const response = await this.client.request({type: 'query.performance'});
-      const content = renderPerformanceCurve(response.performance ?? [], response.events ?? []);
+      const content = renderPerformanceCurve(
+        response.performance ?? [],
+        response.events ?? [],
+        response.performance_context,
+      );
       this.#setState(setPaneContent(this.#state, view, content));
     } catch (error) {
       const message = errorMessage(error);
@@ -1028,7 +1032,11 @@ function renderResponse(
 ): string | null {
   if (response.ack) return `${response.ack.action}: ${response.ack.status}`;
   if (request.type === 'query.performance' || responseView === 'perf') {
-    return renderPerformanceCurve(response.performance ?? [], response.events ?? []);
+    return renderPerformanceCurve(
+      response.performance ?? [],
+      response.events ?? [],
+      response.performance_context,
+    );
   }
   return null;
 }

@@ -1775,6 +1775,102 @@
       "title": "PauseCommand",
       "type": "object"
     },
+    "PerformanceContext": {
+      "additionalProperties": false,
+      "description": "What the performance plot measures and how to read it.\n\nCopied from recorded run state and the run manifest, never recomputed.\nEvery field is optional so the section can describe the objective before\nthe first measurement and omit facts a run never recorded; a run whose\nprose is known before its metric still gets a description-only context.",
+      "properties": {
+        "objective_metric": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Metric"
+        },
+        "objective_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Unit"
+        },
+        "objective_direction": {
+          "anyOf": [
+            {
+              "enum": [
+                "max",
+                "min"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Direction"
+        },
+        "objective_baseline_value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Baseline Value"
+        },
+        "objective_baseline_round": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Baseline Round"
+        },
+        "objective_baseline_commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Baseline Commit"
+        },
+        "objective_description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective Description"
+        }
+      },
+      "title": "PerformanceContext",
+      "type": "object"
+    },
     "PerformanceQuery": {
       "additionalProperties": false,
       "properties": {
@@ -2051,6 +2147,17 @@
           },
           "title": "Performance",
           "type": "array"
+        },
+        "performance_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PerformanceContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "experiments": {
           "items": {
