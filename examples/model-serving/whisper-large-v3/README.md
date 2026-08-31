@@ -22,7 +22,7 @@ whisper-large-v3/
 │   ├── config.json        # whisper-large-v3 config
 │   └── reference.py       # reference_transcribe() used by the checker
 ├── accuracy_checker/      # checker.py — reference-vs-candidate word-overlap gate
-├── benchmark/             # Request Factory adapter — offline requests_per_second
+├── benchmark/             # checked-in Request Factory workload trace
 └── test_audio/            # LibriSpeech test-clean clips + manifest.json
 ```
 
@@ -39,16 +39,13 @@ class VibeServeModel:
 
 and serve `/v1/audio/transcriptions` for the benchmark.
 
-The benchmark is executed by the pinned `vibesys-evaluator-request-factory`
-package. Its task-owned adapter verifies and hashes the WAV fixtures, writes
-canonical Request Factory traces, runs separate warmup and measured saturated
-phases, and projects the measured request throughput onto the historical
-top-level `requests_per_second` result field. Separate engine processes warm the
-server but do not share an HTTP connection pool. Request Factory's nonstreaming
-HTTP timeout is fixed at 3600 seconds, so the retained `--request-timeout` CLI
-option cannot change it. Its request-throughput window runs from the first
-Request Factory submission to the last completion, while the previous harness
-started timing just before it constructed the measured task set.
+The benchmark is executed directly by the pinned
+`vibesys-evaluator-request-factory` engine. Its checked-in 64-request trace
+cycles over the four WAV fixtures under saturated load at concurrency eight.
+VibeSys reads `request_throughput_per_s` from the Request Factory summary. No
+warmup requests are excluded, so cold-start work is part of the score. Request
+Factory measures from first submission to last completion and uses a fixed
+3600-second timeout for this nonstreaming endpoint.
 
 Cargo-tool evaluator packages currently require the Local run environment.
 Docker, Modal, and SkyPilot reject this task during evaluator provisioning.
