@@ -1,6 +1,7 @@
-"""Tests for the shared supervision diagnostic contract."""
+"""Tests for the server diagnostic contract."""
 
-from vibesys.server.diagnostics import (
+from server.api.protocol import ProtocolErrorMessage, Response
+from server.diagnostics import (
     Diagnostic,
     DiagnosticRetryability,
     DiagnosticScope,
@@ -9,8 +10,7 @@ from vibesys.server.diagnostics import (
     exception_to_diagnostic,
     redact_diagnostic_text,
 )
-from vibesys.server.events import EventType, RunEvent, make_event
-from vibesys.server.protocol import ProtocolErrorMessage, Response
+from server.events import EventType, RunEvent, make_event
 
 
 def test_diagnostic_round_trips_on_protocol_and_event_models() -> None:

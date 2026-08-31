@@ -24,7 +24,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from vibesys.constants import DEFAULT_COMPUTE_BACKEND, PROJECT_ROOT, ComputeBackend
 from vibesys.features import FeatureFlag
 from vibesys.repository import REPOSITORY_COMPONENT, RepositoryVisibility
-from vibesys.tui import DEFAULT_TUI_THEME, TuiTheme
 from vs_feature_flags import parse_feature_flag_overrides
 
 Provider = Literal["vertex-ai", "anthropic", "google-genai", "openai", "openai-compatible"]
@@ -240,17 +239,6 @@ class RepositoryCfg(_Strict):  # noqa: D101  # tracked: #288
         return owner
 
 
-class TuiCfg(_Strict):  # noqa: D101  # tracked: #288
-    theme: TuiTheme = Field(
-        default=DEFAULT_TUI_THEME,
-        description=(
-            "Semantic theme for the interactive client. One of: dark, light, "
-            "solarized-dark, solarized-light, catppuccin-mocha, catppuccin-latte, "
-            "high-contrast-dark, high-contrast-light. The --theme flag overrides."
-        ),
-    )
-
-
 class LoadLevelCfg(_Strict):
     """One benchmark load level fed to the perf_eval prompt template.
 
@@ -293,10 +281,6 @@ class Config(_Strict):  # noqa: D101  # tracked: #288
     repository: RepositoryCfg = Field(
         default_factory=RepositoryCfg,
         description="[repository] — defaults for remote experiment repositories.",
-    )
-    tui: TuiCfg = Field(
-        default_factory=TuiCfg,
-        description="[tui] — interactive client presentation settings.",
     )
     perf_eval: PerfEvalCfg = Field(
         default_factory=PerfEvalCfg,
@@ -349,12 +333,17 @@ def _apply_vertex_env_overrides(config: Config) -> None:
         vx.region = env_region
 
 
-def load_config(path: Path) -> Config:
-    """Load, validate, and env-override a TOML agent config file."""
+def load_config(path: Path, *, ignored_sections: frozenset[str] = frozenset()) -> Config:
+    """Load and validate core configuration from a shared TOML file.
+
+    Application entrypoints may name top-level sections they own in
+    ``ignored_sections``. The core schema remains strict for every section it
+    accepts without needing to know which applications embed it.
+    """
     _load_dotenv_file()
     path = Path(path)
     with open(path, "rb") as f:  # noqa: PTH123  # tracked: #288
-        raw = tomllib.load(f)
+        raw = {key: value for key, value in tomllib.load(f).items() if key not in ignored_sections}
 
     config = Config.model_validate(raw)
     _apply_vertex_env_overrides(config)

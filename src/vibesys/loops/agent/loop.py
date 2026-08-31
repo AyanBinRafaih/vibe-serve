@@ -52,7 +52,16 @@ from vibesys.profilers import (
     require_profiler_kind,
 )
 from vibesys.prompts import PROMPTS_DIR, render_template
-from vibesys.run import LoopContext, RepositoryVisibility, RunStateNamespace
+from vibesys.run import LoopContext, RepositoryVisibility, RunIntegration, RunStateNamespace
+from vibesys.run.events import (
+    BenchmarkResultData,
+    CoreEventType,
+    EventStatus,
+    ExperimentsChangedData,
+    JudgeResultData,
+    RoundFinishedData,
+    SubprocessOutputData,
+)
 from vibesys.sandbox.run_environment import (
     RunEnvironmentSpec,
     make_run_environment_spec,
@@ -73,15 +82,6 @@ from vibesys.schemas import (
     ValidationRecipeArtifact,
     Verdict,
     normalize_hypothesis_title,
-)
-from vibesys.server.events import (
-    BenchmarkResultData,
-    EventStatus,
-    EventType,
-    ExperimentsChangedData,
-    JudgeResultData,
-    RoundFinishedData,
-    SubprocessOutputData,
 )
 from vibesys.skills import (
     ResolvedSkillSelection,
@@ -1431,20 +1431,17 @@ def _run_judge(  # noqa: PLR0913  # tracked: #288
                 "verdict": Verdict.FAIL,
             }
         )
-    if ctx.supervisor is not None:
-        ctx.supervisor.record(
-            EventType.JUDGE_RESULT,
-            status=(
-                EventStatus.COMPLETED if response.verdict == Verdict.PASS else EventStatus.FAILED
-            ),
-            round_label=f"round-{round_number}-retry-{retry}",
-            agent_kind="judge",
-            data=JudgeResultData(
-                verdict=response.verdict.value,
-                feedback=response.feedback,
-                attempt=retry,
-            ),
-        )
+    ctx.events.emit(
+        CoreEventType.JUDGE_RESULT,
+        status=(EventStatus.COMPLETED if response.verdict == Verdict.PASS else EventStatus.FAILED),
+        round_label=f"round-{round_number}-retry-{retry}",
+        agent_kind="judge",
+        data=JudgeResultData(
+            verdict=response.verdict.value,
+            feedback=response.feedback,
+            attempt=retry,
+        ),
+    )
     issue_board.append_judge(progress_path, round_number, retry, response)
     ctx.snapshot_workspace(f"round-{round_number}-retry-{retry}-judge")
     return response
@@ -2133,9 +2130,9 @@ def _run_framework_benchmark(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracke
     ctx.snapshot_workspace(f"round-{round_number}-retry-{retry}-framework-benchmark")
     if passed:
         ctx.lprint(f"[framework-benchmark] PASS: {metric_name}={metric_value}")
-        if ctx.supervisor is not None and metric_name is not None and metric_value is not None:
-            ctx.supervisor.record(
-                EventType.BENCHMARK_RESULT,
+        if metric_name is not None and metric_value is not None:
+            ctx.events.emit(
+                CoreEventType.BENCHMARK_RESULT,
                 status=EventStatus.COMPLETED,
                 round_label=f"round-{round_number}",
                 data=BenchmarkResultData(
@@ -2304,6 +2301,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     interface: str = DEFAULT_INTERFACE,
     remote_repo: str | None = None,
     repo_visibility: RepositoryVisibility = RepositoryVisibility.PRIVATE,
+    integration: RunIntegration | None = None,
 ) -> bool:
     """Run the orchestrator-driven build loop.
 
@@ -2447,6 +2445,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         remote_repo=remote_repo,
         repo_visibility=repo_visibility,
         agent_state_model_type=AgentRunState,
+        integration=integration,
     )
     ctx.lprint(f"[log] orchestrate run: {ctx.run_log_path}")
     ctx.lprint(f"[log] project root: {ctx.project_root}")
@@ -2615,11 +2614,10 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         agent_run_state,
                         label=f"agent: start hypothesis {plan.hypothesis_id}",
                     )
-                    if ctx.supervisor is not None:
-                        ctx.supervisor.record(
-                            EventType.EXPERIMENTS_CHANGED,
-                            data=ExperimentsChangedData(reason="active_hypothesis_changed"),
-                        )
+                    ctx.events.emit(
+                        CoreEventType.EXPERIMENTS_CHANGED,
+                        data=ExperimentsChangedData(reason="active_hypothesis_changed"),
+                    )
                 else:
                     plan = active_hypothesis.plan
                     issue_board.append_hypothesis_continuation(
@@ -3561,28 +3559,27 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 ctx.persist_completed_round()
                 agent_run_state = next_agent_run_state
                 active_hypothesis = agent_run_state.active_hypothesis
-                if ctx.supervisor is not None:
-                    ctx.supervisor.record(
-                        EventType.EXPERIMENTS_CHANGED,
-                        data=ExperimentsChangedData(reason="round_persisted"),
-                    )
-                    ctx.supervisor.record(
-                        EventType.ROUND_FINISHED,
-                        status=(
-                            EventStatus.COMPLETED
-                            if passed or not records[-1].reviewed
-                            else EventStatus.FAILED
+                ctx.events.emit(
+                    CoreEventType.EXPERIMENTS_CHANGED,
+                    data=ExperimentsChangedData(reason="round_persisted"),
+                )
+                ctx.events.emit(
+                    CoreEventType.ROUND_FINISHED,
+                    status=(
+                        EventStatus.COMPLETED
+                        if passed or not records[-1].reviewed
+                        else EventStatus.FAILED
+                    ),
+                    round_label=f"round-{round_number}",
+                    data=RoundFinishedData(
+                        attempts=retry,
+                        judge_verdict=(
+                            "pass" if passed else "fail" if records[-1].reviewed else "skipped"
                         ),
-                        round_label=f"round-{round_number}",
-                        data=RoundFinishedData(
-                            attempts=retry,
-                            judge_verdict=(
-                                "pass" if passed else "fail" if records[-1].reviewed else "skipped"
-                            ),
-                            perf_metric=perf_metric,
-                            perf_unit=perf_unit,
-                        ),
-                    )
+                        perf_metric=perf_metric,
+                        perf_unit=perf_unit,
+                    ),
+                )
 
                 round_number += 1
 
@@ -3599,10 +3596,10 @@ def _publish_subprocess_output(
     process_kind: str,
     content: str,
 ) -> None:
-    if ctx.supervisor is None or not content:
+    if not content:
         return
-    ctx.supervisor.record(
-        EventType.SUBPROCESS_OUTPUT,
+    ctx.events.emit(
+        CoreEventType.SUBPROCESS_OUTPUT,
         data=SubprocessOutputData(
             process_id=process_id,
             process_kind=process_kind,

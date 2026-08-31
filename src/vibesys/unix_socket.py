@@ -4,7 +4,7 @@ A ``AF_UNIX`` address is a fixed-size ``sockaddr_un.sun_path`` character array,
 so the kernel refuses to bind a path that does not fit: 108 bytes on Linux and
 104 on macOS, both counting the terminating NUL. Every listening path VibeSys
 builds is derived from a user-chosen directory (a run's log directory for the
-SkyPilot bridge, a session directory for the supervision server), so a deep
+SkyPilot bridge, a session directory for an application server), so a deep
 enough workspace pushes the socket past the limit.
 
 The raw failure is an ``OSError`` reading ``AF_UNIX path too long`` that names

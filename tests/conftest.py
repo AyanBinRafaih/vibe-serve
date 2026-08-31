@@ -28,10 +28,9 @@ def isolated_vibesys_state_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 def headless_renderer() -> Iterator[HeadlessRenderer]:
     """Compose a headless renderer for every test, mirroring production.
 
-    In production ``create_run_context`` subscribes the renderer exactly once
-    per headless run; tests get the same composition so code that emits
-    events through the output sink still produces observable terminal output
-    (e.g. for ``capsys`` assertions).
+    In production the headless entrypoint installs this subscriber. Tests get
+    the same presentation composition so direct output-sink emissions remain
+    observable to ``capsys`` assertions.
     """
     renderer = HeadlessRenderer()
     unsubscribe = output_sink().subscribe(renderer.handle)

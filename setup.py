@@ -38,20 +38,21 @@ class build_py(_build_py):  # noqa: N801 - setuptools command classes are lowerc
     def run(self) -> None:  # noqa: D102  # tracked: #288
         clear_distribution_build_outputs(Path(self.build_lib), self.packages or [])
         super().run()
-        package_root = Path(self.build_lib) / "vibesys"
+        vibesys_package_root = Path(self.build_lib) / "vibesys"
+        entrypoints_package_root = Path(self.build_lib) / "entrypoints"
         target_key = os.environ.get("VIBESYS_WHEEL_TARGET")
         bundle_value = os.environ.get("VIBESYS_TUI_BUNDLE")
         bundle = Path(bundle_value) if bundle_value else None
         required = target_key is not None
         stage_prebuilt_tui(
             bundle,
-            package_root / "_tui",
+            entrypoints_package_root / "_tui",
             required=required,
             expected_target=target_key,
             expected_distribution_version=self.distribution.get_version(),
         )
-        stage_resources(_REPO_ROOT, package_root / "_resources", required=required)
-        stage_sdk(_REPO_ROOT, package_root / "_sdk", required=required)
+        stage_resources(_REPO_ROOT, vibesys_package_root / "_resources", required=required)
+        stage_sdk(_REPO_ROOT, vibesys_package_root / "_sdk", required=required)
 
 
 class bdist_wheel(_bdist_wheel):  # noqa: N801

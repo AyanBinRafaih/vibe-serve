@@ -13,7 +13,7 @@ from vibesys.agents.progress import AgentProgress
 from vibesys.agents.todos import todos_from_tool_call
 from vibesys.render.format import format_status_prefix
 from vibesys.render.sink import output_sink
-from vibesys.server.events import AgentOutputChannel, AgentStatusData, ToolResultPayload
+from vibesys.run.events import AgentOutputChannel, AgentStatusData, ToolResultPayload
 
 ContextWindowLookup = Callable[[str | None], int | None]
 """Resolves a model name to its context window size in tokens.
@@ -67,7 +67,7 @@ class AgentLogger(BaseCallbackHandler):
 
     Every observation is published as typed events through the process-global
     :func:`~vibesys.render.sink.output_sink` (rendered by whichever surface is
-    composed — headless terminal renderer or TUI client) and, when ``log_file``
+    composed, such as a headless renderer or application subscriber) and, when ``log_file``
     is provided, written untruncated as plain text to the durable run log.
     ``AgentLogger`` itself never writes to the terminal.
     """

@@ -66,7 +66,7 @@ from vibesys.loops.gates import run_accuracy_gate
 from vibesys.loops.profiler import invoke_profiler
 from vibesys.profilers import ProfilerKind, profiler_definition
 from vibesys.prompts import PROMPTS_DIR
-from vibesys.run import LoopContext, RepositoryVisibility, RunStateNamespace
+from vibesys.run import LoopContext, RepositoryVisibility, RunIntegration, RunStateNamespace
 from vibesys.sandbox.run_environment import (
     RunEnvironmentSpec,
     make_run_environment_spec,
@@ -1307,6 +1307,7 @@ def run_evolve_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     openevolve_config: OpenEvolveSearchConfig | None = None,
     remote_repo: str | None = None,
     repo_visibility: RepositoryVisibility = RepositoryVisibility.PRIVATE,
+    integration: RunIntegration | None = None,
 ) -> bool:
     """Run an LLM-driven evolutionary search.
 
@@ -1403,6 +1404,7 @@ def run_evolve_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         environment_hooks=domain_definition.environment_hooks,
         remote_repo=remote_repo,
         repo_visibility=repo_visibility,
+        integration=integration,
     )
     ctx.lprint(f"[log] evolutionary run: {ctx.run_log_path}")
     ctx.lprint(f"[log] project root: {ctx.project_root}")

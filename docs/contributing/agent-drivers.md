@@ -20,7 +20,7 @@ The `omnigent` package is a base dependency (pinned exactly in
 
 `driver = "mock"` is test infrastructure. It satisfies the same driver
 contract while streaming a deterministic playbook, so tests exercise the real
-`AgentClient` -> `OutputSink` -> supervisor -> transport path without an agent
+`AgentClient` -> `OutputSink` -> server integration -> transport path without an agent
 CLI, a model, or a network. It never writes events, state, or files itself.
 
 ```toml

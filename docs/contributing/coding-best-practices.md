@@ -7,7 +7,9 @@ path.
 
 ## Architecture Boundaries
 
-- Put framework behavior under `src/vibesys/`.
+- Put headless optimization behavior under `src/vibesys/`.
+- Put frontend-serving behavior under `src/server/`.
+- Put process composition under `src/entrypoints/`, not in `libs/`.
 - Put reusable standalone libraries under `libs/`.
 - Put prompt, loop, and domain behavior in the package that owns that surface.
 - Put long-form serving knowledge under `resources/skills/`, not in framework

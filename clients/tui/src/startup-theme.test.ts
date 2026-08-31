@@ -33,7 +33,7 @@ describe('resolveStartupTheme', () => {
   });
 
   it('falls back to the default theme when the request fails', async () => {
-    const rejected = Promise.reject(new Error('Supervision server disconnected'));
+    const rejected = Promise.reject(new Error('Server disconnected'));
 
     await expect(resolveStartupTheme(rejected, {timeoutMs: 1_000})).resolves.toBe('dark');
   });

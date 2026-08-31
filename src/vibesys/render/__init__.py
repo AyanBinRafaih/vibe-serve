@@ -3,7 +3,7 @@
 The backend never prints to the terminal directly. It emits typed events
 through :data:`~vibesys.render.sink.OutputSink` (see :func:`output_sink`)
 and writes plain text to the durable run log. Every human-facing surface —
-the headless terminal view, the TUI client — is a renderer subscribed to
+the headless terminal view or an application integration, is a renderer subscribed to
 the same event stream.
 """
 

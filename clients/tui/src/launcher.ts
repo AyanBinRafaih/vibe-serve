@@ -14,15 +14,15 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
 const BACKEND_EXIT_GRACE_MS = 2_000;
 
 export async function launch(argv: string[]): Promise<number> {
-  const backend = resolveBackendCommand();
-  if (!backend) return reportMissingPython();
+  const python = resolvePythonCommand();
+  if (!python) return reportMissingPython();
 
   if (argv[0] === 'validate') {
-    return runToCompletion(backend.command, [...backend.args, ...argv]);
+    return runToCompletion(python.command, [...python.args, '-m', 'entrypoints.headless', ...argv]);
   }
 
   if (argv.some(argument => argument === '-h' || argument === '--help')) {
-    return runToCompletion(backend.command, [...backend.args, ...argv, '--headless']);
+    return runToCompletion(python.command, [...python.args, '-m', 'entrypoints.headless', ...argv]);
   }
 
   const runtime = process.env['VIBESYS_TUI_RUNTIME'] ?? 'bun';
@@ -51,8 +51,8 @@ export async function launch(argv: string[]): Promise<number> {
   const backendLogFd = openSync(backendLogPath, 'w');
   let backendLogClosed = false;
   const backendProcess = spawn(
-    backend.command,
-    [...backend.args, ...argv, '--headless', '--control-socket', socketPath],
+    python.command,
+    [...python.args, '-m', 'entrypoints.server', ...argv, '--control-socket', socketPath],
     {
       detached: true,
       stdio: ['ignore', backendLogFd, backendLogFd],
@@ -107,7 +107,7 @@ export async function launch(argv: string[]): Promise<number> {
   }
 }
 
-interface BackendCommand {
+interface PythonCommand {
   command: string;
   args: string[];
 }
@@ -138,11 +138,11 @@ function optionValue(argv: string[], option: string): string | undefined {
   return undefined;
 }
 
-function resolveBackendCommand(): BackendCommand | undefined {
+function resolvePythonCommand(): PythonCommand | undefined {
   const configuredPython = process.env['VIBESYS_PYTHON'];
-  if (configuredPython) return {command: configuredPython, args: ['-m', 'vibesys']};
-  if (commandExistsSync('python3')) return {command: 'python3', args: ['-m', 'vibesys']};
-  if (commandExistsSync('python')) return {command: 'python', args: ['-m', 'vibesys']};
+  if (configuredPython) return {command: configuredPython, args: []};
+  if (commandExistsSync('python3')) return {command: 'python3', args: []};
+  if (commandExistsSync('python')) return {command: 'python', args: []};
   return undefined;
 }
 

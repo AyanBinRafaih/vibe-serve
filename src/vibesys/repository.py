@@ -7,10 +7,6 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path  # noqa: TC003  # tracked: #288
 
-from pydantic import BaseModel, ConfigDict
-
-from vibesys.tui import TuiTheme
-
 
 class RepositoryVisibility(StrEnum):
     """Supported GitHub repository visibility values."""
@@ -22,20 +18,6 @@ class RepositoryVisibility(StrEnum):
 
 REPOSITORY_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 REPOSITORY_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
-
-class InteractiveSetupDefaults(BaseModel):
-    """JSON contract passed from Python configuration to the pre-launch TUI."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    runs_dir: str
-    input_path: str
-    experiment_name: str
-    repository_owner: str | None
-    repository_name: str
-    visibility: RepositoryVisibility
-    theme: TuiTheme
 
 
 def generate_experiment_name(

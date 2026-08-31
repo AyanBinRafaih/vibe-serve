@@ -12,7 +12,7 @@ export interface EventSubscription {
   close(): Promise<void>;
 }
 
-export interface SupervisionClientOptions {
+export interface ServerClientOptions {
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
   /** Delay between connection attempts while the socket does not exist yet. */
@@ -34,18 +34,18 @@ const DEFAULT_CONNECT_RETRY_INTERVAL_MS = 25;
 /** Errors a not-yet-listening server produces; anything else is fatal. */
 const RETRYABLE_CONNECT_CODES = new Set(['ENOENT', 'ECONNREFUSED']);
 
-/** A failed supervision response, including its optional structured diagnostic. */
-export class SupervisionError extends Error {
+/** A failed server response, including its optional structured diagnostic. */
+export class ServerError extends Error {
   constructor(
     message: string,
     readonly diagnostic: Diagnostic | null = null,
   ) {
     super(message);
-    this.name = 'SupervisionError';
+    this.name = 'ServerError';
   }
 }
 
-export class SupervisionClient {
+export class ServerClient {
   readonly #socket: Socket;
   readonly #path: string;
   readonly #pending = new Map<
@@ -61,7 +61,7 @@ export class SupervisionClient {
   readonly #longRunningSockets = new Set<Socket>();
   #buffer = '';
 
-  private constructor(socket: Socket, path: string, options: SupervisionClientOptions) {
+  private constructor(socket: Socket, path: string, options: ServerClientOptions) {
     this.#socket = socket;
     this.#path = path;
     this.#connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
@@ -69,35 +69,32 @@ export class SupervisionClient {
     socket.setEncoding('utf8');
     socket.on('data', chunk => this.#onData(chunk.toString()));
     socket.on('error', error => this.#rejectAll(error));
-    socket.on('close', () => this.#rejectAll(new Error('Supervision server disconnected')));
+    socket.on('close', () => this.#rejectAll(new Error('Server disconnected')));
   }
 
   /**
-   * Connect to the supervision socket, retrying until it accepts.
+   * Connect to the server socket, retrying until it accepts.
    *
    * The launcher starts the backend and this client concurrently, so the
    * socket routinely does not exist for the first few hundred milliseconds.
    * Only the errors a starting server produces are retried; every other
    * failure, and the overall deadline, still surfaces to the caller.
    */
-  static async connect(
-    path: string,
-    options: SupervisionClientOptions = {},
-  ): Promise<SupervisionClient> {
+  static async connect(path: string, options: ServerClientOptions = {}): Promise<ServerClient> {
     const timeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     const retryIntervalMs = options.connectRetryIntervalMs ?? DEFAULT_CONNECT_RETRY_INTERVAL_MS;
     const deadline = Date.now() + timeoutMs;
     let lastError: Error | undefined;
     while (true) {
       try {
-        return await SupervisionClient.#connectOnce(path, options, deadline);
+        return await ServerClient.#connectOnce(path, options, deadline);
       } catch (error) {
         if (!isRetryableConnectError(error)) throw error;
         lastError = error;
       }
       if (Date.now() + retryIntervalMs >= deadline) {
         throw new Error(
-          `Timed out connecting to supervision server after ${timeoutMs}ms: ${lastError?.message}`,
+          `Timed out connecting to server after ${timeoutMs}ms: ${lastError?.message}`,
         );
       }
       await delay(retryIntervalMs);
@@ -106,9 +103,9 @@ export class SupervisionClient {
 
   static #connectOnce(
     path: string,
-    options: SupervisionClientOptions,
+    options: ServerClientOptions,
     deadline: number,
-  ): Promise<SupervisionClient> {
+  ): Promise<ServerClient> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(path);
       const onError = (error: Error): void => {
@@ -120,7 +117,7 @@ export class SupervisionClient {
           socket.destroy();
           reject(
             new Error(
-              `Timed out connecting to supervision server after ${options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS}ms`,
+              `Timed out connecting to server after ${options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS}ms`,
             ),
           );
         },
@@ -129,7 +126,7 @@ export class SupervisionClient {
       socket.once('connect', () => {
         clearTimeout(timeout);
         socket.off('error', onError);
-        resolve(new SupervisionClient(socket, path, options));
+        resolve(new ServerClient(socket, path, options));
       });
       socket.once('error', onError);
     });
@@ -137,7 +134,7 @@ export class SupervisionClient {
 
   request(input: RequestInput): Promise<ProtocolResponse> {
     if (this.#socket.destroyed) {
-      return Promise.reject(new Error('Supervision server is disconnected'));
+      return Promise.reject(new Error('Server is disconnected'));
     }
     const requestId = randomUUID();
     const request = {
@@ -150,7 +147,7 @@ export class SupervisionClient {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.#pending.delete(requestId);
-        reject(new Error(`Supervision request timed out after ${this.#requestTimeoutMs}ms`));
+        reject(new Error(`Server request timed out after ${this.#requestTimeoutMs}ms`));
       }, this.#requestTimeoutMs);
       this.#pending.set(requestId, {resolve, reject, timeout});
       this.#socket.write(`${JSON.stringify(request)}\n`, error => {
@@ -173,9 +170,7 @@ export class SupervisionClient {
       let disconnected = false;
       let protocolErrorReceived = false;
       const handshakeTimeout = setTimeout(() => {
-        disconnect(
-          new Error(`Supervision subscription timed out after ${this.#connectTimeoutMs}ms`),
-        );
+        disconnect(new Error(`Server subscription timed out after ${this.#connectTimeoutMs}ms`));
         socket.destroy();
       }, this.#connectTimeoutMs);
       const disconnect = (error: Error): void => {
@@ -243,8 +238,8 @@ export class SupervisionClient {
         disconnect(
           new Error(
             subscribed
-              ? 'Supervision event stream disconnected'
-              : 'Supervision event stream disconnected before subscription',
+              ? 'Server event stream disconnected'
+              : 'Server event stream disconnected before subscription',
           ),
         );
       });
@@ -275,9 +270,7 @@ export class SupervisionClient {
       let buffer = '';
       let settled = false;
       const connectTimeout = setTimeout(() => {
-        fail(
-          new Error(`Timed out connecting to supervision server after ${this.#connectTimeoutMs}ms`),
-        );
+        fail(new Error(`Timed out connecting to server after ${this.#connectTimeoutMs}ms`));
       }, this.#connectTimeoutMs);
 
       const cleanup = (): void => {
@@ -293,12 +286,11 @@ export class SupervisionClient {
         socket.destroy();
         reject(error);
       };
-      const disconnected = (): void =>
-        fail(new Error('Supervision server disconnected during chat'));
+      const disconnected = (): void => fail(new Error('Server disconnected during chat'));
       const finish = (response: ProtocolResponse): void => {
         if (settled) return;
         if (response.request_id !== request.request_id) {
-          fail(new Error('Supervision chat response has an unexpected request ID'));
+          fail(new Error('Server chat response has an unexpected request ID'));
           return;
         }
         settled = true;
@@ -390,11 +382,8 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function responseError(response: ProtocolResponse): SupervisionError {
-  return new SupervisionError(
-    response.error ?? 'Unknown supervision error',
-    response.diagnostic ?? null,
-  );
+function responseError(response: ProtocolResponse): ServerError {
+  return new ServerError(response.error ?? 'Unknown server error', response.diagnostic ?? null);
 }
 
 function closeSocket(socket: Socket): Promise<void> {
@@ -407,12 +396,12 @@ function closeSocket(socket: Socket): Promise<void> {
 
 function parseProtocolResponse(line: string): ProtocolResponse {
   const value = parseRecord(line, 'response');
-  if (value['protocol_version'] !== 1) throw new Error('Unsupported supervision protocol version');
+  if (value['protocol_version'] !== 1) throw new Error('Unsupported server protocol version');
   if (typeof value['request_id'] !== 'string') {
-    throw new Error('Invalid supervision response: request_id must be a string');
+    throw new Error('Invalid server response: request_id must be a string');
   }
   if (typeof value['ok'] !== 'boolean') {
-    throw new Error('Invalid supervision response: ok must be a boolean');
+    throw new Error('Invalid server response: ok must be a boolean');
   }
   return value as unknown as ProtocolResponse;
 }
@@ -437,7 +426,7 @@ function parseServerMessage(line: string): ServerMessage {
       throw new Error('Invalid protocol error message');
     }
   } else {
-    throw new Error(`Unknown supervision event-stream message: ${String(type)}`);
+    throw new Error(`Unknown server event-stream message: ${String(type)}`);
   }
   return value as unknown as ServerMessage;
 }
@@ -448,10 +437,10 @@ function parseRecord(line: string, description: string): Record<string, unknown>
     value = JSON.parse(line);
   } catch (error) {
     throw new Error(
-      `Invalid supervision ${description} JSON: ${error instanceof Error ? error.message : String(error)}`,
+      `Invalid server ${description} JSON: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  if (!isRecord(value)) throw new Error(`Invalid supervision ${description}: expected an object`);
+  if (!isRecord(value)) throw new Error(`Invalid server ${description}: expected an object`);
   return value;
 }
 

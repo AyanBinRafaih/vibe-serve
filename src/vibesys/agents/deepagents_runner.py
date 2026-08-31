@@ -91,7 +91,7 @@ class DeepAgentsClient(AgentClient):
     ) -> tuple[MemorySaver, str]:
         """Return a fresh thread by default, or a durable thread for a key."""
         checkpointer = self._checkpointer(kind)
-        if not reuse_session or kind == "chat":
+        if not reuse_session:
             return checkpointer, uuid.uuid4().hex
         key = f"{kind}:{session_key}" if session_key else kind
         if key not in self._deepagents_sessions:

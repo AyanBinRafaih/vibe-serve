@@ -14,8 +14,10 @@ bundles, and the TUI.
 ## Repository layout
 
 ```text
-src/vibesys/             Python framework and loop implementation
-clients/backend-client/  TypeScript supervision protocol and transport
+src/vibesys/             Headless optimization core and loop implementation
+src/server/              Frontend-serving runtime and protocol
+src/entrypoints/         Process composition and command entrypoints
+clients/backend-client/  TypeScript server protocol and transport
 clients/core-state/      Pure backend-event projection
 clients/tui/             TypeScript terminal UI and launcher
 libs/                    Reusable standalone libraries
@@ -29,6 +31,10 @@ tests/                   Python and integration tests
 
 The main framework boundaries are:
 
+- `src/entrypoints/` owns executable composition. Entrypoints do not live in
+  `libs/`.
+- `src/server/` owns serving and frontend-specific behavior. It may depend on
+  `src/vibesys/`, but the headless core does not depend on it.
 - `src/vibesys/loops/` owns the outer-loop policies and shared loop helpers.
 - `src/vibesys/agents/` owns the agent-runner abstraction and integrations.
 - `src/vibesys/domains/` owns domain-specific prompt context and hooks.
@@ -104,7 +110,7 @@ uv run pytest
 For a focused test, use for example:
 
 ```bash
-uv run pytest tests/loops/plain/test_plain_loop.py
+uv run pytest tests/vibesys/loops/plain/test_plain_loop.py
 uv run pytest -k orchestrator
 ```
 

@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 PYPI_FILE_SIZE_LIMIT = 100_000_000
 FRAMEWORK_PACKAGES = (
     "vibesys",
+    "entrypoints",
+    "server",
     "vs_evaluator_protocol",
     "vs_feature_flags",
     "vs_github",
@@ -61,6 +63,8 @@ _INTERNAL_DISTRIBUTIONS = frozenset(
 )
 _PACKAGE_SOURCE_ROOTS = {
     Path("src/vibesys"): PurePosixPath("vibesys"),
+    Path("src/entrypoints"): PurePosixPath("entrypoints"),
+    Path("src/server"): PurePosixPath("server"),
     Path("libs/vs-evaluator-protocol/src/vs_evaluator_protocol"): PurePosixPath(
         "vs_evaluator_protocol"
     ),
@@ -105,7 +109,7 @@ _REQUIRED_TUI_FILES = (
     "manifest.json",
 )
 _EXPECTED_ENTRY_POINTS = {
-    "vibesys": "vibesys.cli:main",
+    "vibesys": "entrypoints.launcher:main",
     "vibesys-issue-mcp": "vs_issue_board.mcp:main",
 }
 _DIST_INFO_FILES = frozenset(
@@ -502,7 +506,7 @@ def _verify_tui_payload(
     target: WheelTarget,
     version: str,
 ) -> set[str]:
-    root = _archive_path(platlib, "vibesys/_tui")
+    root = _archive_path(platlib, "entrypoints/_tui")
     for relative in _REQUIRED_TUI_FILES:
         _required_member(members, f"{root}/{relative}", relative)
 
@@ -610,7 +614,7 @@ def _verify_repository_licenses(
         archive,
         members,
         source=source_root / "third_party/bun/LICENSE",
-        member=_archive_path(platlib, "vibesys/_tui/licenses/BUN-LICENSE.md"),
+        member=_archive_path(platlib, "entrypoints/_tui/licenses/BUN-LICENSE.md"),
         description="Bun license",
     )
     _verify_source_digest(

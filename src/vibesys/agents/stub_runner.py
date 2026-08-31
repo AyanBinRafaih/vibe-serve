@@ -88,7 +88,7 @@ class StubAgentClient:
         reuse_session: bool | None = None,
         session_key: str | None = None,
     ) -> str:
-        """Return a deterministic conversational answer for TUI smoke tests."""
+        """Return a deterministic answer for auxiliary-agent smoke tests."""
         del (
             workspace,
             system_prompt,
@@ -108,4 +108,4 @@ class StubAgentClient:
             round_label=round_label,
             invocation_id=invocation_id,
         )
-        return "Stub chat inspected the available experiment trajectory."
+        return "Stub agent inspected the available experiment trajectory."

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from vibesys.server.events import EventStore, EventType, RunEvent, ToolCallData, make_event
+from server.events import EventStore, EventType, RunEvent, ToolCallData, make_event
 
 
 def _persisted_event(sequence: int, text: str = "") -> RunEvent:

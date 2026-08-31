@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from langchain_core.callbacks import BaseCallbackHandler
 
 from vibesys.render.sink import output_sink
+from vibesys.run.events import AgentOutputChannel, TodoItemData
 from vibesys.schemas import (
     ImplementerResponse,
     IssueImplementerResponse,
@@ -27,7 +28,6 @@ from vibesys.schemas import (
     ProfilerResponse,
     Verdict,
 )
-from vibesys.server.events import AgentOutputChannel, TodoItemData
 
 T = TypeVar("T", bound=BaseModel)
 

@@ -23,7 +23,7 @@ AGENT_DRIVERS: tuple[str, ...] = ("agentshim", "omnigent", "mock")
 
 ``mock`` is test infrastructure: it satisfies the same driver contract while
 streaming a deterministic playbook, so integration tests exercise the real
-client, sink, supervisor, and transport path without an agent CLI.
+client, sink, and application integration path without an agent CLI.
 """
 
 

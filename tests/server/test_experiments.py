@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
+from tests.server.support import build_server_parts
+
+from server.api.experiments import build_experiment_log
+from server.api.protocol import ExperimentQuery, PerformanceQuery
 from vibesys.loops.agent.model import (
     AgentRunState,
     Hypothesis,
@@ -14,10 +18,6 @@ from vibesys.loops.agent.model import (
 )
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.schemas import HypothesisOutcome, OrchestratorPlan
-from vibesys.server import RunSupervisor
-from vibesys.server.experiments import build_experiment_log
-from vibesys.server.protocol import ExperimentQuery, PerformanceQuery
-from vibesys.server.service import SupervisionService
 from vs_loop_state import RoundRecord
 from vs_project import AgentRunConfiguration, Project, RunEnvironmentRecord
 
@@ -302,10 +302,8 @@ def test_service_reads_only_authoritative_agent_state(tmp_path: Path) -> None:
             ],
         )
     )
-    supervisor = RunSupervisor()
-    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
-
-    response = SupervisionService(supervisor).execute(ExperimentQuery())
+    parts = build_server_parts(project.state.log_directory(run_id), project=project, run_id=run_id)
+    response = parts.api.execute(ExperimentQuery())
 
     assert [entry.hypothesis_id for entry in response.experiments] == ["H-01", "H-02"]
     assert response.experiments[1].active is True
@@ -334,10 +332,8 @@ def test_service_reads_performance_from_authoritative_agent_state(tmp_path: Path
             ]
         )
     )
-    supervisor = RunSupervisor()
-    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
-
-    response = SupervisionService(supervisor).execute(PerformanceQuery())
+    parts = build_server_parts(project.state.log_directory(run_id), project=project, run_id=run_id)
+    response = parts.api.execute(PerformanceQuery())
 
     assert [(item.round, item.perf_metric) for item in response.performance] == [(1, 42.0)]
 
@@ -355,10 +351,8 @@ def test_service_adapts_legacy_state_read_only(tmp_path: Path) -> None:
     )
     portable = project.state.portable_namespace(run_id, "agent")
     store = AgentRunStateStore(portable)
-    supervisor = RunSupervisor()
-    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
-
-    (entry,) = SupervisionService(supervisor).execute(ExperimentQuery()).experiments
+    parts = build_server_parts(project.state.log_directory(run_id), project=project, run_id=run_id)
+    (entry,) = parts.api.execute(ExperimentQuery()).experiments
 
     assert entry.hypothesis_id == "H-01"
     assert entry.claim == "legacy claim"
@@ -401,10 +395,8 @@ def test_service_rebuilds_legacy_measurement_and_resolution_from_round_evidence(
             perf_unit="ops_s",
         ),
     )
-    supervisor = RunSupervisor()
-    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
-
-    entries = SupervisionService(supervisor).execute(ExperimentQuery()).experiments
+    parts = build_server_parts(project.state.log_directory(run_id), project=project, run_id=run_id)
+    entries = parts.api.execute(ExperimentQuery()).experiments
 
     regression = next(entry for entry in entries if entry.hypothesis_id == "H-regression")
     assert regression.resolved_outcome == "disproven"
@@ -424,10 +416,8 @@ def test_service_rebuilds_legacy_measurement_and_resolution_from_round_evidence(
 
 def test_service_returns_authoritative_empty_log_after_attach(tmp_path: Path) -> None:
     project, run_id = _project_run(tmp_path / "project")
-    supervisor = RunSupervisor()
-    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
-
-    response = SupervisionService(supervisor).execute(ExperimentQuery())
+    parts = build_server_parts(project.state.log_directory(run_id), project=project, run_id=run_id)
+    response = parts.api.execute(ExperimentQuery())
 
     assert response.experiments == []
     assert response.experiments_ready is True

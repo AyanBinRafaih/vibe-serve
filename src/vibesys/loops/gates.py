@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from vibesys.run import LoopContext  # noqa: TC001  # tracked: #288
-from vibesys.server.events import EventType, SubprocessOutputData
+from vibesys.run.events import CoreEventType, SubprocessOutputData
 
 
 @dataclass(frozen=True)
@@ -92,10 +92,10 @@ def _publish_subprocess_output(
     process_id: str,
     content: str,
 ) -> None:
-    if ctx.supervisor is None or not content:
+    if not content:
         return
-    ctx.supervisor.record(
-        EventType.SUBPROCESS_OUTPUT,
+    ctx.events.emit(
+        CoreEventType.SUBPROCESS_OUTPUT,
         data=SubprocessOutputData(
             process_id=process_id,
             process_kind="accuracy_checker",

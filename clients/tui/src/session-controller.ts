@@ -3,9 +3,9 @@ import {
   type ProtocolResponse,
   type RequestInput,
   type RunEvent,
+  ServerError,
   type ServerMessage,
   type SubscribeOptions,
-  SupervisionError,
 } from '@vibesys/backend-client';
 import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
 import type {StartupTrace} from './boot-trace.js';
@@ -150,7 +150,7 @@ export interface SessionController {
   subscribe(listener: (state: SessionState) => void): () => void;
 }
 
-export interface SupervisionTransport {
+export interface ServerTransport {
   request(input: RequestInput): Promise<ProtocolResponse>;
   subscribe(
     afterSequence: number,
@@ -218,7 +218,7 @@ export class SocketSessionController implements SessionController {
   #streamProtocolError = false;
 
   constructor(
-    private readonly client: SupervisionTransport,
+    private readonly client: ServerTransport,
     themeName: ThemeName = DEFAULT_THEME_NAME,
     /**
      * Where boot measurements go. The controller only reports; whether
@@ -1017,7 +1017,7 @@ function reportCaughtError(
 ): SessionState {
   return reportError(state, errorMessage(error), {
     scope,
-    diagnostic: error instanceof SupervisionError ? error.diagnostic : null,
+    diagnostic: error instanceof ServerError ? error.diagnostic : null,
   });
 }
 

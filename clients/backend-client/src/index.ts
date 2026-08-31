@@ -1,9 +1,9 @@
 export {
   type EventSubscription,
+  ServerClient,
+  type ServerClientOptions,
+  ServerError,
   type SubscribeOptions,
-  SupervisionClient,
-  type SupervisionClientOptions,
-  SupervisionError,
 } from './client.js';
 export type {
   ChatModelOption,

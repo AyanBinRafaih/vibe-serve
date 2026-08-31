@@ -8,7 +8,7 @@ vs --help
 ```
 
 The package installs `vs` and `vibesys` as aliases for the same launcher. The
-launcher starts the Python VibeSys backend with `python -m vibesys --headless`
+launcher starts the Python VibeSys server with `python -m entrypoints.server`
 from the current directory and then attaches the OpenTUI client. The launcher
 passes run arguments through unchanged. With no `--input`, the current
 directory is the in-place project; pass `--input PATH` to select another
@@ -269,10 +269,10 @@ pnpm check:clients
 pnpm test:clients
 pnpm build:clients
 pnpm check:ts
-uv run pytest tests/test_tui.py tests/agents/test_callbacks.py tests/render/test_sink.py
+uv run pytest tests/server tests/vibesys/agents/test_callbacks.py tests/vibesys/render/test_sink.py
 ```
 
 After changing Python protocol models, regenerate both files in
 `clients/backend-client/src/generated/` and review their diff. The test suite covers reducer behavior,
 OpenTUI frames and navigation, launcher cleanup, socket fragmentation and
-timeouts, replay/live delivery, and the Python supervision service.
+timeouts, replay/live delivery, and the Python server.

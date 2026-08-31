@@ -4,12 +4,12 @@ import {
   type ProtocolResponse,
   type RequestInput,
   type RunEvent,
+  ServerError,
   type ServerMessage,
   type SubscribeOptions,
-  SupervisionError,
 } from '@vibesys/backend-client';
 import {resolveStartupTrace} from './boot-trace.js';
-import {SocketSessionController, type SupervisionTransport} from './session-controller.js';
+import {type ServerTransport, SocketSessionController} from './session-controller.js';
 import {chatPaneVisible, experimentLogVisible} from './session-model.js';
 
 describe('session controller', () => {
@@ -68,7 +68,7 @@ describe('session controller', () => {
   it('issues every boot request concurrently', async () => {
     const started: string[] = [];
     const pending: Array<() => void> = [];
-    const transport: SupervisionTransport = {
+    const transport: ServerTransport = {
       request(input: RequestInput): Promise<ProtocolResponse> {
         started.push(input.type ?? 'untyped');
         return new Promise(resolve => {
@@ -241,7 +241,7 @@ describe('session controller', () => {
     });
     expect(controller.state.core.activeExecutions['impl-1']).toBeDefined();
 
-    transport.disconnect(new Error('Supervision event stream disconnected'));
+    transport.disconnect(new Error('Server event stream disconnected'));
 
     expect(controller.state.core.activeExecutions['impl-1']).toBeDefined();
     expect(controller.state.eventStreamAvailable).toBe(false);
@@ -263,7 +263,7 @@ describe('session controller', () => {
       [],
       [],
       undefined,
-      new SupervisionError('legacy request message', diagnostic),
+      new ServerError('legacy request message', diagnostic),
     );
     const controller = new SocketSessionController(transport);
 
@@ -293,7 +293,7 @@ describe('session controller', () => {
       scope: 'protocol',
       severity: 'recoverable',
     });
-    protocolTransport.disconnect(new Error('Supervision event stream disconnected'));
+    protocolTransport.disconnect(new Error('Server event stream disconnected'));
     expect(protocolController.state.errorBanner).toMatchObject({
       message: diagnostic.summary,
       diagnosticId: 'protocol-1',
@@ -1490,7 +1490,7 @@ describe('session controller', () => {
   it('reports the transport error when the full subscription fails too', async () => {
     const transport = new HistoryTransport();
     transport.rejectTail = true;
-    transport.subscribeError = new Error('Supervision server is disconnected');
+    transport.subscribeError = new Error('Server is disconnected');
     const controller = new SocketSessionController(transport);
 
     await controller.start();
@@ -1709,7 +1709,7 @@ describe('a stream that re-bootstraps at a raised floor', () => {
   });
 });
 
-class FakeTransport implements SupervisionTransport {
+class FakeTransport implements ServerTransport {
   closed = false;
   /** Mutable so a test can change what a refetch returns mid-run. */
   experiments: NonNullable<ProtocolResponse['experiments']> = [];
@@ -1774,7 +1774,7 @@ class FakeTransport implements SupervisionTransport {
   }
 }
 
-class DeferredExperimentsTransport implements SupervisionTransport {
+class DeferredExperimentsTransport implements ServerTransport {
   experimentRequests = 0;
   readonly #pending: Array<(response: ProtocolResponse) => void> = [];
   #message: ((message: ServerMessage) => void) | null = null;
@@ -1831,7 +1831,7 @@ class DeferredExperimentsTransport implements SupervisionTransport {
   }
 }
 
-class DeferredChatTransport implements SupervisionTransport {
+class DeferredChatTransport implements ServerTransport {
   readonly requests: RequestInput[] = [];
   readonly #pending: Array<(response: ProtocolResponse) => void> = [];
 
@@ -1870,7 +1870,7 @@ class DeferredChatTransport implements SupervisionTransport {
 }
 
 /** A backend that creates one thread and answers threaded chat. */
-class ThreadTransport implements SupervisionTransport {
+class ThreadTransport implements ServerTransport {
   readonly requests: RequestInput[] = [];
   #sequence = 0;
   #threads = 0;
@@ -1975,7 +1975,7 @@ class ThreadTransport implements SupervisionTransport {
  * delivers whatever a test emits, and `query.events` answers out of the same
  * history, so a backfill returns exactly the range the controller asked for.
  */
-class HistoryTransport implements SupervisionTransport {
+class HistoryTransport implements ServerTransport {
   readonly requests: RequestInput[] = [];
   /** The `tail` each subscribe carried, in order; `undefined` for a plain one. */
   readonly subscribeTails: Array<number | undefined> = [];
@@ -2023,7 +2023,7 @@ class HistoryTransport implements SupervisionTransport {
     this.subscribeTails.push(options?.tail);
     if (this.subscribeError !== null) return Promise.reject(this.subscribeError);
     if (this.rejectTail && options?.tail !== undefined) {
-      return Promise.reject(new SupervisionError('Extra inputs are not permitted: tail'));
+      return Promise.reject(new ServerError('Extra inputs are not permitted: tail'));
     }
     this.#message = onMessage;
     return Promise.resolve({close: async () => undefined});
