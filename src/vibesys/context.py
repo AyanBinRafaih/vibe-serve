@@ -22,6 +22,7 @@ from vibesys.agents.factory import (
     resolve_agent_driver,
     supported_cli_providers,
 )
+from vibesys.agents.host_resource_declarations import task_agent_host_resources
 from vibesys.agents.progress import AgentProgress
 from vibesys.backends.base import ComputeBackendImpl, ContentionMonitor
 from vibesys.config import Config, as_config
@@ -88,6 +89,7 @@ from vs_project import (
     StateTransition,
     generate_run_id,
 )
+from vs_sandbox import HostResource
 
 if TYPE_CHECKING:
     from vibesys.server.supervisor import ChatThreadHandle, RunSupervisor
@@ -933,6 +935,16 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             teardown_stack.callback(device.close)
             device.start_monitor()
 
+        # A microservice candidate is a container topology, so its local agent needs
+        # resources the default confinement withholds. Other domains keep the
+        # narrower default set.
+        agent_host_resources = task_agent_host_resources(
+            container_topology=profiler_domain is DomainName.MICROSERVICES,
+            cli_sandboxed=session.view.cli_sandboxed,
+            task_name=task_name,
+            evaluator_package_root=evaluator_package_root,
+        )
+
         with boot_trace.span("agent_client_build"):
             # Build the backend-agnostic agent client. Loops invoke this instead
             # of calling create_deep_agent / vibesys._agent_cli directly. The cli
@@ -966,6 +978,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 log_dir=log_dir,
                 project_path_policy=project_path_policy,
                 require_host_sandbox=not session.view.cli_sandboxed,
+                host_resources=agent_host_resources,
             )
         close_agent_client = getattr(agent_client, "close", None)
         if callable(close_agent_client):
@@ -1191,6 +1204,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 round_transaction_coordinator=round_transaction_coordinator,
                 experiment_chat=experiment_chat,
                 chat_thread_services=chat_thread_services,
+                agent_host_resources=agent_host_resources,
             )
         except BaseException as construction_error:
             if supervisor is not None:
@@ -1367,6 +1381,10 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         log_dir=log_dir,
         project_path_policy=project_path_policy,
         require_host_sandbox=not session.view.cli_sandboxed,
+        # A candidate runs the same domain as its parent, so it needs the same
+        # container access; recomputing is impossible here because a candidate
+        # context carries neither the profiler domain nor the task name.
+        host_resources=parent.agent_host_resources,
     )
     close_agent_client = getattr(agent_client, "close", None)
     if callable(close_agent_client):
@@ -1416,6 +1434,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         project=parent.project,
         state=parent.state,
         run_id=parent.run_id,
+        agent_host_resources=parent.agent_host_resources,
     )
 
 
@@ -1690,8 +1709,13 @@ class _RunContext:
         round_transaction_coordinator: RoundTransactionCoordinator | None = None,
         experiment_chat: _ExperimentChatService | None = None,
         chat_thread_services: list[_ExperimentChatService] | None = None,
+        agent_host_resources: tuple[HostResource, ...] = (),
     ):
         self.backend = backend
+        # Retained so a candidate sub-context can hand its own agent runner the
+        # same declarations the parent computed, rather than recomputing them
+        # from state a candidate context does not carry.
+        self.agent_host_resources = agent_host_resources
         self.run_environment = run_environment
         self.supervisor = supervisor
         self.logger = logger
