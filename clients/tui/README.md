@@ -21,19 +21,33 @@ the Python `vibesys` package in the Python environment you want to use, or set
 Use Experiment chat for ordinary questions about the current run. The command
 input accepts these slash commands:
 
+Every command below is defined once in a shared registry, so the command bar and
+the chat resolve the same name to the same action, match case-insensitively, and
+report the same errors.
+
 | Command | Behavior |
 | --- | --- |
-| `/help` | Show commands and planned controls. |
-| `/chat` | Put the pane keys on the docked chat, or open it as a modal where it cannot dock; `/chat <question>` asks immediately. |
-| | Slash commands work inside the chat too, and do the same thing as in the main input. |
+| `/help` | Show the commands available on the current surface. |
+| `/chat` | Put the pane keys on the docked chat, or open it as a modal where it cannot dock; `/chat <question>` asks immediately. Command bar only, since the chat has nothing to open. |
+| | Every command below works in the chat too, and does the same thing as in the command bar. |
 | `/pause` | Pause after the current agent call finishes. |
-| `/resume` | Resume a paused run. |
+| `/resume` | Resume a paused run. Works from the command bar and the chat. |
 | `/steer <message>` | Queue an instruction that is appended to the next agent invocation's prompt. |
 | `/open-round` | Open the rounds behind the selected hypothesis. |
 | `/open-round --N` | Open round N, inside whichever hypothesis owns it. |
 | `/perf` | Plot the recorded performance metric by round, in the right pane. |
 | `/design` | Summarize what each round changed in the workspace, in the right pane. |
+| `/todos` | Expand or collapse the visible agent's todo list. |
+| `/prompt` | Expand or collapse the latest prompt in view. |
 | `/theme` | Pick a theme from a keyboard-navigable list; `/theme <name>` switches immediately. |
+
+The chat composer adds its own thread commands, which exist only in the chat:
+
+| Command | Behavior |
+| --- | --- |
+| `/clear` | Start a fresh thread with the current thread's agent and model. |
+| `/model` | Pick a harness and model, and start a thread on it. |
+| `/switch` | Switch to another chat thread. |
 
 ### Experiment log
 
@@ -188,8 +202,7 @@ not support OSC52, VibeSys keeps the selection and shows a status explaining
 that the terminal's native copy command is the fallback. Rounds and agents can
 also be clicked: a round chip
 selects its round, an agent node filters the transcript to that agent, and
-clicking the selected node clears the filter. Commands listed under "Planned" in
-`/help` are not accepted yet.
+clicking the selected node clears the filter.
 
 The rounds strip covers the whole run, including rounds it has not reached yet,
 and windows onto the part that fits. The selected round is always in view, and

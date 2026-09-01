@@ -21,7 +21,8 @@ describe('session controller', () => {
 
     expect(controller.state.overlay?.kind).toBe('help');
     expect(controller.state.overlay?.content).toContain('/open-round');
-    expect(controller.state.overlay?.content).toContain('Planned');
+    expect(controller.state.overlay?.content).not.toContain('Planned');
+    expect(controller.state.overlay?.content).not.toContain('/invocation');
     expect(transport.requests).toEqual([]);
   });
 
@@ -1494,7 +1495,7 @@ describe('session controller', () => {
     ]);
   });
 
-  it('/resume lists the threads with their runtime and switches', async () => {
+  it('/switch lists the threads with their runtime and switches', async () => {
     const transport = new ThreadTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
@@ -1502,7 +1503,7 @@ describe('session controller', () => {
     await controller.confirmChatMenu();
     controller.switchChatThread('default');
 
-    await controller.submitChat('/resume');
+    await controller.submitChat('/switch');
 
     const menu = controller.state.chatMenu;
     expect(menu?.kind).toBe('resume');
@@ -1523,6 +1524,19 @@ describe('session controller', () => {
 
     expect(controller.state.chatMenu).toBeNull();
     expect(controller.state.activeChatThreadId).toBe('thread-1');
+  });
+
+  it('resumes the paused run from the chat, same as the command bar', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/resume');
+
+    // The chat forwards /resume to the one command executor: it resumes the run
+    // and opens no thread menu.
+    expect(transport.requests).toContainEqual({type: 'command.resume'});
+    expect(controller.state.chatMenu).toBeNull();
   });
 
   it('reports an unknown theme as an error without switching', async () => {
