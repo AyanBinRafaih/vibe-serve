@@ -17,6 +17,7 @@ from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationError
 from vibesys.input_manifest import BenchmarkResult, WorkspaceSource
 from vibesys.loops.agent import issue_board
+from vibesys.loops.agent.hypotheses import reproject_run_evidence
 from vibesys.loops.agent.loop import (
     FrameworkBenchmarkOutcome,
     _backfill_revert_commit,
@@ -33,7 +34,7 @@ from vibesys.loops.agent.loop import (
     _terminal_workspace_notice,
     run_agent_loop,
 )
-from vibesys.loops.agent.model import Hypothesis
+from vibesys.loops.agent.model import Hypothesis, HypothesisResolution, HypothesisReview
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.evolve.population import Objective
 from vibesys.profilers import ProfilerKind, ProfilerPreflightResult
@@ -2928,6 +2929,27 @@ def test_cadence_review_is_not_duplicated_for_provisional_retry(tmp_path, ref_fi
     # The final-round nomination is still reviewed immediately.
     assert runner.counters["impl"] == 5
     assert runner.counters["judge"] == 2
+
+    # Round 3's final attempt is an unreviewed continuation: the cadence review
+    # judged attempt 1 (a different implementation), then attempt 2 deferred
+    # re-review.  The record must not persist attempt 1's stale verdict; it
+    # carries ``deferred`` so it agrees with ``reviewed=False``/outcome=continue.
+    round_three = _round_payloads(tmp_path)[2]
+    assert round_three["round"] == 3
+    assert round_three["reviewed"] is False
+    assert round_three["hypothesis_outcome"] == "continue"
+    assert round_three["judge_verdict"] == "deferred"
+
+    # Projection must not reject the still-active, continuing hypothesis: an
+    # unreviewed round leaves it deferred and unresolved, not failed/rejected.
+    project = _created_project(tmp_path)
+    state = Project.open(project).state
+    unified = AgentRunStateStore(state.portable_namespace(_run_id(project), "agent")).load()
+    stable = reproject_run_evidence(unified).by_id("stable-hypothesis")
+    assert stable is not None
+    assert stable.review is HypothesisReview.DEFERRED
+    assert stable.resolution is not HypothesisResolution.REJECTED
+    assert stable.resolution is None
 
 
 def test_unreviewed_terminal_outcome_returns_control_to_designer(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
