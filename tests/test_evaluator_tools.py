@@ -277,6 +277,22 @@ def test_target_install_command_publishes_and_reuses_verified_tool(tmp_path: Pat
     assert not list(root.parent.glob(f".{root.name}-*"))
 
 
+def test_target_install_command_anchors_relative_root_before_cargo_cwd_change(
+    tmp_path: Path,
+) -> None:
+    executable_dir, call_log = _fake_cargo(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    command = evaluator_tools_install_command({"example": _spec()}, Path("tools"))
+
+    result = _run_target_command(command, executable_dir, call_log, cwd=workspace)
+
+    assert result.returncode == 0, result.stderr
+    root = tool_install_root(workspace / "tools", "example", _spec())
+    assert (root / "bin" / "runner").is_file()
+    assert (root / "bin" / "tracegen").is_file()
+
+
 def test_target_install_receipt_is_reused_by_host_installer(tmp_path: Path) -> None:
     executable_dir, call_log = _fake_cargo(tmp_path)
     install_parent = tmp_path / "tools"
@@ -439,10 +455,12 @@ def test_target_install_command_rejects_missing_declared_binary(tmp_path: Path) 
         executable_dir,
         call_log,
         FAKE_CARGO_SKIP="tracegen",
+        FAKE_CARGO_STDERR="cargo reported success without every requested binary",
     )
 
     assert result.returncode == 1
     assert "did not install every declared binary" in result.stderr
+    assert "cargo reported success without every requested binary" in result.stderr
     cache = install_parent / "example"
     assert not list(cache.glob(".*-*"))
 

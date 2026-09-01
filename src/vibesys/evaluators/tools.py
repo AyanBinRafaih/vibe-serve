@@ -190,8 +190,11 @@ def install_tool(name, spec, target):
             raise InstallError(f"cannot install evaluator tool {name!r}: {detail}")
         binaries = binary_hashes(staging, spec)
         if binaries is None:
+            detail = bounded_detail(stderr_detail or stdout_detail)
+            suffix = f": {detail}" if detail else ""
             raise InstallError(
                 f"cargo did not install every declared binary for evaluator tool {name!r}"
+                + suffix
             )
         write_receipt(staging, spec, binaries)
         published = False
@@ -220,6 +223,8 @@ def main():
     ):
         raise InstallError("invalid evaluator tool manifest")
     install_parent = Path(sys.argv[2])
+    if not install_parent.is_absolute():
+        install_parent = Path.cwd() / install_parent
     if install_parent.is_symlink():
         raise InstallError(f"evaluator tool install root is a symlink: {install_parent}")
     install_parent.mkdir(parents=True, exist_ok=True)
@@ -412,8 +417,10 @@ def _install_tool(
             )
         binaries = _installed_binary_hashes(staging, spec)
         if binaries is None:
-            raise EvaluatorToolError(  # noqa: TRY003
-                f"cargo did not install every declared binary for evaluator tool {name!r}"
+            detail = _bounded_install_detail(result.stderr or result.stdout)
+            suffix = f": {detail}" if detail else ""
+            raise EvaluatorToolError(
+                f"cargo did not install every declared binary for evaluator tool {name!r}" + suffix
             )
         _write_receipt(
             staging,
