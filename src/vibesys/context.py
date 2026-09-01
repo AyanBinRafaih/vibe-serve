@@ -1256,7 +1256,7 @@ class _RunContext:
     sandbox session.
     """
 
-    def __init__(  # noqa: ANN204, PLR0913, PLR0915  # tracked: #288
+    def __init__(  # noqa: ANN204, PLR0913  # tracked: #288
         self,
         *,
         backend: ComputeBackend,

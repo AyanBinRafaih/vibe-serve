@@ -196,7 +196,7 @@ def test_native_runner_build_ignores_candidate_cargo_config(
     if go is None or shutil.which("cargo") is None:
         pytest.skip("Go and Rust are required by the trusted queue evaluator")
 
-    project_root = Path(__file__).parents[1]
+    project_root = Path(__file__).parents[2]
     workspace = tmp_path / "workspace"
     package = workspace / ".vibesys-evaluator-package"
     shutil.copytree(_queue_evaluator(project_root), package)
