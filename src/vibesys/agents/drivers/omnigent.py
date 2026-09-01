@@ -520,6 +520,16 @@ class OmnigentSession:
                     self._failed = True
                 raise
 
+    def seed_provider_session(self, session_id: str) -> None:
+        """Resuming an Omnigent executor thread from disk is not yet supported.
+
+        Omnigent owns its executor's ``thread_id`` lifecycle internally, so a
+        persisted ID cannot be injected the way a CLI provider's can. The turn
+        starts a fresh conversation; cross-process resume is scoped to the
+        agentshim codex/claude providers.
+        """
+        del session_id
+
     def close(self) -> None:
         """Release the executor exactly once."""
         if self.owns_current_loop_thread():

@@ -189,6 +189,7 @@ class MockSession:
         self._playbook = playbook
         self._turns = 0
         self._closed = False
+        self._seeded_session_id: str | None = None
 
     def run_turn(
         self,
@@ -214,12 +215,18 @@ class MockSession:
         return AgentTurnResult(
             text=_scripted_turn_text(request, round_index),
             usage=_scripted_usage(round_index),
-            provider_session_id=f"mock-{self._spec.role}-{id(self):x}",
+            # A seeded session ID is echoed back so a resumed run's continuity
+            # is observable; otherwise each session mints its own stable ID.
+            provider_session_id=(self._seeded_session_id or f"mock-{self._spec.role}-{id(self):x}"),
         )
 
     def close(self) -> None:
         """Release this session. Idempotent; the mock owns no resources."""
         self._closed = True
+
+    def seed_provider_session(self, session_id: str) -> None:
+        """Record a resumed provider session so its continuity is observable."""
+        self._seeded_session_id = session_id
 
 
 class MockDriver:

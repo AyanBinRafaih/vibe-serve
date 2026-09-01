@@ -61,6 +61,46 @@ def test_public_round_record_codec_round_trips_current_schema() -> None:
     assert parse_round_record(payload) == record
 
 
+def test_implementer_attribution_round_trips_and_defaults_to_none() -> None:
+    bare = _record(1, "a" * 40)
+    assert bare.implementer_driver is None
+    assert bare.implementer_provider is None
+    assert bare.implementer_model is None
+    assert bare.implementer_session_key is None
+
+    attributed = RoundRecord(
+        round_number=2,
+        commit="c" * 40,
+        perf_metric=None,
+        perf_unit=None,
+        passed=True,
+        implementer_driver="agentshim",
+        implementer_provider="codex",
+        implementer_model="gpt-5.6-sol",
+        implementer_session_key="hypothesis:H-01",
+    )
+    payload = serialize_round_record(attributed)
+    assert payload["implementer_provider"] == "codex"
+    assert payload["implementer_session_key"] == "hypothesis:H-01"
+    assert parse_round_record(payload) == attributed
+
+
+def test_legacy_record_without_attribution_still_loads() -> None:
+    # A record written before attribution existed has none of the new keys;
+    # ``extra="forbid"`` rejects unknown keys, not missing defaulted ones.
+    legacy = serialize_round_record(_record(1, "a" * 40))
+    for key in (
+        "implementer_driver",
+        "implementer_provider",
+        "implementer_model",
+        "implementer_session_key",
+    ):
+        legacy.pop(key, None)
+    restored = parse_round_record(legacy)
+    assert restored.implementer_provider is None
+    assert restored.implementer_session_key is None
+
+
 def test_parse_round_record_applies_declared_defaults() -> None:
     record = parse_round_record(
         {

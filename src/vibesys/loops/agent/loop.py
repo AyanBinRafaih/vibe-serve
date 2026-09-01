@@ -3461,6 +3461,9 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     perf_baseline_metric=baseline_metric,
                     perf_delta_pct=perf_delta_pct,
                     perf_comparison=perf_comparison,
+                    implementer_driver=ctx.agent_client.driver_name,
+                    implementer_provider=ctx.agent_client.provider,
+                    implementer_model=ctx.agent_client.model_for_kind("implementer"),
                 )
                 # Compute the completed lifecycle transition in memory so its
                 # exact representation can enter the write-ahead journal before

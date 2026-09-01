@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     from .client import AgentClient
     from .deepagents_runner import DeepAgentsClient
+    from .session_store import SessionStore
 
 __all__ = [
     "AgentClient",
@@ -60,6 +61,7 @@ def build_agent_client(  # noqa: PLR0913
     host_resources: Iterable[HostResource] = (),
     project_path_policy: ProjectPathPolicy | None = None,
     require_host_sandbox: bool = False,
+    session_store: SessionStore | None = None,
 ) -> AgentClient:
     """Build an agent service through the application composition module."""
     from .factory import build_agent_client as build  # noqa: PLC0415
@@ -80,4 +82,5 @@ def build_agent_client(  # noqa: PLR0913
         host_resources=host_resources,
         project_path_policy=project_path_policy,
         require_host_sandbox=require_host_sandbox,
+        session_store=session_store,
     )

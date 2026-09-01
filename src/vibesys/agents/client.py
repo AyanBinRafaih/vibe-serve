@@ -32,6 +32,7 @@ from vibesys.agents.contracts import (
     MCPServerSpec,
     SessionDisposition,
 )
+from vibesys.agents.session_store import NullSessionStore, SessionStore
 from vibesys.run.events import CommandResultPayload, JsonResultPayload
 
 if TYPE_CHECKING:
@@ -168,10 +169,12 @@ class AgentClient:
         containerized: bool = False,
         driver_log: AgentDiagnosticLog | None = None,
         driver_name: str | None = None,
+        session_store: SessionStore | None = None,
     ) -> None:
         """Create a client that owns ``driver`` and every session it creates."""
         self._driver = driver
         self._driver_name = driver_name
+        self._session_store: SessionStore = session_store or NullSessionStore()
         self._provider = provider
         self._skills = tuple(skills)
         self._compute_backend = compute_backend
@@ -448,13 +451,21 @@ class AgentClient:
             return self._run_ephemeral(session_spec, turn, observer)
 
         cached = self._sessions.get(session_key)
-        if cached is None or cached.spec != session_spec:
-            if cached is not None:
-                self._evict(session_key)
-            cached = _CachedSession(
-                spec=session_spec,
-                session=self._create_session(session_spec),
-            )
+        if cached is not None and cached.spec != session_spec:
+            # Provider/model/policy changed within this process: the persisted
+            # provider session no longer matches the new configuration, so drop
+            # both the live session and its durable ID before rebuilding.
+            self._evict(session_key)
+            self._session_store.clear(session_key)
+            cached = None
+        if cached is None:
+            session = self._create_session(session_spec)
+            # A fresh session on a resumed process starts with no in-memory
+            # conversation; seed the persisted provider session ID so the very
+            # first turn resumes (``codex exec resume`` / ``claude --resume``)
+            # instead of replaying the round.
+            self._seed_session(session, session_spec, session_key)
+            cached = _CachedSession(spec=session_spec, session=session)
             self._sessions[session_key] = cached
 
         try:
@@ -468,7 +479,51 @@ class AgentClient:
 
         if result.disposition is SessionDisposition.RESET_REQUIRED:
             self._evict(session_key)
+            self._session_store.clear(session_key)
+        else:
+            self._persist_session(session_key, session_spec, result)
         return result
+
+    def _seed_session(
+        self,
+        session: AgentSession,
+        spec: AgentSessionSpec,
+        session_key: str,
+    ) -> None:
+        """Seed a freshly created session with a matching persisted provider ID."""
+        record = self._session_store.get(session_key)
+        if record is None:
+            return
+        if record.provider != spec.provider or record.model != spec.model:
+            # A configuration change since the ID was stored: never resume with a
+            # mismatched provider/model. Leave the fresh session cold; the store
+            # is corrected once this turn persists a new ID.
+            return
+        # ``seed_provider_session`` is an optional session capability; a driver
+        # whose provider cannot resume (or a session type without it) simply
+        # starts fresh, and a stale/deleted rollout falls back inside the driver.
+        seed = getattr(session, "seed_provider_session", None)
+        if callable(seed):
+            seed(record.session_id)
+
+    def _persist_session(
+        self,
+        session_key: str,
+        spec: AgentSessionSpec,
+        result: AgentTurnResult,
+    ) -> None:
+        """Persist the provider session ID produced by a completed turn."""
+        if result.provider_session_id is None:
+            # No resumable ID this turn (e.g. a driver without session support);
+            # keep any prior ID rather than clobbering it with ``None``.
+            return
+        self._session_store.record(
+            session_key,
+            provider=spec.provider,
+            model=spec.model,
+            session_id=result.provider_session_id,
+            role=spec.role,
+        )
 
     def close(self) -> None:
         """Close all cached sessions and the driver exactly once."""

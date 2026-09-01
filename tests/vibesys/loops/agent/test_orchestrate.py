@@ -179,6 +179,11 @@ def _make_orchestrate_runner(  # noqa: ANN202, PLR0913  # tracked: #288
 
     runner = MagicMock(spec=AgentClient)
     runner.backend_name = "deepagents"
+    # The loop records implementer attribution on each round; give the mock
+    # real strings so the RoundRecord (str | None fields) validates.
+    runner.driver_name = "mock"
+    runner.provider = "mock"
+    runner.model_for_kind.return_value = "mock-model"
 
     def _invoke(*, kind, response_cls, fallback_factory, **kwargs):  # noqa: ANN001, ANN003, ANN202, ARG001, PLR0911  # tracked: #288
         if kind == "orchestrator" and response_cls is PreRoundDecision:

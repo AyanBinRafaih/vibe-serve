@@ -22,6 +22,7 @@ from vibesys.agents.factory import (
 )
 from vibesys.agents.host_resource_declarations import task_agent_host_resources
 from vibesys.agents.progress import AgentProgress
+from vibesys.agents.session_store import AgentSessionState, DurableSessionStore
 from vibesys.backends.base import ComputeBackendImpl, ContentionMonitor
 from vibesys.config import Config, as_config
 from vibesys.constants import (
@@ -900,6 +901,16 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
         )
 
         with boot_trace.span("agent_client_build"):
+            # Persist coding-agent provider session IDs in the run's
+            # machine-local namespace so a resumed run can continue the
+            # implementor's conversation instead of replaying the round. The
+            # store lives beside completed rounds under the local (never
+            # snapshotted) namespace because provider transcripts are host-local.
+            agent_session_store = DurableSessionStore(
+                project_state.local_namespace(run_id, RunStateNamespace.AGENT.value).slot(
+                    "sessions.json", AgentSessionState
+                )
+            )
             # Build the backend-agnostic agent client. Loops invoke this instead
             # of calling create_deep_agent / vibesys._agent_cli directly. The cli
             # backend is rejected if --docker is set; build_agent_client raises
@@ -908,6 +919,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 config,
                 agent_backend=agent_backend,
                 cli_provider=cli_provider,
+                session_store=agent_session_store,
                 backends={
                     "implementer": session.sandbox,
                     "judge": session.sandbox,

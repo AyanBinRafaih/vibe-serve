@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import TextIO
 
+    from vibesys.agents.session_store import SessionStore
     from vibesys.config import Config
     from vibesys.constants import ComputeBackend
     from vs_sandbox import HostResource, ProjectPathPolicy
@@ -103,6 +104,7 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
     host_resources: Iterable[HostResource] = (),
     project_path_policy: ProjectPathPolicy | None = None,
     require_host_sandbox: bool = False,
+    session_store: SessionStore | None = None,
 ) -> AgentClient:
     """Build the configured application-level agent service."""
     host_resources = tuple(host_resources)
@@ -235,4 +237,5 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
         require_host_sandbox=require_host_sandbox,
         containerized=use_docker,
         driver_log=driver_log,
+        session_store=session_store,
     )

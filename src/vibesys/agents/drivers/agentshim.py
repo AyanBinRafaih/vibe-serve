@@ -291,6 +291,21 @@ class AgentShimSession:
         self._closed = True
         self._event_handler.observer = None
 
+    def seed_provider_session(self, session_id: str) -> None:
+        """Resume a prior provider conversation on the next turn.
+
+        Sets the underlying agent's ``session_id`` so the first ``generate``
+        takes the resume branch (``codex exec resume`` / ``claude --resume``).
+        A live in-memory ID (a mid-run continuation) is never overwritten, and
+        a stale or deleted rollout falls back to a fresh session inside
+        ``_generate_with_stale_rollout_retry``.
+        """
+        if hasattr(self._agent, "session_id") and self._agent.session_id is None:
+            # Mirror the stale-rollout retry's cast: the concrete session-capable
+            # agents (codex, claude) expose a writable ``session_id``, but the
+            # structural ``CodingAgent`` type does not declare it as assignable.
+            cast("CodexCodingAgent", self._agent).session_id = session_id
+
     def _prepare_prompt(self, request: AgentTurnRequest) -> tuple[str, str | None]:
         response_cls = request.output_schema
         native_schema_path: str | None = None
