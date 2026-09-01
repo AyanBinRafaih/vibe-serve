@@ -205,7 +205,11 @@ def test_lifecycle_hooks_reject_target_install_failure(
     sandbox = MagicMock()
     sandbox.execute.return_value = MagicMock(
         exit_code=exit_code,
-        output="permission denied" + ("x" * 1000),
+        output=(
+            "permission denied\n"
+            + ("unhelpful install progress\n" * 1000)
+            + "root sandbox failure"
+        ),
         truncated=True,
     )
     lifecycle = SandboxLifecycle(
@@ -218,7 +222,8 @@ def test_lifecycle_hooks_reject_target_install_failure(
     ) as error:
         lifecycle.hooks[0].before_ready(BeforeReadyContext(sandbox=sandbox))
 
-    assert len(str(error.value)) < 600
+    assert "root sandbox failure" in str(error.value)
+    assert len(str(error.value)) < 2100
 
 
 def test_target_install_command_quotes_manifest_and_root(tmp_path: Path) -> None:
@@ -396,12 +401,13 @@ def test_target_install_command_bounds_cargo_failure_and_cleans_staging(
         executable_dir,
         call_log,
         FAKE_CARGO_EXIT="7",
-        FAKE_CARGO_STDERR="failure" * 1000,
+        FAKE_CARGO_STDERR="unhelpful compiler progress\n" * 1000 + "root compiler failure",
     )
 
     assert result.returncode == 1
-    assert result.stderr.startswith("cannot install evaluator tool 'example': failure")
-    assert len(result.stderr) <= 501
+    assert result.stderr.startswith("cannot install evaluator tool 'example':")
+    assert "root compiler failure" in result.stderr
+    assert len(result.stderr) <= 2001
     cache = install_parent / "example"
     assert not list(cache.glob(".*-*"))
 
@@ -508,7 +514,12 @@ def test_prepare_tools_translates_missing_cargo(tmp_path: Path) -> None:
 
 def test_prepare_tools_reports_cargo_failure_and_cleans_staging(tmp_path: Path) -> None:
     def fail(arguments):  # noqa: ANN001, ANN202
-        return subprocess.CompletedProcess(arguments, 7, "", "dependency resolution failed")
+        return subprocess.CompletedProcess(
+            arguments,
+            7,
+            "",
+            "unhelpful compiler progress\n" * 1000 + "dependency resolution failed",
+        )
 
     with pytest.raises(EvaluatorToolError, match="dependency resolution failed"):
         prepare_evaluator_tools({"example": _spec()}, tmp_path, command_runner=fail)

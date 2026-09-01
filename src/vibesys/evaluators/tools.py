@@ -23,7 +23,7 @@ ToolCommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 _CARGO_INSTALL_TIMEOUT_SECONDS = 600
 _SANDBOX_INSTALL_TIMEOUT_SECONDS = 660
-_MAX_INSTALL_ERROR_CHARACTERS = 500
+_MAX_INSTALL_ERROR_CHARACTERS = 2000
 _TOOL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
 
 _TARGET_INSTALL_PROGRAM = r"""
@@ -38,7 +38,7 @@ import tempfile
 from pathlib import Path
 
 CARGO_TIMEOUT = 600
-MAX_ERROR_CHARACTERS = 500
+MAX_ERROR_CHARACTERS = 2000
 TOOL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
 
 
@@ -52,6 +52,25 @@ def file_sha256(path):
         while chunk := binary.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def output_tail(stream):
+    maximum_bytes = MAX_ERROR_CHARACTERS * 4
+    stream.seek(0, os.SEEK_END)
+    stream.seek(max(0, stream.tell() - maximum_bytes))
+    return stream.read(maximum_bytes).decode("utf-8", errors="replace")[
+        -MAX_ERROR_CHARACTERS:
+    ]
+
+
+def bounded_detail(value):
+    detail = value.strip()
+    if len(detail) <= MAX_ERROR_CHARACTERS:
+        return detail
+    marker = "\n... output truncated ...\n"
+    head_length = min(256, MAX_ERROR_CHARACTERS - len(marker))
+    tail_length = MAX_ERROR_CHARACTERS - len(marker) - head_length
+    return detail[:head_length] + marker + detail[-tail_length:]
 
 
 def binary_hashes(root, spec):
@@ -164,18 +183,10 @@ def install_tool(name, spec, target):
                 raise InstallError(
                     f"cannot install evaluator tool {name!r}: cargo install timed out"
                 ) from exc
-            stderr.seek(0)
-            stdout.seek(0)
-            stderr_detail = stderr.read(MAX_ERROR_CHARACTERS * 4).decode(
-                "utf-8", errors="replace"
-            )
-            stdout_detail = stdout.read(MAX_ERROR_CHARACTERS * 4).decode(
-                "utf-8", errors="replace"
-            )
+            stderr_detail = output_tail(stderr)
+            stdout_detail = output_tail(stdout)
         if result.returncode != 0:
-            detail = (stderr_detail or stdout_detail or "cargo install failed").strip()[
-                :MAX_ERROR_CHARACTERS
-            ]
+            detail = bounded_detail(stderr_detail or stdout_detail or "cargo install failed")
             raise InstallError(f"cannot install evaluator tool {name!r}: {detail}")
         binaries = binary_hashes(staging, spec)
         if binaries is None:
@@ -232,8 +243,8 @@ def main():
 try:
     main()
 except Exception as exc:
-    detail = str(exc).strip() or type(exc).__name__
-    print(detail[:MAX_ERROR_CHARACTERS], file=sys.stderr)
+    detail = bounded_detail(str(exc) or type(exc).__name__)
+    print(detail, file=sys.stderr)
     raise SystemExit(1) from None
 """.strip()
 
@@ -265,10 +276,12 @@ class EvaluatorToolLifecycleHooks(SandboxLifecycleHooks):
             timeout=_SANDBOX_INSTALL_TIMEOUT_SECONDS,
         )
         if result.exit_code != 0:
-            detail = (result.output or "target-side installer failed").strip()
+            detail = _bounded_install_detail(
+                result.output or "target-side installer failed"
+            )
             raise EvaluatorToolError(  # noqa: TRY003
                 "evaluator tool sandbox installation failed "
-                f"(exit {result.exit_code}): {detail[:_MAX_INSTALL_ERROR_CHARACTERS]}"
+                f"(exit {result.exit_code}): {detail}"
             )
 
 
@@ -394,7 +407,9 @@ def _install_tool(
                 f"cannot install evaluator tool {name!r}: cargo install timed out"
             ) from exc
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "cargo install failed").strip()[:500]
+            detail = _bounded_install_detail(
+                result.stderr or result.stdout or "cargo install failed"
+            )
             raise EvaluatorToolError(  # noqa: TRY003
                 f"cannot install evaluator tool {name!r}: {detail}"
             )
@@ -417,6 +432,16 @@ def _install_tool(
     finally:
         if staging.exists():
             shutil.rmtree(staging)
+
+
+def _bounded_install_detail(value: str) -> str:
+    detail = value.strip()
+    if len(detail) <= _MAX_INSTALL_ERROR_CHARACTERS:
+        return detail
+    marker = "\n... output truncated ...\n"
+    head_length = min(256, _MAX_INSTALL_ERROR_CHARACTERS - len(marker))
+    tail_length = _MAX_INSTALL_ERROR_CHARACTERS - len(marker) - head_length
+    return detail[:head_length] + marker + detail[-tail_length:]
 
 
 def _installed_binary_hashes(root: Path, spec: CargoGitToolSpec) -> dict[str, str] | None:

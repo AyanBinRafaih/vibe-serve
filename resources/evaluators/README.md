@@ -82,7 +82,9 @@ needed to install the declared tool. Cargo Git tools cause VibeSys to install a
 compatible Rust toolchain when necessary, then run `cargo install` at the
 pinned revision with `--locked`. Target images and remote clusters therefore
 need outbound package access and a working native linker during first-time
-setup.
+setup. They must also provide any native build dependencies required by the
+declared Cargo package. The currently pinned Request Factory revision uses
+`openssl-sys`; Debian and Ubuntu targets need `pkg-config` and `libssl-dev`.
 
 The bundled Request Factory evaluator exposes two entrypoints. The low-level
 `request-factory-engine` entrypoint resolves directly to the pinned binary.
