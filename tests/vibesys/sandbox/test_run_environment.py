@@ -449,9 +449,7 @@ def test_isolated_environments_install_and_translate_evaluator_tools(
         )
         monkeypatch.setattr(
             "vibesys.sandbox.run_environment._docker_evaluator_tool_mounts",
-            lambda _request, _tools, **_kwargs: [
-                (str(built_root), str(container_root), True)
-            ],
+            lambda _request, _tools, **_kwargs: [(str(built_root), str(container_root), True)],
         )
         monkeypatch.setattr(
             "vibesys.sandbox.run_environment._resolve_docker_image_id",

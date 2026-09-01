@@ -276,12 +276,9 @@ class EvaluatorToolLifecycleHooks(SandboxLifecycleHooks):
             timeout=_SANDBOX_INSTALL_TIMEOUT_SECONDS,
         )
         if result.exit_code != 0:
-            detail = _bounded_install_detail(
-                result.output or "target-side installer failed"
-            )
+            detail = _bounded_install_detail(result.output or "target-side installer failed")
             raise EvaluatorToolError(  # noqa: TRY003
-                "evaluator tool sandbox installation failed "
-                f"(exit {result.exit_code}): {detail}"
+                f"evaluator tool sandbox installation failed (exit {result.exit_code}): {detail}"
             )
 
 

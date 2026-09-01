@@ -206,9 +206,7 @@ def test_lifecycle_hooks_reject_target_install_failure(
     sandbox.execute.return_value = MagicMock(
         exit_code=exit_code,
         output=(
-            "permission denied\n"
-            + ("unhelpful install progress\n" * 1000)
-            + "root sandbox failure"
+            "permission denied\n" + ("unhelpful install progress\n" * 1000) + "root sandbox failure"
         ),
         truncated=True,
     )
