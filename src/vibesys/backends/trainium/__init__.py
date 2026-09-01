@@ -31,7 +31,6 @@ from vibesys.backends.base import (
     ContentionMonitor,
     ModalOptions,
     SandboxKind,
-    SetupFn,
     make_local_shell_sandbox,
 )
 from vibesys.constants import ComputeBackend
@@ -40,6 +39,8 @@ from vibesys.profilers import ProfilerKind
 if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
+
+    from vs_sandbox.lifecycle import SandboxLifecycleHandler
 
 # AWS Neuron DLC.  Tag chosen to match the host's Neuron tools (2.30):
 # PyTorch 2.9 / Python 3.12 / Neuron SDK 2.30 on Ubuntu 24.04.  Carries
@@ -117,7 +118,7 @@ class TrainiumBackend:
         passthrough_paths: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
         extra_init_commands: list[str] | None = None,
-        setup_fns: list[SetupFn] | None = None,
+        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
@@ -129,7 +130,7 @@ class TrainiumBackend:
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
         extra_init_commands = list(extra_init_commands or [])
-        setup_fns = setup_fns or []
+        lifecycle_handlers = lifecycle_handlers or []
 
         if kind is SandboxKind.MODAL:
             raise ValueError(  # noqa: TRY003  # tracked: #288
@@ -156,7 +157,11 @@ class TrainiumBackend:
                 "TMPDIR": str(host_tmp),
             }
             local_env.update(extra_env)
-            return make_local_shell_sandbox(host_workspace=host_workspace, env=local_env)
+            return make_local_shell_sandbox(
+                host_workspace=host_workspace,
+                env=local_env,
+                lifecycle_handlers=lifecycle_handlers,
+            )
 
         if kind is SandboxKind.DOCKER:
             # Persistent host-side compile cache → container, kept out of
@@ -195,7 +200,7 @@ class TrainiumBackend:
                 env=env,
                 log_path=log_path,
                 extra_init_commands=extra_init_commands,
-                setup_fns=setup_fns,
+                lifecycle_handlers=lifecycle_handlers,
             )
 
         raise ValueError(f"Unknown sandbox kind: {kind!r}")  # noqa: TRY003  # tracked: #288

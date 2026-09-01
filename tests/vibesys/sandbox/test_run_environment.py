@@ -20,12 +20,13 @@ from vibesys.sandbox.run_environment import (
     RunEnvironmentRequest,
     RunEnvironmentSpec,
     _SkyPilotRunEnvironmentSession,
+    _symlink_lifecycle_handlers,
     build_run_environment,
     make_run_environment_spec,
     run_environment_record,
 )
 from vs_project import Project, RunEnvironmentRecord, RunResourceRequest
-from vs_sandbox import ProjectPathPolicy
+from vs_sandbox import BeforeReadyContext, ProjectPathPolicy
 
 if TYPE_CHECKING:
     from deepagents.backends.protocol import SandboxBackendProtocol
@@ -243,10 +244,36 @@ def test_docker_environment_opens_one_started_sandbox_with_agent_paths(tmp_path)
     assert session.view.paths.accuracy_command == "uv run python accuracy_checker/checker.py"
     assert session.view.paths.benchmark_command == "uv run python benchmark/benchmark.py"
     assert backend.calls[0][1]["extra_env"]["UV_CACHE_DIR"] == "/workspace/.cache/uv"
+    assert backend.calls[0][1]["lifecycle_handlers"] == []
     backend.sandbox.start.assert_called_once()
 
     session.close()
     backend.sandbox.stop.assert_called_once()
+
+
+def test_symlink_lifecycle_handler_installs_and_records_quoted_commands() -> None:
+    sandbox = MagicMock()
+    sandbox.execute.return_value = MagicMock(exit_code=0, output="")
+    handlers = _symlink_lifecycle_handlers(
+        [("/workspace/model link", "/workspace/_mounts/model target")]
+    )
+
+    handlers[0].before_ready(BeforeReadyContext(sandbox=sandbox))
+
+    command = "ln -sfn '/workspace/_mounts/model target' '/workspace/model link'"
+    sandbox.execute.assert_called_once_with(command)
+    sandbox.save_symlink_commands.assert_called_once_with([command])
+
+
+def test_symlink_lifecycle_handler_rejects_failed_setup() -> None:
+    sandbox = MagicMock()
+    sandbox.execute.return_value = MagicMock(exit_code=17, output="permission denied")
+    handlers = _symlink_lifecycle_handlers([("/workspace/model", "/mount/model")])
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        handlers[0].before_ready(BeforeReadyContext(sandbox=sandbox))
+
+    sandbox.save_symlink_commands.assert_not_called()
 
 
 def test_isolated_environment_mounts_and_translates_evaluator_package(tmp_path: Path) -> None:

@@ -13,7 +13,15 @@ from vibesys.backends import SandboxKind
 from vibesys.backends.local import LocalBackend
 from vibesys.constants import ComputeBackend
 from vibesys.profilers import ProfilerKind
-from vs_sandbox import DockerSandbox
+from vs_sandbox import BeforeReadyContext, DockerSandbox, SandboxLifecycleHandler
+
+
+class _RecordingHandler(SandboxLifecycleHandler):
+    def __init__(self) -> None:
+        self.sandbox: object | None = None
+
+    def before_ready(self, context: BeforeReadyContext) -> None:
+        self.sandbox = context.sandbox
 
 
 def _make_backend(tmp_path) -> LocalBackend:  # noqa: ANN001  # tracked: #288
@@ -42,6 +50,21 @@ class TestCpuSandbox:
             extra_env={"FOO": "bar"},
         )
         assert isinstance(sb, LocalShellBackend)
+
+    def test_local_runs_lifecycle_handlers_before_returning(self, tmp_path):  # noqa: ANN001, ANN201
+        impl = _make_backend(tmp_path)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        handler = _RecordingHandler()
+
+        sb = impl.make_sandbox(
+            SandboxKind.LOCAL,
+            host_workspace=str(workspace),
+            log_path=None,
+            lifecycle_handlers=[handler],
+        )
+
+        assert handler.sandbox is sb
 
     def test_docker_returns_docker_sandbox_without_gpus(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         impl = _make_backend(tmp_path)

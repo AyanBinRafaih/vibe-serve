@@ -23,7 +23,6 @@ from vibesys.backends.base import (
     ContentionMonitor,
     ModalOptions,
     SandboxKind,
-    SetupFn,
     make_local_shell_sandbox,
 )
 from vibesys.constants import ComputeBackend
@@ -32,6 +31,8 @@ from vibesys.profilers import ProfilerKind
 if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
+
+    from vs_sandbox.lifecycle import SandboxLifecycleHandler
 
 _DEFAULT_CPU_IMAGE = "python:3.12-bookworm"
 
@@ -73,7 +74,7 @@ class LocalBackend:
         passthrough_paths: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
         extra_init_commands: list[str] | None = None,
-        setup_fns: list[SetupFn] | None = None,
+        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
@@ -86,10 +87,14 @@ class LocalBackend:
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
         extra_init_commands = list(extra_init_commands or [])
-        setup_fns = setup_fns or []
+        lifecycle_handlers = lifecycle_handlers or []
 
         if kind is SandboxKind.LOCAL:
-            return make_local_shell_sandbox(host_workspace=host_workspace, env=extra_env)
+            return make_local_shell_sandbox(
+                host_workspace=host_workspace,
+                env=extra_env,
+                lifecycle_handlers=lifecycle_handlers,
+            )
         if kind is SandboxKind.DOCKER and self._supports_docker:
             if self.image is None:
                 raise ValueError(f"{self.name.value} backend requires a Docker image")  # noqa: TRY003  # tracked: #288
@@ -102,7 +107,7 @@ class LocalBackend:
                 env=extra_env,
                 log_path=log_path,
                 extra_init_commands=extra_init_commands,
-                setup_fns=setup_fns,
+                lifecycle_handlers=lifecycle_handlers,
             )
         if kind in (SandboxKind.DOCKER, SandboxKind.MODAL):
             raise ValueError(  # noqa: TRY003  # tracked: #288

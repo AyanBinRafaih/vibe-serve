@@ -11,7 +11,6 @@ import signal
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Callable  # noqa: TC003  # tracked: #288
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +22,8 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 from deepagents.backends.sandbox import BaseSandbox
+
+from vs_sandbox.lifecycle import SandboxLifecycle, SandboxLifecycleHandler
 
 if TYPE_CHECKING:
     from types import FrameType
@@ -154,7 +155,7 @@ class DockerSandbox(BaseSandbox):
         passthrough_paths: list[str] | None = None,
         log_path: str | Path | None = None,
         extra_init_commands: list[str] | None = None,
-        setup_fns: list[Callable[[BaseSandbox], None]] | None = None,
+        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
     ) -> None:
         """Initialize Docker sandbox configuration.
 
@@ -198,6 +199,9 @@ class DockerSandbox(BaseSandbox):
                 ``uv``, failures here **raise RuntimeError** — use this for
                 commands that must succeed (e.g. installing a CLI binary the
                 loop depends on).
+            lifecycle_handlers: Trusted extensions invoked in order after
+                built-in initialization and before the sandbox becomes ready.
+                They run again after every container recreation.
         """
         self._host_workspace = host_workspace
         self._image = image
@@ -215,7 +219,7 @@ class DockerSandbox(BaseSandbox):
         self._container_id: str | None = None
         self._logger = self._setup_logger(log_path)
         self._extra_init_commands: list[str] = list(extra_init_commands or [])
-        self._setup_fns: list[Callable[[BaseSandbox], None]] = list(setup_fns or [])
+        self._lifecycle = SandboxLifecycle(lifecycle_handlers)
 
         # Container paths outside /workspace that _vpath must not rewrite.
         self._passthrough_prefixes: list[str] = list(passthrough_paths or [])
@@ -524,10 +528,7 @@ class DockerSandbox(BaseSandbox):
                     f"Container init command timed out after 600s: {init_cmd_str}"
                 ) from exc
 
-        # Run caller-supplied setup functions.  These re-execute on every
-        # restart (so e.g. docker symlinks survive ``reselect_device``).
-        for fn in self._setup_fns:
-            fn(self)
+        self._lifecycle.before_ready(self)
 
     def _discard_started_container(self) -> None:
         """Best-effort rollback for a container whose startup did not finish."""
