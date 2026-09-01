@@ -77,7 +77,7 @@ Modal setup and evaluation remain colocated with the deployed service. The
 framework owns setup ordering and staged inputs, but Modal's container-exec API
 does not add a separate process-identity or mount boundary from the live service.
 
-The target must provide Python 3, `curl`, `tar`, and the system facilities
+The target must provide Python 3, `tar`, and the system facilities
 needed to install the declared tool. Cargo Git tools cause VibeSys to install a
 compatible Rust toolchain when necessary, then run `cargo install` at the
 pinned revision with `--locked`. Target images and remote clusters therefore

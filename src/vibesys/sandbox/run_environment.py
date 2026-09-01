@@ -76,6 +76,21 @@ _REMOTE_EVALUATOR_TOOLS_ROOT = Path(".vibesys-evaluator-tools")
 _REMOTE_EVALUATOR_TOOLCHAINS_ROOT = Path(".vibesys-evaluator-toolchains")
 _EVALUATOR_RUST_TOOLCHAIN_VERSION = "1.92.0"
 _DOCKER_EVALUATOR_CACHE_SCHEMA = 2
+_PYTHON_DOWNLOAD_SCRIPT = """\
+import sys
+import time
+import urllib.request
+
+url = sys.argv[1].format(arch=sys.argv[3])
+for attempt in range(5):
+    try:
+        urllib.request.urlretrieve(url, sys.argv[2])
+        break
+    except Exception:
+        if attempt == 4:
+            raise
+        time.sleep(5)
+"""
 
 if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
@@ -1573,16 +1588,16 @@ def _evaluator_container_setup(
         return []
     commands = (
         [
-            "command -v curl >/dev/null && command -v tar >/dev/null || "
-            "{ echo 'evaluator setup requires curl and tar in this remote environment' "
+            "command -v python3 >/dev/null && command -v tar >/dev/null || "
+            "{ echo 'evaluator setup requires Python 3 and tar in this remote environment' "
             ">&2; exit 1; }",
             f"mkdir -p .bin {shlex.quote(str(_REMOTE_EVALUATOR_TOOLCHAINS_ROOT))}",
             'PATH="$PWD/.bin:$PATH"; export PATH',
         ]
         if rootless
         else [
-            "command -v curl >/dev/null && command -v tar >/dev/null || "
-            "{ apt-get update -qq && apt-get install -y -qq curl ca-certificates tar; }",
+            "command -v python3 >/dev/null && command -v tar >/dev/null || "
+            "{ apt-get update -qq && apt-get install -y -qq python3 ca-certificates tar; }",
         ]
     )
     if "go" in toolchains:
@@ -1590,17 +1605,26 @@ def _evaluator_container_setup(
             f"$PWD/{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/go" if rootless else "/usr/local/go"
         )
         go_link = "$PWD/.bin/go" if rootless else "/usr/local/bin/go"
+        go_archive = (
+            f"{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/go.tgz" if rootless else "/tmp/vibesys-go.tgz"  # noqa: S108  # isolated setup container
+        )
+        go_download = _python_download_command(
+            "https://go.dev/dl/go1.23.12.linux-{arch}.tar.gz",
+            go_archive,
+            architecture_variable="go_arch",
+        )
         commands.append(
             "go_version=$(go env GOVERSION 2>/dev/null || true); "
             'case "$go_version" in go1.2[1-9]*|go1.[3-9][0-9]*) ;; *) '
             'arch=$(uname -m); case "$arch" in x86_64) go_arch=amd64 ;; '
             "aarch64|arm64) go_arch=arm64 ;; *) "
             'echo "unsupported Go architecture: $arch" >&2; exit 1 ;; esac; '
-            "curl -fsSL --retry 5 --retry-delay 5 "
-            "https://go.dev/dl/go1.23.12.linux-${go_arch}.tar.gz -o /tmp/go.tgz && "
+            f"{go_download} || "
+            "{ echo 'failed to download evaluator Go toolchain' >&2; exit 1; }; "
             f"rm -rf {go_destination} && mkdir -p $(dirname {go_destination}) && "
-            f"tar -C $(dirname {go_destination}) -xzf /tmp/go.tgz && "
-            f"ln -sf {go_destination}/bin/go {go_link} && rm -f /tmp/go.tgz ;; esac"
+            f"tar -C $(dirname {go_destination}) -xzf {go_archive} && "
+            f"ln -sf {go_destination}/bin/go {go_link} && rm -f {go_archive} || "
+            "{ echo 'failed to install evaluator Go toolchain' >&2; exit 1; } ;; esac"
         )
         commands.append("GOWORK=off; export GOWORK")
     if "rust" in toolchains:
@@ -1615,16 +1639,32 @@ def _evaluator_container_setup(
             if rootless
             else "ln -sf /root/.cargo/bin/* /usr/local/bin/"
         )
+        rustup_init = (
+            f"{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/rustup-init"
+            if rootless
+            else "/tmp/vibesys-rustup-init"  # noqa: S108  # isolated setup container
+        )
+        rustup_download = _python_download_command(
+            "https://static.rust-lang.org/rustup/dist/{arch}-unknown-linux-gnu/rustup-init",
+            rustup_init,
+            architecture_variable="rust_arch",
+        )
         commands.append(
-            "if command -v cargo >/dev/null; then "
-            "rust_version=$(rustc --version 2>/dev/null | awk '{print $2}'); "
-            "else rust_version=missing; fi; "
-            'case "$rust_version" in 1.7[89].*|1.[89][0-9].*|1.[1-9][0-9][0-9].*) ;; *) '
-            "curl -fsSL --retry 5 --retry-delay 5 "
-            "https://sh.rustup.rs -o /tmp/rustup-init.sh && "
-            f"{rustup_environment}sh /tmp/rustup-init.sh -y --profile minimal "
-            f"--default-toolchain {_EVALUATOR_RUST_TOOLCHAIN_VERSION} && "
-            f"{cargo_link} && rm -f /tmp/rustup-init.sh ;; esac"
+            "rust_version=$(rustc --version 2>/dev/null | awk '{print $2}' || true); "
+            "cargo_version=$(cargo --version 2>/dev/null | awk '{print $2}' || true); "
+            'rust_ready=; case "$rust_version" in '
+            "1.7[89].*|1.[89][0-9].*|1.[1-9][0-9][0-9].*) "
+            'case "$cargo_version" in ?*) rust_ready=1 ;; esac ;; esac; '
+            'if [ "$rust_ready" != 1 ]; then '
+            'arch=$(uname -m); case "$arch" in x86_64) rust_arch=x86_64 ;; '
+            "aarch64|arm64) rust_arch=aarch64 ;; *) "
+            'echo "unsupported Rust architecture: $arch" >&2; exit 1 ;; esac; '
+            f"{rustup_download} || "
+            "{ echo 'failed to download evaluator Rust toolchain' >&2; exit 1; }; "
+            f"chmod +x {rustup_init} && {rustup_environment}{rustup_init} "
+            f"-y --profile minimal --default-toolchain {_EVALUATOR_RUST_TOOLCHAIN_VERSION} && "
+            f"{cargo_link} && rm -f {rustup_init} || "
+            "{ echo 'failed to install evaluator Rust toolchain' >&2; exit 1; }; fi"
         )
         if rootless:
             commands.append(
@@ -1634,6 +1674,16 @@ def _evaluator_container_setup(
                 "export RUSTUP_HOME CARGO_HOME; fi"
             )
     return commands
+
+
+def _python_download_command(
+    url_template: str,
+    destination: str,
+    *,
+    architecture_variable: str,
+) -> str:
+    command = shlex.join(("python3", "-c", _PYTHON_DOWNLOAD_SCRIPT, url_template, destination))
+    return f'{command} "${{{architecture_variable}}}"'
 
 
 class _EvaluatorToolBuildRequiredError(RuntimeError):

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shlex
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -28,6 +30,7 @@ from vibesys.sandbox.run_environment import (
     RunEnvironmentRequest,
     RunEnvironmentSpec,
     _docker_evaluator_tool_mounts,
+    _evaluator_container_setup,
     _EvaluatorToolBuildRequiredError,
     _resolve_docker_image_id,
     _SkyPilotRunEnvironmentSession,
@@ -88,6 +91,80 @@ def _request(tmp_path: Path, backend: FakeBackend, **overrides: Any) -> RunEnvir
     values.update(overrides)
     values["log_dir"].mkdir(exist_ok=True)
     return RunEnvironmentRequest(**values)
+
+
+def _write_executable(path: Path, contents: str) -> None:
+    path.write_text(contents, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _run_rootless_rust_setup(
+    tmp_path: Path,
+    *,
+    downloader_exit_code: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "rustc",
+        "#!/bin/sh\nprintf '%s\\n' 'rustc 1.85.0 (fake)'\n",
+    )
+    _write_executable(
+        fake_bin / "cargo",
+        "#!/bin/sh\necho 'rustup has no configured default toolchain' >&2\nexit 1\n",
+    )
+
+    rustup_init = tmp_path / "fake-rustup-init"
+    working_cargo = tmp_path / "working-cargo"
+    working_rustc = tmp_path / "working-rustc"
+    _write_executable(
+        working_cargo,
+        "#!/bin/sh\nprintf '%s\\n' 'cargo 1.92.0 (fake)'\n",
+    )
+    _write_executable(
+        working_rustc,
+        "#!/bin/sh\nprintf '%s\\n' 'rustc 1.92.0 (fake)'\n",
+    )
+    _write_executable(
+        rustup_init,
+        "#!/bin/sh\n"
+        'mkdir -p "$CARGO_HOME/bin" "$RUSTUP_HOME"\n'
+        'cp "$FAKE_WORKING_CARGO" "$CARGO_HOME/bin/cargo"\n'
+        'cp "$FAKE_WORKING_RUSTC" "$CARGO_HOME/bin/rustc"\n'
+        'chmod +x "$CARGO_HOME/bin/cargo" "$CARGO_HOME/bin/rustc"\n',
+    )
+    downloader = (
+        '#!/bin/sh\ncp "$FAKE_RUSTUP_INIT" "$4"\n'
+        if downloader_exit_code == 0
+        else f"#!/bin/sh\nexit {downloader_exit_code}\n"
+    )
+    _write_executable(fake_bin / "python3", downloader)
+
+    backend = FakeBackend()
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    request = _request(tmp_path, backend, evaluator_package_root=package.root)
+    commands = _evaluator_container_setup(request, rootless=True)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RUSTUP_INIT": str(rustup_init),
+        "FAKE_WORKING_CARGO": str(working_cargo),
+        "FAKE_WORKING_RUSTC": str(working_rustc),
+    }
+    return subprocess.run(  # noqa: S603
+        ["/bin/sh", "-c", "set -e\n" + "\n".join((*commands, "cargo --version"))],
+        cwd=request.workspace,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -325,8 +402,24 @@ def test_isolated_environment_mounts_and_translates_evaluator_package(tmp_path: 
     ) in backend.calls[0][1]["bind_mounts"]
     init_commands = backend.calls[0][1]["extra_init_commands"]
     assert any("go1.23.12" in item for item in init_commands)
-    assert any("rustup.rs" in item for item in init_commands)
-    assert any("command -v cargo" in item for item in init_commands)
+    assert any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
+    assert any("cargo --version" in item for item in init_commands)
+
+
+def test_rootless_rust_setup_replaces_broken_rustup_cargo_shim(tmp_path: Path) -> None:
+    result = _run_rootless_rust_setup(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "cargo 1.92.0 (fake)" in result.stdout
+    assert (tmp_path / "workspace" / ".bin" / "cargo").is_symlink()
+
+
+def test_rootless_rust_setup_does_not_mask_download_failure(tmp_path: Path) -> None:
+    result = _run_rootless_rust_setup(tmp_path, downloader_exit_code=7)
+
+    assert result.returncode != 0
+    assert "failed to download evaluator Rust toolchain" in result.stderr
+    assert "cargo 1.92.0 (fake)" not in result.stdout
 
 
 def test_local_environment_prepares_and_translates_evaluator_tool(
@@ -478,7 +571,7 @@ def test_isolated_environments_install_and_translate_evaluator_tools(
             for hook in backend.calls[0][1]["lifecycle_hooks"]
         )
         assert (str(built_root), str(container_root), True) in backend.calls[0][1]["bind_mounts"]
-        assert not any("rustup.rs" in item for item in init_commands)
+        assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
     else:
         arguments = shlex.split(rendered)
         separator = arguments.index("--")
@@ -499,7 +592,7 @@ def test_isolated_environments_install_and_translate_evaluator_tools(
         assert arguments[arguments.index("--evaluator-package-root") + 1] == (
             "/opt/vibesys-evaluator-package"
         )
-        assert not any("rustup.rs" in item for item in init_commands)
+        assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
 
 
 def test_docker_evaluator_tools_use_ephemeral_builder_and_read_only_final_mounts(
@@ -547,7 +640,9 @@ def test_docker_evaluator_tools_use_ephemeral_builder_and_read_only_final_mounts
     assert kwargs["container_image"] == "sha256:pinned"
     assert len(kwargs["lifecycle_hooks"]) == 1
     assert isinstance(kwargs["lifecycle_hooks"][0], EvaluatorToolLifecycleHooks)
-    assert any("rustup.rs" in command for command in kwargs["extra_init_commands"])
+    assert any(
+        "static.rust-lang.org/rustup/dist" in command for command in kwargs["extra_init_commands"]
+    )
     assert kwargs["bind_mounts"][0][2] is False
     assert all(read_only for _, _, read_only in mounts)
     backend.sandbox.start.assert_called_once_with()
@@ -716,7 +811,7 @@ def test_microservice_package_does_not_install_rust(tmp_path: Path) -> None:
 
     init_commands = backend.calls[0][1]["extra_init_commands"]
     assert any("go1.23.12" in item for item in init_commands)
-    assert not any("rustup.rs" in item for item in init_commands)
+    assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
 
 
 def test_docker_environment_mounts_effective_objective_read_only(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
