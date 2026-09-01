@@ -42,7 +42,7 @@ from vibesys.domains.environment import EnvironmentBindMount  # noqa: TC001  # t
 from vibesys.evaluators import (
     PROJECT_ROOT_TOKEN,
     CargoGitToolSpec,
-    EvaluatorToolLifecycleHandler,
+    EvaluatorToolLifecycleHooks,
     load_evaluator_package,
     tool_path_replacements,
 )
@@ -281,10 +281,10 @@ class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:  # noqa: D102  # tracked: #288
         objective_document = _materialize_effective_objective(request)
         tools = _evaluator_tools(request)
-        lifecycle_handlers: list[SandboxLifecycleHandler] = []
+        lifecycle_hooks: list[SandboxLifecycleHooks] = []
         if tools:
-            lifecycle_handlers.append(
-                EvaluatorToolLifecycleHandler(
+            lifecycle_hooks.append(
+                EvaluatorToolLifecycleHooks(
                     tools,
                     _required_evaluator_tools_root(request),
                 )
@@ -297,7 +297,7 @@ class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
             passthrough_paths=[],
             extra_env={},
             extra_init_commands=[],
-            lifecycle_handlers=lifecycle_handlers,
+            lifecycle_hooks=lifecycle_hooks,
         )
         return _DefaultRunEnvironmentSession(
             sandbox=sandbox,

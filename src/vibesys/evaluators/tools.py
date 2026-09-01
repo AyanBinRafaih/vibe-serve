@@ -15,7 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from vibesys.evaluators.packages import CargoGitToolSpec, tool_token
-from vs_sandbox import BeforeReadyContext, SandboxLifecycleHandler
+from vs_sandbox import BeforeReadyContext, SandboxLifecycleHooks
 
 ToolCommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
@@ -24,7 +24,7 @@ class EvaluatorToolError(RuntimeError):
     """Raised when an evaluator tool cannot be prepared safely."""
 
 
-class EvaluatorToolLifecycleHandler(SandboxLifecycleHandler):
+class EvaluatorToolLifecycleHooks(SandboxLifecycleHooks):
     """Install evaluator-declared tools while a sandbox becomes ready."""
 
     def __init__(

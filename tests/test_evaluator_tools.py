@@ -12,7 +12,7 @@ import pytest
 from vibesys.evaluators import (
     CargoGitToolSpec,
     EvaluatorToolError,
-    EvaluatorToolLifecycleHandler,
+    EvaluatorToolLifecycleHooks,
     cargo_install_argv,
     prepare_evaluator_tools,
     tool_install_root,
@@ -85,7 +85,7 @@ def test_prepare_tools_publishes_complete_install_and_reuses_it(tmp_path: Path) 
     assert not list(root.parent.glob(f".{root.name}-*"))
 
 
-def test_lifecycle_handler_snapshots_and_prepares_tool_requirements(tmp_path: Path) -> None:
+def test_lifecycle_hooks_snapshots_and_prepares_tool_requirements(tmp_path: Path) -> None:
     calls: list[tuple[str, ...]] = []
 
     def install(arguments):  # noqa: ANN001, ANN202
@@ -101,14 +101,14 @@ def test_lifecycle_handler_snapshots_and_prepares_tool_requirements(tmp_path: Pa
 
     tools = {"example": _spec()}
     install_parent = tmp_path / "tools"
-    handler = EvaluatorToolLifecycleHandler(
+    hooks = EvaluatorToolLifecycleHooks(
         tools,
         install_parent,
         command_runner=install,
     )
     tools.clear()
 
-    lifecycle = SandboxLifecycle([handler])
+    lifecycle = SandboxLifecycle([hooks])
     lifecycle.before_ready(MagicMock())
     lifecycle.before_ready(MagicMock())
 

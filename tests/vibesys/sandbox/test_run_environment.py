@@ -363,9 +363,9 @@ def test_local_environment_prepares_and_translates_evaluator_tool(
         )
     )
 
-    lifecycle_handlers = backend.calls[0][1]["lifecycle_handlers"]
-    assert len(lifecycle_handlers) == 1
-    SandboxLifecycle(lifecycle_handlers).before_ready(backend.sandbox)
+    lifecycle_hooks = backend.calls[0][1]["lifecycle_hooks"]
+    assert len(lifecycle_hooks) == 1
+    SandboxLifecycle(lifecycle_hooks).before_ready(backend.sandbox)
     prepare.assert_called_once_with(
         package.metadata.tools,
         tools_root,

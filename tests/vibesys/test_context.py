@@ -42,7 +42,7 @@ class _FakeBackend:
         self.sandbox = MagicMock()
 
     def make_sandbox(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
-        SandboxLifecycle(_kwargs.get("lifecycle_handlers")).before_ready(self.sandbox)
+        SandboxLifecycle(_kwargs.get("lifecycle_hooks")).before_ready(self.sandbox)
         return self.sandbox
 
     def make_monitor(self, _log_dir):  # noqa: ANN001, ANN202
