@@ -11,7 +11,7 @@ from vs_sandbox import (
     BeforeReadyContext,
     SandboxLifecycle,
     SandboxLifecycleError,
-    SandboxLifecycleHandler,
+    SandboxLifecycleHooks,
 )
 
 if TYPE_CHECKING:
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class _RecordingHandler(SandboxLifecycleHandler):
+class _RecordingHooks(SandboxLifecycleHooks):
     name: str
     events: list[tuple[str, object]]
 
@@ -27,7 +27,7 @@ class _RecordingHandler(SandboxLifecycleHandler):
         self.events.append((self.name, context.sandbox))
 
 
-class _FailingHandler(SandboxLifecycleHandler):
+class _FailingHooks(SandboxLifecycleHooks):
     def before_ready(self, context: BeforeReadyContext) -> None:  # noqa: ARG002
         raise ValueError("setup exploded")  # noqa: TRY003
 
@@ -36,17 +36,17 @@ def _sandbox() -> SandboxBackendProtocol:
     return cast("SandboxBackendProtocol", object())
 
 
-def test_base_handler_is_a_noop() -> None:
-    SandboxLifecycle([SandboxLifecycleHandler()]).before_ready(_sandbox())
+def test_base_hooks_are_a_noop() -> None:
+    SandboxLifecycle([SandboxLifecycleHooks()]).before_ready(_sandbox())
 
 
-def test_before_ready_passes_sandbox_to_handlers_in_registration_order() -> None:
+def test_before_ready_passes_sandbox_to_hooks_in_registration_order() -> None:
     sandbox = _sandbox()
     events: list[tuple[str, object]] = []
     lifecycle = SandboxLifecycle(
         [
-            _RecordingHandler("first", events),
-            _RecordingHandler("second", events),
+            _RecordingHooks("first", events),
+            _RecordingHooks("second", events),
         ]
     )
 
@@ -55,30 +55,30 @@ def test_before_ready_passes_sandbox_to_handlers_in_registration_order() -> None
     assert events == [("first", sandbox), ("second", sandbox)]
 
 
-def test_constructor_snapshots_mutable_handler_sequence() -> None:
+def test_constructor_snapshots_mutable_hooks_sequence() -> None:
     events: list[tuple[str, object]] = []
-    handlers: list[SandboxLifecycleHandler] = [_RecordingHandler("first", events)]
-    lifecycle = SandboxLifecycle(handlers)
-    handlers.append(_RecordingHandler("late", events))
+    hooks: list[SandboxLifecycleHooks] = [_RecordingHooks("first", events)]
+    lifecycle = SandboxLifecycle(hooks)
+    hooks.append(_RecordingHooks("late", events))
 
     lifecycle.before_ready(_sandbox())
 
     assert [name for name, _ in events] == ["first"]
-    assert lifecycle.handlers == (handlers[0],)
+    assert lifecycle.hooks == (hooks[0],)
 
 
-def test_failure_names_handler_preserves_cause_and_stops_dispatch() -> None:
+def test_failure_names_hooks_provider_preserves_cause_and_stops_dispatch() -> None:
     events: list[tuple[str, object]] = []
     lifecycle = SandboxLifecycle(
         [
-            _FailingHandler(),
-            _RecordingHandler("not-run", events),
+            _FailingHooks(),
+            _RecordingHooks("not-run", events),
         ]
     )
 
     with pytest.raises(
         SandboxLifecycleError,
-        match=r"before_ready lifecycle handler _FailingHandler failed: setup exploded",
+        match=r"before_ready hook in _FailingHooks failed: setup exploded",
     ) as error:
         lifecycle.before_ready(_sandbox())
 

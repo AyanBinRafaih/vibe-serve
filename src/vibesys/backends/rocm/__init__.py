@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
 
-    from vs_sandbox.lifecycle import SandboxLifecycleHandler
+    from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 # ROCm PyTorch image. Carries the ROCm runtime + a matching torch build.
 # Pinned rather than ``:latest`` for reproducibility and because the
@@ -158,7 +158,7 @@ class RocmBackend:
         passthrough_paths: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
         extra_init_commands: list[str] | None = None,
-        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
@@ -170,7 +170,7 @@ class RocmBackend:
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
         extra_init_commands = list(extra_init_commands or [])
-        lifecycle_handlers = lifecycle_handlers or []
+        lifecycle_hooks = lifecycle_hooks or []
 
         if kind is SandboxKind.MODAL:
             raise ValueError(  # noqa: TRY003  # tracked: #288
@@ -185,7 +185,7 @@ class RocmBackend:
             return make_local_shell_sandbox(
                 host_workspace=host_workspace,
                 env=env,
-                lifecycle_handlers=lifecycle_handlers,
+                lifecycle_hooks=lifecycle_hooks,
             )
 
         if kind is SandboxKind.DOCKER:
@@ -201,7 +201,7 @@ class RocmBackend:
                 env=env,
                 log_path=log_path,
                 extra_init_commands=extra_init_commands,
-                lifecycle_handlers=lifecycle_handlers,
+                lifecycle_hooks=lifecycle_hooks,
             )
 
         raise ValueError(f"Unknown sandbox kind: {kind!r}")  # noqa: TRY003  # tracked: #288

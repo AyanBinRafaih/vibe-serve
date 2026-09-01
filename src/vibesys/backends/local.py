@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
 
-    from vs_sandbox.lifecycle import SandboxLifecycleHandler
+    from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 _DEFAULT_CPU_IMAGE = "python:3.12-bookworm"
 
@@ -74,7 +74,7 @@ class LocalBackend:
         passthrough_paths: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
         extra_init_commands: list[str] | None = None,
-        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
@@ -87,13 +87,13 @@ class LocalBackend:
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
         extra_init_commands = list(extra_init_commands or [])
-        lifecycle_handlers = lifecycle_handlers or []
+        lifecycle_hooks = lifecycle_hooks or []
 
         if kind is SandboxKind.LOCAL:
             return make_local_shell_sandbox(
                 host_workspace=host_workspace,
                 env=extra_env,
-                lifecycle_handlers=lifecycle_handlers,
+                lifecycle_hooks=lifecycle_hooks,
             )
         if kind is SandboxKind.DOCKER and self._supports_docker:
             if self.image is None:
@@ -107,7 +107,7 @@ class LocalBackend:
                 env=extra_env,
                 log_path=log_path,
                 extra_init_commands=extra_init_commands,
-                lifecycle_handlers=lifecycle_handlers,
+                lifecycle_hooks=lifecycle_hooks,
             )
         if kind in (SandboxKind.DOCKER, SandboxKind.MODAL):
             raise ValueError(  # noqa: TRY003  # tracked: #288

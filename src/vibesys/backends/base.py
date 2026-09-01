@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
 
-    from vs_sandbox.lifecycle import SandboxLifecycleHandler
+    from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 
 class SandboxKind(StrEnum):
@@ -69,13 +69,13 @@ class ComputeBackendImpl(Protocol):
         passthrough_paths: list[str],
         extra_env: dict[str, str],
         extra_init_commands: list[str],
-        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
         """Construct (do not start) a sandbox configured for this backend.
 
-        ``lifecycle_handlers`` are invoked before the sandbox becomes ready,
+        ``lifecycle_hooks`` are invoked before the sandbox becomes ready,
         during both initial creation and replacement.
 
         ``attach_accelerator=False`` creates a CPU-only control-plane sandbox
@@ -90,7 +90,7 @@ class ComputeBackendImpl(Protocol):
         """Re-pick the optimal device for this backend (e.g. migrate to a
         less-loaded GPU) and restart affected sandboxes in place.
 
-        Each restarted sandbox re-runs its lifecycle handlers automatically as
+        Each restarted sandbox re-runs its lifecycle hooks automatically as
         part of ``start()``.  No-op for backends without rebalancing.
         """  # noqa: D205  # tracked: #288
         ...
@@ -100,7 +100,7 @@ def make_local_shell_sandbox(
     *,
     host_workspace: str,
     env: dict[str, str],
-    lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
+    lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
 ) -> SandboxBackendProtocol:
     """Construct deepagents' local-shell sandbox, importing deepagents on first use.
 
@@ -117,7 +117,7 @@ def make_local_shell_sandbox(
         inherit_env=True,
         env=env,
     )
-    SandboxLifecycle(lifecycle_handlers).before_ready(sandbox)
+    SandboxLifecycle(lifecycle_hooks).before_ready(sandbox)
     return sandbox
 
 

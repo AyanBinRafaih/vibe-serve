@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
 
-    from vs_sandbox.lifecycle import SandboxLifecycleHandler
+    from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 # Default container image for the cuda backend.  Carries CUDA toolkit + PyTorch.
 _DEFAULT_IMAGE = "nvcr.io/nvidia/pytorch:25.04-py3"
@@ -77,7 +77,7 @@ class CudaBackend:
         passthrough_paths: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
         extra_init_commands: list[str] | None = None,
-        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,
         attach_accelerator: bool = True,
     ) -> SandboxBackendProtocol:
@@ -90,7 +90,7 @@ class CudaBackend:
         passthrough_paths = passthrough_paths or []
         extra_env = extra_env or {}
         extra_init_commands = extra_init_commands or []
-        lifecycle_handlers = lifecycle_handlers or []
+        lifecycle_hooks = lifecycle_hooks or []
 
         # Pick a GPU lazily on first sandbox creation (modal manages its own).
         if attach_accelerator and kind is not SandboxKind.MODAL and self.selected_device is None:
@@ -106,7 +106,7 @@ class CudaBackend:
             sandbox = make_local_shell_sandbox(
                 host_workspace=host_workspace,
                 env=env,
-                lifecycle_handlers=lifecycle_handlers,
+                lifecycle_hooks=lifecycle_hooks,
             )
         elif kind is SandboxKind.DOCKER:
             sandbox = DockerSandbox(
@@ -118,7 +118,7 @@ class CudaBackend:
                 env=env,
                 log_path=log_path,
                 extra_init_commands=extra_init_commands,
-                lifecycle_handlers=lifecycle_handlers,
+                lifecycle_hooks=lifecycle_hooks,
             )
         elif kind is SandboxKind.MODAL:
             if modal_options is None:
@@ -137,7 +137,7 @@ class CudaBackend:
                 extra_writable_volumes=modal_options.extra_writable_volumes,
                 log_path=log_path,
                 extra_init_commands=extra_init_commands,
-                lifecycle_handlers=lifecycle_handlers,
+                lifecycle_hooks=lifecycle_hooks,
                 app_name=modal_options.app_name,
             )
         else:
@@ -158,7 +158,7 @@ class CudaBackend:
     def reselect_device(self) -> None:
         """Re-pick the least-loaded GPU; restart any docker sandboxes affected.
 
-        Each restarted sandbox re-runs its lifecycle handlers automatically as
+        Each restarted sandbox re-runs its lifecycle hooks automatically as
         part of ``start()`` — callers don't need to replay anything.
         """
         if os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -194,7 +194,7 @@ class CudaBackend:
                 assert isinstance(sb, DockerSandbox)  # noqa: S101  # registration invariant
                 sb.stop()
                 sb._gpus = self._docker_gpu_spec()  # noqa: SLF001  # tracked: #288
-                sb.start()  # re-runs lifecycle handlers
+                sb.start()  # re-runs lifecycle hooks
             elif kind is SandboxKind.LOCAL:
                 assert isinstance(sb, LocalShellBackend)  # noqa: S101  # registration invariant
                 env: dict[str, str] | None = getattr(sb, "_env", None)

@@ -23,7 +23,7 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
-from vs_sandbox.lifecycle import SandboxLifecycle, SandboxLifecycleHandler
+from vs_sandbox.lifecycle import SandboxLifecycle, SandboxLifecycleHooks
 
 if TYPE_CHECKING:
     from types import FrameType
@@ -155,7 +155,7 @@ class DockerSandbox(BaseSandbox):
         passthrough_paths: list[str] | None = None,
         log_path: str | Path | None = None,
         extra_init_commands: list[str] | None = None,
-        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
     ) -> None:
         """Initialize Docker sandbox configuration.
 
@@ -199,7 +199,7 @@ class DockerSandbox(BaseSandbox):
                 ``uv``, failures here **raise RuntimeError** — use this for
                 commands that must succeed (e.g. installing a CLI binary the
                 loop depends on).
-            lifecycle_handlers: Trusted extensions invoked in order after
+            lifecycle_hooks: Trusted extensions invoked in order after
                 built-in initialization and before the sandbox becomes ready.
                 They run again after every container recreation.
         """
@@ -219,7 +219,7 @@ class DockerSandbox(BaseSandbox):
         self._container_id: str | None = None
         self._logger = self._setup_logger(log_path)
         self._extra_init_commands: list[str] = list(extra_init_commands or [])
-        self._lifecycle = SandboxLifecycle(lifecycle_handlers)
+        self._lifecycle = SandboxLifecycle(lifecycle_hooks)
 
         # Container paths outside /workspace that _vpath must not rewrite.
         self._passthrough_prefixes: list[str] = list(passthrough_paths or [])

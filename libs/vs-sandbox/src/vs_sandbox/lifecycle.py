@@ -1,9 +1,9 @@
 """Trusted lifecycle extensions for sandbox startup.
 
-Lifecycle handlers are registered by framework code, not by candidate code.
-The sandbox invokes :meth:`SandboxLifecycleHandler.before_ready` after its
+Lifecycle hooks are registered by framework code, not by candidate code.
+The sandbox invokes :meth:`SandboxLifecycleHooks.before_ready` after its
 execution environment accepts commands and before it is exposed to callers.
-Handlers run again whenever a backend creates a replacement execution
+Hooks run again whenever a backend creates a replacement execution
 environment, so implementations must be idempotent.
 """
 
@@ -25,11 +25,11 @@ class BeforeReadyContext:
     sandbox: SandboxBackendProtocol
 
 
-class SandboxLifecycleHandler:
-    """Base class for trusted sandbox lifecycle extensions.
+class SandboxLifecycleHooks:
+    """Base class for trusted sandbox lifecycle hooks.
 
     Future lifecycle points can be added here as concrete no-op methods. That
-    keeps existing subclasses compatible while allowing one handler instance
+    keeps existing subclasses compatible while allowing one hooks provider
     to participate in more than one phase.
     """
 
@@ -38,34 +38,34 @@ class SandboxLifecycleHandler:
 
 
 class SandboxLifecycleError(RuntimeError):
-    """Raised when a lifecycle handler prevents a sandbox becoming ready."""
+    """Raised when a lifecycle hook prevents a sandbox becoming ready."""
 
-    def __init__(self, hook: str, handler: str, cause: Exception) -> None:
-        """Name the failed hook and handler while retaining the cause."""
-        super().__init__(f"{hook} lifecycle handler {handler} failed: {cause}")
+    def __init__(self, hook: str, provider: str, cause: Exception) -> None:
+        """Name the failed hook and provider while retaining the cause."""
+        super().__init__(f"{hook} hook in {provider} failed: {cause}")
 
 
 class SandboxLifecycle:
-    """Run an ordered, immutable snapshot of lifecycle handlers."""
+    """Run an ordered, immutable snapshot of lifecycle hooks."""
 
     def __init__(
         self,
-        handlers: Sequence[SandboxLifecycleHandler] | None = None,
+        hooks: Sequence[SandboxLifecycleHooks] | None = None,
     ) -> None:
-        """Snapshot handlers in their deterministic execution order."""
-        self._handlers = tuple(handlers or ())
+        """Snapshot hooks providers in their deterministic execution order."""
+        self._hooks = tuple(hooks or ())
 
     @property
-    def handlers(self) -> tuple[SandboxLifecycleHandler, ...]:
-        """Return the handlers in their deterministic execution order."""
-        return self._handlers
+    def hooks(self) -> tuple[SandboxLifecycleHooks, ...]:
+        """Return the hooks providers in their deterministic execution order."""
+        return self._hooks
 
     def before_ready(self, sandbox: SandboxBackendProtocol) -> None:
-        """Run every handler, stopping at the first failure."""
+        """Run every provider's hook, stopping at the first failure."""
         context = BeforeReadyContext(sandbox=sandbox)
-        for handler in self._handlers:
+        for provider in self._hooks:
             try:
-                handler.before_ready(context)
+                provider.before_ready(context)
             except Exception as exc:
-                name = type(handler).__name__
+                name = type(provider).__name__
                 raise SandboxLifecycleError("before_ready", name, exc) from exc

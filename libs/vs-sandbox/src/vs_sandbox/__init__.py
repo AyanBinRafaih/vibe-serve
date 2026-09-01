@@ -35,7 +35,7 @@ if TYPE_CHECKING:
         BeforeReadyContext,
         SandboxLifecycle,
         SandboxLifecycleError,
-        SandboxLifecycleHandler,
+        SandboxLifecycleHooks,
     )
     from vs_sandbox.modal_model_setup import ensure_model_volume
     from vs_sandbox.modal_sandbox import ModalSandbox
@@ -55,7 +55,7 @@ __all__ = [
     "ProjectPathPolicyError",
     "SandboxLifecycle",
     "SandboxLifecycleError",
-    "SandboxLifecycleHandler",
+    "SandboxLifecycleHooks",
     "SandboxUnavailableError",
     "SeatbeltSandbox",
     "WorkspaceSandbox",
@@ -109,7 +109,7 @@ def __getattr__(name: str) -> Any:  # noqa: ANN401, PLR0911  # tracked: #288
         "BeforeReadyContext",
         "SandboxLifecycle",
         "SandboxLifecycleError",
-        "SandboxLifecycleHandler",
+        "SandboxLifecycleHooks",
     }:
         from vs_sandbox import lifecycle  # noqa: PLC0415
 

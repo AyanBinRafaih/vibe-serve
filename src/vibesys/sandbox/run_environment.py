@@ -47,7 +47,7 @@ from vibesys.skypilot.bridge import SkyPilotBridge
 from vibesys.skypilot.config import load_cluster_profiles, resolve_profile
 from vibesys.skypilot.runner import SkyPilotJobRunner, stable_cluster_name
 from vs_project import RunEnvironmentRecord, RunResourceRequest
-from vs_sandbox import BeforeReadyContext, ProjectPathPolicy, SandboxLifecycleHandler
+from vs_sandbox import BeforeReadyContext, ProjectPathPolicy, SandboxLifecycleHooks
 
 _SHELL_COMMAND_ARG_COUNT = 3
 _RunEnvironmentName = Literal["local", "docker", "modal", "skypilot"]
@@ -328,7 +328,7 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
         if request.git_history_root is not None:
             cli_provider_env.setdefault("VIBESYS_GIT_HISTORY", "/opt/vibesys-history")
         bind_mounts = _dedupe_mounts(bind_mounts)
-        lifecycle_handlers = _symlink_lifecycle_handlers(docker_symlinks)
+        lifecycle_hooks = _symlink_lifecycle_hooks(docker_symlinks)
 
         sandbox = request.backend.make_sandbox(
             SandboxKind.DOCKER,
@@ -338,7 +338,7 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
             passthrough_paths=passthrough,
             extra_env=cli_provider_env,
             extra_init_commands=extra_init_commands,
-            lifecycle_handlers=lifecycle_handlers,
+            lifecycle_hooks=lifecycle_hooks,
         )
         log: Callable[[str], None] = request.log or (lambda _: None)
         label = getattr(request.backend, "image", self.config.image or "<backend-default>")
@@ -571,7 +571,7 @@ class SkyPilotEnvironment(DockerEnvironment):
                 passthrough_paths=passthrough,
                 extra_env=cli_provider_env,
                 extra_init_commands=extra_init_commands,
-                lifecycle_handlers=_symlink_lifecycle_handlers(docker_symlinks),
+                lifecycle_hooks=_symlink_lifecycle_hooks(docker_symlinks),
                 attach_accelerator=False,
             )
             _start_sandbox(sandbox)
@@ -702,7 +702,7 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
         extra_init_commands.insert(0, "pip install --quiet 'modal>=0.66'")
 
         bind_mounts = _dedupe_mounts(bind_mounts)
-        lifecycle_handlers = _symlink_lifecycle_handlers(docker_symlinks)
+        lifecycle_hooks = _symlink_lifecycle_hooks(docker_symlinks)
 
         sandbox = request.backend.make_sandbox(
             SandboxKind.DOCKER,
@@ -712,7 +712,7 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
             passthrough_paths=passthrough,
             extra_env=cli_provider_env,
             extra_init_commands=extra_init_commands,
-            lifecycle_handlers=lifecycle_handlers,
+            lifecycle_hooks=lifecycle_hooks,
             attach_accelerator=False,
         )
         log: Callable[[str], None] = request.log or (lambda _: None)
@@ -1518,7 +1518,7 @@ def _dedupe_mounts(
 
 
 @dataclass(frozen=True)
-class _SymlinkLifecycleHandler(SandboxLifecycleHandler):
+class _SymlinkLifecycleHooks(SandboxLifecycleHooks):
     commands: tuple[str, ...]
 
     def before_ready(self, context: BeforeReadyContext) -> None:
@@ -1533,15 +1533,15 @@ class _SymlinkLifecycleHandler(SandboxLifecycleHandler):
             save_symlink_commands(list(self.commands))
 
 
-def _symlink_lifecycle_handlers(
+def _symlink_lifecycle_hooks(
     symlinks: list[tuple[str, str]],
-) -> list[SandboxLifecycleHandler]:
+) -> list[SandboxLifecycleHooks]:
     if not symlinks:
         return []
     commands = tuple(
         f"ln -sfn {shlex.quote(target)} {shlex.quote(link)}" for link, target in symlinks
     )
-    return [_SymlinkLifecycleHandler(commands)]
+    return [_SymlinkLifecycleHooks(commands)]
 
 
 def _collect_symlink_mounts(

@@ -57,7 +57,7 @@ class DeviceLease:  # noqa: D101  # tracked: #288
     def reselect(self) -> None:
         """Delegate mid-run device rebalance to the backend.
 
-        Restarted sandboxes re-run their lifecycle handlers (e.g. Docker symlinks)
+        Restarted sandboxes re-run their lifecycle hooks (e.g. Docker symlinks)
         as part of ``start()`` — no replay logic needed here.
         """
         if self._view is not None and not self._view.host_device_reselect:

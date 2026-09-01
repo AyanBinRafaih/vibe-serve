@@ -4,10 +4,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vs_sandbox import BeforeReadyContext, SandboxLifecycleError, SandboxLifecycleHandler
+from vs_sandbox import BeforeReadyContext, SandboxLifecycleError, SandboxLifecycleHooks
 
 
-class _RecordingHandler(SandboxLifecycleHandler):
+class _RecordingHooks(SandboxLifecycleHooks):
     def __init__(self, invocations: list[object]) -> None:
         self._invocations = invocations
 
@@ -15,12 +15,12 @@ class _RecordingHandler(SandboxLifecycleHandler):
         self._invocations.append(context.sandbox)
 
 
-class _FailingHandler(SandboxLifecycleHandler):
+class _FailingHooks(SandboxLifecycleHooks):
     def before_ready(self, context: BeforeReadyContext) -> None:  # noqa: ARG002
         raise ValueError("setup exploded")  # noqa: TRY003
 
 
-class _FailOnSecondInvocationHandler(SandboxLifecycleHandler):
+class _FailOnSecondInvocationHooks(SandboxLifecycleHooks):
     def __init__(self) -> None:
         self.invocations = 0
 
@@ -230,14 +230,14 @@ class TestStart:
             assert not any(".venv" in c for c in uploaded)
             assert not any(".git" in c for c in uploaded)
 
-    def test_lifecycle_handlers_run_before_ready(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201, ARG002
+    def test_lifecycle_hooks_run_before_ready(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201, ARG002
         from vs_sandbox.modal_sandbox import ModalSandbox  # noqa: PLC0415
 
         invocations: list[object] = []
         sb = ModalSandbox(
             host_workspace=str(tmp_path),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
-            lifecycle_handlers=[_RecordingHandler(invocations)],
+            lifecycle_hooks=[_RecordingHooks(invocations)],
         )
 
         try:
@@ -246,7 +246,7 @@ class TestStart:
         finally:
             sb.stop()
 
-    def test_init_failure_skips_handlers_and_cleans_up(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201
+    def test_init_failure_skips_hooks_and_cleans_up(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201
         from vs_sandbox.modal_sandbox import ModalSandbox, _live_sandboxes  # noqa: PLC0415
 
         invocations: list[object] = []
@@ -255,7 +255,7 @@ class TestStart:
             host_workspace=str(tmp_path),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
             extra_init_commands=["install-required-tool"],
-            lifecycle_handlers=[_RecordingHandler(invocations)],
+            lifecycle_hooks=[_RecordingHooks(invocations)],
         )
 
         with pytest.raises(RuntimeError, match="Modal sandbox init command failed"):
@@ -273,10 +273,10 @@ class TestStart:
         sb = ModalSandbox(
             host_workspace=str(tmp_path),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
-            lifecycle_handlers=[_FailingHandler()],
+            lifecycle_hooks=[_FailingHooks()],
         )
 
-        with pytest.raises(SandboxLifecycleError, match="_FailingHandler failed") as error:
+        with pytest.raises(SandboxLifecycleError, match="_FailingHooks failed") as error:
             sb.start()
 
         assert isinstance(error.value.__cause__, ValueError)
@@ -285,14 +285,14 @@ class TestStart:
         mock_modal["sandbox"].terminate.assert_called_once()
         mock_modal["objects"].delete.assert_called_once()
 
-    def test_lifecycle_handlers_replay_on_fallback_replacement(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201
+    def test_lifecycle_hooks_replay_on_fallback_replacement(self, tmp_path, mock_modal):  # noqa: ANN001, ANN201
         from vs_sandbox.modal_sandbox import ModalSandbox  # noqa: PLC0415
 
         invocations: list[object] = []
         sb = ModalSandbox(
             host_workspace=str(tmp_path),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
-            lifecycle_handlers=[_RecordingHandler(invocations)],
+            lifecycle_hooks=[_RecordingHooks(invocations)],
         )
 
         try:
@@ -310,17 +310,17 @@ class TestStart:
     ):
         from vs_sandbox.modal_sandbox import ModalSandbox, _live_sandboxes  # noqa: PLC0415
 
-        handler = _FailOnSecondInvocationHandler()
+        hooks = _FailOnSecondInvocationHooks()
         sb = ModalSandbox(
             host_workspace=str(tmp_path),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
-            lifecycle_handlers=[handler],
+            lifecycle_hooks=[hooks],
         )
 
         sb.start()
         workspace_volume_name = sb._workspace_volume_name  # noqa: SLF001
         assert not sb._restart_sandbox()  # noqa: SLF001
-        assert handler.invocations == 2
+        assert hooks.invocations == 2
         assert sb._sandbox is None  # noqa: SLF001
         assert not _live_sandboxes
         assert sb._workspace_volume_name == workspace_volume_name  # noqa: SLF001

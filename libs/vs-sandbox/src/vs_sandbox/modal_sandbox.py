@@ -40,7 +40,7 @@ from deepagents.backends.protocol import (
 from deepagents.backends.sandbox import BaseSandbox
 from modal.volume import AbstractVolumeUploadContextManager  # noqa: TC002  # tracked: #288
 
-from vs_sandbox.lifecycle import SandboxLifecycle, SandboxLifecycleHandler
+from vs_sandbox.lifecycle import SandboxLifecycle, SandboxLifecycleHooks
 
 if TYPE_CHECKING:
     from types import FrameType
@@ -195,7 +195,7 @@ class ModalSandbox(BaseSandbox):
         extra_writable_volumes: dict[str, str] | None = None,
         log_path: str | Path | None = None,
         extra_init_commands: list[str] | None = None,
-        lifecycle_handlers: list[SandboxLifecycleHandler] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         app_name: str = "vibesys",
         enable_fallback_restart: bool = True,  # noqa: FBT001, FBT002  # tracked: #288
         max_restart_attempts: int = 2,
@@ -239,7 +239,7 @@ class ModalSandbox(BaseSandbox):
             extra_init_commands: Additional bash one-liners run inside the
                 sandbox after the default ``pip install uv``.  Failures
                 raise ``RuntimeError``.
-            lifecycle_handlers: Trusted extensions invoked in order after
+            lifecycle_hooks: Trusted extensions invoked in order after
                 built-in initialization and before the sandbox becomes ready.
                 They run again after every container recreation.
             app_name: Modal App name to attach the sandbox to.  Created if
@@ -259,7 +259,7 @@ class ModalSandbox(BaseSandbox):
         self._extra_readonly_volumes = dict(extra_readonly_volumes or {})
         self._extra_writable_volumes = dict(extra_writable_volumes or {})
         self._extra_init_commands = list(extra_init_commands or [])
-        self._lifecycle = SandboxLifecycle(lifecycle_handlers)
+        self._lifecycle = SandboxLifecycle(lifecycle_hooks)
         self._app_name = app_name
         self._enable_fallback_restart = enable_fallback_restart
         self._max_restart_attempts = max_restart_attempts
