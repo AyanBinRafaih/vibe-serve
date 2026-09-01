@@ -628,6 +628,51 @@ describe('OpenTUI presentation', () => {
     expect(early).toContain('[ r1 ]');
   });
 
+  it('leaves brackets and cursor keys to a typed command', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed' as const},
+          {number: 2, status: 'active' as const},
+        ],
+        transcript: [
+          {
+            id: 'live',
+            kind: 'assistant',
+            label: 'Agent',
+            content: 'live output',
+            roundNumber: 2,
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+    const focusBefore = controller.state.roundFocus;
+
+    // With text in the command input, brackets are characters and the cursor
+    // keys stay in the input: nothing navigates rounds or moves pane focus.
+    await testRenderer.mockInput.typeText('/steer fix arr[0]');
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    const typed = await frameAfter(testRenderer);
+    expect(typed).toContain('arr[0]');
+    expect(controller.state.selectedRound).toBeNull();
+    expect(controller.state.roundFocus).toBe(focusBefore);
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    expect(controller.submissions).toEqual(['/steer fix arr[0]']);
+
+    // With the input empty again, the same key is round navigation.
+    testRenderer.mockInput.pressKey('[');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedRound).toBe(1);
+  });
+
   it('filters the transcript to an agent node that is clicked', async () => {
     const testRenderer = await createTestRenderer({width: 150, height: 24});
     const controller = new FakeController({
@@ -2057,7 +2102,7 @@ describe('theming', () => {
     expect(controller.liveCalls).toBe(0);
   });
 
-  it('leaves Enter to a typed command while the theme list is open', async () => {
+  it('contains typing and Enter while the theme list is open', async () => {
     const testRenderer = await createTestRenderer({width: 90, height: 24});
     const controller = new FakeController(initialSessionState());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -2069,14 +2114,19 @@ describe('theming', () => {
     testRenderer.mockInput.pressKey('ARROW_DOWN');
     await testRenderer.waitForFrame(value => value.includes('\u203a light'));
 
-    await testRenderer.mockInput.typeText('/help');
+    // The picker is modal: typed text is swallowed instead of reaching the
+    // command input hidden behind it, and Enter applies the highlighted theme
+    // rather than submitting whatever leaked through.
+    await testRenderer.mockInput.typeText('/quack');
     testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(() => controller.submissions.length === 2);
+    await testRenderer.waitForFrame(() => controller.state.themePicker === null);
 
-    // The command ran; the highlighted theme was not applied by its Enter.
-    expect(controller.submissions).toEqual(['/theme', '/help']);
-    expect(controller.state.themeName).toBe('dark');
-    expect(controller.state.themePicker?.selected).toBe('light');
+    expect(controller.submissions).toEqual(['/theme']);
+    expect(controller.state.themeName).toBe('light');
+    const settled = testRenderer.captureCharFrame();
+    // The input still shows its placeholder: nothing typed reached it.
+    expect(settled).not.toContain('/quack');
+    expect(settled).toContain('Type /help for commands');
   });
 
   it('owns its keys over the chat it was opened from', async () => {
@@ -2423,6 +2473,52 @@ describe('theming', () => {
     const back = await frameAfterEscape(testRenderer);
     expect(back).toContain('Implementation Details');
     expect(back).not.toContain('Available commands');
+  });
+
+  it('swallows keys an overlay does not use instead of leaking them behind', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      overlay: {kind: 'help', content: 'Available commands'},
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed' as const},
+          {number: 2, status: 'active' as const},
+        ],
+        transcript: [
+          {
+            id: 'live',
+            kind: 'assistant',
+            label: 'Agent',
+            content: 'live output',
+            roundNumber: 2,
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('Available commands'));
+
+    // The overlay is modal: round navigation, pane focus, and typing are
+    // swallowed rather than applied to the panes or the hidden command input.
+    testRenderer.mockInput.pressKey('[');
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    await testRenderer.mockInput.typeText('/quack');
+    testRenderer.mockInput.pressEnter();
+    const held = await frameAfter(testRenderer);
+    expect(held).toContain('Available commands');
+    expect(controller.state.overlay).not.toBeNull();
+    expect(controller.state.selectedRound).toBeNull();
+    expect(controller.submissions).toEqual([]);
+
+    // Escape still closes it, and nothing typed while it was open surfaces.
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const back = await frameAfterEscape(testRenderer);
+    expect(back).not.toContain('Available commands');
+    expect(back).toContain('live output');
+    expect(back).not.toContain('/quack');
   });
 
   it('colors the outcome cell from the active theme in light and dark', async () => {

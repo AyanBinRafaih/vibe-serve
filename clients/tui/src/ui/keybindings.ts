@@ -142,10 +142,9 @@ export function bindKeybindings(
       else if (key.name === 'pageup') controller.moveThemeSelection(-10);
       else if (key.name === 'pagedown') controller.moveThemeSelection(10);
       else if (key.name === 'escape') controller.closeThemePicker();
-      else if (key.name === 'return' || key.name === 'enter') {
-        if (!actions.inputIsEmpty()) return;
-        controller.applySelectedTheme();
-      } else return;
+      else if (key.name === 'return' || key.name === 'enter') controller.applySelectedTheme();
+      // The picker is modal: keys it does not use are swallowed here so they
+      // cannot move panes or type into the still-focused input behind it.
       key.preventDefault();
       return;
     }
@@ -167,9 +166,13 @@ export function bindKeybindings(
       }
       return;
     }
-    if (key.name === 'escape' && controller.state.overlay !== null) {
-      controller.live();
-      viewport.scrollTo(viewport.scrollHeight);
+    if (controller.state.overlay !== null) {
+      if (key.name === 'escape') {
+        controller.live();
+        viewport.scrollTo(viewport.scrollHeight);
+      }
+      // The overlay is modal: everything it does not handle is swallowed so
+      // keys cannot reach the panes or the hidden command input behind it.
       key.preventDefault();
       return;
     }
@@ -234,7 +237,9 @@ export function bindKeybindings(
         return;
       }
     }
-    if (key.name === 'left' || key.name === 'right') {
+    // Like Enter above, pane focus and round navigation yield to a typed
+    // command: cursor keys and brackets belong to a non-empty input.
+    if ((key.name === 'left' || key.name === 'right') && actions.inputIsEmpty()) {
       controller.focusRound(key.name === 'left' ? 'agents' : 'transcript');
       key.preventDefault();
       return;
@@ -279,13 +284,13 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    if (key.name === ']') {
+    if (key.name === ']' && actions.inputIsEmpty()) {
       actions.selectNextRound();
       viewport.scrollTo(viewport.scrollHeight);
       key.preventDefault();
       return;
     }
-    if (key.name === '[') {
+    if (key.name === '[' && actions.inputIsEmpty()) {
       actions.selectPreviousRound();
       viewport.scrollTo(viewport.scrollHeight);
       key.preventDefault();
