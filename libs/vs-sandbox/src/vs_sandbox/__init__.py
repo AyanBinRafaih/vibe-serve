@@ -31,10 +31,17 @@ if TYPE_CHECKING:
     from vs_sandbox.host_sandbox import (
         build as build_host_sandbox,
     )
+    from vs_sandbox.lifecycle import (
+        BeforeReadyContext,
+        SandboxLifecycle,
+        SandboxLifecycleError,
+        SandboxLifecycleHooks,
+    )
     from vs_sandbox.modal_model_setup import ensure_model_volume
     from vs_sandbox.modal_sandbox import ModalSandbox
 
 __all__ = [
+    "BeforeReadyContext",
     "DockerSandbox",
     "HostResource",
     "HostResourceAccess",
@@ -46,6 +53,9 @@ __all__ = [
     "ModalSandbox",
     "ProjectPathPolicy",
     "ProjectPathPolicyError",
+    "SandboxLifecycle",
+    "SandboxLifecycleError",
+    "SandboxLifecycleHooks",
     "SandboxUnavailableError",
     "SeatbeltSandbox",
     "WorkspaceSandbox",
@@ -55,7 +65,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str) -> Any:  # noqa: ANN401  # tracked: #288
+def __getattr__(name: str) -> Any:  # noqa: ANN401, PLR0911  # tracked: #288
     if name == "DockerSandbox":
         from vs_sandbox.docker_sandbox import DockerSandbox  # noqa: PLC0415  # tracked: #288
 
@@ -95,4 +105,13 @@ def __getattr__(name: str) -> Any:  # noqa: ANN401  # tracked: #288
         )
 
         return ensure_model_volume
+    if name in {
+        "BeforeReadyContext",
+        "SandboxLifecycle",
+        "SandboxLifecycleError",
+        "SandboxLifecycleHooks",
+    }:
+        from vs_sandbox import lifecycle  # noqa: PLC0415
+
+        return getattr(lifecycle, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")  # noqa: TRY003  # tracked: #288

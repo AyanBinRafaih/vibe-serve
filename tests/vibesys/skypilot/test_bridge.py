@@ -6,6 +6,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -122,9 +123,13 @@ class FakeRunner(SkyPilotJobRunner):
         assert (workdir / "candidate.py").read_text() == "candidate"
         assert (workdir / ".vibesys-evaluator-package" / "checker.py").exists()
         job_started(9)
-        if tuple(command[:2]) == ("sh", "-c"):
-            begin = re.search(r"__VIBESYS_SKYPILOT_ARTIFACT_BEGIN_[0-9a-f]+__", command[2])
-            end = re.search(r"__VIBESYS_SKYPILOT_ARTIFACT_END_[0-9a-f]+__", command[2])
+        artifact_script = next(
+            (argument for argument in command if "__VIBESYS_SKYPILOT_ARTIFACT_BEGIN_" in argument),
+            None,
+        )
+        if artifact_script is not None:
+            begin = re.search(r"__VIBESYS_SKYPILOT_ARTIFACT_BEGIN_[0-9a-f]+__", artifact_script)
+            end = re.search(r"__VIBESYS_SKYPILOT_ARTIFACT_END_[0-9a-f]+__", artifact_script)
             assert begin is not None
             assert end is not None
             stdout_sink(f"out\n{begin.group()}\neyJsYXRlbmN5IjoxfQ==\n{end.group()}\n")
@@ -331,6 +336,162 @@ def test_terminal_replay_tracks_persisted_cluster_for_release(
     assert set(runner.release_names) == {"new-lease", "old-lease"}
 
 
+def test_framework_setup_wraps_new_job_argv_and_runs_first_in_workdir(
+    tmp_path: Path,
+    socket_dir: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "candidate.py").write_text("candidate")
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "checker.py").write_text("checker")
+    runner = FakeRunner()
+    setup = "printf '%s' ready > .framework-setup"
+    evaluator = (
+        "sh",
+        "-c",
+        'test "$(cat .framework-setup)" = ready && printf "%s" "$1" > evaluator-output',
+        "evaluator",
+        "value; touch injected",
+    )
+    bridge = SkyPilotBridge(
+        runner=runner,
+        cluster_name="lease",
+        resources=_resources(),
+        workspace=workspace,
+        evaluator_package_root=package,
+        hidden_paths=(),
+        commands={"accuracy": evaluator},
+        benchmark_output_argument=None,
+        state_namespace=_namespace(tmp_path),
+        socket_path=socket_dir / "bridge.sock",
+        log=lambda _: None,
+        framework_setup_command=setup,
+    )
+    bridge.start()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(bridge.socket_path))
+            invocation_id = "4" * 32
+            client.sendall(
+                encode_message(EvaluationRequest(kind="accuracy", invocation_id=invocation_id))
+            )
+            reader = client.makefile("rb")
+            frames = [decode_response(reader.readline()) for _ in range(3)]
+            client.sendall(encode_message(AckRequest(invocation_id=invocation_id)))
+            assert decode_response(reader.readline()).type == "acked"
+
+        assert [frame.type for frame in frames] == ["stdout", "stderr", "result"]
+        submitted = runner.commands[0]
+        assert submitted == (
+            "sh",
+            "-c",
+            f'set -e\n{setup}\nexec "$@"',
+            "vibesys-framework-evaluator",
+            *evaluator,
+        )
+        assert "value; touch injected" not in submitted[2]
+        assert runner.workdirs[0] == bridge._snapshot(invocation_id)  # noqa: SLF001
+
+        execution_root = tmp_path / "wrapper-execution"
+        execution_root.mkdir()
+        result = subprocess.run(  # noqa: S603
+            submitted,
+            cwd=execution_root,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert (execution_root / "evaluator-output").read_text() == "value; touch injected"
+        assert not (execution_root / "injected").exists()
+    finally:
+        bridge.close()
+
+
+def test_framework_setup_participates_in_recovery_digest_without_changing_legacy_digest(
+    tmp_path: Path,
+    socket_dir: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    request = EvaluationRequest(kind="accuracy", invocation_id="5" * 32)
+    command = ("python", "checker.py", "argument")
+
+    def make_bridge(setup: str | None) -> SkyPilotBridge:
+        return SkyPilotBridge(
+            runner=FakeRunner(),
+            cluster_name="lease",
+            resources=_resources(),
+            workspace=workspace,
+            evaluator_package_root=None,
+            hidden_paths=(),
+            commands={"accuracy": command},
+            benchmark_output_argument=None,
+            state_namespace=_namespace(tmp_path),
+            socket_path=socket_dir / "bridge.sock",
+            log=lambda _: None,
+            framework_setup_command=setup,
+        )
+
+    legacy = hashlib.sha256(
+        json.dumps(
+            {
+                "request": request.model_dump(mode="json", exclude={"invocation_id"}),
+                "command": command,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    without_setup = make_bridge(None)
+    with_setup = make_bridge("prepare one")
+    changed_setup = make_bridge("prepare two")
+
+    assert without_setup._request_digest(request, command) == legacy  # noqa: SLF001
+    assert with_setup._request_digest(request, command) != legacy  # noqa: SLF001
+    assert with_setup._request_digest(  # noqa: SLF001
+        request, command
+    ) != changed_setup._request_digest(request, command)  # noqa: SLF001
+
+
+def test_framework_setup_failure_prevents_evaluator_execution(
+    tmp_path: Path,
+    socket_dir: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge = SkyPilotBridge(
+        runner=FakeRunner(),
+        cluster_name="lease",
+        resources=_resources(),
+        workspace=workspace,
+        evaluator_package_root=None,
+        hidden_paths=(),
+        commands={"accuracy": ("true",)},
+        benchmark_output_argument=None,
+        state_namespace=_namespace(tmp_path),
+        socket_path=socket_dir / "bridge.sock",
+        log=lambda _: None,
+        framework_setup_command="exit 23",
+    )
+    command = bridge._with_framework_setup(  # noqa: SLF001
+        ("sh", "-c", "touch evaluator-ran")
+    )
+
+    result = subprocess.run(  # noqa: S603
+        command,
+        cwd=workspace,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 23
+    assert not (workspace / "evaluator-ran").exists()
+
+
 def test_job_discovered_during_close_is_cancelled_and_released(
     tmp_path: Path, socket_dir: Path
 ) -> None:
@@ -369,7 +530,7 @@ def test_job_discovered_during_close_is_cancelled_and_released(
     assert set(runner.release_names) == {"new-lease", "old-lease"}
 
 
-def test_bridge_stages_allowlisted_command_streams_and_cleans_up(
+def test_bridge_stages_allowlisted_command_streams_and_cleans_up(  # noqa: PLR0915
     tmp_path: Path, socket_dir: Path
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -378,6 +539,19 @@ def test_bridge_stages_allowlisted_command_streams_and_cleans_up(
     (workspace / ".env").write_text("SECRET=x")
     (workspace / ".venv").mkdir()
     (workspace / ".venv" / "large-cache").write_text("excluded")
+    (workspace / ".vibesys-evaluator-tools").mkdir()
+    (workspace / ".vibesys-evaluator-tools" / "poisoned").write_text("candidate")
+    (workspace / ".vibesys-evaluator-toolchains").mkdir()
+    (workspace / ".vibesys-evaluator-toolchains" / "poisoned").write_text("candidate")
+    (workspace / ".bin").mkdir()
+    (workspace / ".bin" / "cargo").write_text("candidate")
+    (workspace / ".pip").mkdir()
+    (workspace / ".pip" / "uv.py").write_text("candidate")
+    (workspace / ".uv-cache").mkdir()
+    (workspace / ".uv-cache" / "archive").write_text("candidate")
+    (workspace / ".vibesys-evaluator-package").mkdir()
+    (workspace / ".vibesys-evaluator-package" / "checker.py").write_text("candidate")
+    (workspace / ".skyignore").write_text(".vibesys-evaluator-package\n")
     (workspace / "private").mkdir()
     (workspace / "private" / "token").write_text("secret")
     package = tmp_path / "package"
@@ -422,6 +596,14 @@ def test_bridge_stages_allowlisted_command_streams_and_cleans_up(
         assert runner.commands[0][2].index("rm -f --") < runner.commands[0][2].index("python")
         assert ".vibesys-evaluator-package/checker.py" in runner.commands[0][2]
         assert remote_result in runner.commands[0][2]
+        staged = runner.workdirs[0]
+        assert not (staged / ".vibesys-evaluator-tools").exists()
+        assert not (staged / ".vibesys-evaluator-toolchains").exists()
+        assert not (staged / ".bin").exists()
+        assert not (staged / ".pip").exists()
+        assert not (staged / ".uv-cache").exists()
+        assert (staged / ".vibesys-evaluator-package" / "checker.py").read_text() == "checker"
+        assert staged.joinpath(".skyignore").read_text().startswith("# VibeSys")
         assert bridge.socket_path.stat().st_mode & 0o777 == 0o600
     finally:
         bridge.close()

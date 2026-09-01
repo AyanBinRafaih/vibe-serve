@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,11 +32,22 @@ func nativeRunnerPath() (string, error) {
 			return
 		}
 		source := filepath.Join(cwd, "native_runner")
-		manifest := filepath.Join(source, "Cargo.toml")
-		if _, err := os.Stat(manifest); err != nil {
-			runnerErr = fmt.Errorf("native runner manifest %q: %w", manifest, err)
+		sourceManifest := filepath.Join(source, "Cargo.toml")
+		if _, err := os.Stat(sourceManifest); err != nil {
+			runnerErr = fmt.Errorf("native runner manifest %q: %w", sourceManifest, err)
 			return
 		}
+		isolatedSource, err := os.MkdirTemp("", "vibesys-queue-native-source-")
+		if err != nil {
+			runnerErr = fmt.Errorf("create isolated native runner source: %w", err)
+			return
+		}
+		defer os.RemoveAll(isolatedSource)
+		if err := copySourceTree(source, isolatedSource); err != nil {
+			runnerErr = fmt.Errorf("copy isolated native runner source: %w", err)
+			return
+		}
+		manifest := filepath.Join(isolatedSource, "Cargo.toml")
 
 		digest := sha256.Sum256([]byte(source))
 		target := filepath.Join(
@@ -53,7 +65,10 @@ func nativeRunnerPath() (string, error) {
 			"--target-dir",
 			target,
 		)
-		command.Dir = source
+		// Cargo discovers .cargo/config.toml in ancestor directories. Build from
+		// the isolated copy so candidate workspace configuration cannot affect
+		// compilation of this trusted runner.
+		command.Dir = isolatedSource
 		log := newBoundedLog(64 * 1024)
 		command.Stdout = log
 		command.Stderr = log
@@ -69,6 +84,34 @@ func nativeRunnerPath() (string, error) {
 		runnerErr = validateRunnerExecutable(runnerPath)
 	})
 	return runnerPath, runnerErr
+}
+
+func copySourceTree(source, destination string) error {
+	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("unsupported native runner source file: %s", path)
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, contents, info.Mode().Perm())
+	})
 }
 
 func validateRunnerExecutable(path string) error {

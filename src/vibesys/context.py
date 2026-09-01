@@ -38,6 +38,7 @@ from vibesys.domains.environment import (
     NoopEnvironmentHooks,
 )
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
+from vibesys.evaluators import load_evaluator_package, tool_install_root
 from vibesys.input_manifest import WorkspaceSource
 from vibesys.llm_client import build_model
 from vibesys.profilers import (
@@ -556,6 +557,16 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             project_state = project.state
             log_dir = project_state.log_directory(run_id)
             log_dir.mkdir(parents=True, exist_ok=True)
+            evaluator_tools_root = None
+            evaluator_tool_roots: tuple[Path, ...] = ()
+            if evaluator_package_root is not None:
+                evaluator_tools = load_evaluator_package(evaluator_package_root).metadata.tools
+                if evaluator_tools:
+                    evaluator_tools_root = project_state.model_cache_directory("evaluator-tools")
+                    evaluator_tool_roots = tuple(
+                        tool_install_root(evaluator_tools_root, name, spec)
+                        for name, spec in evaluator_tools.items()
+                    )
         with boot_trace.span("log_bootstrap"):
             integration.attach(log_dir)
             logger = RunLogger(log_dir)
@@ -851,6 +862,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 benchmark_command=benchmark_command,
                 benchmark_output_argument=benchmark_output_argument,
                 evaluator_package_root=evaluator_package_root,
+                evaluator_tools_root=evaluator_tools_root,
                 profiler_support_path=profiler_support_path,
                 profiler_support_name=profiler_support_name,
                 git_history_root=git.history_root,
@@ -884,6 +896,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             cli_sandboxed=session.view.cli_sandboxed,
             task_name=task_name,
             evaluator_package_root=evaluator_package_root,
+            evaluator_tool_roots=evaluator_tool_roots,
         )
 
         with boot_trace.span("agent_client_build"):
@@ -939,6 +952,8 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             workspace_sources=(),
             evaluator_path=evaluator_source,
             evaluator_package_root=evaluator_package_root,
+            evaluator_tools_root=evaluator_tools_root,
+            evaluator_tool_roots=evaluator_tool_roots,
             effective_objective=objective,
             accuracy_command=accuracy_command,
             benchmark_command=benchmark_command,
@@ -1126,6 +1141,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
                 accuracy_command=parent.accuracy_command,
                 benchmark_command=parent.benchmark_command,
                 evaluator_package_root=parent.evaluator_package_root,
+                evaluator_tools_root=parent.evaluator_tools_root,
                 profiler_support_path=parent.profiler_support_path,
                 profiler_support_name=parent.profiler_support_name,
                 git_history_root=parent.git.history_root,
@@ -1194,6 +1210,8 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         workspace_sources=parent.workspace_sources,
         evaluator_path=parent.evaluator_path,
         evaluator_package_root=parent.evaluator_package_root,
+        evaluator_tools_root=parent.evaluator_tools_root,
+        evaluator_tool_roots=parent.evaluator_tool_roots,
         effective_objective=effective_objective,
         accuracy_command=parent.accuracy_command,
         benchmark_command=parent.benchmark_command,
@@ -1254,6 +1272,8 @@ class _RunContext:
         workspace_sources: tuple[WorkspaceSource, ...],
         evaluator_path: Path | None,
         evaluator_package_root: Path | None,
+        evaluator_tools_root: Path | None,
+        evaluator_tool_roots: tuple[Path, ...],
         effective_objective: str | None,
         accuracy_command: str,
         benchmark_command: str,
@@ -1297,6 +1317,8 @@ class _RunContext:
         self.workspace_sources = workspace_sources
         self.evaluator_path = evaluator_path
         self.evaluator_package_root = evaluator_package_root
+        self.evaluator_tools_root = evaluator_tools_root
+        self.evaluator_tool_roots = evaluator_tool_roots
         self.effective_objective = effective_objective
         self.accuracy_command = accuracy_command
         self.benchmark_command = benchmark_command

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import shlex
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -13,19 +16,31 @@ from vibesys.agents.cli_docker import DockerAuthPath
 from vibesys.backends import SandboxKind
 from vibesys.constants import ComputeBackend
 from vibesys.domains.environment import EnvironmentBindMount
-from vibesys.evaluators import EvaluatorPackageRequirement, resolve_evaluator_package
+from vibesys.evaluators import (
+    EvaluatorPackageRequirement,
+    EvaluatorToolLifecycleHooks,
+    evaluator_tools_install_command,
+    resolve_evaluator_package,
+    tool_install_root,
+    tool_spec_digest,
+)
 from vibesys.input_manifest import load_project_task
 from vibesys.profilers import ProfilerKind
 from vibesys.sandbox.run_environment import (
     RunEnvironmentRequest,
     RunEnvironmentSpec,
+    _docker_evaluator_tool_mounts,
+    _evaluator_container_setup,
+    _EvaluatorToolBuildRequiredError,
+    _resolve_docker_image_id,
     _SkyPilotRunEnvironmentSession,
+    _symlink_lifecycle_hooks,
     build_run_environment,
     make_run_environment_spec,
     run_environment_record,
 )
 from vs_project import Project, RunEnvironmentRecord, RunResourceRequest
-from vs_sandbox import ProjectPathPolicy
+from vs_sandbox import BeforeReadyContext, ProjectPathPolicy, SandboxLifecycle
 
 if TYPE_CHECKING:
     from deepagents.backends.protocol import SandboxBackendProtocol
@@ -76,6 +91,80 @@ def _request(tmp_path: Path, backend: FakeBackend, **overrides: Any) -> RunEnvir
     values.update(overrides)
     values["log_dir"].mkdir(exist_ok=True)
     return RunEnvironmentRequest(**values)
+
+
+def _write_executable(path: Path, contents: str) -> None:
+    path.write_text(contents, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _run_rootless_rust_setup(
+    tmp_path: Path,
+    *,
+    downloader_exit_code: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "rustc",
+        "#!/bin/sh\nprintf '%s\\n' 'rustc 1.85.0 (fake)'\n",
+    )
+    _write_executable(
+        fake_bin / "cargo",
+        "#!/bin/sh\necho 'rustup has no configured default toolchain' >&2\nexit 1\n",
+    )
+
+    rustup_init = tmp_path / "fake-rustup-init"
+    working_cargo = tmp_path / "working-cargo"
+    working_rustc = tmp_path / "working-rustc"
+    _write_executable(
+        working_cargo,
+        "#!/bin/sh\nprintf '%s\\n' 'cargo 1.92.0 (fake)'\n",
+    )
+    _write_executable(
+        working_rustc,
+        "#!/bin/sh\nprintf '%s\\n' 'rustc 1.92.0 (fake)'\n",
+    )
+    _write_executable(
+        rustup_init,
+        "#!/bin/sh\n"
+        'mkdir -p "$CARGO_HOME/bin" "$RUSTUP_HOME"\n'
+        'cp "$FAKE_WORKING_CARGO" "$CARGO_HOME/bin/cargo"\n'
+        'cp "$FAKE_WORKING_RUSTC" "$CARGO_HOME/bin/rustc"\n'
+        'chmod +x "$CARGO_HOME/bin/cargo" "$CARGO_HOME/bin/rustc"\n',
+    )
+    downloader = (
+        '#!/bin/sh\ncp "$FAKE_RUSTUP_INIT" "$4"\n'
+        if downloader_exit_code == 0
+        else f"#!/bin/sh\nexit {downloader_exit_code}\n"
+    )
+    _write_executable(fake_bin / "python3", downloader)
+
+    backend = FakeBackend()
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    request = _request(tmp_path, backend, evaluator_package_root=package.root)
+    commands = _evaluator_container_setup(request, rootless=True)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_RUSTUP_INIT": str(rustup_init),
+        "FAKE_WORKING_CARGO": str(working_cargo),
+        "FAKE_WORKING_RUSTC": str(working_rustc),
+    }
+    return subprocess.run(  # noqa: S603
+        ["/bin/sh", "-c", "set -e\n" + "\n".join((*commands, "cargo --version"))],
+        cwd=request.workspace,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -243,10 +332,34 @@ def test_docker_environment_opens_one_started_sandbox_with_agent_paths(tmp_path)
     assert session.view.paths.accuracy_command == "uv run python accuracy_checker/checker.py"
     assert session.view.paths.benchmark_command == "uv run python benchmark/benchmark.py"
     assert backend.calls[0][1]["extra_env"]["UV_CACHE_DIR"] == "/workspace/.cache/uv"
+    assert backend.calls[0][1]["lifecycle_hooks"] == []
     backend.sandbox.start.assert_called_once()
 
     session.close()
     backend.sandbox.stop.assert_called_once()
+
+
+def test_symlink_lifecycle_hooks_install_and_record_quoted_commands() -> None:
+    sandbox = MagicMock()
+    sandbox.execute.return_value = MagicMock(exit_code=0, output="")
+    hooks = _symlink_lifecycle_hooks([("/workspace/model link", "/workspace/_mounts/model target")])
+
+    hooks[0].before_ready(BeforeReadyContext(sandbox=sandbox))
+
+    command = "ln -sfn '/workspace/_mounts/model target' '/workspace/model link'"
+    sandbox.execute.assert_called_once_with(command)
+    sandbox.save_symlink_commands.assert_called_once_with([command])
+
+
+def test_symlink_lifecycle_hooks_reject_failed_setup() -> None:
+    sandbox = MagicMock()
+    sandbox.execute.return_value = MagicMock(exit_code=17, output="permission denied")
+    hooks = _symlink_lifecycle_hooks([("/workspace/model", "/mount/model")])
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        hooks[0].before_ready(BeforeReadyContext(sandbox=sandbox))
+
+    sandbox.save_symlink_commands.assert_not_called()
 
 
 def test_isolated_environment_mounts_and_translates_evaluator_package(tmp_path: Path) -> None:
@@ -289,8 +402,284 @@ def test_isolated_environment_mounts_and_translates_evaluator_package(tmp_path: 
     ) in backend.calls[0][1]["bind_mounts"]
     init_commands = backend.calls[0][1]["extra_init_commands"]
     assert any("go1.23.12" in item for item in init_commands)
-    assert any("rustup.rs" in item for item in init_commands)
-    assert any("command -v cargo" in item for item in init_commands)
+    assert any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
+    assert any("--no-modify-path" in item for item in init_commands)
+    assert any("cargo --version" in item for item in init_commands)
+
+
+def test_rootless_rust_setup_replaces_broken_rustup_cargo_shim(tmp_path: Path) -> None:
+    result = _run_rootless_rust_setup(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "cargo 1.92.0 (fake)" in result.stdout
+    assert (tmp_path / "workspace" / ".bin" / "cargo").is_symlink()
+
+
+def test_rootless_rust_setup_does_not_mask_download_failure(tmp_path: Path) -> None:
+    result = _run_rootless_rust_setup(tmp_path, downloader_exit_code=7)
+
+    assert result.returncode != 0
+    assert "failed to download evaluator Rust toolchain" in result.stderr
+    assert "cargo 1.92.0 (fake)" not in result.stdout
+
+
+def test_local_environment_prepares_and_translates_evaluator_tool(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    backend.sandbox.execute.return_value = MagicMock(exit_code=0, output="", truncated=False)
+    env = build_run_environment(RunEnvironmentSpec("local"))
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    command = shlex.join(
+        package.command(
+            "request-factory-engine",
+            "--trace",
+            "trace.jsonl",
+            "--model",
+            "m",
+            "--input-file-format",
+            "multimodal-independent-v1",
+            "--dry-run",
+        )
+    )
+    tools_root = tmp_path / "operator-tools"
+
+    session = env.open(
+        _request(
+            tmp_path,
+            backend,
+            accuracy_command="true",
+            benchmark_command=command,
+            evaluator_package_root=package.root,
+            evaluator_tools_root=tools_root,
+        )
+    )
+
+    lifecycle_hooks = backend.calls[0][1]["lifecycle_hooks"]
+    assert len(lifecycle_hooks) == 1
+    SandboxLifecycle(lifecycle_hooks).before_ready(backend.sandbox)
+    backend.sandbox.execute.assert_called_once_with(
+        evaluator_tools_install_command(package.metadata.tools, tools_root),
+        timeout=660,
+    )
+    tool = package.metadata.tools["request-factory"]
+    benchmark = shlex.split(session.view.paths.benchmark_command or "")
+    engine = tool_install_root(tools_root, "request-factory", tool) / "bin" / "session_runner"
+    assert benchmark == [
+        str(engine),
+        "--trace",
+        "trace.jsonl",
+        "--model",
+        "m",
+        "--input-file-format",
+        "multimodal-independent-v1",
+        "--dry-run",
+    ]
+    assert "${TOOL:" not in (session.view.paths.benchmark_command or "")
+
+
+def test_local_environment_rejects_evaluator_tools_root_inside_workspace(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    env = build_run_environment(RunEnvironmentSpec("local"))
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(ValueError, match="must be outside the candidate workspace"):
+        env.open(
+            _request(
+                tmp_path,
+                backend,
+                workspace=workspace,
+                accuracy_command="true",
+                benchmark_command="true",
+                evaluator_package_root=package.root,
+                evaluator_tools_root=workspace / "cache",
+            )
+        )
+
+    assert backend.calls == []
+
+
+@pytest.mark.parametrize("environment_name", ["docker", "modal"])
+def test_isolated_environments_install_and_translate_evaluator_tools(
+    tmp_path: Path,
+    environment_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend()
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    env = build_run_environment(RunEnvironmentSpec(environment_name))
+    command = shlex.join(
+        package.command(
+            "request-factory-engine",
+            "--trace",
+            "trace.jsonl",
+            "--dry-run",
+        )
+    )
+    if environment_name == "docker":
+        tool = package.metadata.tools["request-factory"]
+        built_root = tmp_path / "built-request-factory"
+        container_root = tool_install_root(
+            Path("/opt/vibesys-evaluator-tools"), "request-factory", tool
+        )
+        monkeypatch.setattr(
+            "vibesys.sandbox.run_environment._docker_evaluator_tool_mounts",
+            lambda _request, _tools, **_kwargs: [(str(built_root), str(container_root), True)],
+        )
+        monkeypatch.setattr(
+            "vibesys.sandbox.run_environment._resolve_docker_image_id",
+            lambda _image: "sha256:pinned",
+        )
+
+    session = env.open(
+        _request(
+            tmp_path,
+            backend,
+            accuracy_command="true",
+            benchmark_command=command,
+            evaluator_package_root=package.root,
+        )
+    )
+
+    rendered = session.view.paths.benchmark_command or ""
+    assert "${TOOL:" not in rendered
+    assert "evaluator-tools" in rendered
+    init_commands = backend.calls[0][1]["extra_init_commands"]
+    if environment_name == "docker":
+        assert "/opt/vibesys-evaluator-tools" in rendered
+        assert backend.calls[0][1]["container_image"] == "sha256:pinned"
+        assert not any(
+            isinstance(hook, EvaluatorToolLifecycleHooks)
+            for hook in backend.calls[0][1]["lifecycle_hooks"]
+        )
+        assert (str(built_root), str(container_root), True) in backend.calls[0][1]["bind_mounts"]
+        assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
+    else:
+        arguments = shlex.split(rendered)
+        separator = arguments.index("--")
+        assert arguments[separator + 1].startswith(".vibesys-evaluator-tools/request-factory/")
+        assert "--setup-command-base64" in arguments[:separator]
+        encoded_setup = arguments[arguments.index("--setup-command-base64") + 1]
+        setup_argv = json.loads(base64.urlsafe_b64decode(encoded_setup))
+        assert setup_argv[:2] == ["sh", "-c"]
+        assert "cargo" in setup_argv[2]
+        assert ".vibesys-evaluator-tools" in setup_argv[2]
+        assert "RUSTUP_HOME" in setup_argv[2]
+        assert "CARGO_HOME" in setup_argv[2]
+        assert "apt-get" not in setup_argv[2]
+        assert "/root" not in setup_argv[2]
+        assert setup_argv[2].index("rm -rf") < setup_argv[2].index("cargo install")
+        for bootstrap_path in (".bin", ".pip", ".uv-cache"):
+            assert bootstrap_path not in setup_argv[2].splitlines()[1]
+        assert arguments[arguments.index("--evaluator-package-root") + 1] == (
+            "/opt/vibesys-evaluator-package"
+        )
+        assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
+
+
+def test_docker_evaluator_tools_use_ephemeral_builder_and_read_only_final_mounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend()
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    request = _request(
+        tmp_path,
+        backend,
+        evaluator_package_root=package.root,
+        evaluator_tools_root=tmp_path / "operator-tools",
+    )
+    prepare_calls = 0
+
+    def prepare(tools, install_parent, *, command_runner=None):  # noqa: ANN001, ANN202
+        nonlocal prepare_calls
+        del tools, install_parent, command_runner
+        prepare_calls += 1
+        if prepare_calls == 1:
+            raise _EvaluatorToolBuildRequiredError
+        return {}
+
+    monkeypatch.setattr("vibesys.sandbox.run_environment.prepare_evaluator_tools", prepare)
+    backend.sandbox.execute.return_value = MagicMock(exit_code=0, output="")
+
+    mounts = _docker_evaluator_tool_mounts(
+        request,
+        package.metadata.tools,
+        container_image="sha256:pinned",
+    )
+
+    assert prepare_calls == 2
+    assert len(backend.calls) == 1
+    kind, kwargs = backend.calls[0]
+    assert kind is SandboxKind.DOCKER
+    assert kwargs["ephemeral"] is True
+    assert kwargs["attach_accelerator"] is False
+    assert kwargs["container_image"] == "sha256:pinned"
+    assert len(kwargs["lifecycle_hooks"]) == 1
+    assert isinstance(kwargs["lifecycle_hooks"][0], EvaluatorToolLifecycleHooks)
+    assert any(
+        "static.rust-lang.org/rustup/dist" in command for command in kwargs["extra_init_commands"]
+    )
+    assert kwargs["bind_mounts"][0][2] is False
+    assert all(read_only for _, _, read_only in mounts)
+    backend.sandbox.start.assert_called_once_with()
+    ownership_command = backend.sandbox.execute.call_args.args[0]
+    ownership_argv = shlex.split(ownership_command)
+    assert ownership_argv[:2] == ["sh", "-c"]
+    assert "stat -c" in ownership_argv[2]
+    assert "chown -R" in ownership_argv[2]
+    assert ".host-owner-" in ownership_argv[4]
+    backend.sandbox.stop.assert_called_once_with()
+
+
+def test_docker_tool_cache_resolves_existing_image_content_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspect = MagicMock(return_value=MagicMock(returncode=0, stdout="sha256:abc\n"))
+    monkeypatch.setattr("vibesys.sandbox.run_environment.subprocess.run", inspect)
+
+    assert _resolve_docker_image_id("example:latest") == "sha256:abc"
+    inspect.assert_called_once()
+
+
+def test_docker_tool_cache_pulls_then_pins_missing_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = MagicMock(
+        side_effect=[
+            MagicMock(returncode=1, stdout="", stderr="missing"),
+            MagicMock(returncode=0, stdout="pulled", stderr=""),
+            MagicMock(returncode=0, stdout="sha256:resolved\n", stderr=""),
+        ]
+    )
+    monkeypatch.setattr("vibesys.sandbox.run_environment.subprocess.run", run)
+
+    assert _resolve_docker_image_id("example:latest") == "sha256:resolved"
+    assert run.call_args_list[1].args[0] == ["docker", "image", "pull", "example:latest"]
 
 
 def test_environment_quotes_project_root_after_token_expansion(tmp_path: Path) -> None:
@@ -423,7 +812,7 @@ def test_microservice_package_does_not_install_rust(tmp_path: Path) -> None:
 
     init_commands = backend.calls[0][1]["extra_init_commands"]
     assert any("go1.23.12" in item for item in init_commands)
-    assert not any("rustup.rs" in item for item in init_commands)
+    assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
 
 
 def test_docker_environment_mounts_effective_objective_read_only(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1050,6 +1439,96 @@ remote_artifact_root = "/remote/vibesys"
     bridge = session.bridge
     assert isinstance(bridge, FakeBridge)
     assert bridge.closed == 1
+
+
+def test_skypilot_environment_installs_evaluator_tools_in_remote_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profiles = tmp_path / "clusters.toml"
+    profiles.write_text(
+        """schema_version = 1
+[profiles.gpu]
+runner = "skypilot"
+infra = "aws"
+accelerator_backend = "cuda"
+accelerator_type = "H100"
+accelerators_per_node = 1
+remote_artifact_root = "/remote/vibesys"
+"""
+    )
+    captures: dict[str, object] = {}
+
+    class FakeBridge:
+        def __init__(self, **kwargs):  # noqa: ANN003, ANN204
+            captures.update(kwargs)
+            self.socket_path = kwargs["socket_path"]
+
+        def start(self) -> None:
+            self.socket_path.write_text("socket")
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr("vibesys.sandbox.run_environment.SkyPilotBridge", FakeBridge)
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    benchmark = shlex.join(
+        package.command("request-factory-engine", "--trace", "trace.jsonl", "--dry-run")
+    )
+    backend = FakeBackend()
+    environment = build_run_environment(
+        make_run_environment_spec(
+            use_skypilot=True,
+            cluster_profile="gpu",
+            cluster_profiles_file=profiles,
+            resources=RunResourceRequest(
+                nodes=1,
+                accelerators_per_node=1,
+                accelerator_backend="cuda",
+            ),
+        )
+    )
+
+    session = environment.open(
+        _request(
+            tmp_path,
+            backend,
+            accuracy_command="true",
+            benchmark_command=benchmark,
+            evaluator_package_root=package.root,
+            state_namespace=MagicMock(),
+        )
+    )
+
+    tool = package.metadata.tools["request-factory"]
+    expected = (
+        Path(".vibesys-evaluator-tools")
+        / "request-factory"
+        / tool_spec_digest(tool)
+        / "bin"
+        / "session_runner"
+    )
+    commands = captures["commands"]
+    assert isinstance(commands, dict)
+    assert commands["benchmark"][0] == str(expected)
+    setup = captures["framework_setup_command"]
+    assert isinstance(setup, str)
+    assert "cargo" in setup
+    assert ".vibesys-evaluator-tools" in setup
+    assert "RUSTUP_HOME" in setup
+    assert "CARGO_HOME" in setup
+    assert "apt-get" not in setup
+    assert "/root" not in setup
+    assert setup.index("rm -rf") < setup.index("cargo install")
+    for reserved in (".bin", ".pip", ".uv-cache"):
+        assert reserved in setup.splitlines()[1]
+    assert str(package.root) not in setup
+    assert backend.calls[0][1]["lifecycle_hooks"] == []
+    session.close()
 
 
 def test_docker_remove_workspace_child_quotes_path(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288

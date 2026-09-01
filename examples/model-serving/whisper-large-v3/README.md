@@ -22,7 +22,7 @@ whisper-large-v3/
 │   ├── config.json        # whisper-large-v3 config
 │   └── reference.py       # reference_transcribe() used by the checker
 ├── accuracy_checker/      # checker.py — reference-vs-candidate word-overlap gate
-├── benchmark/             # benchmark.py — offline throughput (requests_per_second)
+├── benchmark/             # checked-in Request Factory workload trace
 └── test_audio/            # LibriSpeech test-clean clips + manifest.json
 ```
 
@@ -39,6 +39,17 @@ class VibeServeModel:
 
 and serve `/v1/audio/transcriptions` for the benchmark.
 
+The benchmark is executed directly by the pinned
+`vibesys-evaluator-request-factory` engine. Its checked-in 64-request trace
+cycles over the four WAV fixtures under saturated load at concurrency eight.
+VibeSys reads `request_throughput_per_s` from the Request Factory summary. No
+warmup requests are excluded, so cold-start work is part of the score. Request
+Factory measures from first submission to last completion and uses a fixed
+3600-second timeout for this nonstreaming endpoint.
+
+Cargo-tool evaluator packages currently require the Local run environment.
+Docker, Modal, and SkyPilot reject this task during evaluator provisioning.
+
 ## Run it
 
 ```bash
@@ -46,7 +57,6 @@ vibesys \
   --input examples/model-serving/whisper-large-v3 \
   --runs-dir /work/vibesys-runs --local \
   --exp-name whisper-offline \
-  --docker \
   --agent-backend cli --cli-provider codex \
   --max-rounds 4 \
   --modality speech_to_text

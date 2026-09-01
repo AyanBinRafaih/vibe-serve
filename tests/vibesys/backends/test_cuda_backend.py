@@ -27,3 +27,18 @@ def test_cpu_only_control_plane_docker_skips_gpu_runtime(
     assert isinstance(sandbox, DockerSandbox)
     assert sandbox._gpus is None  # noqa: SLF001  # tracked: #288
     assert backend.selected_device is None
+
+
+def test_ephemeral_setup_sandbox_is_not_tracked_for_reselection(tmp_path: Path) -> None:
+    backend = CudaBackend(tmp_path)
+
+    sandbox = backend.make_sandbox(
+        SandboxKind.DOCKER,
+        host_workspace=str(tmp_path),
+        log_path=None,
+        attach_accelerator=False,
+        ephemeral=True,
+    )
+
+    assert isinstance(sandbox, DockerSandbox)
+    assert backend._sandboxes == []  # noqa: SLF001

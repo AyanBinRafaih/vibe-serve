@@ -407,7 +407,7 @@ class TestReselectGpu:
         ctx.gpu_monitor.stop()
 
     # Note: symlink replay on restart is now the sandbox class's
-    # responsibility (it runs setup_fns at the end of start()).  That
+    # responsibility (it runs lifecycle hooks before becoming ready). That
     # behaviour is tested in libs/vs-sandbox/tests/test_docker_sandbox.py; reselect_gpu
     # itself just calls sb.stop()/sb.start() and the rest happens for free.
 

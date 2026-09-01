@@ -26,5 +26,10 @@ Applications wire these into their own run-environment policy.
 - `ModalSandbox` mirrors `DockerSandbox` semantics on remote Modal GPUs,
   backing the workspace with an ephemeral Modal Volume that is synced at
   start and stop.
+- `SandboxLifecycleHooks` lets trusted application code prepare an
+  execution-capable sandbox in `before_ready`. Hooks run in registration
+  order before startup completes, and rerun whenever a backend
+  creates a replacement execution environment. Hooks must be idempotent;
+  a raised exception aborts startup and triggers backend-owned cleanup.
 - `ensure_model_volume` provisions a per-model Modal Volume populated with
   HuggingFace model weights, reusing already-populated volumes.

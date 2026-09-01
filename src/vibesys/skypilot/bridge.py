@@ -60,18 +60,26 @@ _MAX_ARTIFACT_BYTES = 512 * 1024
 _MAX_STAGED_FILES = 50_000
 _MAX_STAGED_BYTES = 512 * 1024 * 1024
 _FRAMEWORK_ARGUMENT_COUNT = 2
+_FRAMEWORK_EVALUATOR_ARGV0 = "vibesys-framework-evaluator"
 _FRAMEWORK_ARTIFACT = re.compile(r"^/tmp/vibesys-framework-benchmark-[a-zA-Z0-9._-]+\.json$")
 _STAGING_EXCLUDED_NAMES = frozenset(
     {
         ".cache",
+        ".bin",
         ".env",
         ".git",
         ".mypy_cache",
         ".nox",
+        ".pip",
         ".pytest_cache",
         ".ruff_cache",
+        ".skyignore",
         ".tox",
+        ".uv-cache",
         ".venv",
+        ".vibesys-evaluator-package",
+        ".vibesys-evaluator-toolchains",
+        ".vibesys-evaluator-tools",
         "__pycache__",
         "agent.toml",
         "build",
@@ -230,6 +238,7 @@ class SkyPilotBridge:
         state_namespace: StateNamespace,
         socket_path: Path,
         log: Callable[[str], None],
+        framework_setup_command: str | None = None,
         max_infrastructure_retries: int = 1,
     ) -> None:
         """Bind fixed host policy and trusted evaluator commands."""
@@ -241,6 +250,7 @@ class SkyPilotBridge:
         self._hidden_paths = tuple(hidden_paths)
         self._commands = {kind: tuple(command) for kind, command in commands.items()}
         self._benchmark_output_argument = benchmark_output_argument
+        self._framework_setup_command = framework_setup_command
         self._state_namespace = state_namespace
         self._journal = InvocationJournal(state_namespace)
         self.socket_path = socket_path
@@ -381,16 +391,7 @@ class SkyPilotBridge:
         effective_command = (*command, *request.arguments)
         staging = self._snapshot(request.invocation_id)
         snapshot_digest = self._snapshot_digest(staging)
-        request_digest = hashlib.sha256(
-            json.dumps(
-                {
-                    "request": request.model_dump(mode="json", exclude={"invocation_id"}),
-                    "command": effective_command,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        request_digest = self._request_digest(request, effective_command)
         existing_record = self._journal.load(request.invocation_id)
         record = self._journal.prepare(request.invocation_id, request_digest, snapshot_digest)
         if existing_record is None:
@@ -400,6 +401,26 @@ class SkyPilotBridge:
             self._deliver(record, reader, writer)
             return
         self._run(request, effective_command, record, staging, reader, writer, connection)
+
+    def _request_digest(
+        self,
+        request: EvaluationRequest,
+        command: tuple[str, ...],
+    ) -> str:
+        """Bind recovery identity to the request, evaluator argv, and trusted setup."""
+        request_document: dict[str, object] = {
+            "request": request.model_dump(mode="json", exclude={"invocation_id"}),
+            "command": command,
+        }
+        if self._framework_setup_command is not None:
+            request_document["framework_setup_command"] = self._framework_setup_command
+        return hashlib.sha256(
+            json.dumps(
+                request_document,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
 
     def _run(  # noqa: C901, PLR0913, PLR0915
         self,
@@ -465,6 +486,7 @@ class SkyPilotBridge:
                         begin_marker=begin_marker,
                         end_marker=end_marker,
                     )
+                    effective_command = self._with_framework_setup(effective_command)
                     try:
                         found = self._reconcile(active_record)
                         self._require_open_for_remote_action()
@@ -705,6 +727,10 @@ class SkyPilotBridge:
         try:
             self._validate_workspace_symlinks()
             self._stage_workspace(staging)
+            (staging / ".skyignore").write_text(
+                "# VibeSys already filtered this trusted evaluator snapshot.\n",
+                encoding="utf-8",
+            )
             if self._evaluator_package_root is not None:
                 shutil.copytree(
                     self._evaluator_package_root,
@@ -767,6 +793,19 @@ class SkyPilotBridge:
             ]
         )
         return ("sh", "-c", script)
+
+    def _with_framework_setup(self, command: tuple[str, ...]) -> tuple[str, ...]:
+        """Run trusted setup before ``command`` without interpolating its argv."""
+        if self._framework_setup_command is None:
+            return command
+        script = f'set -e\n{self._framework_setup_command}\nexec "$@"'
+        return (
+            "sh",
+            "-c",
+            script,
+            _FRAMEWORK_EVALUATOR_ARGV0,
+            *command,
+        )
 
     def _job_started(
         self,

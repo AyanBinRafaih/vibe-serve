@@ -15,18 +15,19 @@ compute backend supplies the right values for its platform inside
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path  # noqa: TC003  # tracked: #288
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from vibesys.constants import ComputeBackend  # noqa: TC001  # tracked: #288
 from vibesys.profilers import ProfilerKind  # noqa: TC001  # tracked: #288
+from vs_sandbox.lifecycle import SandboxLifecycle
 
 if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
-    from deepagents.backends.sandbox import BaseSandbox
+
+    from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 
 class SandboxKind(StrEnum):
@@ -51,15 +52,6 @@ class ContentionMonitor(Protocol):
     def stop(self) -> None: ...  # noqa: D102  # tracked: #288
 
 
-type SetupFn = Callable[[BaseSandbox], None]
-"""A function the sandbox runs after every ``start()`` (initial or restart).
-
-Use it to install setup that doesn't survive container restart and that the
-sandbox class itself doesn't know about — e.g. ``ln -sfn`` symlinks pointing
-into HuggingFace-cache-style bind mounts.
-"""
-
-
 @runtime_checkable
 class ComputeBackendImpl(Protocol):
     """Per-platform backend.  See module docstring for the contract."""
@@ -77,18 +69,26 @@ class ComputeBackendImpl(Protocol):
         passthrough_paths: list[str],
         extra_env: dict[str, str],
         extra_init_commands: list[str],
-        setup_fns: list[SetupFn] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,
         attach_accelerator: bool = True,
+        ephemeral: bool = False,
+        container_image: str | None = None,
     ) -> SandboxBackendProtocol:
         """Construct (do not start) a sandbox configured for this backend.
 
-        ``setup_fns`` are invoked by the sandbox at the end of every
-        ``start()`` — initial and restart alike.
+        ``lifecycle_hooks`` are invoked before the sandbox becomes ready,
+        during both initial creation and replacement.
 
         ``attach_accelerator=False`` creates a CPU-only control-plane sandbox
         while preserving the target backend's image and tooling. Remote
         dispatch environments use this for local editor containers.
+
+        ``ephemeral=True`` excludes a short-lived framework setup sandbox from
+        backend restart or device-reselection tracking.
+
+        ``container_image`` pins a Docker sandbox to a resolved image ID. It is
+        ignored by non-Docker sandboxes.
         """
         ...
 
@@ -98,7 +98,7 @@ class ComputeBackendImpl(Protocol):
         """Re-pick the optimal device for this backend (e.g. migrate to a
         less-loaded GPU) and restart affected sandboxes in place.
 
-        Each restarted sandbox re-runs its ``setup_fns`` automatically as
+        Each restarted sandbox re-runs its lifecycle hooks automatically as
         part of ``start()``.  No-op for backends without rebalancing.
         """  # noqa: D205  # tracked: #288
         ...
@@ -108,6 +108,7 @@ def make_local_shell_sandbox(
     *,
     host_workspace: str,
     env: dict[str, str],
+    lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
 ) -> SandboxBackendProtocol:
     """Construct deepagents' local-shell sandbox, importing deepagents on first use.
 
@@ -118,12 +119,14 @@ def make_local_shell_sandbox(
     """
     from deepagents.backends import LocalShellBackend  # noqa: PLC0415  # tracked: #288
 
-    return LocalShellBackend(
+    sandbox = LocalShellBackend(
         root_dir=host_workspace,
         virtual_mode=True,
         inherit_env=True,
         env=env,
     )
+    SandboxLifecycle(lifecycle_hooks).before_ready(sandbox)
+    return sandbox
 
 
 class ModalOptions:

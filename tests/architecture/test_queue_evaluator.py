@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tomllib
@@ -184,6 +185,57 @@ def test_queue_tasks_live_with_the_editable_repository():  # noqa: ANN201  # tra
     assert not (project_root / "examples" / "starters" / "queue-rs").exists()
     for old_name in ("queue-spsc", "queue-mpsc", "queue-mpmc"):
         assert not (project_root / "examples" / "data-structures" / old_name).exists()
+
+
+def test_native_runner_build_ignores_candidate_cargo_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compiled_queue_candidate: Path,
+) -> None:
+    go = shutil.which("go")
+    if go is None or shutil.which("cargo") is None:
+        pytest.skip("Go and Rust are required by the trusted queue evaluator")
+
+    project_root = Path(__file__).parents[2]
+    workspace = tmp_path / "workspace"
+    package = workspace / ".vibesys-evaluator-package"
+    shutil.copytree(_queue_evaluator(project_root), package)
+    shutil.copy2(compiled_queue_candidate, workspace / "queue-candidate.so")
+    cargo_config = workspace / ".cargo" / "config.toml"
+    cargo_config.parent.mkdir()
+    cargo_config.write_text('[build]\nrustc-wrapper = "/candidate/missing-wrapper"\n')
+    monkeypatch.delenv("VIBESYS_QUEUE_NATIVE_RUNNER", raising=False)
+
+    completed = subprocess.run(  # noqa: S603
+        [
+            go,
+            "-C",
+            str(package),
+            "run",
+            ".",
+            "check",
+            "--workspace",
+            str(workspace),
+            "--scenario",
+            "spsc",
+            "--capacity",
+            "4",
+            "--value-size",
+            "64",
+            "--operations",
+            "4",
+            "--trials",
+            "1",
+        ],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "GOWORK": "off"},
+        text=True,
+        timeout=180,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "PASS - spsc linearizable bounded FIFO" in completed.stdout
 
 
 @pytest.mark.usefixtures("queue_native_runner")

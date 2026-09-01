@@ -8,12 +8,14 @@ import pytest
 from pydantic import ValidationError
 
 from vibesys.evaluators import (
+    CargoGitToolSpec,
     EvaluatorPackageError,
     EvaluatorPackageNotFoundError,
     EvaluatorPackageRegistry,
     EvaluatorPackageRequirement,
     load_evaluator_package,
     resolve_evaluator_package,
+    tool_token,
 )
 
 if TYPE_CHECKING:
@@ -26,6 +28,7 @@ def _write_package(
     name: str = "vibesys-evaluator-test",
     version: str = "1.2.3",
     extra_metadata: str = "",
+    entrypoint_command: str = '"python", "${PACKAGE_ROOT}/runner.py"',
 ) -> Path:
     root.mkdir(parents=True)
     (root / "runner.py").write_text("print('ok')\n", encoding="utf-8")
@@ -36,7 +39,7 @@ version = "{version}"
 protocol_version = 1
 {extra_metadata}
 [entrypoints]
-test-check = ["python", "${{PACKAGE_ROOT}}/runner.py"]
+test-check = [{entrypoint_command}]
 ''',
         encoding="utf-8",
     )
@@ -142,6 +145,111 @@ def test_metadata_rejects_unknown_fields(tmp_path: Path) -> None:
         load_evaluator_package(root)
 
 
+def test_load_package_validates_cargo_git_tool_and_token(tmp_path: Path) -> None:
+    revision = "1" * 40
+    root = _write_package(
+        tmp_path / "package",
+        extra_metadata=f'''[tools.request-factory]
+kind = "cargo-git"
+git = "https://github.com/uw-syfi/request-factory"
+rev = "{revision}"
+package = "req-frontend"
+bins = ["session_runner"]
+''',
+        entrypoint_command='"${TOOL:request-factory/session_runner}"',
+    )
+
+    package = load_evaluator_package(root)
+
+    assert package.metadata.tools["request-factory"] == CargoGitToolSpec(
+        kind="cargo-git",
+        git="https://github.com/uw-syfi/request-factory",
+        rev=revision,
+        package="req-frontend",
+        bins=("session_runner",),
+    )
+    assert package.command("test-check") == (tool_token("request-factory", "session_runner"),)
+
+
+def test_package_command_rejects_malformed_tool_token_in_appended_arguments(
+    tmp_path: Path,
+) -> None:
+    root = _write_package(
+        tmp_path / "package",
+        extra_metadata="""[tools.tool]
+kind = "cargo-git"
+git = "https://example.com/tool"
+rev = "1111111111111111111111111111111111111111"
+package = "package"
+bins = ["runner"]
+""",
+    )
+    package = load_evaluator_package(root)
+
+    with pytest.raises(EvaluatorPackageError, match="complete argv element"):
+        package.command("test-check", "prefix-${TOOL:tool/runner}")
+
+
+@pytest.mark.parametrize(
+    ("tool_metadata", "error"),
+    [
+        ('rev = "abc"', "full 40-character"),
+        ('rev = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"', "full 40-character"),
+        ("bins = []", "at least one binary"),
+        ('bins = ["runner", "runner"]', "must not contain duplicates"),
+    ],
+)
+def test_cargo_git_tool_rejects_noncanonical_fields(
+    tmp_path: Path, tool_metadata: str, error: str
+) -> None:
+    fields = {
+        "rev": 'rev = "1111111111111111111111111111111111111111"',
+        "bins": 'bins = ["runner"]',
+    }
+    key = tool_metadata.split(" =", maxsplit=1)[0]
+    fields[key] = tool_metadata
+    root = _write_package(
+        tmp_path / "package",
+        extra_metadata=f"""[tools.tool]
+kind = "cargo-git"
+git = "https://example.com/tool"
+{fields["rev"]}
+package = "package"
+{fields["bins"]}
+""",
+    )
+
+    with pytest.raises(EvaluatorPackageError, match=error):
+        load_evaluator_package(root)
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "error"),
+    [
+        ('"${TOOL:missing/runner}"', "undeclared tool"),
+        ('"${TOOL:tool/missing}"', "undeclared binary"),
+        ('"prefix-${TOOL:tool/runner}"', "complete argv element"),
+    ],
+)
+def test_entrypoint_rejects_invalid_tool_references(
+    tmp_path: Path, entrypoint: str, error: str
+) -> None:
+    root = _write_package(
+        tmp_path / "package",
+        extra_metadata="""[tools.tool]
+kind = "cargo-git"
+git = "https://example.com/tool"
+rev = "1111111111111111111111111111111111111111"
+package = "package"
+bins = ["runner"]
+""",
+        entrypoint_command=entrypoint,
+    )
+
+    with pytest.raises(EvaluatorPackageError, match=error):
+        load_evaluator_package(root)
+
+
 @pytest.mark.parametrize(
     ("name", "version"),
     [
@@ -179,6 +287,10 @@ def test_framework_resolver_finds_bundled_queue_package() -> None:
             "vibesys-evaluator-microservice",
             {"servicebench", "otelinject", "otelcapture"},
         ),
+        (
+            "vibesys-evaluator-request-factory",
+            {"request-factory-adapter", "request-factory-engine"},
+        ),
     ],
 )
 def test_bundled_evaluator_package_metadata(name: str, entrypoints: set[str]) -> None:
@@ -208,3 +320,14 @@ def test_bundled_evaluator_packages_declare_only_required_toolchains() -> None:
 
     assert queue.metadata.toolchains == ("go", "rust")
     assert microservice.metadata.toolchains == ("go",)
+
+
+def test_bundled_request_factory_package_pins_cargo_git_tool() -> None:
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(name="vibesys-evaluator-request-factory", version="0.1.0")
+    )
+
+    tool = package.metadata.tools["request-factory"]
+    assert tool.rev == "118da6137275fda3a290e9012853214dc437c6c0"
+    assert tool.package == "req-frontend"
+    assert tool.bins == ("session_runner",)

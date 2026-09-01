@@ -25,29 +25,42 @@ container or remote process lifetime at the command layer.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Mapping  # noqa: TC003  # tracked: #288
+import tempfile
+from collections.abc import Callable, Mapping, Sequence  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from vibesys.backends import SandboxKind
-from vibesys.backends.base import ComputeBackendImpl, SetupFn  # noqa: TC001  # tracked: #288
+from vibesys.backends.base import ComputeBackendImpl  # noqa: TC001  # tracked: #288
 from vibesys.constants import DEFAULT_AGENT_BACKEND, PROJECT_ROOT
 from vibesys.domains.environment import EnvironmentBindMount  # noqa: TC001  # tracked: #288
-from vibesys.evaluators import PROJECT_ROOT_TOKEN, load_evaluator_package
+from vibesys.evaluators import (
+    PROJECT_ROOT_TOKEN,
+    CargoGitToolSpec,
+    EvaluatorToolError,
+    EvaluatorToolLifecycleHooks,
+    evaluator_tools_install_command,
+    load_evaluator_package,
+    prepare_evaluator_tools,
+    tool_install_root,
+    tool_path_replacements,
+)
 from vibesys.input_manifest import WorkspaceSource  # noqa: TC001  # tracked: #288
 from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, render_template
+from vibesys.sandbox.modal_evaluator import encode_setup_command
 from vibesys.skypilot.bridge import SkyPilotBridge
 from vibesys.skypilot.config import load_cluster_profiles, resolve_profile
 from vibesys.skypilot.runner import SkyPilotJobRunner, stable_cluster_name
 from vs_project import RunEnvironmentRecord, RunResourceRequest
-from vs_sandbox import ProjectPathPolicy
+from vs_sandbox import BeforeReadyContext, ProjectPathPolicy, SandboxLifecycleHooks
 
 _SHELL_COMMAND_ARG_COUNT = 3
 _RunEnvironmentName = Literal["local", "docker", "modal", "skypilot"]
@@ -58,11 +71,30 @@ _RECORDED_ENVIRONMENT_NAMES: tuple[_RunEnvironmentName, ...] = (
     "skypilot",
 )
 _ENVIRONMENTS_TEMPLATE_DIR = PROMPTS_DIR / "environments"
+_SANDBOX_EVALUATOR_TOOLS_ROOT = Path("/opt/vibesys-evaluator-tools")
+_REMOTE_EVALUATOR_TOOLS_ROOT = Path(".vibesys-evaluator-tools")
+_REMOTE_EVALUATOR_TOOLCHAINS_ROOT = Path(".vibesys-evaluator-toolchains")
+_EVALUATOR_RUST_TOOLCHAIN_VERSION = "1.92.0"
+_DOCKER_EVALUATOR_CACHE_SCHEMA = 2
+_PYTHON_DOWNLOAD_SCRIPT = """\
+import sys
+import time
+import urllib.request
+
+url = sys.argv[1].format(arch=sys.argv[3])
+for attempt in range(5):
+    try:
+        urllib.request.urlretrieve(url, sys.argv[2])
+        break
+    except Exception:
+        if attempt == 4:
+            raise
+        time.sleep(5)
+"""
 
 if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
-    from deepagents.backends.sandbox import BaseSandbox
 
     from vs_project import StateNamespace
 
@@ -142,6 +174,7 @@ class RunEnvironmentRequest:  # noqa: D101  # tracked: #288
     benchmark_command: str | None = None
     benchmark_output_argument: str | None = None
     evaluator_package_root: Path | None = None
+    evaluator_tools_root: Path | None = None
     profiler_support_path: str | None = None
     profiler_support_name: str | None = None
     git_history_root: Path | None = None
@@ -274,6 +307,15 @@ class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
 
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:  # noqa: D102  # tracked: #288
         objective_document = _materialize_effective_objective(request)
+        tools = _evaluator_tools(request)
+        lifecycle_hooks: list[SandboxLifecycleHooks] = []
+        if tools:
+            lifecycle_hooks.append(
+                EvaluatorToolLifecycleHooks(
+                    tools,
+                    _required_evaluator_tools_root(request),
+                )
+            )
         sandbox = request.backend.make_sandbox(
             SandboxKind.LOCAL,
             host_workspace=str(request.workspace),
@@ -282,6 +324,7 @@ class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
             passthrough_paths=[],
             extra_env={},
             extra_init_commands=[],
+            lifecycle_hooks=lifecycle_hooks,
         )
         return _DefaultRunEnvironmentSession(
             sandbox=sandbox,
@@ -322,14 +365,23 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
         return cls(DockerEnvironmentConfig(image=str(image) if image else None))
 
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:  # noqa: D102  # tracked: #288
+        tools = _evaluator_tools(request)
+        container_image = (
+            _resolve_docker_image_id(_docker_backend_image(request)) if tools else None
+        )
         bind_mounts, docker_symlinks, passthrough = _container_mount_plan(request)
+        bind_mounts.extend(
+            _docker_evaluator_tool_mounts(request, tools, container_image=container_image)
+        )
         extra_init_commands, cli_provider_env = _cli_container_setup(request)
-        extra_init_commands.extend(_evaluator_container_setup(request))
+        extra_init_commands.extend(
+            _evaluator_container_setup(request, include_declared_tools=False)
+        )
         cli_provider_env.setdefault("UV_CACHE_DIR", "/workspace/.cache/uv")
         if request.git_history_root is not None:
             cli_provider_env.setdefault("VIBESYS_GIT_HISTORY", "/opt/vibesys-history")
         bind_mounts = _dedupe_mounts(bind_mounts)
-        setup_fns = _symlink_setup_fns(docker_symlinks)
+        lifecycle_hooks = _symlink_lifecycle_hooks(docker_symlinks)
 
         sandbox = request.backend.make_sandbox(
             SandboxKind.DOCKER,
@@ -339,7 +391,8 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
             passthrough_paths=passthrough,
             extra_env=cli_provider_env,
             extra_init_commands=extra_init_commands,
-            setup_fns=setup_fns,
+            lifecycle_hooks=lifecycle_hooks,
+            container_image=container_image,
         )
         log: Callable[[str], None] = request.log or (lambda _: None)
         label = getattr(request.backend, "image", self.config.image or "<backend-default>")
@@ -350,7 +403,10 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
         return _DefaultRunEnvironmentSession(
             sandbox=sandbox,
             view=RunEnvironmentView(
-                paths=_isolated_paths(request),
+                paths=_isolated_paths(
+                    request,
+                    evaluator_tools_root=_SANDBOX_EVALUATOR_TOOLS_ROOT,
+                ),
                 prompt_notes=render_template(
                     "docker/prompt_notes.j2",
                     template_dir=_ENVIRONMENTS_TEMPLATE_DIR,
@@ -526,6 +582,7 @@ class SkyPilotEnvironment(DockerEnvironment):
             evaluator_package_root=request.evaluator_package_root,
             hidden_paths=request.project_path_policy.hidden_paths,
             commands=commands,
+            framework_setup_command=_remote_evaluator_setup_command(request),
             benchmark_output_argument=request.benchmark_output_argument,
             state_namespace=request.state_namespace,
             socket_path=request.log_dir / "skypilot-bridge.sock",
@@ -535,7 +592,6 @@ class SkyPilotEnvironment(DockerEnvironment):
             bridge.start()
             bind_mounts, docker_symlinks, passthrough = _container_mount_plan(request)
             extra_init_commands, cli_provider_env = _cli_container_setup(request)
-            extra_init_commands.extend(_evaluator_container_setup(request))
             cli_provider_env.setdefault("UV_CACHE_DIR", "/workspace/.cache/uv")
             helper_source = Path(__file__).with_name("skypilot_evaluator.py")
             helper_path = "/opt/vibesys-skypilot-evaluator.py"
@@ -572,7 +628,7 @@ class SkyPilotEnvironment(DockerEnvironment):
                 passthrough_paths=passthrough,
                 extra_env=cli_provider_env,
                 extra_init_commands=extra_init_commands,
-                setup_fns=_symlink_setup_fns(docker_symlinks),
+                lifecycle_hooks=_symlink_lifecycle_hooks(docker_symlinks),
                 attach_accelerator=False,
             )
             _start_sandbox(sandbox)
@@ -662,7 +718,6 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
 
         bind_mounts, docker_symlinks, passthrough = _container_mount_plan(request)
         extra_init_commands, cli_provider_env = _cli_container_setup(request)
-        extra_init_commands.extend(_evaluator_container_setup(request))
         cli_provider_env.setdefault("UV_CACHE_DIR", "/workspace/.cache/uv")
         if request.git_history_root is not None:
             cli_provider_env.setdefault("VIBESYS_GIT_HISTORY", "/opt/vibesys-history")
@@ -703,7 +758,7 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
         extra_init_commands.insert(0, "pip install --quiet 'modal>=0.66'")
 
         bind_mounts = _dedupe_mounts(bind_mounts)
-        setup_fns = _symlink_setup_fns(docker_symlinks)
+        lifecycle_hooks = _symlink_lifecycle_hooks(docker_symlinks)
 
         sandbox = request.backend.make_sandbox(
             SandboxKind.DOCKER,
@@ -713,7 +768,7 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
             passthrough_paths=passthrough,
             extra_env=cli_provider_env,
             extra_init_commands=extra_init_commands,
-            setup_fns=setup_fns,
+            lifecycle_hooks=lifecycle_hooks,
             attach_accelerator=False,
         )
         log: Callable[[str], None] = request.log or (lambda _: None)
@@ -725,15 +780,20 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
         _start_sandbox(sandbox)
 
         setup_timeout_seconds = 1200
-        evaluator_prefix = (
-            f"python {evaluator_container_path} "
-            + (
-                f"--entrypoint {shlex.quote(self.config.entrypoint)} "
-                if self.config.entrypoint is not None
-                else ""
+        evaluator_arguments = ["python", evaluator_container_path]
+        if self.config.entrypoint is not None:
+            evaluator_arguments.extend(("--entrypoint", self.config.entrypoint))
+        evaluator_arguments.extend(("--readiness-timeout-seconds", str(setup_timeout_seconds)))
+        remote_setup = _remote_evaluator_setup_command(request, preserve_bootstrap=True)
+        if remote_setup is not None:
+            evaluator_arguments.extend(
+                ("--setup-command-base64", encode_setup_command(("sh", "-c", remote_setup)))
             )
-            + f"--readiness-timeout-seconds {setup_timeout_seconds} --"
-        )
+        if request.evaluator_package_root is not None:
+            evaluator_arguments.extend(
+                ("--evaluator-package-root", "/opt/vibesys-evaluator-package")
+            )
+        evaluator_prefix = f"{shlex.join(evaluator_arguments)} --"
         return _DefaultRunEnvironmentSession(
             sandbox=sandbox,
             view=RunEnvironmentView(
@@ -745,11 +805,23 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
                     ),
                     accuracy_command=_prefix_command(
                         evaluator_prefix,
-                        _environment_command(request, request.accuracy_command, isolated=True),
+                        _environment_command(
+                            request,
+                            request.accuracy_command,
+                            isolated=True,
+                            evaluator_package_root=".vibesys-evaluator-package",
+                            evaluator_tools_root=_REMOTE_EVALUATOR_TOOLS_ROOT,
+                        ),
                     ),
                     benchmark_command=_prefix_command(
                         evaluator_prefix,
-                        _environment_command(request, request.benchmark_command, isolated=True),
+                        _environment_command(
+                            request,
+                            request.benchmark_command,
+                            isolated=True,
+                            evaluator_package_root=".vibesys-evaluator-package",
+                            evaluator_tools_root=_REMOTE_EVALUATOR_TOOLS_ROOT,
+                        ),
                     ),
                     profiler_support=(
                         request.profiler_support_name if request.profiler_support_path else None
@@ -1051,13 +1123,27 @@ def _materialize_effective_objective(request: RunEnvironmentRequest) -> Path | N
     return path
 
 
-def _isolated_paths(request: RunEnvironmentRequest) -> AgentPaths:
+def _isolated_paths(
+    request: RunEnvironmentRequest,
+    *,
+    evaluator_tools_root: Path | None = None,
+) -> AgentPaths:
     return AgentPaths(
         objective=(
             "/opt/vibesys-runtime/objective.md" if request.objective is not None else "OBJECTIVE.md"
         ),
-        accuracy_command=_environment_command(request, request.accuracy_command, isolated=True),
-        benchmark_command=_environment_command(request, request.benchmark_command, isolated=True),
+        accuracy_command=_environment_command(
+            request,
+            request.accuracy_command,
+            isolated=True,
+            evaluator_tools_root=evaluator_tools_root,
+        ),
+        benchmark_command=_environment_command(
+            request,
+            request.benchmark_command,
+            isolated=True,
+            evaluator_tools_root=evaluator_tools_root,
+        ),
         profiler_support=(request.profiler_support_name if request.profiler_support_path else None),
     )
 
@@ -1077,6 +1163,8 @@ def _environment_command(
     command: str | None,
     *,
     isolated: bool = False,
+    evaluator_package_root: str | None = None,
+    evaluator_tools_root: Path | None = None,
 ) -> str | None:
     """Translate semantic paths in argv, then quote the translated command."""
     if command is None:
@@ -1092,12 +1180,19 @@ def _environment_command(
             (
                 str(request.evaluator_package_root),
                 (
-                    "/opt/vibesys-evaluator-package"
-                    if isolated
-                    else str(request.evaluator_package_root)
+                    evaluator_package_root
+                    or (
+                        "/opt/vibesys-evaluator-package"
+                        if isolated
+                        else str(request.evaluator_package_root)
+                    )
                 ),
             )
         )
+    tools = _evaluator_tools(request)
+    if tools:
+        tools_root = evaluator_tools_root or _required_evaluator_tools_root(request)
+        replacements.extend(tool_path_replacements(tools, tools_root).items())
     _reject_semantic_tokens_in_source(arguments, replacements)
     arguments = [_translate_command_argument(argument, replacements) for argument in arguments]
     return shlex.join(arguments)
@@ -1107,7 +1202,12 @@ def _remote_evaluator_command(
     request: RunEnvironmentRequest, command: str | None
 ) -> tuple[str, ...] | None:
     """Translate a trusted command into the synchronized remote workdir."""
-    rendered = _environment_command(request, command, isolated=True)
+    rendered = _environment_command(
+        request,
+        command,
+        isolated=True,
+        evaluator_tools_root=_REMOTE_EVALUATOR_TOOLS_ROOT,
+    )
     if rendered is None:
         return None
     arguments = shlex.split(rendered)
@@ -1472,41 +1572,317 @@ def _cli_container_setup(
     return commands, env
 
 
-def _evaluator_container_setup(request: RunEnvironmentRequest) -> list[str]:
+def _evaluator_container_setup(
+    request: RunEnvironmentRequest,
+    *,
+    include_declared_tools: bool = True,
+    rootless: bool = False,
+) -> list[str]:
     """Install the toolchain required by bundled evaluator packages."""
     if request.evaluator_package_root is None:
         return []
     toolchains = set(load_evaluator_package(request.evaluator_package_root).metadata.toolchains)
+    if include_declared_tools and _evaluator_tools(request):
+        toolchains.add("rust")
     if not toolchains:
         return []
-    commands = [
-        "command -v curl >/dev/null && command -v tar >/dev/null || "
-        "{ apt-get update -qq && apt-get install -y -qq curl ca-certificates tar; }",
-    ]
+    commands = (
+        [
+            "command -v python3 >/dev/null && command -v tar >/dev/null || "
+            "{ echo 'evaluator setup requires Python 3 and tar in this remote environment' "
+            ">&2; exit 1; }",
+            f"mkdir -p .bin {shlex.quote(str(_REMOTE_EVALUATOR_TOOLCHAINS_ROOT))}",
+            'PATH="$PWD/.bin:$PATH"; export PATH',
+        ]
+        if rootless
+        else [
+            "command -v python3 >/dev/null && command -v tar >/dev/null || "
+            "{ apt-get update -qq && apt-get install -y -qq python3 ca-certificates tar; }",
+        ]
+    )
     if "go" in toolchains:
+        go_destination = (
+            f"$PWD/{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/go" if rootless else "/usr/local/go"
+        )
+        go_link = "$PWD/.bin/go" if rootless else "/usr/local/bin/go"
+        go_archive = (
+            f"{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/go.tgz" if rootless else "/tmp/vibesys-go.tgz"  # noqa: S108  # isolated setup container
+        )
+        go_download = _python_download_command(
+            "https://go.dev/dl/go1.23.12.linux-{arch}.tar.gz",
+            go_archive,
+            architecture_variable="go_arch",
+        )
         commands.append(
             "go_version=$(go env GOVERSION 2>/dev/null || true); "
             'case "$go_version" in go1.2[1-9]*|go1.[3-9][0-9]*) ;; *) '
             'arch=$(uname -m); case "$arch" in x86_64) go_arch=amd64 ;; '
             "aarch64|arm64) go_arch=arm64 ;; *) "
             'echo "unsupported Go architecture: $arch" >&2; exit 1 ;; esac; '
-            "curl -fsSL --retry 5 --retry-delay 5 "
-            "https://go.dev/dl/go1.23.12.linux-${go_arch}.tar.gz -o /tmp/go.tgz && "
-            "rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz && "
-            "ln -sf /usr/local/go/bin/go /usr/local/bin/go && rm -f /tmp/go.tgz ;; esac"
+            f"{go_download} || "
+            "{ echo 'failed to download evaluator Go toolchain' >&2; exit 1; }; "
+            f"rm -rf {go_destination} && mkdir -p $(dirname {go_destination}) && "
+            f"tar -C $(dirname {go_destination}) -xzf {go_archive} && "
+            f"ln -sf {go_destination}/bin/go {go_link} && rm -f {go_archive} || "
+            "{ echo 'failed to install evaluator Go toolchain' >&2; exit 1; } ;; esac"
         )
+        commands.append("GOWORK=off; export GOWORK")
     if "rust" in toolchains:
-        commands.append(
-            "if command -v cargo >/dev/null; then "
-            "rust_version=$(rustc --version 2>/dev/null | awk '{print $2}'); "
-            "else rust_version=missing; fi; "
-            'case "$rust_version" in 1.7[89].*|1.[89][0-9].*|1.[1-9][0-9][0-9].*) ;; *) '
-            "curl -fsSL --retry 5 --retry-delay 5 "
-            "https://sh.rustup.rs -o /tmp/rustup-init.sh && "
-            "sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.92.0 && "
-            "ln -sf /root/.cargo/bin/* /usr/local/bin/ && rm -f /tmp/rustup-init.sh ;; esac"
+        rustup_environment = (
+            f"RUSTUP_HOME=$PWD/{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/rustup "
+            f"CARGO_HOME=$PWD/{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/cargo "
+            if rootless
+            else ""
         )
+        cargo_link = (
+            f"ln -sf $PWD/{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/cargo/bin/* $PWD/.bin/"
+            if rootless
+            else "ln -sf /root/.cargo/bin/* /usr/local/bin/"
+        )
+        rustup_init = (
+            f"{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/rustup-init"
+            if rootless
+            else "/tmp/vibesys-rustup-init"  # noqa: S108  # isolated setup container
+        )
+        rustup_download = _python_download_command(
+            "https://static.rust-lang.org/rustup/dist/{arch}-unknown-linux-gnu/rustup-init",
+            rustup_init,
+            architecture_variable="rust_arch",
+        )
+        commands.append(
+            "rust_version=$(rustc --version 2>/dev/null | awk '{print $2}' || true); "
+            "cargo_version=$(cargo --version 2>/dev/null | awk '{print $2}' || true); "
+            'rust_ready=; case "$rust_version" in '
+            "1.7[89].*|1.[89][0-9].*|1.[1-9][0-9][0-9].*) "
+            'case "$cargo_version" in ?*) rust_ready=1 ;; esac ;; esac; '
+            'if [ "$rust_ready" != 1 ]; then '
+            'arch=$(uname -m); case "$arch" in x86_64) rust_arch=x86_64 ;; '
+            "aarch64|arm64) rust_arch=aarch64 ;; *) "
+            'echo "unsupported Rust architecture: $arch" >&2; exit 1 ;; esac; '
+            f"{rustup_download} || "
+            "{ echo 'failed to download evaluator Rust toolchain' >&2; exit 1; }; "
+            f"chmod +x {rustup_init} && {rustup_environment}{rustup_init} "
+            "-y --profile minimal --no-modify-path "
+            f"--default-toolchain {_EVALUATOR_RUST_TOOLCHAIN_VERSION} && "
+            f"{cargo_link} && rm -f {rustup_init} || "
+            "{ echo 'failed to install evaluator Rust toolchain' >&2; exit 1; }; fi"
+        )
+        if rootless:
+            commands.append(
+                f"if [ -d $PWD/{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/cargo ]; then "
+                f"RUSTUP_HOME=$PWD/{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/rustup; "
+                f"CARGO_HOME=$PWD/{_REMOTE_EVALUATOR_TOOLCHAINS_ROOT}/cargo; "
+                "export RUSTUP_HOME CARGO_HOME; fi"
+            )
     return commands
+
+
+def _python_download_command(
+    url_template: str,
+    destination: str,
+    *,
+    architecture_variable: str,
+) -> str:
+    command = shlex.join(("python3", "-c", _PYTHON_DOWNLOAD_SCRIPT, url_template, destination))
+    return f'{command} "${{{architecture_variable}}}"'
+
+
+class _EvaluatorToolBuildRequiredError(RuntimeError):
+    pass
+
+
+def _docker_evaluator_tool_mounts(
+    request: RunEnvironmentRequest,
+    tools: Mapping[str, CargoGitToolSpec],
+    *,
+    container_image: str | None = None,
+) -> list[tuple[str, str, bool]]:
+    """Build tools in the target image, then mount verified roots read-only."""
+    if not tools:
+        return []
+    resolved_image = container_image or _resolve_docker_image_id(_docker_backend_image(request))
+    host_parent = _docker_evaluator_tools_root(request, image_identity=resolved_image)
+
+    def require_builder(_arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise _EvaluatorToolBuildRequiredError
+
+    try:
+        prepare_evaluator_tools(tools, host_parent, command_runner=require_builder)
+    except _EvaluatorToolBuildRequiredError:
+        for name in tools:
+            (host_parent / name).mkdir(parents=True, exist_ok=True)
+        builder_workspace = request.log_dir / "evaluator-tool-builder-workspace"
+        builder_workspace.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=".host-owner-", dir=host_parent) as marker:
+            container_marker = str(_SANDBOX_EVALUATOR_TOOLS_ROOT / Path(marker.name).name)
+            builder = request.backend.make_sandbox(
+                SandboxKind.DOCKER,
+                host_workspace=str(builder_workspace),
+                log_path=request.log_dir / "evaluator-tool-builder.log",
+                bind_mounts=[
+                    (str(host_parent), str(_SANDBOX_EVALUATOR_TOOLS_ROOT), False),
+                ],
+                passthrough_paths=[str(_SANDBOX_EVALUATOR_TOOLS_ROOT)],
+                extra_env={},
+                extra_init_commands=_evaluator_container_setup(request),
+                lifecycle_hooks=[EvaluatorToolLifecycleHooks(tools, _SANDBOX_EVALUATOR_TOOLS_ROOT)],
+                attach_accelerator=False,
+                ephemeral=True,
+                container_image=resolved_image,
+            )
+            try:
+                _start_sandbox(builder)
+                container_roots = [
+                    str(tool_install_root(_SANDBOX_EVALUATOR_TOOLS_ROOT, name, spec))
+                    for name, spec in tools.items()
+                ]
+                ownership_script = (
+                    'owner=$(stat -c "%u:%g" -- "$1") && shift && chown -R "$owner" -- "$@"'
+                )
+                ownership = builder.execute(
+                    shlex.join(
+                        (
+                            "sh",
+                            "-c",
+                            ownership_script,
+                            "vibesys-chown",
+                            container_marker,
+                            *container_roots,
+                        )
+                    ),
+                    timeout=120,
+                )
+                if ownership.exit_code != 0:
+                    detail = (ownership.output or "chown failed").strip()
+                    raise EvaluatorToolError(  # noqa: TRY003
+                        "Docker evaluator tool builder could not return cache ownership "
+                        f"to the host user: {detail[:500]}"
+                    )
+            finally:
+                _stop_sandbox(builder)
+        try:
+            prepare_evaluator_tools(tools, host_parent, command_runner=require_builder)
+        except _EvaluatorToolBuildRequiredError as exc:
+            raise EvaluatorToolError(  # noqa: TRY003
+                "Docker evaluator tool builder did not publish every declared tool"
+            ) from exc
+
+    return [
+        (
+            str(tool_install_root(host_parent, name, spec)),
+            str(tool_install_root(_SANDBOX_EVALUATOR_TOOLS_ROOT, name, spec)),
+            True,
+        )
+        for name, spec in tools.items()
+    ]
+
+
+def _docker_evaluator_tools_root(
+    request: RunEnvironmentRequest,
+    *,
+    image_identity: str,
+) -> Path:
+    base = _required_evaluator_tools_root(request)
+    identity = (
+        f"{_DOCKER_EVALUATOR_CACHE_SCHEMA}\0{image_identity}\0{os.uname().machine}\0"
+        f"{_EVALUATOR_RUST_TOOLCHAIN_VERSION}"
+    ).encode()
+    return base / "docker" / hashlib.sha256(identity).hexdigest()
+
+
+def _docker_backend_image(request: RunEnvironmentRequest) -> str:
+    image = getattr(request.backend, "image", None)
+    if not isinstance(image, str) or not image:
+        raise EvaluatorToolError("Docker evaluator tools require a configured backend image")  # noqa: TRY003
+    return image
+
+
+def _inspect_docker_image_id(image: str) -> str | None:
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["docker", "image", "inspect", "--format={{.Id}}", image],  # noqa: S607
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        result = None
+    if result is None or result.returncode != 0:
+        return None
+    identity = result.stdout.strip()
+    return (
+        identity
+        if identity.startswith("sha256:") and not any(c.isspace() for c in identity)
+        else None
+    )
+
+
+def _resolve_docker_image_id(image: str) -> str:
+    """Resolve and pin the exact Docker image used for tool build and execution."""
+    if identity := _inspect_docker_image_id(image):
+        return identity
+    try:
+        pull = subprocess.run(  # noqa: S603
+            ["docker", "image", "pull", image],  # noqa: S607
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=600,
+        )
+    except FileNotFoundError as exc:
+        raise EvaluatorToolError(  # noqa: TRY003
+            "Docker was not found while resolving the evaluator image"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise EvaluatorToolError(f"Docker image pull timed out: {image}") from exc  # noqa: TRY003
+    if pull.returncode != 0:
+        detail = (pull.stderr or pull.stdout or "docker image pull failed").strip()[:500]
+        raise EvaluatorToolError(f"Could not resolve Docker image {image!r}: {detail}")  # noqa: TRY003
+    if identity := _inspect_docker_image_id(image):
+        return identity
+    raise EvaluatorToolError(  # noqa: TRY003
+        f"Docker image {image!r} has no resolvable immutable image ID after pull"
+    )
+
+
+def _remote_evaluator_setup_command(
+    request: RunEnvironmentRequest,
+    *,
+    preserve_bootstrap: bool = False,
+) -> str | None:
+    """Build idempotent setup for the environment that runs the evaluator."""
+    commands = _evaluator_container_setup(request, rootless=True)
+    tools = _evaluator_tools(request)
+    if tools:
+        commands.append(evaluator_tools_install_command(tools, _REMOTE_EVALUATOR_TOOLS_ROOT))
+    if not commands:
+        return None
+    reserved_paths = [
+        str(_REMOTE_EVALUATOR_TOOLS_ROOT),
+        str(_REMOTE_EVALUATOR_TOOLCHAINS_ROOT),
+    ]
+    if not preserve_bootstrap:
+        reserved_paths[:0] = [".bin", ".pip", ".uv-cache"]
+    reserved = shlex.join(("rm", "-rf", "--", *reserved_paths))
+    return "set -e\n" + "\n".join((reserved, *commands))
+
+
+def _evaluator_tools(request: RunEnvironmentRequest) -> dict[str, CargoGitToolSpec]:
+    if request.evaluator_package_root is None:
+        return {}
+    return load_evaluator_package(request.evaluator_package_root).metadata.tools
+
+
+def _required_evaluator_tools_root(request: RunEnvironmentRequest) -> Path:
+    if request.evaluator_tools_root is None:
+        raise ValueError("evaluator tools require an operator-owned tools root")  # noqa: TRY003
+    root = request.evaluator_tools_root.resolve()
+    try:
+        root.relative_to(request.workspace.resolve())
+    except ValueError:
+        return root
+    raise ValueError("evaluator tools root must be outside the candidate workspace")  # noqa: TRY003
 
 
 def _dedupe_mounts(
@@ -1518,19 +1894,31 @@ def _dedupe_mounts(
     return list(seen.values())
 
 
-def _symlink_setup_fns(symlinks: list[tuple[str, str]]) -> list[SetupFn]:
+@dataclass(frozen=True)
+class _SymlinkLifecycleHooks(SandboxLifecycleHooks):
+    commands: tuple[str, ...]
+
+    def before_ready(self, context: BeforeReadyContext) -> None:
+        for command in self.commands:
+            result = context.sandbox.execute(command)
+            if result.exit_code != 0:
+                raise RuntimeError(  # noqa: TRY003
+                    f"failed to create sandbox symlink with {command!r}: {result.output}"
+                )
+        save_symlink_commands = getattr(context.sandbox, "save_symlink_commands", None)
+        if callable(save_symlink_commands):
+            save_symlink_commands(list(self.commands))
+
+
+def _symlink_lifecycle_hooks(
+    symlinks: list[tuple[str, str]],
+) -> list[SandboxLifecycleHooks]:
     if not symlinks:
         return []
-    symlink_cmds = [f"ln -sfn {target} {link}" for link, target in symlinks]
-
-    def install_symlinks(sb: BaseSandbox) -> None:
-        for cmd in symlink_cmds:
-            sb.execute(cmd)
-        save_symlink_commands = getattr(sb, "save_symlink_commands", None)
-        if callable(save_symlink_commands):
-            save_symlink_commands(symlink_cmds)
-
-    return [install_symlinks]
+    commands = tuple(
+        f"ln -sfn {shlex.quote(target)} {shlex.quote(link)}" for link, target in symlinks
+    )
+    return [_SymlinkLifecycleHooks(commands)]
 
 
 def _collect_symlink_mounts(

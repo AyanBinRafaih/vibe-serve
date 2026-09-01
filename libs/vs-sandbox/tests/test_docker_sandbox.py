@@ -6,9 +6,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from deepagents.backends.sandbox import BaseSandbox
 
+from vs_sandbox import BeforeReadyContext, SandboxLifecycleError, SandboxLifecycleHooks
 from vs_sandbox.docker_sandbox import DockerSandbox
+
+
+class _RecordingHooks(SandboxLifecycleHooks):
+    def __init__(self, invocations: list[object]) -> None:
+        self._invocations = invocations
+
+    def before_ready(self, context: BeforeReadyContext) -> None:
+        self._invocations.append(context.sandbox)
+
+
+class _FailingHooks(SandboxLifecycleHooks):
+    def before_ready(self, context: BeforeReadyContext) -> None:  # noqa: ARG002
+        raise ValueError("setup exploded")  # noqa: TRY003
 
 
 @pytest.fixture
@@ -195,10 +208,12 @@ class TestStart:
     def test_init_failure_stops_and_removes_created_container(self, mock_run, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         from vs_sandbox.docker_sandbox import _live_containers  # noqa: PLC0415  # tracked: #288
 
+        invocations: list[object] = []
         sandbox = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="test-image",
             extra_init_commands=["install-required-tool"],
+            lifecycle_hooks=[_RecordingHooks(invocations)],
         )
         mock_run.side_effect = [
             subprocess.CompletedProcess(args=[], returncode=0, stdout="abc123\n", stderr=""),
@@ -216,6 +231,7 @@ class TestStart:
 
             assert sandbox._container_id is None  # noqa: SLF001  # tracked: #288
             assert "abc123" not in _live_containers
+            assert invocations == []
             assert mock_run.call_args_list[-2][0][0] == ["docker", "stop", "abc123"]
             assert mock_run.call_args_list[-1][0][0] == ["docker", "rm", "-f", "abc123"]
         finally:
@@ -306,59 +322,48 @@ class TestExecute:
             sandbox.execute("echo hello")
 
 
-class TestSetupFns:
+class TestLifecycleHooks:
     @patch("subprocess.run")
-    def test_setup_fns_run_after_start(self, mock_run, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        """setup_fns receive the sandbox and run at the end of start()."""
+    def test_hooks_run_before_ready(self, mock_run, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
             stdout="abc123container\n",
             stderr="",
         )
-        invocations: list[BaseSandbox] = []
-
-        def fn(sb: BaseSandbox) -> None:
-            invocations.append(sb)
+        invocations: list[object] = []
 
         s = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
-            setup_fns=[fn],
+            lifecycle_hooks=[_RecordingHooks(invocations)],
         )
         s.start()
         assert invocations == [s]
 
     @patch("subprocess.run")
-    def test_setup_fns_re_run_on_restart(self, mock_run, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        """A second start() (e.g. after stop() from reselect_device) re-runs."""
+    def test_hooks_re_run_on_restart(self, mock_run, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        """A second start, such as device reselection, reruns the hooks."""
         mock_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
             stdout="abc123container\n",
             stderr="",
         )
-        calls = 0
-
-        def fn(_sb: BaseSandbox) -> None:
-            nonlocal calls
-            calls += 1
+        invocations: list[object] = []
 
         s = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="nvcr.io/nvidia/pytorch:25.04-py3",
-            setup_fns=[fn],
+            lifecycle_hooks=[_RecordingHooks(invocations)],
         )
         s.start()
         s.start()
-        assert calls == 2
+        assert invocations == [s, s]
 
     @patch("subprocess.run")
     def test_setup_failure_preserves_error_when_stop_fails(self, mock_run, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         from vs_sandbox.docker_sandbox import _live_containers  # noqa: PLC0415  # tracked: #288
-
-        def fail_setup(_sandbox: BaseSandbox) -> None:
-            raise ValueError("setup exploded")  # noqa: TRY003  # tracked: #288
 
         def run(cmd, **_kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
             if cmd[:2] == ["docker", "run"]:
@@ -373,13 +378,14 @@ class TestSetupFns:
         sandbox = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="test-image",
-            setup_fns=[fail_setup],
+            lifecycle_hooks=[_FailingHooks()],
         )
 
         try:
-            with pytest.raises(ValueError, match="setup exploded"):
+            with pytest.raises(SandboxLifecycleError, match="_FailingHooks failed") as error:
                 sandbox.start()
 
+            assert isinstance(error.value.__cause__, ValueError)
             assert sandbox._container_id is None  # noqa: SLF001  # tracked: #288
             assert "abc123" not in _live_containers
             commands = [call.args[0] for call in mock_run.call_args_list]
@@ -398,9 +404,6 @@ class TestSetupFns:
     ):
         from vs_sandbox.docker_sandbox import _live_containers  # noqa: PLC0415  # tracked: #288
 
-        def fail_setup(_sandbox: BaseSandbox) -> None:
-            raise ValueError("setup exploded")  # noqa: TRY003  # tracked: #288
-
         def run(cmd, **_kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
             if cmd[:2] == ["docker", "run"]:
                 return subprocess.CompletedProcess(
@@ -418,11 +421,11 @@ class TestSetupFns:
         sandbox = DockerSandbox(
             host_workspace=str(tmp_path / "workspace"),
             image="test-image",
-            setup_fns=[fail_setup],
+            lifecycle_hooks=[_FailingHooks()],
         )
 
         try:
-            with pytest.raises(ValueError, match="setup exploded"):
+            with pytest.raises(SandboxLifecycleError, match="_FailingHooks failed"):
                 sandbox.start()
 
             assert sandbox._container_id == "abc123"  # noqa: SLF001  # tracked: #288

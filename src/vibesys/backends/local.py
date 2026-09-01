@@ -23,7 +23,6 @@ from vibesys.backends.base import (
     ContentionMonitor,
     ModalOptions,
     SandboxKind,
-    SetupFn,
     make_local_shell_sandbox,
 )
 from vibesys.constants import ComputeBackend
@@ -32,6 +31,8 @@ from vibesys.profilers import ProfilerKind
 if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
+
+    from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 _DEFAULT_CPU_IMAGE = "python:3.12-bookworm"
 
@@ -73,36 +74,42 @@ class LocalBackend:
         passthrough_paths: list[str] | None = None,
         extra_env: dict[str, str] | None = None,
         extra_init_commands: list[str] | None = None,
-        setup_fns: list[SetupFn] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
+        ephemeral: bool = False,
+        container_image: str | None = None,
     ) -> SandboxBackendProtocol:
         # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
         # pulls langchain + anthropic. Registration must stay import-cheap.
         from vs_sandbox import DockerSandbox  # noqa: PLC0415  # tracked: #288
 
-        del attach_accelerator
+        del attach_accelerator, ephemeral
         bind_mounts = list(bind_mounts or [])
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
         extra_init_commands = list(extra_init_commands or [])
-        setup_fns = setup_fns or []
+        lifecycle_hooks = lifecycle_hooks or []
 
         if kind is SandboxKind.LOCAL:
-            return make_local_shell_sandbox(host_workspace=host_workspace, env=extra_env)
+            return make_local_shell_sandbox(
+                host_workspace=host_workspace,
+                env=extra_env,
+                lifecycle_hooks=lifecycle_hooks,
+            )
         if kind is SandboxKind.DOCKER and self._supports_docker:
             if self.image is None:
                 raise ValueError(f"{self.name.value} backend requires a Docker image")  # noqa: TRY003  # tracked: #288
             return DockerSandbox(
                 host_workspace=host_workspace,
-                image=self.image,
+                image=container_image or self.image,
                 gpus=None,
                 bind_mounts=bind_mounts,
                 passthrough_paths=passthrough_paths,
                 env=extra_env,
                 log_path=log_path,
                 extra_init_commands=extra_init_commands,
-                setup_fns=setup_fns,
+                lifecycle_hooks=lifecycle_hooks,
             )
         if kind in (SandboxKind.DOCKER, SandboxKind.MODAL):
             raise ValueError(  # noqa: TRY003  # tracked: #288

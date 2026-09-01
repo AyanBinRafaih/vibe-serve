@@ -40,6 +40,8 @@ from deepagents.backends.protocol import (
 from deepagents.backends.sandbox import BaseSandbox
 from modal.volume import AbstractVolumeUploadContextManager  # noqa: TC002  # tracked: #288
 
+from vs_sandbox.lifecycle import SandboxLifecycle, SandboxLifecycleHooks
+
 if TYPE_CHECKING:
     from types import FrameType
 
@@ -193,7 +195,7 @@ class ModalSandbox(BaseSandbox):
         extra_writable_volumes: dict[str, str] | None = None,
         log_path: str | Path | None = None,
         extra_init_commands: list[str] | None = None,
-        setup_fns: list[Callable[[BaseSandbox], None]] | None = None,
+        lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         app_name: str = "vibesys",
         enable_fallback_restart: bool = True,  # noqa: FBT001, FBT002  # tracked: #288
         max_restart_attempts: int = 2,
@@ -237,6 +239,9 @@ class ModalSandbox(BaseSandbox):
             extra_init_commands: Additional bash one-liners run inside the
                 sandbox after the default ``pip install uv``.  Failures
                 raise ``RuntimeError``.
+            lifecycle_hooks: Trusted extensions invoked in order after
+                built-in initialization and before the sandbox becomes ready.
+                They run again after every container recreation.
             app_name: Modal App name to attach the sandbox to.  Created if
                 missing.
         """
@@ -254,7 +259,7 @@ class ModalSandbox(BaseSandbox):
         self._extra_readonly_volumes = dict(extra_readonly_volumes or {})
         self._extra_writable_volumes = dict(extra_writable_volumes or {})
         self._extra_init_commands = list(extra_init_commands or [])
-        self._setup_fns = list(setup_fns or [])
+        self._lifecycle = SandboxLifecycle(lifecycle_hooks)
         self._app_name = app_name
         self._enable_fallback_restart = enable_fallback_restart
         self._max_restart_attempts = max_restart_attempts
@@ -328,8 +333,13 @@ class ModalSandbox(BaseSandbox):
         )
         self._log(f"created workspace volume {self._workspace_volume_name}")
 
-        self._populate_workspace_volume()
-        self._create_container()
+        try:
+            self._populate_workspace_volume()
+            self._create_container()
+        except BaseException:
+            self._discard_started_sandbox()
+            self._delete_workspace_volume()
+            raise
 
     def _create_container(self) -> None:  # noqa: C901  # tracked: #288
         """Create (or recreate) the Modal sandbox container on top of the
@@ -432,10 +442,7 @@ class ModalSandbox(BaseSandbox):
                     self._log(f"init command stdout: {out.strip()[:500]}")
             self._log(f"init command completed: {cmd}")
 
-        # Run caller-supplied setup functions.  These re-execute on every
-        # restart so transient in-container state (symlinks etc.) survives.
-        for fn in self._setup_fns:
-            fn(self)
+        self._lifecycle.before_ready(self)
 
     def _restart_sandbox(self) -> bool:
         """Terminate the (likely dead) sandbox container and recreate it.
@@ -476,6 +483,7 @@ class ModalSandbox(BaseSandbox):
             self._log(f"[fallback] restart succeeded (new id={self._sandbox_id})")
             return True  # noqa: TRY300  # tracked: #288
         except Exception as exc:  # noqa: BLE001  # tracked: #288
+            self._discard_started_sandbox()
             self._log(f"[fallback] restart failed: {exc}")
             return False
 
@@ -785,28 +793,33 @@ class ModalSandbox(BaseSandbox):
 
     def stop(self) -> None:
         """Terminate the sandbox and sync the workspace back to the host."""
-        if self._sandbox is None:
-            return
+        if self._sandbox is not None:
+            # Download BEFORE clearing self._sandbox — _download_workspace
+            # early-returns when self._sandbox is None.
+            try:
+                self._download_workspace()
+            except Exception as exc:  # noqa: BLE001  # tracked: #288
+                self._log(f"workspace download failed: {exc}")
+            self._discard_started_sandbox()
+        self._delete_workspace_volume()
 
-        # Download BEFORE clearing self._sandbox — _download_workspace
-        # early-returns when self._sandbox is None.
-        try:
-            self._download_workspace()
-        except Exception as exc:  # noqa: BLE001  # tracked: #288
-            self._log(f"workspace download failed: {exc}")
-
+    def _discard_started_sandbox(self) -> None:
+        """Best-effort rollback for a container that did not become ready."""
         sandbox = self._sandbox
         sandbox_id = self._sandbox_id
         self._sandbox = None
         self._sandbox_id = None
         if sandbox_id is not None:
             _live_sandboxes.pop(sandbox_id, None)
-
+        if sandbox is None:
+            return
         try:
             sandbox.terminate()
         except Exception as exc:  # noqa: BLE001  # tracked: #288
             self._log(f"terminate failed: {exc}")
 
+    def _delete_workspace_volume(self) -> None:
+        """Best-effort deletion of the workspace volume owned by this sandbox."""
         if self._workspace_volume_name:
             try:
                 modal.Volume.objects.delete(

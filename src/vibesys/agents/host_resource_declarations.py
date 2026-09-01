@@ -268,12 +268,13 @@ def container_runtime_resources(env: Mapping[str, str] | None = None) -> tuple[H
     )
 
 
-def task_agent_host_resources(
+def task_agent_host_resources(  # noqa: PLR0913
     *,
     container_topology: bool,
     cli_sandboxed: bool,
     task_name: str | None,
     evaluator_package_root: Path | None,
+    evaluator_tool_roots: tuple[Path, ...] = (),
     env: Mapping[str, str] | None = None,
 ) -> tuple[HostResource, ...]:
     """Declare the extra host resources a repository-native task's agent needs.
@@ -282,10 +283,12 @@ def task_agent_host_resources(
     Docker socket and a scratch directory that names the same path inside and
     outside confinement, because Docker resolves a bind-mount source in the
     daemon's namespace rather than the agent's. Separately, a packaged
-    benchmark command names ``${PACKAGE_ROOT}``: the package lives outside the
-    workspace, so without importing it the command dies on a missing directory
-    and the Profiler returns no evidence at all. That import is read-only, since
-    the evaluator is trusted, integrity-checked input no role may edit.
+    benchmark command may name ``${PACKAGE_ROOT}`` and preinstalled evaluator
+    tools. Those resources live outside the workspace, so without importing
+    them the command dies on a missing directory and the Profiler returns no
+    evidence at all. Imports are read-only because evaluator packages and
+    selected content-addressed tool installations are integrity-checked input
+    no role may edit. The writable tool-cache parent remains operator-only.
 
     Container backends run the agent inside their own image and own resource
     exposure themselves, so a sandboxed run declares nothing here.
@@ -307,7 +310,13 @@ def task_agent_host_resources(
             *resources,
             HostResource(evaluator_package_root, HostResourceAccess.READ_ONLY, "evaluator package"),
         )
-    return resources
+    return (
+        *resources,
+        *(
+            HostResource(root, HostResourceAccess.READ_ONLY, "evaluator tool")
+            for root in evaluator_tool_roots
+        ),
+    )
 
 
 def _operator_allowlist(ctx: HostResourceContext) -> Iterable[HostResource]:
