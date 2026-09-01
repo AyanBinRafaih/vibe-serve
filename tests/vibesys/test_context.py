@@ -31,7 +31,7 @@ from vibesys.run.events import CoreEventType
 from vibesys.sandbox.run_environment import RunEnvironmentSpec
 from vs_loop_state import PlainLoopCursor
 from vs_project import AgentRunConfiguration, Project, RunEnvironmentRecord
-from vs_sandbox import HostResourceAccess
+from vs_sandbox import HostResourceAccess, SandboxLifecycle
 
 
 class _FakeBackend:
@@ -42,6 +42,7 @@ class _FakeBackend:
         self.sandbox = MagicMock()
 
     def make_sandbox(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        SandboxLifecycle(_kwargs.get("lifecycle_handlers")).before_ready(self.sandbox)
         return self.sandbox
 
     def make_monitor(self, _log_dir):  # noqa: ANN001, ANN202
@@ -258,14 +259,14 @@ def test_context_places_evaluator_tools_in_operator_cache_and_imports_it_read_on
         )
     )
 
-    def prepare(tools, root):  # noqa: ANN001, ANN202
+    def prepare(tools, root, *, command_runner=None):  # noqa: ANN001, ANN202, ARG001
         root.mkdir(parents=True, exist_ok=True)
         for name, spec in tools.items():
             tool_install_root(root, name, spec).mkdir(parents=True)
         return {}
 
     with (
-        patch("vibesys.sandbox.run_environment.prepare_evaluator_tools", side_effect=prepare),
+        patch("vibesys.evaluators.tools.prepare_evaluator_tools", side_effect=prepare),
         _create_context(project, evaluator_package_root=package.root) as ctx,
     ):
         tools_root = ctx.project.state.model_cache_directory("evaluator-tools")

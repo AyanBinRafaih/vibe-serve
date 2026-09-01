@@ -15,12 +15,38 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from vibesys.evaluators.packages import CargoGitToolSpec, tool_token
+from vs_sandbox import BeforeReadyContext, SandboxLifecycleHandler
 
 ToolCommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
 
 class EvaluatorToolError(RuntimeError):
     """Raised when an evaluator tool cannot be prepared safely."""
+
+
+class EvaluatorToolLifecycleHandler(SandboxLifecycleHandler):
+    """Install evaluator-declared tools while a sandbox becomes ready."""
+
+    def __init__(
+        self,
+        tools: Mapping[str, CargoGitToolSpec],
+        install_parent: Path,
+        *,
+        command_runner: ToolCommandRunner | None = None,
+    ) -> None:
+        """Snapshot immutable tool requirements and their operator-owned cache."""
+        self._tools = dict(tools)
+        self._install_parent = install_parent
+        self._command_runner = command_runner
+
+    def before_ready(self, context: BeforeReadyContext) -> None:
+        """Prepare verified tools before the sandbox is exposed to callers."""
+        del context
+        prepare_evaluator_tools(
+            self._tools,
+            self._install_parent,
+            command_runner=self._command_runner,
+        )
 
 
 class _EvaluatorToolReceipt(BaseModel):

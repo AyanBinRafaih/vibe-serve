@@ -17,6 +17,7 @@ from vibesys.evaluators.packages import (
 )
 from vibesys.evaluators.tools import (
     EvaluatorToolError,
+    EvaluatorToolLifecycleHandler,
     cargo_install_argv,
     prepare_evaluator_tools,
     tool_install_root,
@@ -35,6 +36,7 @@ __all__ = [
     "EvaluatorPackageRegistry",
     "EvaluatorPackageRequirement",
     "EvaluatorToolError",
+    "EvaluatorToolLifecycleHandler",
     "ResolvedEvaluatorPackage",
     "cargo_install_argv",
     "load_evaluator_package",

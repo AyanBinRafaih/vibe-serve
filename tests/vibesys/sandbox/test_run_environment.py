@@ -30,7 +30,7 @@ from vibesys.sandbox.run_environment import (
     run_environment_record,
 )
 from vs_project import Project, RunEnvironmentRecord, RunResourceRequest
-from vs_sandbox import BeforeReadyContext, ProjectPathPolicy
+from vs_sandbox import BeforeReadyContext, ProjectPathPolicy, SandboxLifecycle
 
 if TYPE_CHECKING:
     from deepagents.backends.protocol import SandboxBackendProtocol
@@ -335,7 +335,7 @@ def test_local_environment_prepares_and_translates_evaluator_tool(
     )
     prepare = MagicMock()
     monkeypatch.setattr(
-        "vibesys.sandbox.run_environment.prepare_evaluator_tools",
+        "vibesys.evaluators.tools.prepare_evaluator_tools",
         prepare,
     )
     command = shlex.join(
@@ -363,7 +363,14 @@ def test_local_environment_prepares_and_translates_evaluator_tool(
         )
     )
 
-    prepare.assert_called_once_with(package.metadata.tools, tools_root)
+    lifecycle_handlers = backend.calls[0][1]["lifecycle_handlers"]
+    assert len(lifecycle_handlers) == 1
+    SandboxLifecycle(lifecycle_handlers).before_ready(backend.sandbox)
+    prepare.assert_called_once_with(
+        package.metadata.tools,
+        tools_root,
+        command_runner=None,
+    )
     tool = package.metadata.tools["request-factory"]
     benchmark = shlex.split(session.view.paths.benchmark_command or "")
     engine = tool_install_root(tools_root, "request-factory", tool) / "bin" / "session_runner"

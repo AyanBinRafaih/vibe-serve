@@ -5,18 +5,21 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from vibesys.evaluators import (
     CargoGitToolSpec,
     EvaluatorToolError,
+    EvaluatorToolLifecycleHandler,
     cargo_install_argv,
     prepare_evaluator_tools,
     tool_install_root,
     tool_spec_digest,
     tool_token,
 )
+from vs_sandbox import SandboxLifecycle
 
 
 def _spec() -> CargoGitToolSpec:
@@ -80,6 +83,37 @@ def test_prepare_tools_publishes_complete_install_and_reuses_it(tmp_path: Path) 
     assert set(receipt["binaries"]) == {"runner", "tracegen"}
     assert root.name == tool_spec_digest(_spec())
     assert not list(root.parent.glob(f".{root.name}-*"))
+
+
+def test_lifecycle_handler_snapshots_and_prepares_tool_requirements(tmp_path: Path) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def install(arguments):  # noqa: ANN001, ANN202
+        normalized = tuple(arguments)
+        calls.append(normalized)
+        root = Path(normalized[normalized.index("--root") + 1])
+        for binary in ("runner", "tracegen"):
+            path = root / "bin" / binary
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("binary", encoding="utf-8")
+            path.chmod(0o755)
+        return subprocess.CompletedProcess(normalized, 0, "", "")
+
+    tools = {"example": _spec()}
+    install_parent = tmp_path / "tools"
+    handler = EvaluatorToolLifecycleHandler(
+        tools,
+        install_parent,
+        command_runner=install,
+    )
+    tools.clear()
+
+    lifecycle = SandboxLifecycle([handler])
+    lifecycle.before_ready(MagicMock())
+    lifecycle.before_ready(MagicMock())
+
+    assert len(calls) == 1
+    assert (tool_install_root(install_parent, "example", _spec()) / "bin" / "runner").is_file()
 
 
 def test_prepare_tools_rejects_binary_changed_after_receipt(tmp_path: Path) -> None:
