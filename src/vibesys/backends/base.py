@@ -72,6 +72,8 @@ class ComputeBackendImpl(Protocol):
         lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,
         attach_accelerator: bool = True,
+        ephemeral: bool = False,
+        container_image: str | None = None,
     ) -> SandboxBackendProtocol:
         """Construct (do not start) a sandbox configured for this backend.
 
@@ -81,6 +83,12 @@ class ComputeBackendImpl(Protocol):
         ``attach_accelerator=False`` creates a CPU-only control-plane sandbox
         while preserving the target backend's image and tooling. Remote
         dispatch environments use this for local editor containers.
+
+        ``ephemeral=True`` excludes a short-lived framework setup sandbox from
+        backend restart or device-reselection tracking.
+
+        ``container_image`` pins a Docker sandbox to a resolved image ID. It is
+        ignored by non-Docker sandboxes.
         """
         ...
 

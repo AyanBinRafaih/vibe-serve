@@ -12,15 +12,17 @@ ingress, or Modal's function-admission queue.
 The public endpoint is used only for deploy discovery, readiness, and periodic
 keep-warm probes during the in-container run (colocated traffic does not reset
 Modal's idle scaledown timer). Workspace-relative input files referenced by the
-command are staged into the container; absolute not-yet-existing paths in the
-command (for example a ``--output-json`` target) are relayed back to the caller
-after the run.
+command and an explicitly selected framework-owned evaluator package are staged
+into the container. An optional framework-owned setup argv runs from that random
+stage before the evaluator. Absolute not-yet-existing paths in the command (for
+example a ``--output-json`` target) are relayed back to the caller after the run.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import fcntl
 import io
 import json
@@ -53,8 +55,17 @@ _MAX_DIAGNOSTIC_CHARS = 20_000
 _EXEC_RC_MARKER = "__VIBESYS_EXEC_RC__="
 _OUTPUT_FILE_MARKER = "__VIBESYS_OUTPUT_FILE__"
 _OUTPUT_END_MARKER = "__VIBESYS_OUTPUT_END__"
+_TRUSTED_SETUP_FAILURE_EXIT_CODE = 96
+_EVALUATOR_BOOTSTRAP_FAILURE_EXIT_CODE = 97
+_EVALUATOR_PACKAGE_STAGE_PATH = ".vibesys-evaluator-package"
+_EVALUATOR_TOOLS_STAGE_PATH = ".vibesys-evaluator-tools"
+_EVALUATOR_TOOLCHAINS_STAGE_PATH = ".vibesys-evaluator-toolchains"
+_FRAMEWORK_BIN_STAGE_PATH = ".bin"
+_FRAMEWORK_PIP_STAGE_PATH = ".pip"
+_FRAMEWORK_UV_CACHE_STAGE_PATH = ".uv-cache"
 # Linux caps a single argv string at 128 KiB; stay well under it per chunk.
 _B64_CHUNK_CHARS = 60_000
+_MAX_ENCODED_SETUP_COMMAND_CHARS = 60_000
 _MAX_STAGE_ARCHIVE_BYTES = 8 * 1024 * 1024
 _CONTAINER_DISCOVERY_TIMEOUT_SECONDS = 90.0
 _KEEPWARM_INTERVAL_SECONDS = 30.0
@@ -65,6 +76,50 @@ class _DeploymentLease:
     candidate_revision: str
     base_url: str
     app_identifier: str | None = None
+
+
+def _normalized_setup_command(command: Sequence[str]) -> tuple[str, ...]:
+    """Snapshot one opaque executable argv or reject malformed input."""
+    if isinstance(command, str) or any(not isinstance(item, str) for item in command):
+        raise TypeError("trusted setup command must contain only argv strings")  # noqa: TRY003
+    if not command:
+        raise ValueError("trusted setup command must be a non-empty string argv")  # noqa: TRY003
+    normalized = tuple(command)
+    if not normalized[0]:
+        raise ValueError("trusted setup command executable must not be empty")  # noqa: TRY003
+    return normalized
+
+
+def encode_setup_command(command: Sequence[str]) -> str:
+    """Encode trusted setup argv for ``--setup-command-base64``."""
+    normalized = _normalized_setup_command(command)
+    document = json.dumps(normalized, separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(document).decode("ascii")
+    if len(encoded) > _MAX_ENCODED_SETUP_COMMAND_CHARS:
+        raise ValueError("trusted setup command exceeds the encoded size limit")  # noqa: TRY003
+    return encoded
+
+
+def _decode_setup_command(encoded: str) -> tuple[str, ...]:
+    """Decode and structurally validate framework-owned setup argv."""
+    if len(encoded) > _MAX_ENCODED_SETUP_COMMAND_CHARS:
+        raise ValueError("trusted setup command exceeds the encoded size limit")  # noqa: TRY003
+    try:
+        payload = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        document = json.loads(payload.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("trusted setup command is not valid base64-encoded JSON argv") from exc  # noqa: TRY003
+    if not isinstance(document, list):
+        raise TypeError("trusted setup command must decode to a JSON argv array")  # noqa: TRY003
+    return _normalized_setup_command(document)
+
+
+def _setup_command_argument(encoded: str) -> tuple[str, ...]:
+    """Translate setup-command validation into an argparse diagnostic."""
+    try:
+        return _decode_setup_command(encoded)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _compact_rich_output(output: str) -> str:
@@ -267,6 +322,19 @@ class _CommandTransferPlan:
     output_paths: tuple[str, ...]
 
 
+def _uses_trusted_go_package_cwd(command: Sequence[str]) -> bool:
+    if not command or Path(command[0]).name != "go" or command[1:2] != ["-C"]:
+        return False
+    try:
+        go_cwd = Path(command[2])
+    except IndexError:
+        return False
+    if go_cwd.is_absolute() or any(part in {"", ".", ".."} for part in go_cwd.parts):
+        return False
+    package_path = Path(_EVALUATOR_PACKAGE_STAGE_PATH)
+    return go_cwd == package_path or go_cwd.is_relative_to(package_path)
+
+
 def _plan_command_transfer(command: Sequence[str], workspace: str) -> _CommandTransferPlan:
     """Classify command tokens into staged inputs and relayed outputs.
 
@@ -277,6 +345,7 @@ def _plan_command_transfer(command: Sequence[str], workspace: str) -> _CommandTr
     write, and are relayed back after the in-container run.
     """
     workspace_root = Path(workspace).resolve(strict=True)
+    framework_go_cwd = _uses_trusted_go_package_cwd(command)
     staged: list[str] = []
     outputs: list[str] = []
     for token in command:
@@ -286,6 +355,10 @@ def _plan_command_transfer(command: Sequence[str], workspace: str) -> _CommandTr
             path = Path(token)
             if not path.exists() and path.parent.is_dir() and token not in outputs:
                 outputs.append(token)
+            continue
+        if framework_go_cwd and token == ".":  # noqa: S105
+            # ``go -C <trusted-package> run .`` resolves the dot below the
+            # separately staged evaluator package, not the candidate root.
             continue
         candidate = workspace_root / token
         try:
@@ -308,13 +381,57 @@ def _plan_command_transfer(command: Sequence[str], workspace: str) -> _CommandTr
     return _CommandTransferPlan(stage_paths=kept, output_paths=tuple(outputs))
 
 
-def _build_stage_archive(workspace: str, stage_paths: Sequence[str]) -> bytes:
-    """Produce a gzipped tar of the staged paths, keyed by their relative paths."""
+def _build_stage_archive(
+    workspace: str,
+    stage_paths: Sequence[str],
+    *,
+    evaluator_package_root: str | None = None,
+) -> bytes:
+    """Produce the trusted evaluator's gzipped serving-container inputs."""
     workspace_root = Path(workspace).resolve(strict=True)
+    package_root: Path | None = None
+    if evaluator_package_root is not None:
+        package_root = Path(evaluator_package_root).resolve(strict=True)
+        if not package_root.is_dir():
+            raise ValueError(  # noqa: TRY003
+                f"evaluator package root is not a directory: {package_root}"
+            )
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for relative in stage_paths:
+            relative_path = Path(relative)
+            reserved_paths = (
+                Path(_EVALUATOR_PACKAGE_STAGE_PATH),
+                Path(_EVALUATOR_TOOLS_STAGE_PATH),
+                Path(_EVALUATOR_TOOLCHAINS_STAGE_PATH),
+                Path(_FRAMEWORK_BIN_STAGE_PATH),
+                Path(_FRAMEWORK_PIP_STAGE_PATH),
+                Path(_FRAMEWORK_UV_CACHE_STAGE_PATH),
+            )
+            if relative_path == Path():
+                for child in workspace_root.iterdir():
+                    if child.name not in {
+                        _EVALUATOR_PACKAGE_STAGE_PATH,
+                        _EVALUATOR_TOOLS_STAGE_PATH,
+                        _EVALUATOR_TOOLCHAINS_STAGE_PATH,
+                        _FRAMEWORK_BIN_STAGE_PATH,
+                        _FRAMEWORK_PIP_STAGE_PATH,
+                        _FRAMEWORK_UV_CACHE_STAGE_PATH,
+                    }:
+                        archive.add(str(child), arcname=child.name)
+                continue
+            if any(
+                relative_path == reserved
+                or relative_path.is_relative_to(reserved)
+                or reserved.is_relative_to(relative_path)
+                for reserved in reserved_paths
+            ):
+                raise ValueError(  # noqa: TRY003
+                    "workspace evaluator input collides with a reserved framework path"
+                )
             archive.add(str(workspace_root / relative), arcname=relative)
+        if package_root is not None:
+            archive.add(str(package_root), arcname=_EVALUATOR_PACKAGE_STAGE_PATH)
     payload = buffer.getvalue()
     if len(payload) > _MAX_STAGE_ARCHIVE_BYTES:
         raise ValueError(  # noqa: TRY003
@@ -373,17 +490,45 @@ def _find_app_container(
         time.sleep(5)
 
 
-def _bootstrap_script(command: Sequence[str], output_paths: Sequence[str]) -> str:
+def _bootstrap_script(
+    command: Sequence[str],
+    output_paths: Sequence[str],
+    *,
+    setup_command: Sequence[str] | None = None,
+) -> str:
     """Build the in-container POSIX shell bootstrap.
 
     Receives the staged archive as base64 chunks in ``"$@"``, recreates the
-    workspace-relative layout in a temp directory, provides ``uv`` through a
-    ``python3 -m uv`` shim, runs the trusted command verbatim from that
-    directory (so its localhost defaults and relative paths hold), then emits
-    each existing output file and the command's exit code between sentinel
-    markers — ``modal container exec`` does not propagate exit codes.
+    workspace-relative layout in a temp directory, provides ``uv`` through an
+    isolated Python shim, runs optional trusted setup and the evaluator argv
+    verbatim from that directory, then emits each existing output file and the
+    command's exit code between sentinel markers. ``modal container exec`` does
+    not propagate exit codes itself.
     """
     quoted_command = " ".join(shlex.quote(token) for token in command)
+    uv_wrapper = base64.b64encode(
+        (
+            "#!/bin/sh\n"
+            'pip_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.pip" && pwd)\n'
+            "exec python3 -I -c "
+            "'import runpy,sys; sys.path.insert(0, sys.argv.pop(1)); "
+            'runpy.run_module("uv", run_name="__main__")'
+            '\' "$pip_root" "$@"\n'
+        ).encode("ascii")
+    ).decode("ascii")
+    setup_block = ""
+    if setup_command is not None:
+        quoted_setup = " ".join(
+            shlex.quote(token) for token in _normalized_setup_command(setup_command)
+        )
+        setup_block = f"""{quoted_setup}
+setup_rc=$?
+if [ "$setup_rc" -ne 0 ]; then
+  printf 'vibesys trusted evaluator setup failed (exit %s)\\n' "$setup_rc" >&2
+  printf '\\n{_EXEC_RC_MARKER}%s\\n' {_TRUSTED_SETUP_FAILURE_EXIT_CODE}
+  exit 0
+fi
+"""
     relay_blocks = "\n".join(
         f"if [ -f {shlex.quote(path)} ]; then\n"
         f"  printf '\\n%s %s\\n' {shlex.quote(_OUTPUT_FILE_MARKER)} {shlex.quote(path)}\n"
@@ -395,18 +540,26 @@ def _bootstrap_script(command: Sequence[str], output_paths: Sequence[str]) -> st
     return f"""set -u
 stage=$(mktemp -d /tmp/vibesys-eval-XXXXXX)
 printf '%s' "$@" | base64 -d | tar -xzf - -C "$stage"
+rm -rf "$stage/.bin" "$stage/.pip" "$stage/.uv-cache"
 mkdir -p "$stage/.bin"
-printf '#!/bin/sh\\nexec python3 -m uv "$@"\\n' > "$stage/.bin/uv"
+printf '%s' {shlex.quote(uv_wrapper)} | base64 -d > "$stage/.bin/uv"
 chmod +x "$stage/.bin/uv"
-if ! python3 -m pip install --quiet --target "$stage/.pip" uv >&2; then
+cd /tmp
+if ! python3 -I -m pip install --quiet --target "$stage/.pip" uv >&2; then
   echo 'vibesys evaluator bootstrap failed: serving container lacks python3 -m pip' >&2
-  printf '\\n{_EXEC_RC_MARKER}%s\\n' 97
+  printf '\\n{_EXEC_RC_MARKER}%s\\n' {_EVALUATOR_BOOTSTRAP_FAILURE_EXIT_CODE}
   exit 0
 fi
 PATH="$stage/.bin:$PATH"; export PATH
 PYTHONPATH="$stage/.pip${{PYTHONPATH:+:$PYTHONPATH}}"; export PYTHONPATH
 UV_CACHE_DIR="$stage/.uv-cache"; export UV_CACHE_DIR
 cd "$stage"
+{setup_block}if [ -d "$stage/.vibesys-evaluator-toolchains/cargo" ]; then
+  RUSTUP_HOME="$stage/.vibesys-evaluator-toolchains/rustup"
+  CARGO_HOME="$stage/.vibesys-evaluator-toolchains/cargo"
+  export RUSTUP_HOME CARGO_HOME
+fi
+GOWORK=off; export GOWORK
 {quoted_command}
 rc=$?
 {relay_blocks}
@@ -472,16 +625,22 @@ class _DeploymentKeepWarm:
             _healthy_now(self._base_url)
 
 
-def _execute_colocated(
+def _execute_colocated(  # noqa: PLR0913
     command: Sequence[str],
     *,
     workspace: str,
     app_identifier: str,
     base_url: str,
+    setup_command: Sequence[str] | None = None,
+    evaluator_package_root: str | None = None,
 ) -> int:
     """Run the trusted command inside the app's serving container."""
     plan = _plan_command_transfer(command, workspace)
-    archive = _build_stage_archive(workspace, plan.stage_paths)
+    archive = _build_stage_archive(
+        workspace,
+        plan.stage_paths,
+        evaluator_package_root=evaluator_package_root,
+    )
     encoded = base64.b64encode(archive).decode("ascii")
     chunks = [
         encoded[offset : offset + _B64_CHUNK_CHARS]
@@ -492,7 +651,11 @@ def _execute_colocated(
         workspace=workspace,
         base_url=base_url,
     )
-    script = _bootstrap_script(command, plan.output_paths)
+    script = _bootstrap_script(
+        command,
+        plan.output_paths,
+        setup_command=setup_command,
+    )
     with _DeploymentKeepWarm(base_url):
         result = subprocess.run(  # noqa: S603  # tracked: #288
             [  # noqa: S607  # tracked: #288
@@ -532,16 +695,30 @@ def _execute_colocated(
     return exit_code
 
 
-def run_evaluator(
+def run_evaluator(  # noqa: PLR0913
     command: Sequence[str],
     *,
     workspace: str = "/workspace",
     entrypoint: str = "main.py",
     readiness_timeout_seconds: float = 90,
+    setup_command: Sequence[str] | None = None,
+    evaluator_package_root: str | None = None,
 ) -> int:
     """Deploy the candidate and run ``command`` inside its serving container."""
     if not command:
         raise ValueError("missing evaluator command after '--'")  # noqa: TRY003  # tracked: #288
+    normalized_setup = (
+        _normalized_setup_command(setup_command) if setup_command is not None else None
+    )
+    normalized_package_root = (
+        str(Path(evaluator_package_root).resolve(strict=True))
+        if evaluator_package_root is not None
+        else None
+    )
+    if normalized_package_root is not None and not Path(normalized_package_root).is_dir():
+        raise ValueError(  # noqa: TRY003
+            f"evaluator package root is not a directory: {normalized_package_root}"
+        )
 
     with _exclusive_evaluation():
         return _run_evaluator_unlocked(
@@ -549,15 +726,19 @@ def run_evaluator(
             workspace=workspace,
             entrypoint=entrypoint,
             readiness_timeout_seconds=readiness_timeout_seconds,
+            setup_command=normalized_setup,
+            evaluator_package_root=normalized_package_root,
         )
 
 
-def _run_evaluator_unlocked(  # noqa: C901, PLR0911, PLR0912, PLR0915  # tracked: #288
+def _run_evaluator_unlocked(  # noqa: C901, PLR0911, PLR0912, PLR0913, PLR0915  # tracked: #288
     command: Sequence[str],
     *,
     workspace: str,
     entrypoint: str,
     readiness_timeout_seconds: float,
+    setup_command: Sequence[str] | None,
+    evaluator_package_root: str | None,
 ) -> int:
     candidate_revision = os.environ.get(_CANDIDATE_REVISION_ENV)
     if candidate_revision:
@@ -579,6 +760,8 @@ def _run_evaluator_unlocked(  # noqa: C901, PLR0911, PLR0912, PLR0915  # tracked
                         workspace=workspace,
                         app_identifier=lease.app_identifier,
                         base_url=lease.base_url,
+                        setup_command=setup_command,
+                        evaluator_package_root=evaluator_package_root,
                     )
                 except (TimeoutError, ValueError) as exc:
                     print(f"Modal evaluator setup failed: {exc}", file=sys.stderr)  # noqa: T201
@@ -636,6 +819,8 @@ def _run_evaluator_unlocked(  # noqa: C901, PLR0911, PLR0912, PLR0915  # tracked
             workspace=workspace,
             app_identifier=app_identifier,
             base_url=base_url,
+            setup_command=setup_command,
+            evaluator_package_root=evaluator_package_root,
         )
     except (TimeoutError, ValueError) as exc:
         print(f"Modal evaluator setup failed: {exc}", file=sys.stderr)  # noqa: T201  # tracked: #288
@@ -658,6 +843,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", default="/workspace")
     parser.add_argument("--entrypoint", default="main.py")
     parser.add_argument("--readiness-timeout-seconds", type=float, default=90)
+    parser.add_argument("--setup-command-base64", type=_setup_command_argument)
+    parser.add_argument("--evaluator-package-root")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     return parser
 
@@ -672,6 +859,8 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: D103  # tracked: #2
         workspace=args.workspace,
         entrypoint=args.entrypoint,
         readiness_timeout_seconds=args.readiness_timeout_seconds,
+        setup_command=args.setup_command_base64,
+        evaluator_package_root=args.evaluator_package_root,
     )
 
 

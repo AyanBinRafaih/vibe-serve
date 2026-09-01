@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import shlex
+import subprocess
 import tarfile
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -130,6 +133,29 @@ def test_extract_modal_app_identifier_handles_rich_line_wrapping() -> None:
     assert modal_evaluator.extract_modal_app_identifier(output) == "vibesys-long-candidate"
 
 
+def test_setup_command_encoding_round_trips_opaque_argv() -> None:
+    command = ("sh", "-c", "printf '%s' '$HOME; touch nope'", "")
+
+    encoded = modal_evaluator.encode_setup_command(command)
+    parsed = modal_evaluator._parser().parse_args(  # noqa: SLF001
+        ["--setup-command-base64", encoded, "--", "true"]
+    )
+
+    assert parsed.setup_command_base64 == command
+    assert parsed.command == ["--", "true"]
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    ["not-base64!", base64.urlsafe_b64encode(b"{}").decode()],
+)
+def test_setup_command_cli_rejects_malformed_payload(encoded: str) -> None:
+    with pytest.raises(SystemExit):
+        modal_evaluator._parser().parse_args(  # noqa: SLF001
+            ["--setup-command-base64", encoded, "--", "true"]
+        )
+
+
 def test_plan_command_transfer_classifies_inputs_and_outputs(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     task = workspace / ".vibesys" / "tasks" / "demo"
@@ -178,6 +204,41 @@ def test_plan_command_transfer_ignores_escaping_symlinks(tmp_path: Path) -> None
     assert plan.stage_paths == ()
 
 
+def test_plan_command_transfer_does_not_stage_candidate_root_for_trusted_go_package(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "candidate.go").write_text("package candidate\n")
+
+    plan = modal_evaluator._plan_command_transfer(  # noqa: SLF001
+        ["go", "-C", ".vibesys-evaluator-package", "run", "."],
+        str(workspace),
+    )
+
+    assert plan.stage_paths == ()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["go", "run", ".", "-C", ".vibesys-evaluator-package"],
+        ["go", "-C", ".vibesys-evaluator-package/..", "run", "."],
+    ],
+)
+def test_plan_command_transfer_does_not_misclassify_untrusted_go_cwd(
+    tmp_path: Path,
+    command: list[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "candidate.go").write_text("package candidate\n")
+
+    plan = modal_evaluator._plan_command_transfer(command, str(workspace))  # noqa: SLF001
+
+    assert plan.stage_paths == (".",)
+
+
 def test_build_stage_archive_preserves_relative_layout(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     nested = workspace / "task" / "data"
@@ -188,6 +249,79 @@ def test_build_stage_archive_preserves_relative_layout(tmp_path: Path) -> None:
 
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
         assert "task/data/cases.json" in archive.getnames()
+
+
+def test_build_stage_archive_places_trusted_package_at_reserved_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "adapter.py").write_text("print('ok')\n")
+
+    payload = modal_evaluator._build_stage_archive(  # noqa: SLF001
+        str(workspace),
+        [],
+        evaluator_package_root=str(package),
+    )
+
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        assert ".vibesys-evaluator-package/adapter.py" in archive.getnames()
+
+
+def test_build_stage_archive_stages_workspace_root_without_candidate_framework_paths(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "go.mod").write_text("module example\n")
+    for reserved in (
+        ".vibesys-evaluator-package",
+        ".vibesys-evaluator-tools",
+        ".vibesys-evaluator-toolchains",
+        ".bin",
+        ".pip",
+        ".uv-cache",
+    ):
+        (workspace / reserved).mkdir()
+        (workspace / reserved / "poisoned").write_text("candidate")
+
+    payload = modal_evaluator._build_stage_archive(  # noqa: SLF001
+        str(workspace),
+        ["."],
+    )
+
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        names = archive.getnames()
+        assert "go.mod" in names
+        assert not any(name.startswith(".vibesys-evaluator-") for name in names)
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    [
+        ".vibesys-evaluator-package",
+        ".vibesys-evaluator-tools/nested/bin",
+        ".vibesys-evaluator-toolchains/rustup",
+        ".bin/go",
+        ".pip/uv",
+        ".uv-cache/archive",
+    ],
+)
+def test_build_stage_archive_rejects_workspace_collision_with_framework_paths(
+    tmp_path: Path,
+    reserved: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / reserved).mkdir(parents=True)
+    package = tmp_path / "package"
+    package.mkdir()
+
+    with pytest.raises(ValueError, match="collides with a reserved framework path"):
+        modal_evaluator._build_stage_archive(  # noqa: SLF001
+            str(workspace),
+            [reserved],
+            evaluator_package_root=str(package),
+        )
 
 
 def test_build_stage_archive_rejects_oversized_inputs(
@@ -306,7 +440,7 @@ def test_parse_exec_output_without_rc_marker_returns_none() -> None:
     assert passthrough == "crashed early"
 
 
-def test_bootstrap_script_runs_command_verbatim_and_relays_outputs() -> None:
+def test_bootstrap_script_runs_command_verbatim_and_relays_outputs(tmp_path: Path) -> None:
     script = modal_evaluator._bootstrap_script(  # noqa: SLF001
         ["uv", "run", "python", "bench.py"],
         ["/tmp/result.json"],  # noqa: S108
@@ -316,6 +450,87 @@ def test_bootstrap_script_runs_command_verbatim_and_relays_outputs() -> None:
     assert "/tmp/result.json" in script  # noqa: S108
     assert modal_evaluator._EXEC_RC_MARKER in script  # noqa: SLF001
     assert "--url" not in script
+    assert "setup_rc" not in script
+    assert 'rm -rf "$stage/.bin" "$stage/.pip" "$stage/.uv-cache"' in script
+    assert "python3 -I -m pip" in script
+    wrapper_line = next(
+        line for line in script.splitlines() if "base64 -d" in line and ".bin/uv" in line
+    )
+    encoded_wrapper = shlex.split(wrapper_line)[2]
+    wrapper = base64.b64decode(encoded_wrapper).decode()
+    assert "python3 -I -c" in wrapper
+    stage = tmp_path / "stage"
+    (stage / ".bin").mkdir(parents=True)
+    (stage / ".pip" / "uv").mkdir(parents=True)
+    (stage / ".pip" / "uv" / "__init__.py").write_text("")
+    (stage / ".pip" / "uv" / "__main__.py").write_text("print('trusted uv')\n")
+    wrapper_path = stage / ".bin" / "uv"
+    wrapper_path.write_text(wrapper)
+    wrapper_path.chmod(0o755)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "uv.py").write_text("print('candidate uv')\n")
+
+    result = subprocess.run(  # noqa: S603
+        [str(wrapper_path), "--help"],
+        cwd=candidate,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "trusted uv"
+
+
+def test_bootstrap_script_runs_setup_before_evaluator_and_quotes_argv() -> None:
+    script = modal_evaluator._bootstrap_script(  # noqa: SLF001
+        ["python", "bench.py"],
+        [],
+        setup_command=["installer", "argument with spaces", "; touch nope"],
+    )
+
+    setup = "installer 'argument with spaces' '; touch nope'"
+    assert setup in script
+    assert script.index(setup) < script.index("python bench.py")
+    assert script.index("export RUSTUP_HOME CARGO_HOME") < script.index("python bench.py")
+    assert script.index("GOWORK=off") < script.index("python bench.py")
+    assert "setup_rc=$?" in script
+    assert str(modal_evaluator._TRUSTED_SETUP_FAILURE_EXIT_CODE) in script  # noqa: SLF001
+
+
+def test_bootstrap_script_maps_setup_failure_to_distinct_exit(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text("#!/bin/sh\nexit 0\n")
+    fake_python.chmod(0o755)
+    evaluator_ran = tmp_path / "evaluator-ran"
+    archive = modal_evaluator._build_stage_archive(str(workspace), [])  # noqa: SLF001
+    encoded = base64.b64encode(archive).decode("ascii")
+    script = modal_evaluator._bootstrap_script(  # noqa: SLF001
+        ["sh", "-c", f"touch {evaluator_ran}"],
+        [],
+        setup_command=["sh", "-c", "exit 23"],
+    )
+
+    result = subprocess.run(  # noqa: S603
+        ["sh", "-c", script, "vibesys-eval", encoded],  # noqa: S607
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+        text=True,
+    )
+    rc, _, _ = modal_evaluator._parse_exec_output(result.stdout)  # noqa: SLF001
+
+    assert result.returncode == 0
+    assert rc == modal_evaluator._TRUSTED_SETUP_FAILURE_EXIT_CODE  # noqa: SLF001
+    assert "setup failed (exit 23)" in result.stderr
+    assert not evaluator_ran.exists()
 
 
 def _colocated_exec_result(rc: int = 0) -> SimpleNamespace:
@@ -354,6 +569,36 @@ def test_execute_colocated_execs_in_container_and_returns_sentinel_rc(
     assert exec_argv[:6] == ["uv", "run", "modal", "container", "exec", "ta-123"]
     assert exec_argv[6:9] == ["--", "sh", "-c"]
     assert "python checker.py" in exec_argv[9]
+
+
+def test_execute_colocated_stages_package_and_includes_setup(
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "adapter.py").write_text("print('ok')\n")
+    run = MagicMock(return_value=_colocated_exec_result())
+    monkeypatch.setattr(modal_evaluator.subprocess, "run", run)
+    monkeypatch.setattr(modal_evaluator, "_find_app_container", MagicMock(return_value="ta-123"))
+
+    result = modal_evaluator._execute_colocated(  # noqa: SLF001
+        ["python", ".vibesys-evaluator-package/adapter.py"],
+        workspace=str(workspace),
+        app_identifier="candidate-app",
+        base_url="https://workspace--candidate.modal.run",
+        setup_command=["sh", "-c", "echo prepared"],
+        evaluator_package_root=str(package),
+    )
+
+    assert result == 0
+    exec_argv = run.call_args.args[0]
+    assert "sh -c 'echo prepared'" in exec_argv[9]
+    payload = base64.b64decode("".join(exec_argv[11:]))
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        assert ".vibesys-evaluator-package/adapter.py" in archive.getnames()
 
 
 def test_execute_colocated_writes_relayed_output_files(
@@ -443,6 +688,68 @@ def test_run_evaluator_deploys_waits_and_runs_colocated(monkeypatch) -> None:  #
         workspace="/workspace",
         app_identifier="candidate-app",
         base_url="https://workspace--candidate.modal.run",
+        setup_command=None,
+        evaluator_package_root=None,
+    )
+
+
+def test_run_evaluator_threads_trusted_setup_and_package(
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    deploy = SimpleNamespace(returncode=0, stdout=_DEPLOY_STDOUT, stderr="")
+    colocated = MagicMock(return_value=0)
+    monkeypatch.setattr(modal_evaluator.subprocess, "run", MagicMock(return_value=deploy))
+    monkeypatch.setattr(modal_evaluator, "wait_for_health", MagicMock())
+    monkeypatch.setattr(modal_evaluator, "_execute_colocated", colocated)
+
+    result = modal_evaluator.run_evaluator(
+        ["python", ".vibesys-evaluator-package/adapter.py"],
+        workspace="/workspace",
+        setup_command=["installer", "--locked"],
+        evaluator_package_root=str(package),
+    )
+
+    assert result == 0
+    colocated.assert_called_once_with(
+        ["python", ".vibesys-evaluator-package/adapter.py"],
+        workspace="/workspace",
+        app_identifier="candidate-app",
+        base_url="https://workspace--candidate.modal.run",
+        setup_command=("installer", "--locked"),
+        evaluator_package_root=str(package.resolve()),
+    )
+
+
+def test_main_decodes_setup_command_and_forwards_package(monkeypatch) -> None:  # noqa: ANN001
+    run = MagicMock(return_value=4)
+    monkeypatch.setattr(modal_evaluator, "run_evaluator", run)
+    encoded = modal_evaluator.encode_setup_command(["installer", "argument with spaces"])
+
+    result = modal_evaluator.main(
+        [
+            "--workspace",
+            "/workspace",
+            "--setup-command-base64",
+            encoded,
+            "--evaluator-package-root",
+            "/opt/vibesys-evaluator-package",
+            "--",
+            "python",
+            ".vibesys-evaluator-package/adapter.py",
+        ]
+    )
+
+    assert result == 4
+    run.assert_called_once_with(
+        ["python", ".vibesys-evaluator-package/adapter.py"],
+        workspace="/workspace",
+        entrypoint="main.py",
+        readiness_timeout_seconds=90,
+        setup_command=("installer", "argument with spaces"),
+        evaluator_package_root="/opt/vibesys-evaluator-package",
     )
 
 
@@ -531,6 +838,8 @@ def test_run_evaluator_reuses_healthy_deployment_for_exact_revision(
         workspace="/workspace",
         app_identifier="candidate-app",
         base_url="https://workspace--candidate.modal.run",
+        setup_command=None,
+        evaluator_package_root=None,
     )
 
 

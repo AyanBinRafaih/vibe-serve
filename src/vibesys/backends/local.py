@@ -77,12 +77,14 @@ class LocalBackend:
         lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
+        ephemeral: bool = False,
+        container_image: str | None = None,
     ) -> SandboxBackendProtocol:
         # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
         # pulls langchain + anthropic. Registration must stay import-cheap.
         from vs_sandbox import DockerSandbox  # noqa: PLC0415  # tracked: #288
 
-        del attach_accelerator
+        del attach_accelerator, ephemeral
         bind_mounts = list(bind_mounts or [])
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
@@ -100,7 +102,7 @@ class LocalBackend:
                 raise ValueError(f"{self.name.value} backend requires a Docker image")  # noqa: TRY003  # tracked: #288
             return DockerSandbox(
                 host_workspace=host_workspace,
-                image=self.image,
+                image=container_image or self.image,
                 gpus=None,
                 bind_mounts=bind_mounts,
                 passthrough_paths=passthrough_paths,

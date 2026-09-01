@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +21,222 @@ from vs_sandbox import BeforeReadyContext, SandboxLifecycleHooks
 
 ToolCommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
+_CARGO_INSTALL_TIMEOUT_SECONDS = 600
+_SANDBOX_INSTALL_TIMEOUT_SECONDS = 660
+_MAX_INSTALL_ERROR_CHARACTERS = 500
+_TOOL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
+
+_TARGET_INSTALL_PROGRAM = r"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+CARGO_TIMEOUT = 600
+MAX_ERROR_CHARACTERS = 500
+TOOL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
+
+
+class InstallError(RuntimeError):
+    pass
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as binary:
+        while chunk := binary.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def binary_hashes(root, spec):
+    hashes = {}
+    for binary in spec["bins"]:
+        binary_path = root / "bin" / binary
+        if (
+            binary_path.is_symlink()
+            or not binary_path.is_file()
+            or not os.access(binary_path, os.X_OK)
+        ):
+            return None
+        hashes[binary] = file_sha256(binary_path)
+    return hashes
+
+
+def verified_install(root, spec):
+    if root.is_symlink():
+        return False
+    receipt_path = root / "receipt.json"
+    if receipt_path.is_symlink():
+        return False
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    hashes = binary_hashes(root, spec)
+    expected = {"schema_version": 1, "spec": spec, "binaries": hashes}
+    return hashes is not None and receipt == expected
+
+
+def write_receipt(root, spec, binaries):
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".receipt-", dir=root)
+    temporary = Path(temporary_name)
+    try:
+        document = json.dumps(
+            {"schema_version": 1, "spec": spec, "binaries": binaries},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(document + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(root / "receipt.json")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def make_install_readable(root, spec):
+    (root / "receipt.json").chmod(0o444)
+    (root / "bin").chmod(0o555)
+    for binary in spec["bins"]:
+        (root / "bin" / binary).chmod(0o555)
+    root.chmod(0o555)
+
+
+def install_tool(name, spec, target):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=target.parent))
+    try:
+        binary_arguments = [
+            argument
+            for binary in spec["bins"]
+            for argument in ("--bin", binary)
+        ]
+        arguments = [
+            "cargo",
+            "install",
+            "--git",
+            spec["git"],
+            "--rev",
+            spec["rev"],
+            "--locked",
+            "--root",
+            str(staging),
+            *binary_arguments,
+            spec["package"],
+        ]
+        with (
+            tempfile.TemporaryDirectory(prefix="vibesys-cargo-home-") as cargo_home,
+            tempfile.TemporaryDirectory(prefix="vibesys-cargo-work-") as cargo_work,
+            tempfile.TemporaryFile() as stdout,
+            tempfile.TemporaryFile() as stderr,
+        ):
+            cargo_environment = {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith(("CARGO_", "GIT_CONFIG", "RUST"))
+                and key not in {"GIT_DIR", "GIT_WORK_TREE"}
+            }
+            cargo_environment["CARGO_HOME"] = cargo_home
+            if "RUSTUP_HOME" in os.environ:
+                cargo_environment["RUSTUP_HOME"] = os.environ["RUSTUP_HOME"]
+            try:
+                result = subprocess.run(
+                    arguments,
+                    check=False,
+                    cwd=cargo_work,
+                    env=cargo_environment,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=CARGO_TIMEOUT,
+                )
+            except FileNotFoundError as exc:
+                raise InstallError(
+                    f"cannot install evaluator tool {name!r}: cargo was not found"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise InstallError(
+                    f"cannot install evaluator tool {name!r}: cargo install timed out"
+                ) from exc
+            stderr.seek(0)
+            stdout.seek(0)
+            stderr_detail = stderr.read(MAX_ERROR_CHARACTERS * 4).decode(
+                "utf-8", errors="replace"
+            )
+            stdout_detail = stdout.read(MAX_ERROR_CHARACTERS * 4).decode(
+                "utf-8", errors="replace"
+            )
+        if result.returncode != 0:
+            detail = (stderr_detail or stdout_detail or "cargo install failed").strip()[
+                :MAX_ERROR_CHARACTERS
+            ]
+            raise InstallError(f"cannot install evaluator tool {name!r}: {detail}")
+        binaries = binary_hashes(staging, spec)
+        if binaries is None:
+            raise InstallError(
+                f"cargo did not install every declared binary for evaluator tool {name!r}"
+            )
+        write_receipt(staging, spec, binaries)
+        published = False
+        try:
+            staging.replace(target)
+            published = True
+        except OSError as exc:
+            if not target.exists() or not verified_install(target, spec):
+                raise InstallError(
+                    f"cannot publish evaluator tool installation: {target}"
+                ) from exc
+        if published:
+            make_install_readable(target, spec)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
+def main():
+    document = json.loads(sys.argv[1])
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schema_version", "tools"}
+        or document["schema_version"] != 1
+        or not isinstance(document["tools"], dict)
+    ):
+        raise InstallError("invalid evaluator tool manifest")
+    install_parent = Path(sys.argv[2])
+    if install_parent.is_symlink():
+        raise InstallError(f"evaluator tool install root is a symlink: {install_parent}")
+    install_parent.mkdir(parents=True, exist_ok=True)
+    for name, spec in document["tools"].items():
+        if not isinstance(name, str) or TOOL_NAME_PATTERN.fullmatch(name) is None:
+            raise InstallError(f"invalid evaluator tool name: {name!r}")
+        encoded = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
+        tool_parent = install_parent / name
+        if tool_parent.is_symlink():
+            raise InstallError(f"evaluator tool cache path is a symlink: {tool_parent}")
+        target = tool_parent / hashlib.sha256(encoded).hexdigest()
+        if verified_install(target, spec):
+            continue
+        if target.exists():
+            raise InstallError(
+                f"evaluator tool installation failed receipt verification: {target}"
+            )
+        install_tool(name, spec, target)
+
+
+try:
+    main()
+except Exception as exc:
+    detail = str(exc).strip() or type(exc).__name__
+    print(detail[:MAX_ERROR_CHARACTERS], file=sys.stderr)
+    raise SystemExit(1) from None
+""".strip()
+
 
 class EvaluatorToolError(RuntimeError):
     """Raised when an evaluator tool cannot be prepared safely."""
@@ -31,22 +249,27 @@ class EvaluatorToolLifecycleHooks(SandboxLifecycleHooks):
         self,
         tools: Mapping[str, CargoGitToolSpec],
         install_parent: Path,
-        *,
-        command_runner: ToolCommandRunner | None = None,
     ) -> None:
-        """Snapshot immutable tool requirements and their operator-owned cache."""
+        """Snapshot immutable tool requirements and the target-native install root."""
         self._tools = dict(tools)
         self._install_parent = install_parent
-        self._command_runner = command_runner
 
     def before_ready(self, context: BeforeReadyContext) -> None:
         """Prepare verified tools before the sandbox is exposed to callers."""
-        del context
-        prepare_evaluator_tools(
+        command = evaluator_tools_install_command(
             self._tools,
             self._install_parent,
-            command_runner=self._command_runner,
         )
+        result = context.sandbox.execute(
+            command,
+            timeout=_SANDBOX_INSTALL_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            detail = (result.output or "target-side installer failed").strip()
+            raise EvaluatorToolError(  # noqa: TRY003
+                "evaluator tool sandbox installation failed "
+                f"(exit {result.exit_code}): {detail[:_MAX_INSTALL_ERROR_CHARACTERS]}"
+            )
 
 
 class _EvaluatorToolReceipt(BaseModel):
@@ -55,6 +278,35 @@ class _EvaluatorToolReceipt(BaseModel):
     schema_version: Literal[1]
     spec: CargoGitToolSpec
     binaries: dict[str, str]
+
+
+def evaluator_tools_install_command(
+    tools: Mapping[str, CargoGitToolSpec],
+    install_parent: str | Path,
+) -> str:
+    """Return a safely quoted command that prepares tools in an execution target.
+
+    The target needs only ``python3``, Cargo, and the standard library. The
+    generated command verifies content-addressed cache hits, installs missing
+    tools through atomic staging directories, and records executable hashes in
+    versioned receipts.
+    """
+    invalid_name = next(
+        (
+            name
+            for name in tools
+            if not isinstance(name, str) or _TOOL_NAME_PATTERN.fullmatch(name) is None
+        ),
+        None,
+    )
+    if invalid_name is not None:
+        raise ValueError(f"invalid evaluator tool name: {invalid_name!r}")  # noqa: TRY003
+    document = {
+        "schema_version": 1,
+        "tools": {name: spec.model_dump(mode="json") for name, spec in sorted(tools.items())},
+    }
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    return shlex.join(("python3", "-c", _TARGET_INSTALL_PROGRAM, payload, str(install_parent)))
 
 
 def cargo_install_argv(spec: CargoGitToolSpec, install_root: Path) -> tuple[str, ...]:
@@ -171,16 +423,25 @@ def _installed_binary_hashes(root: Path, spec: CargoGitToolSpec) -> dict[str, st
     hashes: dict[str, str] = {}
     for binary in spec.bins:
         binary_path = root / "bin" / binary
-        if not binary_path.is_file() or not os.access(binary_path, os.X_OK):
+        if (
+            binary_path.is_symlink()
+            or not binary_path.is_file()
+            or not os.access(binary_path, os.X_OK)
+        ):
             return None
         hashes[binary] = _file_sha256(binary_path)
     return hashes
 
 
 def _verified_install(root: Path, spec: CargoGitToolSpec) -> bool:
+    if root.is_symlink():
+        return False
+    receipt_path = root / "receipt.json"
+    if receipt_path.is_symlink():
+        return False
     try:
         receipt = _EvaluatorToolReceipt.model_validate_json(
-            (root / "receipt.json").read_text(encoding="utf-8")
+            receipt_path.read_text(encoding="utf-8")
         )
     except (OSError, ValidationError):
         return False
@@ -215,10 +476,25 @@ def _file_sha256(path: Path) -> str:
 
 
 def _run_cargo(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603
-        list(arguments),
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=600,
-    )
+    with (
+        tempfile.TemporaryDirectory(prefix="vibesys-cargo-home-") as cargo_home,
+        tempfile.TemporaryDirectory(prefix="vibesys-cargo-work-") as cargo_work,
+    ):
+        cargo_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("CARGO_", "GIT_CONFIG", "RUST"))
+            and key not in {"GIT_DIR", "GIT_WORK_TREE"}
+        }
+        cargo_environment["CARGO_HOME"] = cargo_home
+        if "RUSTUP_HOME" in os.environ:
+            cargo_environment["RUSTUP_HOME"] = os.environ["RUSTUP_HOME"]
+        return subprocess.run(  # noqa: S603
+            list(arguments),
+            capture_output=True,
+            check=False,
+            cwd=cargo_work,
+            env=cargo_environment,
+            text=True,
+            timeout=_CARGO_INSTALL_TIMEOUT_SECONDS,
+        )

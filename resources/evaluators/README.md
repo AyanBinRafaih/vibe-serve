@@ -55,14 +55,34 @@ The revision must be a full lowercase commit SHA. VibeSys always passes
 occupy one complete entrypoint argument and may reference only a binary from
 the corresponding declaration.
 
-Local runs install tools in a content-addressed, operator-owned cache outside
-the candidate workspace. The cache records the normalized tool specification
-and each installed binary's SHA256 digest. Only the selected content-addressed
-installation roots are imported read-only into the agent's host confinement;
-the writable cache parent remains operator-only. Tool-bearing evaluator
-packages are not yet supported by the Docker, Modal, or SkyPilot run
-environments; those environments reject the package before starting external
-resources.
+VibeSys installs tools in the environment that executes the evaluator. Local
+runs use an operator-owned cache outside the candidate workspace. Docker uses
+a short-lived sandbox with the target image to build and verify tools, then
+mounts only the selected installation roots read-only into the agent sandbox.
+The Docker cache key includes the resolved local image ID, so changing a mutable
+tag does not reuse a binary built against the previous image. Both the builder
+and final sandbox use that immutable image ID.
+Modal installs inside the deployed serving container's per-evaluation staging
+directory, and SkyPilot installs in the remote job before invoking the
+evaluator. Every location uses the same content-addressed plan, normalized
+receipt, and binary SHA256 verification. Modal and SkyPilot exclude reserved
+evaluator package, tool, and toolchain paths from candidate staging and replace
+the tool, toolchain, and bootstrap directories during setup. Cargo runs from a
+fresh working directory and ignores candidate Cargo, Rust, and Git configuration
+overrides. Remote Go evaluator launches disable parent `go.work` discovery, and
+the queue evaluator copies its trusted Rust helper to an isolated build directory
+before invoking Cargo.
+
+Modal setup and evaluation remain colocated with the deployed service. The
+framework owns setup ordering and staged inputs, but Modal's container-exec API
+does not add a separate process-identity or mount boundary from the live service.
+
+The target must provide Python 3, `curl`, `tar`, and the system facilities
+needed to install the declared tool. Cargo Git tools cause VibeSys to install a
+compatible Rust toolchain when necessary, then run `cargo install` at the
+pinned revision with `--locked`. Target images and remote clusters therefore
+need outbound package access and a working native linker during first-time
+setup.
 
 The bundled Request Factory evaluator exposes two entrypoints. The low-level
 `request-factory-engine` entrypoint resolves directly to the pinned binary.

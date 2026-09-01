@@ -121,6 +121,8 @@ class TrainiumBackend:
         lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
+        ephemeral: bool = False,
+        container_image: str | None = None,
     ) -> SandboxBackendProtocol:
         # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
         # pulls langchain + anthropic. Registration must stay import-cheap.
@@ -131,6 +133,7 @@ class TrainiumBackend:
         extra_env = dict(extra_env or {})
         extra_init_commands = list(extra_init_commands or [])
         lifecycle_hooks = lifecycle_hooks or []
+        del ephemeral
 
         if kind is SandboxKind.MODAL:
             raise ValueError(  # noqa: TRY003  # tracked: #288
@@ -183,7 +186,7 @@ class TrainiumBackend:
 
             return DockerSandbox(
                 host_workspace=host_workspace,
-                image=self.image,
+                image=container_image or self.image,
                 gpus=None,  # Neuron uses --device, not --gpus
                 devices=self._devices if attach_accelerator else [],
                 # The Neuron DLC's ENTRYPOINT launches a model server; clear it

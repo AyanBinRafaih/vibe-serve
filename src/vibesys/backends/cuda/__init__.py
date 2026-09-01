@@ -80,6 +80,8 @@ class CudaBackend:
         lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
         modal_options: ModalOptions | None = None,
         attach_accelerator: bool = True,
+        ephemeral: bool = False,
+        container_image: str | None = None,
     ) -> SandboxBackendProtocol:
         """Construct a sandbox configured for CUDA execution."""
         # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
@@ -111,7 +113,7 @@ class CudaBackend:
         elif kind is SandboxKind.DOCKER:
             sandbox = DockerSandbox(
                 host_workspace=host_workspace,
-                image=self.image,
+                image=container_image or self.image,
                 gpus=self._docker_gpu_spec() if attach_accelerator else None,
                 bind_mounts=bind_mounts,
                 passthrough_paths=passthrough_paths,
@@ -143,7 +145,8 @@ class CudaBackend:
         else:
             raise ValueError(f"Unknown sandbox kind: {kind!r}")  # noqa: TRY003  # tracked: #288
 
-        self._sandboxes.append((kind, sandbox))
+        if not ephemeral:
+            self._sandboxes.append((kind, sandbox))
         return sandbox
 
     def make_monitor(self, log_dir: Path) -> ContentionMonitor | None:  # noqa: D102  # tracked: #288

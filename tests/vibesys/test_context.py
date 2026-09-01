@@ -40,6 +40,7 @@ class _FakeBackend:
 
     def __init__(self) -> None:
         self.sandbox = MagicMock()
+        self.sandbox.execute.return_value = MagicMock(exit_code=0, output="", truncated=False)
 
     def make_sandbox(self, *_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
         SandboxLifecycle(_kwargs.get("lifecycle_hooks")).before_ready(self.sandbox)
@@ -259,14 +260,17 @@ def test_context_places_evaluator_tools_in_operator_cache_and_imports_it_read_on
         )
     )
 
-    def prepare(tools, root, *, command_runner=None):  # noqa: ANN001, ANN202, ARG001
+    def install_command(tools, root):  # noqa: ANN001, ANN202
         root.mkdir(parents=True, exist_ok=True)
         for name, spec in tools.items():
             tool_install_root(root, name, spec).mkdir(parents=True)
-        return {}
+        return "true"
 
     with (
-        patch("vibesys.evaluators.tools.prepare_evaluator_tools", side_effect=prepare),
+        patch(
+            "vibesys.evaluators.tools.evaluator_tools_install_command",
+            side_effect=install_command,
+        ),
         _create_context(project, evaluator_package_root=package.root) as ctx,
     ):
         tools_root = ctx.project.state.model_cache_directory("evaluator-tools")

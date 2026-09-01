@@ -14,7 +14,7 @@ _FORWARD_PREFIX_LENGTH = 3
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Inject the provisioned engine into one task-owned benchmark adapter."""
+    """Inject the installed engine into one task-owned benchmark adapter."""
     arguments = list(sys.argv[1:] if argv is None else argv)
     if (
         len(arguments) <= _FORWARD_PREFIX_LENGTH
