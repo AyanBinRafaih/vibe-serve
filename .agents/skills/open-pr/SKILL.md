@@ -1,6 +1,6 @@
 ---
 name: open-pr
-description: Prepare and open VibeSys pull requests from local repo changes. Use when the user asks to create, open, publish, submit, or draft a PR for this repository, including tasks that need branch hygiene, targeted validation, PR intent reflection, PR template completion, commit/push, or GitHub pull request creation.
+description: Prepare and open VibeSys pull requests from local repo changes. Use when the user asks to create, open, publish, submit, or draft a PR for this repository, including tasks that need branch hygiene, targeted validation, PR intent reflection, PR template completion, commit/push, GitHub pull request creation, or native GitHub stacks for dependent PRs.
 ---
 
 # Open PR
@@ -62,6 +62,35 @@ uv run pytest
    - Default to a draft PR unless the user explicitly asks for a ready PR.
    - Target the repository's default base branch unless the user specifies another base.
    - Use `.github/pull_request_template.md` and fill every section.
+   - When opening a dependent series, create every PR with its complete body,
+     then register the series as a native GitHub stack as described below.
+
+## Native GitHub Stacks
+
+Use a native GitHub stack when two or more PRs form a true dependency chain in
+the same repository. Keep the bottom PR based on the trunk and each later PR
+based on the preceding PR's head branch. Do not stack PRs merely because they
+are related or opened together.
+
+1. Ensure the official extension is available. Install it when missing:
+   `gh extension install github/gh-stack`.
+2. Open each PR normally so its title, draft state, and repository-template
+   body are deliberate and complete.
+3. Link the open PRs in bottom-to-top order:
+   `gh stack link --base <trunk> <bottom-pr> <...> <top-pr>`.
+   Pass PR numbers or URLs. Omit `--open` unless the user requested ready PRs.
+4. Verify each direct base with
+   `gh pr view <pr> --json number,baseRefName,headRefName,isDraft,state,url`.
+5. Verify remote stack membership with
+   `gh api repos/{owner}/{repo}/pulls/<pr> --jq '.stack'`, then inspect the
+   reported stack using
+   `gh api repos/{owner}/{repo}/stacks/<stack-number>` and confirm its trunk
+   and exact bottom-to-top PR order. `gh stack view` reflects local tracking
+   and is not sufficient verification after `gh stack link`.
+
+For every intentionally independent PR opened alongside stacked work, target
+the trunk, do not pass it to `gh stack link`, and verify that its remote
+`.stack` value is `null`.
 
 ## PR Body
 
@@ -87,3 +116,5 @@ Keep the title concrete and behavior-oriented. Avoid generic titles such as "Upd
 ## Handoff
 
 End with the PR URL, draft/ready status, branch name, commit hash, and verification run. If any check was skipped or failed, state that plainly with the reason.
+For stacked work, also report the stack number and PR order. For independent
+work created alongside a stack, state that remote stack membership is absent.
