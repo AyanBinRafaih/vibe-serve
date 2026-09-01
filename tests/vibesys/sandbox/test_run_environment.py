@@ -403,6 +403,7 @@ def test_isolated_environment_mounts_and_translates_evaluator_package(tmp_path: 
     init_commands = backend.calls[0][1]["extra_init_commands"]
     assert any("go1.23.12" in item for item in init_commands)
     assert any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
+    assert any("--no-modify-path" in item for item in init_commands)
     assert any("cargo --version" in item for item in init_commands)
 
 

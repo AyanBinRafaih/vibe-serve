@@ -1662,7 +1662,8 @@ def _evaluator_container_setup(
             f"{rustup_download} || "
             "{ echo 'failed to download evaluator Rust toolchain' >&2; exit 1; }; "
             f"chmod +x {rustup_init} && {rustup_environment}{rustup_init} "
-            f"-y --profile minimal --default-toolchain {_EVALUATOR_RUST_TOOLCHAIN_VERSION} && "
+            "-y --profile minimal --no-modify-path "
+            f"--default-toolchain {_EVALUATOR_RUST_TOOLCHAIN_VERSION} && "
             f"{cargo_link} && rm -f {rustup_init} || "
             "{ echo 'failed to install evaluator Rust toolchain' >&2; exit 1; }; fi"
         )
