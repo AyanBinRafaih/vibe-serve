@@ -685,7 +685,7 @@ function applyChatEvent(
   }
   const entry = eventToTranscriptEntry(event);
   if (entry === null || (entry.kind !== 'assistant' && entry.kind !== 'result')) return next;
-  return appendChatTranscript(next, threadId, entry, folder);
+  return appendChatTranscript(next, threadId, entry, folder, data?.kind === 'chat');
 }
 
 /** Registers a replayed thread, or refreshes the record it already has. */
@@ -729,18 +729,44 @@ function appendChatTranscript(
   threadId: string,
   entry: TranscriptEntry,
   folder: TranscriptFolder | null,
+  finalAnswer = false,
 ): CoreState {
   if (folder !== null) {
-    folder.buffer(threadId, state.chatTranscripts[threadId] ?? []).append(entry);
+    const buffer = folder.buffer(threadId, state.chatTranscripts[threadId] ?? []);
+    if (!(finalAnswer && foldChatAnswer(buffer.entries, entry))) buffer.append(entry);
     return state;
   }
-  const transcript = appendTranscript(state.chatTranscripts[threadId] ?? [], entry);
+  const transcript = [...(state.chatTranscripts[threadId] ?? [])];
+  if (!(finalAnswer && foldChatAnswer(transcript, entry))) {
+    foldTranscriptEntry(transcript, entry, null);
+  }
   const chatTranscripts = {...state.chatTranscripts, [threadId]: transcript};
   return {
     ...state,
     chatTranscripts,
     chatTranscript: threadId === DEFAULT_CHAT_THREAD_ID ? transcript : state.chatTranscript,
   };
+}
+
+/**
+ * Folds a turn's terminal answer over its own streamed chunks.
+ *
+ * The assistant chunks of one chat turn have already merged into a single
+ * entry keyed by the turn's invocation id, and the terminal `chat` event
+ * carries the same text once more. When such a turn is still open at the end
+ * of the transcript, the final answer replaces it in place rather than
+ * appearing as a second copy. The streamed entry's id is kept so consumers
+ * tracking entries by id update instead of duplicating, and the turn id is
+ * dropped because the turn is over: neither a later chunk nor a later answer
+ * may fold into it. Returns false when there is no open streamed turn, in
+ * which case the answer appends as its own entry.
+ */
+function foldChatAnswer(entries: TranscriptEntry[], incoming: TranscriptEntry): boolean {
+  const last = entries.at(-1);
+  if (last === undefined || last.kind !== 'assistant' || last.turnId === undefined) return false;
+  const {turnId: _closed, ...merged} = {...last, ...incoming, id: last.id};
+  entries[entries.length - 1] = merged;
+  return true;
 }
 
 function applyDiagnosticEvent(state: CoreState, event: RunEvent): CoreState {
@@ -1119,6 +1145,10 @@ function foldTranscriptEntry(
   if (
     last !== undefined &&
     last.kind === incoming.kind &&
+    // Chunks of one turn share its id; an entry without a turn (a terminal
+    // chat answer, or one already closed by `foldChatAnswer`) is complete and
+    // must not glue onto a neighbor that is just as complete.
+    last.turnId !== undefined &&
     last.turnId === incoming.turnId &&
     (incoming.kind === 'assistant' || incoming.kind === 'prompt' || incoming.kind === 'analysis')
   ) {

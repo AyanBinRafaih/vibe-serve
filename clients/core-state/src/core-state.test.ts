@@ -400,6 +400,49 @@ describe('core state projection', () => {
     expect(state.transcript).toEqual([]);
   });
 
+  it('folds the final chat answer over its own streamed chunks', () => {
+    let state = initialCoreState();
+    state = reduceEvent(state, chatStreamEvent(1, 'The queue ', 'exec-1'));
+    state = reduceEvent(state, chatStreamEvent(2, 'is lock-free.', 'exec-1'));
+    state = reduceEvent(state, chatAnswerEvent(3, 'The queue is lock-free.'));
+
+    // One answer block, under the streamed entry's id so consumers tracking
+    // entries by id update in place, closed to any further folding.
+    expect(state.chatTranscript).toHaveLength(1);
+    expect(state.chatTranscript[0]).toMatchObject({
+      id: '1',
+      kind: 'assistant',
+      label: 'Answer',
+      content: 'The queue is lock-free.',
+    });
+    expect(state.chatTranscript[0]?.turnId).toBeUndefined();
+  });
+
+  it('reconciles each chat turn separately and appends unstreamed answers', () => {
+    const events = [
+      chatStreamEvent(1, 'first ', 'exec-1'),
+      chatStreamEvent(2, 'answer', 'exec-1'),
+      chatAnswerEvent(3, 'first answer'),
+      chatAnswerEvent(4, 'unstreamed answer'),
+      chatStreamEvent(5, 'second answer', 'exec-2'),
+      chatAnswerEvent(6, 'second answer'),
+    ];
+    const batched = reduceEventBatch(initialCoreState(), events);
+    let single = initialCoreState();
+    for (const item of events) single = reduceEvent(single, item);
+
+    // Both fold paths agree: a finalized turn cannot swallow the next answer,
+    // and an answer that never streamed still lands as its own entry.
+    for (const state of [batched, single]) {
+      expect(state.chatTranscript.map(item => [item.id, item.content])).toEqual([
+        ['1', 'first answer'],
+        ['4', 'unstreamed answer'],
+        ['5', 'second answer'],
+      ]);
+      expect(state.chatTranscript.every(item => item.turnId === undefined)).toBe(true);
+    }
+  });
+
   it('replays the thread list from creation events after the implicit default', () => {
     let state = initialCoreState();
     state = reduceEvent(state, threadCreatedEvent(1, 'thread-a', 'claude'));
@@ -796,6 +839,15 @@ function chatAnswerEvent(sequence: number, answer: string, threadId?: string): R
     round_label: 'experiment-chat',
     ...(threadId === undefined ? {} : {chat_thread_id: threadId}),
     data: {kind: 'chat', answer},
+  };
+}
+
+/** One assistant-channel chunk of a chat turn, as the chat agent streams it. */
+function chatStreamEvent(sequence: number, content: string, invocationId: string): RunEvent {
+  return {
+    ...outputEvent(sequence, content, invocationId),
+    agent_kind: 'chat',
+    round_label: 'experiment-chat',
   };
 }
 
