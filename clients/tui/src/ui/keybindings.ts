@@ -1,7 +1,13 @@
 import type {CliRenderer, KeyEvent, ScrollBoxRenderable} from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
-import {chatPaneFocused, chatPaneVisible, experimentLogVisible} from '../session-model.js';
+import {
+  chatPaneFocused,
+  chatPaneVisible,
+  experimentLogVisible,
+  type RoundFocus,
+} from '../session-model.js';
 import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
+import {roundRailVisible} from './round-rail.js';
 
 export interface KeybindingActions {
   completeInput(): boolean;
@@ -250,13 +256,26 @@ export function bindKeybindings(
     // Like Enter above, pane focus and round navigation yield to a typed
     // command: cursor keys and brackets belong to a non-empty input.
     if ((key.name === 'left' || key.name === 'right') && actions.inputIsEmpty()) {
-      controller.focusRound(key.name === 'left' ? 'agents' : 'transcript');
+      // Left to right, the round view drills rounds -> agents -> transcript, so
+      // the arrows step across that order and clamp at the ends. The rail joins
+      // the order only when it is on screen; narrower than that the view is just
+      // agents and transcript, as before.
+      const order: RoundFocus[] = roundRailVisible(controller.state, renderer.terminalWidth)
+        ? ['rounds', 'agents', 'transcript']
+        : ['agents', 'transcript'];
+      const current = order.indexOf(controller.state.roundFocus);
+      const base = current === -1 ? order.indexOf('agents') : current;
+      const next = Math.min(order.length - 1, Math.max(0, base + (key.name === 'left' ? -1 : 1)));
+      controller.focusRound(order[next] as RoundFocus);
       key.preventDefault();
       return;
     }
     if (key.name === 'up' || key.name === 'down') {
       if (!actions.navigateSuggestions(key.name === 'up' ? -1 : 1)) {
-        if (controller.state.roundFocus === 'agents') {
+        if (controller.state.roundFocus === 'rounds') {
+          if (key.name === 'down') controller.selectNextRound();
+          else controller.selectPreviousRound();
+        } else if (controller.state.roundFocus === 'agents') {
           if (key.name === 'down') controller.selectNextAgent();
           else controller.selectPreviousAgent();
         } else {

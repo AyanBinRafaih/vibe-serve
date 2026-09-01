@@ -106,9 +106,11 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('fast_path()'));
     expect(frame).toContain('running · optimizer · round 2');
-    // No round is selected, so the agent strip is headed by the run.
+    // No round is selected, so the agent strip is headed by the run. The run has
+    // no rounds yet, so the rounds rail stays off and leaves the width to the
+    // agents graph and transcript.
     expect(frame).toContain('Run flow');
-    expect(frame).toContain('Rounds');
+    expect(frame).not.toContain('Rounds');
     expect(frame).toContain('● optimizer');
     expect(frame).toContain('Result');
     expect(frame).toContain('Command');
@@ -192,7 +194,7 @@ describe('OpenTUI presentation', () => {
     expect(frame).not.toContain('A later failure.');
   });
 
-  it('renders quiet round labels without status text or symbols', async () => {
+  it('renders each round on its own rail row with a status word, glyph, and time', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const activeStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
@@ -217,14 +219,13 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('r2'));
 
-    expect(frame).toContain('r1');
-    expect(frame).toContain('r2');
-    expect(frame).toMatch(/r2\s+1m\s+\d+s/);
-    expect(frame).toContain('r3');
+    // Each round is a rail row carrying its number, a status word and glyph, and
+    // its elapsed time; the active round's time is measured from its agent start.
+    expect(frame).toMatch(/r1\s+✓\s+done/);
+    expect(frame).toMatch(/▸r2\s+⟳\s+run\s+1m\s+\d+s/);
+    expect(frame).toMatch(/r3\s+✗\s+fail/);
+    // Status is a word plus a glyph, never a spinner that reads as motion frozen.
     expect(frame).not.toMatch(/[◐◓◑◒]/);
-    expect(frame).not.toContain('done');
-    expect(frame).not.toContain(':run');
-    expect(frame).not.toContain('fail');
   });
 
   it('heads the agent strip with the elapsed time of the running round', async () => {
@@ -631,12 +632,12 @@ describe('OpenTUI presentation', () => {
     registerCleanup(testRenderer.renderer, app);
 
     const frame = await testRenderer.waitForFrame(value => value.includes('r12'));
-    // Rounds the run has not reached are still part of the strip, and the strip
-    // says how many it could not fit.
+    // Rounds the run has not reached are still part of the rail, and the rail
+    // says how many it could not fit below the window.
     expect(frame).toMatch(/r1[34]/);
-    expect(frame).toMatch(/\d+ ›/);
+    expect(frame).toMatch(/↓ \d+/);
 
-    // `[` walks back to the first round, and the strip follows the selection
+    // `[` walks back to the first round, and the rail follows the selection
     // rather than leaving it hidden past the edge.
     let early = frame;
     for (let step = 0; step < 11; step += 1) {
@@ -644,7 +645,7 @@ describe('OpenTUI presentation', () => {
       early = await frameAfter(testRenderer);
     }
     expect(controller.state.selectedRound).toBe(1);
-    expect(early).toContain('[ r1 ]');
+    expect(early).toMatch(/▸r1\s+✓\s+done/);
   });
 
   it('leaves brackets and cursor keys to a typed command', async () => {
@@ -977,8 +978,8 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('has not run yet'));
     expect(frame).toContain('Round 9 has not run yet.');
-    // The strip still shows it as a round of this run, marked as the one open.
-    expect(frame).toContain('[ r9 ]');
+    // The rail still shows it as a round of this run, marked as the one open.
+    expect(frame).toMatch(/▸r9\s+·\s+plan/);
   });
 
   it('closes a visualization and the chat together on one Escape', async () => {
@@ -1095,12 +1096,17 @@ describe('OpenTUI presentation', () => {
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
 
-    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+    // The rounds rail takes its column and the transcript keeps its floor, so at
+    // this width the graph sits at its minimum node size and the first stage's
+    // name truncates; wait on the last column instead to know the graph drew.
+    const frame = await testRenderer.waitForFrame(value => value.includes('profiler'));
 
     expect(frame).toContain('7 agents');
     expect(frame).toContain('2 active');
-    // Every stage is drawn, and the fan-out rows do not collapse onto each other.
-    const nodeRows = frame.split('\n').filter(line => line.includes('implementer'));
+    // Every stage is drawn, and the fan-out rows do not collapse onto each
+    // other. The label truncates to "implement…" once the rail narrows the
+    // graph, so match the stem the truncation keeps.
+    const nodeRows = frame.split('\n').filter(line => line.includes('implement'));
     expect(nodeRows.length).toBeGreaterThanOrEqual(3);
     expect(frame).toContain('▶');
   });
@@ -1421,7 +1427,8 @@ describe('OpenTUI presentation', () => {
 
     const overlay = await testRenderer.waitForFrame(value => value.includes('Esc: close dialog'));
     expect(overlay).toContain('Available commands');
-    expect(overlay).toContain('Rounds');
+    // No round has landed yet, so the rail stays hidden and the round view is
+    // just the agents graph and the transcript behind the overlay.
     expect(overlay).toContain('Agents');
     testRenderer.mockInput.pressKey('ESCAPE');
     await testRenderer.waitForFrame(value => !value.includes('Esc: close dialog'));
@@ -1474,7 +1481,9 @@ describe('OpenTUI presentation', () => {
     const frame = await testRenderer.waitForFrame(value => value.includes('2 passed'));
     expect(frame).toContain('→ Bash(command="pytest")');
     expect(frame).toContain('← 2 passed');
-    expect(frame.match(/╭/g)).toHaveLength(5);
+    // Agents pane, transcript frame, and the card's call and result regions: the
+    // rail is absent because this fixture has no rounds.
+    expect(frame.match(/╭/g)).toHaveLength(4);
   });
 
   it('renders a typed command payload with labeled stderr and exit code', async () => {

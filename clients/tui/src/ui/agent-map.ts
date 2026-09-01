@@ -104,12 +104,15 @@ export class AgentMapView {
     this.#renderedState = null;
   }
 
-  render(state: SessionState, widthOverride?: number): void {
+  render(state: SessionState, widthOverride?: number, availableWidth?: number): void {
     const phases = visiblePhases(state);
     // The pane's width follows the terminal, so a resize has to redraw even
-    // when the state is unchanged.
+    // when the state is unchanged. `availableWidth` is the room left for the
+    // agents and transcript once the rounds rail has taken its column, so the
+    // transcript keeps its floor beside a rail rather than being squeezed by it.
     const width =
-      widthOverride ?? agentPaneWidth(this.renderer.terminalWidth, stageKinds(phases).length);
+      widthOverride ??
+      agentPaneWidth(availableWidth ?? this.renderer.terminalWidth, stageKinds(phases).length);
     const paneWidth = width ?? STACKED_WIDTH;
     if (state === this.#renderedState && paneWidth === this.#renderedWidth) return;
     // Selection and focus are drawn into the nodes, so a change to either is a
@@ -433,7 +436,7 @@ function truncate(text: string, width: number): string {
 
 /**
  * The agent-active elapsed time of the round on screen: wall clock minus the
- * gaps where no agent was running, which is what the rounds strip reports for
+ * gaps where no agent was running, which is what the rounds rail reports for
  * the running round.
  */
 function headingLabel(roundNumber: number | null, round: RoundSummary | null): string {
