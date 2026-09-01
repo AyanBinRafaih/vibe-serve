@@ -41,6 +41,7 @@ import {
   initialSessionState,
   leaveExperimentDrilldown,
   leaveHypothesisDetail,
+  markEventStreamAvailable,
   markEventStreamUnavailable,
   moveChatMenuSelection,
   moveExperimentSelection,
@@ -171,6 +172,15 @@ export interface ServerTransport {
 const BOOTSTRAP_TAIL = 1_000;
 const BACKFILL_CHUNK = 1_000;
 
+/**
+ * Backoff between reconnect attempts after the event stream drops. The
+ * schedule is finite: a server that refuses this many dials in a row is not
+ * coming back on its own, and the disconnect banner stays up as the
+ * persistent answer. A successful resubscribe resets the count, so the next
+ * outage gets the full schedule again.
+ */
+const RECONNECT_DELAYS_MS: readonly number[] = [500, 1_000, 2_000, 4_000, 8_000];
+
 export class SocketSessionController implements SessionController {
   #state: SessionState;
   readonly #listeners = new Set<(state: SessionState) => void>();
@@ -216,6 +226,16 @@ export class SocketSessionController implements SessionController {
    */
   #declaredFloor: number | null = null;
   #streamProtocolError = false;
+  /**
+   * True once the live subscription resumed from the client's own cursor
+   * instead of bootstrapping with a tail. A resumed subscription declares no
+   * history floor of its own, so its batches must not touch the floor
+   * bookkeeping the boot subscription established; see `#onMessage`.
+   */
+  #resumedStream = false;
+  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  #reconnectAttempt = 0;
+  #stopped = false;
 
   constructor(
     private readonly client: ServerTransport,
@@ -226,6 +246,12 @@ export class SocketSessionController implements SessionController {
      * (`boot-trace.ts`), which is why the default discards.
      */
     private readonly trace: StartupTrace = () => {},
+    /**
+     * Backoff schedule for stream reconnects; its length bounds the attempts
+     * per outage. Injected by tests so a retry is immediate instead of half a
+     * second away.
+     */
+    private readonly reconnectDelaysMs: readonly number[] = RECONNECT_DELAYS_MS,
   ) {
     this.#state = initialSessionState(themeName);
   }
@@ -273,33 +299,93 @@ export class SocketSessionController implements SessionController {
    * special case, since the server clamps the floor to 0 and the batch comes
    * back with `history_after_sequence` 0, which is today's behavior exactly.
    */
-  async #openEventStream(): Promise<void> {
+  async #openEventStream(): Promise<boolean> {
     const onMessage = (message: ServerMessage): void => this.#onMessage(message);
-    const onDisconnect = (error: Error): void => {
-      // A terminal event already carries the actual outcome. The socket
-      // closing afterward is lifecycle cleanup, not a second failure that
-      // should replace the useful diagnostic in the banner.
-      if (!this.#state.core.terminal && !this.#streamProtocolError) {
-        this.#setState(
-          reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
-        );
-      }
-    };
+    const onDisconnect = (error: Error): void => this.#onStreamDisconnect(error);
     try {
       this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect, {
         tail: BOOTSTRAP_TAIL,
       });
-      return;
+      return true;
     } catch {
       // Reported only if the full replay fails too: one boot must not put two
       // banners up, and the first failure is expected against an old server.
     }
     try {
       this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect);
+      return true;
     } catch (error) {
       this.#setState(
         reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
       );
+      return false;
+    }
+  }
+
+  #onStreamDisconnect(error: Error): void {
+    // A terminal event already carries the actual outcome. The socket
+    // closing afterward is lifecycle cleanup, not a second failure that
+    // should replace the useful diagnostic in the banner. The same applies
+    // to reconnecting: a finished run has nothing more to stream.
+    if (this.#stopped || this.#state.core.terminal || this.#streamProtocolError) return;
+    this.#setState(reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'));
+    this.#scheduleReconnect();
+  }
+
+  #scheduleReconnect(): void {
+    if (this.#reconnectTimer !== null) return;
+    const delay = this.reconnectDelaysMs[this.#reconnectAttempt];
+    if (delay === undefined) return;
+    this.#reconnectAttempt += 1;
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      void this.#resumeEventStream();
+    }, delay);
+  }
+
+  /**
+   * Re-opens the event stream after a disconnect, resuming from the client's
+   * own cursor: `core.sequence` is the last folded event, and the reducer
+   * skips anything at or below it, so a boundary event delivered twice folds
+   * once and an event the outage swallowed is replayed rather than lost.
+   *
+   * If the boot batch never arrived there is no cursor and no floor to
+   * preserve, so the resume is a fresh bootstrap instead, tail fallback and
+   * all.
+   */
+  async #resumeEventStream(): Promise<void> {
+    if (this.#stopped || this.#state.core.terminal || this.#streamProtocolError) return;
+    const stale = this.#eventSubscription;
+    this.#eventSubscription = null;
+    try {
+      await stale?.close();
+    } catch {
+      // The subscription is already dead; closing it owes nothing.
+    }
+    const recovered =
+      this.#declaredFloor === null ? await this.#openEventStream() : await this.#resubscribe();
+    if (this.#stopped) return;
+    if (recovered) {
+      this.#reconnectAttempt = 0;
+      this.#setState(markEventStreamAvailable(this.#state));
+    } else {
+      this.#scheduleReconnect();
+    }
+  }
+
+  async #resubscribe(): Promise<boolean> {
+    try {
+      this.#eventSubscription = await this.client.subscribe(
+        this.#state.core.sequence,
+        message => this.#onMessage(message),
+        error => this.#onStreamDisconnect(error),
+      );
+      this.#resumedStream = true;
+      return true;
+    } catch {
+      // The disconnect banner is still up and still accurate; the next
+      // attempt, if the schedule has one, speaks for itself.
+      return false;
     }
   }
 
@@ -348,6 +434,11 @@ export class SocketSessionController implements SessionController {
   }
 
   async stop(): Promise<void> {
+    this.#stopped = true;
+    if (this.#reconnectTimer !== null) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
     await this.#eventSubscription?.close();
     this.#eventSubscription = null;
     await this.client.close();
@@ -918,23 +1009,41 @@ export class SocketSessionController implements SessionController {
       this.#refreshPaneFor([message.event]);
     }
     if (message.type === 'event_batch') {
-      const declared = message.history_after_sequence ?? 0;
-      const rebootstrap = this.#declaredFloor !== null && declared > this.#declaredFloor;
-      this.#declaredFloor = declared;
-      const floor = rebootstrap
-        ? this.#raiseHistoryFloor(declared)
-        : this.#lowerHistoryFloor(declared);
-      const apply = rebootstrap ? applyEventRebootstrap : applyEventBatch;
-      this.#setState(
-        apply(
-          this.#state,
-          message.events,
-          message.active_executions,
-          message.through_sequence,
-          floor,
-        ),
-      );
-      this.#recordSpine(message.events, declared);
+      if (this.#resumedStream) {
+        // A resumed subscription replays exactly the events after the
+        // client's own cursor and declares no history floor of its own
+        // (`history_after_sequence` 0 on every batch). Taking that literally
+        // would mark history complete and quietly break scroll-back, so the
+        // floor bookkeeping keeps the boot subscription's answers and the
+        // batch folds at the floor already in state.
+        this.#setState(
+          applyEventBatch(
+            this.#state,
+            message.events,
+            message.active_executions,
+            message.through_sequence,
+            this.#state.core.historyAfterSequence,
+          ),
+        );
+      } else {
+        const declared = message.history_after_sequence ?? 0;
+        const rebootstrap = this.#declaredFloor !== null && declared > this.#declaredFloor;
+        this.#declaredFloor = declared;
+        const floor = rebootstrap
+          ? this.#raiseHistoryFloor(declared)
+          : this.#lowerHistoryFloor(declared);
+        const apply = rebootstrap ? applyEventRebootstrap : applyEventBatch;
+        this.#setState(
+          apply(
+            this.#state,
+            message.events,
+            message.active_executions,
+            message.through_sequence,
+            floor,
+          ),
+        );
+        this.#recordSpine(message.events, declared);
+      }
       this.#refreshExperimentsFor(message.events);
       this.#refreshPaneFor(message.events);
     }
