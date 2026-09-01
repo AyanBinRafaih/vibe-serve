@@ -1,13 +1,8 @@
 """Terminal renderer for headless runs.
 
-Subscribes to the process-global :class:`~vibesys.render.sink.OutputSink`
-and renders the same information the TUI shows: streamed agent output,
-tool calls and results, todo lists, and prompt/diagnostic lines. This is
-the only component that writes presentation output to the terminal; the
-backend itself emits events and plain log text only.
-
-Selection happens once at composition time (``create_run_context``): the
-renderer is subscribed only when no TUI supervisor is attached.
+Subscribes to core events and renders streamed agent output, tool calls and
+results, todo lists, and prompt or diagnostic lines. Application entrypoints
+decide whether to install it.
 """
 
 from __future__ import annotations
@@ -19,9 +14,9 @@ from typing import TextIO
 
 from vibesys.constants import DIM, GREEN, RESET, YELLOW
 from vibesys.render.format import format_status_prefix
-from vibesys.server.events import (
+from vibesys.run.events import (
     AgentOutputChunkData,
-    RunEvent,
+    CoreEvent,
     TodoItemData,
     TodoUpdateData,
     ToolCallData,
@@ -86,7 +81,7 @@ class TodoDisplay:
 
 
 class HeadlessRenderer:
-    """Render run events as colored terminal output for non-TUI runs."""
+    """Render core run events as colored terminal output."""
 
     # Maximum chars shown per tool result before truncation.
     DEFAULT_MAX_RESULT_LEN = 500
@@ -115,7 +110,7 @@ class HeadlessRenderer:
     def _out(self) -> TextIO:
         return self._explicit_out if self._explicit_out is not None else sys.stdout
 
-    def handle(self, event: RunEvent) -> None:  # noqa: D102  # tracked: #288
+    def handle(self, event: CoreEvent) -> None:  # noqa: D102  # tracked: #288
         data = event.data
         if isinstance(data, AgentOutputChunkData):
             self._render_chunk(data)

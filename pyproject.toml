@@ -46,13 +46,16 @@ Issues = "https://github.com/uw-syfi/vibesys/issues"
 vibesys-issue-mcp = "vs_issue_board.mcp:main"
 # The `vibesys` launcher: starts the interactive TUI (bundled only when the
 # wheel was built with a JavaScript toolchain), or runs the headless engine with
-# `--headless`/`validate`/no TTY. The engine itself is also `python -m vibesys`.
-vibesys = "vibesys.cli:main"
+# `--headless`/`validate`/no TTY. The engine itself is
+# `python -m entrypoints.headless`.
+vibesys = "entrypoints.launcher:main"
 
 [tool.setuptools.package-data]
-# ``_tui`` is produced at build time by setup.py's build_py step and injected
-# into the wheel's build tree; the glob keeps it as package data when present.
-vibesys = ["prompts/*.j2", "prompts/**/*.j2", "prompts/**/*.md", "domains/README.md", "_tui/**/*", "_resources/**/*", "_sdk/**/*"]
+# ``entrypoints/_tui`` is produced at build time by setup.py's build_py step;
+# the glob keeps it as package data when present.
+vibesys = ["prompts/*.j2", "prompts/**/*.j2", "prompts/**/*.md", "domains/README.md", "_resources/**/*", "_sdk/**/*"]
+entrypoints = ["py.typed", "_tui/**/*"]
+server = ["py.typed"]
 vs_evaluator_protocol = ["py.typed"]
 vs_feature_flags = ["py.typed"]
 vs_github = ["py.typed"]
@@ -69,6 +72,7 @@ dev = [
     "check-wheel-contents",
     "diff-cover",
     "hypothesis",
+    "import-linter==2.13",
     "matplotlib>=3.10.8",
     "pytest",
     "pytest-asyncio",
@@ -95,7 +99,7 @@ testpaths = ["tests", "libs/vs-evaluator-protocol/tests", "libs/vs-feature-flags
 # flag string CI uses. CI layers on `--cov-report=xml`, `--cov-report=json`,
 # and `--cov-fail-under` on top of this; it does not need its own `--cov=...`
 # flags.
-addopts = "-ra --cov --cov-report=term-missing"
+addopts = "-ra --import-mode=importlib --cov --cov-report=term-missing"
 pythonpath = ["."]
 markers = [
     # Applied by `pytest_collection_modifyitems` in the root conftest.py, which
@@ -106,14 +110,36 @@ markers = [
 
 [tool.coverage.run]
 branch = true
-source = ["vibesys", "vs_evaluator_protocol", "vs_feature_flags", "vs_github", "vs_issue_board", "vs_loop_state", "vs_project", "vs_prompts", "vs_sandbox", "vs_bench"]
+source = ["entrypoints", "server", "vibesys", "vs_evaluator_protocol", "vs_feature_flags", "vs_github", "vs_issue_board", "vs_loop_state", "vs_project", "vs_prompts", "vs_sandbox", "vs_bench"]
 relative_files = true
 omit = [
-    # `python -m vibesys` launcher stub: one import and a guarded call into
-    # `vibesys.main.main`, which is itself measured. Not exercised by unit
-    # tests because doing so would mean invoking the process as a script;
-    # there is no branching logic here for a test to miss.
+    # Module execution stubs contain only a guarded call into a measured
+    # entrypoint. Exercising them would require invoking a separate process.
     "*/__main__.py",
+]
+
+[tool.importlinter]
+root_packages = ["entrypoints", "server", "vibesys"]
+
+[[tool.importlinter.contracts]]
+name = "Application packages depend inward"
+type = "layers"
+layers = ["entrypoints", "server", "vibesys"]
+
+[[tool.importlinter.contracts]]
+name = "Server components depend inward"
+type = "layers"
+layers = [
+    "server.runtime",
+    "server.transport",
+    "server.api",
+    "server.integration",
+    "server.chat",
+    "server.controller",
+    "server.execution",
+    "server.journal",
+    "server.events",
+    "server.diagnostics",
 ]
 
 [tool.coverage.report]

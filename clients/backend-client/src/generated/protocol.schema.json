@@ -290,7 +290,7 @@
       "type": "object"
     },
     "AgentStatusData": {
-      "description": "Structured progress readings for one agent invocation.\n\nCarried on presentation events so renderers can format their own status\nprefix (e.g. ``[Round 3/24 | Implementer | 12.3s | 20k/1.0M]``) without\nthe backend baking any layout or styling into the payload.",
+      "description": "Structured progress readings for one agent invocation.\n\nCarried on presentation events so renderers can format their own status\nprefix (e.g. ``[Round 3/24 | Implementer | 12.3s | 20k/1.0M]``) without\nthe server baking any layout or styling into the payload.",
       "properties": {
         "progress": {
           "anyOf": [
@@ -404,7 +404,7 @@
     },
     "ChatModelOption": {
       "additionalProperties": false,
-      "description": "One model a chat thread can be started with, and where it came from.\n\n``source`` is provenance, not presentation: ``run`` is the run's own\nconfigured model, ``role`` an ``[agent.outer]``/``[agent.inner]``\noverride, ``suggested`` an entry from the backend's short curated list.",
+      "description": "One offered chat model and the source of its suggestion.",
       "properties": {
         "model": {
           "title": "Model",
@@ -434,7 +434,7 @@
     },
     "ChatOptions": {
       "additionalProperties": false,
-      "description": "Every chat agent selection this run offers, grouped by provider.\n\nThe agent driver is absent by design. Threads inherit the run's driver, so\na client never chooses one and never enumerates them.",
+      "description": "All offered chat selections grouped by provider.",
       "properties": {
         "providers": {
           "items": {
@@ -478,7 +478,7 @@
     },
     "ChatProviderOptions": {
       "additionalProperties": false,
-      "description": "One CLI provider the run's configured driver supports, with models.",
+      "description": "One supported chat provider and its suggested models.",
       "properties": {
         "provider": {
           "title": "Provider",
@@ -1233,7 +1233,7 @@
     },
     "HypothesisEntry": {
       "additionalProperties": false,
-      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is copied from the backend's typed hypothesis state,\nnever recomputed by the server or client.",
+      "description": "One unit of investigation: a hypothesis and every round it spans.\n\n``resolved_outcome`` is copied from the server's typed hypothesis state,\nnever recomputed by the server or client.",
       "properties": {
         "hypothesis_id": {
           "title": "Hypothesis Id",
@@ -1546,7 +1546,7 @@
     },
     "InteractiveSetupDefaults": {
       "additionalProperties": false,
-      "description": "JSON contract passed from Python configuration to the pre-launch TUI.",
+      "description": "JSON contract passed to the interactive launch form.",
       "properties": {
         "runs_dir": {
           "title": "Runs Dir",
@@ -2978,7 +2978,7 @@
     },
     "TuiDefaultsQuery": {
       "additionalProperties": false,
-      "description": "Request the launch-directory configuration defaults a TUI applies.\n\nA terminal client resolves its theme from the run's configuration. Asking\nover the control channel keeps TOML parsing in the backend and saves the\nlauncher an extra Python process on the boot path.",
+      "description": "Request the launch-directory configuration defaults a TUI applies.\n\nA terminal client resolves its theme from the run's configuration. Asking\nover the control channel keeps TOML parsing in the server and saves the\nlauncher an extra Python process on the boot path.",
       "properties": {
         "protocol_version": {
           "const": 1,
@@ -3006,7 +3006,7 @@
       "type": "object"
     },
     "TuiTheme": {
-      "description": "Selectable TUI themes, as light/dark pairs.",
+      "description": "Selectable terminal UI themes.",
       "enum": [
         "dark",
         "light",

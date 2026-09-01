@@ -114,7 +114,7 @@ def make_local_shell_sandbox(
     Every backend builds the local sandbox the same way, so the construction
     lives here once. The import is deferred because ``deepagents`` pulls
     langchain + anthropic (seconds on a cold import) and ``backends.get`` runs
-    on the startup path, before the TUI can list experiments.
+    on the startup path, before an application can list experiments.
     """
     from deepagents.backends import LocalShellBackend  # noqa: PLC0415  # tracked: #288
 

@@ -4,8 +4,8 @@ The mock exists so a run can be exercised end to end without an agent CLI,
 a model, or a network. It is a driver, not a shortcut around one: every event
 it produces leaves through the ``AgentObserver`` its caller passed to
 :meth:`MockSession.run_turn`, which means it reaches the output sink, the
-supervisor, and the transport by exactly the same route a real driver's
-events take. The mock never writes an event, a state file, or a log itself.
+core event journal, and any composed adapters by exactly the same route a real
+driver's events take. The mock never writes an event, a state file, or a log itself.
 Anything it wrote directly would be a path integration tests then stop
 covering.
 
@@ -48,12 +48,12 @@ from vibesys.agents.contracts import (
 )
 from vibesys.agents.scripted_rounds import round_number_from_label, scripted_round_payload
 from vibesys.agents.todos import todos_from_tool_call
-from vibesys.server.events import (
+from vibesys.run.events import (
     AgentOutputChunkData,
     CommandResultPayload,
+    CoreEvent,
+    CoreEventType,
     EventPayload,
-    EventType,
-    RunEvent,
     TodoUpdateData,
     ToolCallData,
     ToolResultData,
@@ -92,11 +92,11 @@ _TODO_TOOL = "TodoWrite"
 
 _REPLAYABLE_EVENT_TYPES = frozenset(
     {
-        EventType.AGENT_OUTPUT_CHUNK,
-        EventType.TOOL_CALL,
-        EventType.TOOL_RESULT,
-        EventType.TODO_UPDATE,
-        EventType.USAGE_UPDATE,
+        CoreEventType.AGENT_OUTPUT_CHUNK,
+        CoreEventType.TOOL_CALL,
+        CoreEventType.TOOL_RESULT,
+        CoreEventType.TODO_UPDATE,
+        CoreEventType.USAGE_UPDATE,
     }
 )
 
@@ -405,7 +405,7 @@ def _replayed_events(playbook: ReplayPlaybook) -> Iterator[AgentEvent]:
         # A recorded todo snapshot that a recorded tool call already carries
         # is derived state: re-emitting both would duplicate it downstream,
         # because the tool call regenerates the snapshot on its own.
-        if event.type is EventType.TODO_UPDATE and todos_already_carried:
+        if event.type is CoreEventType.TODO_UPDATE and todos_already_carried:
             todos_already_carried = False
             continue
         driver_event = _as_driver_event(event)
@@ -431,7 +431,7 @@ def _carries_todos(event: AgentEvent) -> bool:
     return todos_from_tool_call(str(event.payload.get("tool", "")), args) is not None
 
 
-def _recorded_events(events_path: Path) -> Iterator[RunEvent]:
+def _recorded_events(events_path: Path) -> Iterator[CoreEvent]:
     """Read one recorded run log, skipping records this fixture cannot use.
 
     A recording is test input, not a live contract: a truncated final line
@@ -445,12 +445,29 @@ def _recorded_events(events_path: Path) -> Iterator[RunEvent]:
             if not line.strip():
                 continue
             try:
-                yield RunEvent.model_validate_json(line)
-            except ValueError:
+                raw = json.loads(line)
+                event_type = CoreEventType(raw["type"])
+                if event_type not in _REPLAYABLE_EVENT_TYPES:
+                    continue
+                yield CoreEvent.model_validate(
+                    {
+                        "sequence": raw.get("sequence", 0),
+                        "run_id": raw.get("run_id", ""),
+                        "timestamp": raw["timestamp"],
+                        "type": event_type,
+                        "text": raw.get("text", ""),
+                        "status": raw.get("status"),
+                        "round_label": raw.get("round_label"),
+                        "agent_kind": raw.get("agent_kind"),
+                        "execution_id": raw.get("execution_id") or raw.get("invocation_id"),
+                        "data": raw.get("data"),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
                 continue
 
 
-def _as_driver_event(event: RunEvent) -> AgentEvent | None:
+def _as_driver_event(event: CoreEvent) -> AgentEvent | None:
     """Project one recorded run event back onto the driver's event vocabulary."""
     if event.type not in _REPLAYABLE_EVENT_TYPES:
         return None

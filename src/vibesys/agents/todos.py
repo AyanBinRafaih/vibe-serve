@@ -5,8 +5,7 @@ convention: Claude Code calls ``TodoWrite``, opencode calls ``todowrite``,
 Gemini calls ``write_todos``, and Codex reports either an ``update_plan``
 tool call or a ``todo_list`` stream item. This module owns the mapping from
 those provider vocabularies to the neutral :class:`TodoItemData` contract so
-everything downstream of the output sink (supervisor, renderers, TUI) stays
-agent-agnostic.
+everything downstream of the output sink stays agent-agnostic.
 
 The deepagents backend additionally publishes todos from its graph state
 channel in :mod:`vibesys.agent_runner`; its ``write_todos`` tool call also
@@ -17,13 +16,13 @@ Extraction is best-effort by design: payloads originate from agent tool
 calls, so a malformed entry is skipped and an unrecognized payload yields
 "no update" — never an exception into the agent run. Statuses pass through
 as open strings; renderers own the degradation of unknown values (see the
-``TodoItemData.status`` contract in :mod:`vibesys.server.events`).
+``TodoItemData.status`` contract in :mod:`vibesys.run.events`).
 """
 
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from vibesys.server.events import TodoItemData
+from vibesys.run.events import TodoItemData
 
 _Extractor = Callable[[Mapping[str, Any]], list[TodoItemData] | None]
 

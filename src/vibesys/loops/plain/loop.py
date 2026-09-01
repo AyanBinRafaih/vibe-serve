@@ -38,7 +38,7 @@ from vibesys.loops.plain.runner_ext import PlainLoopAgentClient
 from vibesys.loops.plain.state import PlainStateStore
 from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, Prompt
-from vibesys.run import LoopContext, RepositoryVisibility, RunStateNamespace
+from vibesys.run import LoopContext, RepositoryVisibility, RunIntegration, RunStateNamespace
 from vibesys.sandbox.run_environment import (
     RunEnvironmentSpec,
     make_run_environment_spec,
@@ -290,6 +290,7 @@ def run_plain_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     domain: DomainName,
     remote_repo: str | None = None,
     repo_visibility: RepositoryVisibility = RepositoryVisibility.PRIVATE,
+    integration: RunIntegration | None = None,
 ) -> bool:
     """Run the issue-tracker driven loop.
 
@@ -347,6 +348,7 @@ def run_plain_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         environment_hooks=domain_definition.environment_hooks,
         remote_repo=remote_repo,
         repo_visibility=repo_visibility,
+        integration=integration,
     ) as ctx:
         ctx.lprint(f"[log] experiment log: {ctx.run_log_path}")
         ctx.lprint(f"[log] project root: {ctx.project_root}")

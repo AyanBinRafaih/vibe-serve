@@ -1,6 +1,6 @@
 import {writeFile} from 'node:fs/promises';
 import {createCliRenderer} from '@opentui/core';
-import {SupervisionClient} from '@vibesys/backend-client';
+import {ServerClient} from '@vibesys/backend-client';
 import {resolveStartupTrace} from './boot-trace.js';
 import {runTuiSession} from './runtime.js';
 import {SocketSessionController} from './session-controller.js';
@@ -13,7 +13,7 @@ const CONNECT_TIMEOUT_MS = 30_000;
 const socketPath = process.env['VIBESYS_CONTROL_SOCKET'];
 if (!socketPath) throw new Error('VIBESYS_CONTROL_SOCKET is required');
 
-const client = await SupervisionClient.connect(socketPath, {
+const client = await ServerClient.connect(socketPath, {
   connectTimeoutMs: CONNECT_TIMEOUT_MS,
 });
 const explicitTheme = process.env['VIBESYS_THEME'];

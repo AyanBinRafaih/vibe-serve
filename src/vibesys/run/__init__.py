@@ -7,8 +7,20 @@ tracking) rather than reusable standalone libraries, so they live under
 
 from vibesys.repository import RepositoryVisibility
 from vibesys.run.device import DeviceLease
+from vibesys.run.event_journal import EventJournal
+from vibesys.run.events import CoreEvent, CoreEventType
 from vibesys.run.experiment_repo import ExperimentRepository
 from vibesys.run.git_tracker import GitTracker
+from vibesys.run.integration import (
+    AgentRuntimeResources,
+    AgentSelection,
+    DirectInvocationLifecycle,
+    ExecutionHandle,
+    InvocationLifecycle,
+    LocalRunIntegration,
+    RunAttachment,
+    RunIntegration,
+)
 from vibesys.run.logger import RunLogger
 from vibesys.run.paths import RunCommands, RunPaths
 from vibesys.run.project import (
@@ -35,12 +47,21 @@ from vibesys.run.workspace import (
 
 __all__ = [
     "EXCLUDED_WORKSPACE_DIRS",
+    "AgentRuntimeResources",
+    "AgentSelection",
     "CompletedRound",
     "CopySpec",
+    "CoreEvent",
+    "CoreEventType",
     "DeviceLease",
+    "DirectInvocationLifecycle",
+    "EventJournal",
+    "ExecutionHandle",
     "ExperimentRepository",
     "GitTracker",
     "InputProjectSpec",
+    "InvocationLifecycle",
+    "LocalRunIntegration",
     "LoopContext",
     "ProjectProvisioningError",
     "ProjectProvisioningSpec",
@@ -49,7 +70,9 @@ __all__ = [
     "RoundTransaction",
     "RoundTransactionCoordinator",
     "RoundTransactionError",
+    "RunAttachment",
     "RunCommands",
+    "RunIntegration",
     "RunLogger",
     "RunPaths",
     "RunState",

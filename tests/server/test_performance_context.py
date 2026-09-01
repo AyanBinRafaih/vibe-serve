@@ -4,18 +4,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tests.server.support import build_server_parts
+
+from server.api.performance import build_performance_context, summarize_objective
+from server.api.protocol import PerformanceQuery
 from vibesys.loops.agent.model import AgentRunState, Hypothesis, HypothesisMeasurement
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.schemas import OrchestratorPlan
-from vibesys.server import RunSupervisor
-from vibesys.server.performance import build_performance_context, summarize_objective
-from vibesys.server.protocol import PerformanceQuery
-from vibesys.server.service import SupervisionService
 from vs_loop_state import RoundRecord
 from vs_project import AgentRunConfiguration, Project, RunEnvironmentRecord
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from server.api.service import RunApi
 
 
 def _hypothesis(identifier: str, started_round: int, **overrides: object) -> Hypothesis:
@@ -79,10 +81,10 @@ def _project_run(project: Path, objectives: tuple[str, ...]) -> tuple[Project, s
     return vibesys_project, manifest.run_id
 
 
-def _service(project: Project, run_id: str) -> SupervisionService:
-    supervisor = RunSupervisor()
-    supervisor.attach(project.state.log_directory(run_id), project=project, run_id=run_id)
-    return SupervisionService(supervisor)
+def _service(project: Project, run_id: str) -> RunApi:
+    return build_server_parts(
+        project.state.log_directory(run_id), project=project, run_id=run_id
+    ).api
 
 
 def test_service_projects_context_from_round_evidence_and_objective_prose(
@@ -150,7 +152,7 @@ def test_service_names_the_objective_before_the_first_measurement(tmp_path: Path
 
 
 def test_service_returns_no_context_without_an_attached_run() -> None:
-    response = SupervisionService(RunSupervisor()).execute(PerformanceQuery())
+    response = build_server_parts().api.execute(PerformanceQuery())
 
     assert response.performance == []
     assert response.performance_context is None

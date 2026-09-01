@@ -1,5 +1,18 @@
 # TUI architecture
 
+The Python packages follow one inward dependency direction:
+
+```text
+entrypoints -> server -> vibesys
+```
+
+`vibesys` is the headless optimization library. It owns run execution and the
+durable core event journal, and does not import serving or process-entrypoint
+code. `server` imports the core in-process, projects core events into its wire
+journal, and owns frontend-specific facilities such as experiment chat.
+`entrypoints` composes either a local headless integration or the server
+runtime. Import Linter enforces this direction in CI.
+
 The TypeScript frontend has three packages with one allowed dependency direction:
 
 ```text
@@ -44,7 +57,7 @@ remain outside core state until the backend event contract becomes complete enou
 
 ## Launch sequence
 
-`vs` spawns the headless backend and the frontend concurrently. The launcher does not wait for the
+`vibesys` spawns the server and the frontend concurrently. The launcher does not wait for the
 control socket: the backend client retries `ENOENT` and `ECONNREFUSED` until its connect deadline,
 so the frontend pays its own startup while the backend is still coming up. The launcher still
 watches for the socket appearing, which is what distinguishes a backend that died before it ever
@@ -59,7 +72,8 @@ if the backend does not answer in time. `--theme` skips the query and reaches th
 ### Boot trace
 
 Boot timings are always recorded and never narrated. The backend times its boot in spans
-(`src/vibesys/boot_trace.py`): the dispatch preamble in `main.py`, then run-context assembly in
+(`src/vibesys/boot_trace.py`): the dispatch preamble in `src/entrypoints/headless.py`, then
+run-context assembly in
 `context.py`. Every span lands in the run's `run-*.log` as
 `boot span <qualified.name>: <ms>ms`, with the preamble's spans ahead of assembly's and each
 enclosing span reporting its region's total after its children.

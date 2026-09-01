@@ -1,4 +1,4 @@
-"""Typed user-facing failures shared by CLI and supervision transports."""
+"""Typed user-facing failures shared by CLI and application transports."""
 
 from __future__ import annotations
 

@@ -1,12 +1,8 @@
-"""The single emission point for presentation events.
+"""Process-global publisher for presentation-neutral core events.
 
-Emission sites (agent callbacks, runner helpers, ``lprint``) call the
-process-global :class:`OutputSink` unconditionally — headless or TUI. The
-sink forwards each event to the active :class:`~vibesys.server.supervisor.
-RunSupervisor` (when a TUI/supervision client is attached) and to any
-in-process subscribers (the headless renderer). This is the only place
-allowed to consult :func:`~vibesys.server.registry.active_supervisor`;
-call sites never branch on presentation mode.
+Producers publish unconditionally. Application entrypoints compose subscribers,
+such as the headless renderer, durable core journal, or server adapter.
+This module has no knowledge of any serving implementation.
 """
 
 from __future__ import annotations
@@ -16,40 +12,52 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from vibesys.server.events import (
+from vibesys.run.events import (
     AgentOutputChannel,
     AgentOutputChunkData,
     AgentStatusData,
-    EventData,
-    EventType,
-    RunEvent,
+    CoreEvent,
+    CoreEventData,
+    CoreEventType,
+    EventStatus,
+    JsonResultPayload,
     TodoItemData,
     TodoUpdateData,
     ToolCallData,
     ToolResultData,
     ToolResultPayload,
     UsageUpdateData,
-    make_event,
+    make_core_event,
 )
-from vibesys.server.tool_payloads import classify_tool_result
 
-EventHandler = Callable[[RunEvent], None]
+EventHandler = Callable[[CoreEvent], object]
 
 
 def _json_safe(args: dict[str, Any]) -> dict[str, Any]:
-    """Coerce tool args to a JSON-serializable dict (events must serialize)."""
+    """Coerce tool arguments to a JSON-serializable dictionary."""
     return json.loads(json.dumps(args, default=repr))
 
 
+def _classify_tool_result(content: str) -> ToolResultPayload | None:
+    """Preserve JSON-shaped tool results alongside their raw text."""
+    try:
+        value = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(value, (dict, list)):
+        return JsonResultPayload(value=value)
+    return None
+
+
 class OutputSink:
-    """Fan presentation events out to the supervisor and local subscribers."""
+    """Fan core events out to explicitly composed in-process subscribers."""
 
     def __init__(self) -> None:  # noqa: D107  # tracked: #288
         self._lock = threading.Lock()
         self._subscribers: tuple[EventHandler, ...] = ()
 
     def subscribe(self, handler: EventHandler) -> Callable[[], None]:
-        """Register *handler* for every emitted event; returns an unsubscriber."""
+        """Register ``handler`` and return an idempotent unsubscriber."""
         with self._lock:
             self._subscribers = (*self._subscribers, handler)
 
@@ -59,7 +67,32 @@ class OutputSink:
 
         return unsubscribe
 
-    # -- semantic emitters ---------------------------------------------------
+    def emit(  # noqa: PLR0913  # tracked: #288
+        self,
+        event_type: CoreEventType,
+        text: str = "",
+        *,
+        data: CoreEventData | None = None,
+        status: EventStatus | None = None,
+        agent_kind: str | None = None,
+        round_label: str | None = None,
+        execution_id: str | None = None,
+    ) -> CoreEvent:
+        """Publish one typed core event and return the emitted value."""
+        event = make_core_event(
+            event_type,
+            text,
+            data=data,
+            status=status,
+            agent_kind=agent_kind,
+            round_label=round_label,
+            execution_id=execution_id,
+        )
+        with self._lock:
+            subscribers = self._subscribers
+        for handler in subscribers:
+            handler(event)
+        return event
 
     def agent_output(  # noqa: D102, PLR0913  # tracked: #288
         self,
@@ -73,12 +106,12 @@ class OutputSink:
     ) -> None:
         if not content:
             return
-        self._emit(
-            EventType.AGENT_OUTPUT_CHUNK,
-            AgentOutputChunkData(channel=channel, content=content, status=status),
+        self.emit(
+            CoreEventType.AGENT_OUTPUT_CHUNK,
+            data=AgentOutputChunkData(channel=channel, content=content, status=status),
             agent_kind=agent_kind,
             round_label=round_label,
-            invocation_id=invocation_id,
+            execution_id=invocation_id,
         )
 
     def tool_call(  # noqa: D102, PLR0913  # tracked: #288
@@ -92,12 +125,12 @@ class OutputSink:
         round_label: str | None = None,
         invocation_id: str | None = None,
     ) -> None:
-        self._emit(
-            EventType.TOOL_CALL,
-            ToolCallData(tool=tool, call_id=call_id, args=_json_safe(args), status=status),
+        self.emit(
+            CoreEventType.TOOL_CALL,
+            data=ToolCallData(tool=tool, call_id=call_id, args=_json_safe(args), status=status),
             agent_kind=agent_kind,
             round_label=round_label,
-            invocation_id=invocation_id,
+            execution_id=invocation_id,
         )
 
     def tool_result(  # noqa: D102, PLR0913  # tracked: #288
@@ -112,13 +145,11 @@ class OutputSink:
         round_label: str | None = None,
         invocation_id: str | None = None,
     ) -> None:
-        # A producer that received real structure pre-empts the classifier's
-        # best-effort guess over the flattened text.
         if payload is None:
-            payload = classify_tool_result(content)
-        self._emit(
-            EventType.TOOL_RESULT,
-            ToolResultData(
+            payload = _classify_tool_result(content)
+        self.emit(
+            CoreEventType.TOOL_RESULT,
+            data=ToolResultData(
                 tool=tool,
                 call_id=call_id,
                 content=content,
@@ -127,7 +158,7 @@ class OutputSink:
             ),
             agent_kind=agent_kind,
             round_label=round_label,
-            invocation_id=invocation_id,
+            execution_id=invocation_id,
         )
 
     def todo_update(  # noqa: D102  # tracked: #288
@@ -140,12 +171,12 @@ class OutputSink:
     ) -> None:
         if not todos:
             return
-        self._emit(
-            EventType.TODO_UPDATE,
-            TodoUpdateData(todos=todos),
+        self.emit(
+            CoreEventType.TODO_UPDATE,
+            data=TodoUpdateData(todos=todos),
             agent_kind=agent_kind,
             round_label=round_label,
-            invocation_id=invocation_id,
+            execution_id=invocation_id,
         )
 
     def usage_update(  # noqa: D102, PLR0913  # tracked: #288
@@ -158,54 +189,22 @@ class OutputSink:
         round_label: str | None = None,
         invocation_id: str | None = None,
     ) -> None:
-        self._emit(
-            EventType.USAGE_UPDATE,
-            UsageUpdateData(input_tokens=input_tokens, context_window=context_window, model=model),
+        self.emit(
+            CoreEventType.USAGE_UPDATE,
+            data=UsageUpdateData(
+                input_tokens=input_tokens,
+                context_window=context_window,
+                model=model,
+            ),
             agent_kind=agent_kind,
             round_label=round_label,
-            invocation_id=invocation_id,
+            execution_id=invocation_id,
         )
-
-    # -- dispatch ------------------------------------------------------------
-
-    def _emit(
-        self,
-        event_type: EventType,
-        data: EventData,
-        *,
-        agent_kind: str | None = None,
-        round_label: str | None = None,
-        invocation_id: str | None = None,
-    ) -> None:
-        from vibesys.server.registry import active_supervisor  # noqa: PLC0415  # tracked: #288
-
-        supervisor = active_supervisor()
-        if supervisor is not None:
-            supervisor.publish_presentation(
-                event_type,
-                data,
-                agent_kind=agent_kind,
-                round_label=round_label,
-                invocation_id=invocation_id,
-            )
-        with self._lock:
-            subscribers = self._subscribers
-        if not subscribers:
-            return
-        event = make_event(
-            event_type,
-            agent_kind=agent_kind,
-            round_label=round_label,
-            invocation_id=invocation_id,
-            data=data,
-        )
-        for handler in subscribers:
-            handler(event)
 
 
 _SINK = OutputSink()
 
 
 def output_sink() -> OutputSink:
-    """Return the process-global presentation sink."""
+    """Return the process-global core event publisher."""
     return _SINK

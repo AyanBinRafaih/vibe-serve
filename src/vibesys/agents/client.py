@@ -32,7 +32,7 @@ from vibesys.agents.contracts import (
     MCPServerSpec,
     SessionDisposition,
 )
-from vibesys.server.events import CommandResultPayload, JsonResultPayload
+from vibesys.run.events import CommandResultPayload, JsonResultPayload
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -374,7 +374,7 @@ class AgentClient:
         )
         log_and_print("--- input ---", self._run_log_file)
         log_prompt_markdown_and_print(f"{system_prompt}\n\n{user_prompt}", self._run_log_file)
-        reuse = kind != "chat" and (reuse_session if reuse_session is not None else True)
+        reuse = reuse_session if reuse_session is not None else True
         cache_key = session_key or kind
         result: AgentTurnResult | None = None
         observer = _LoggerObserver(logger)

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from vibesys.constants import ComputeBackend
     from vibesys.input_manifest import WorkspaceSource
     from vibesys.profilers import ProfilerKind
+    from vibesys.run.event_journal import EventJournal
     from vibesys.run.git_tracker import GitTracker
     from vibesys.run.state import RunState
     from vs_project import Project, StateTransition
@@ -39,7 +40,7 @@ class LoopContext(Protocol):  # noqa: D101  # tracked: #288
     workspace_sources: tuple[WorkspaceSource, ...]
 
     # -- collaborators --------------------------------------------------------
-    supervisor: Any
+    events: EventJournal
     agent_client: AgentClient
     judge_backend: Any
     run_environment: Any

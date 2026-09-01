@@ -34,9 +34,6 @@ if TYPE_CHECKING:
 # /workspace/_opt_vibesys respectively) — not implementer
 # output, and we never want them in git history. ``_mounts`` is
 # the Docker ancestor-mount redirect dir for the same reason.
-# ``_vibesys_chat`` contains the experiment-chat transcript and
-# refreshed trajectory snapshots; it is framework state, not a candidate
-# implementation artifact.
 # ``.cache`` holds any HF-download fallback (drafter, etc.).
 EXCLUDED_WORKSPACE_DIRS: frozenset[str] = frozenset(
     {
@@ -47,7 +44,6 @@ EXCLUDED_WORKSPACE_DIRS: frozenset[str] = frozenset(
         "_auth",
         "_opt_vibesys",
         "_mounts",
-        "_vibesys_chat",
         ".cache",
         ".venv",
         "exp_env",

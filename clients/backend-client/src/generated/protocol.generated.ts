@@ -130,7 +130,7 @@ export type RepositoryName = string;
  */
 export type RepositoryVisibility = "private" | "public" | "internal";
 /**
- * Selectable TUI themes, as light/dark pairs.
+ * Selectable terminal UI themes.
  */
 export type TuiTheme =
   | "dark"
@@ -470,7 +470,7 @@ export interface ChatOptionsQuery {
  * Request the launch-directory configuration defaults a TUI applies.
  *
  * A terminal client resolves its theme from the run's configuration. Asking
- * over the control channel keeps TOML parsing in the backend and saves the
+ * over the control channel keeps TOML parsing in the server and saves the
  * launcher an extra Python process on the boot path.
  */
 export interface TuiDefaultsQuery {
@@ -575,27 +575,20 @@ export interface ChatThreadInfo {
   model: Model1;
 }
 /**
- * Every chat agent selection this run offers, grouped by provider.
- *
- * The agent driver is absent by design. Threads inherit the run's driver, so
- * a client never chooses one and never enumerates them.
+ * All offered chat selections grouped by provider.
  */
 export interface ChatOptions {
   providers?: Providers;
 }
 /**
- * One CLI provider the run's configured driver supports, with models.
+ * One supported chat provider and its suggested models.
  */
 export interface ChatProviderOptions {
   provider: Provider2;
   models?: Models;
 }
 /**
- * One model a chat thread can be started with, and where it came from.
- *
- * ``source`` is provenance, not presentation: ``run`` is the run's own
- * configured model, ``role`` an ``[agent.outer]``/``[agent.inner]``
- * override, ``suggested`` an entry from the backend's short curated list.
+ * One offered chat model and the source of its suggestion.
  */
 export interface ChatModelOption {
   model: Model2;
@@ -603,7 +596,7 @@ export interface ChatModelOption {
   default?: Default;
 }
 /**
- * JSON contract passed from Python configuration to the pre-launch TUI.
+ * JSON contract passed to the interactive launch form.
  */
 export interface InteractiveSetupDefaults {
   runs_dir: RunsDir;
@@ -794,7 +787,7 @@ export interface AgentOutputChunkData {
  *
  * Carried on presentation events so renderers can format their own status
  * prefix (e.g. ``[Round 3/24 | Implementer | 12.3s | 20k/1.0M]``) without
- * the backend baking any layout or styling into the payload.
+ * the server baking any layout or styling into the payload.
  */
 export interface AgentStatusData {
   progress?: Progress;
@@ -917,7 +910,7 @@ export interface PerformanceContext {
 /**
  * One unit of investigation: a hypothesis and every round it spans.
  *
- * ``resolved_outcome`` is copied from the backend's typed hypothesis state,
+ * ``resolved_outcome`` is copied from the server's typed hypothesis state,
  * never recomputed by the server or client.
  */
 export interface HypothesisEntry {

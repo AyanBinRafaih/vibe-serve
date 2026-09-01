@@ -2,8 +2,8 @@
 
 import pytest
 
-from vibesys.server.events import JsonResultPayload
-from vibesys.server.tool_payloads import classify_tool_result
+from server.events import JsonResultPayload
+from server.tool_payloads import classify_tool_result
 
 
 class TestClassifyToolResult:

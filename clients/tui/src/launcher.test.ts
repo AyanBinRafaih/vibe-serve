@@ -102,7 +102,9 @@ process.exit(0);
       'doomed-backend.mjs',
       `
 console.error('vibesys: configuration is unreadable');
-process.exit(3);
+// Give the concurrently spawned frontend time to install its signal handler,
+// so the test observes the launcher's termination rather than an OS-level race.
+setTimeout(() => process.exit(3), 250);
 `,
     );
     const frontend = await writeExecutable(

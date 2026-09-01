@@ -13,8 +13,9 @@ from typing import TypedDict
 
 import pytest
 from pydantic import ValidationError
+from tests.server.support import build_server_parts
 
-from vibesys.server.events import (
+from server.events import (
     _EAGER_TAIL_RECORDS,
     AgentExecutionActivityData,
     AgentExecutionFinishedData,
@@ -29,7 +30,7 @@ from vibesys.server.events import (
     RunStartedData,
     make_event,
 )
-from vibesys.server.supervisor import RunSupervisor, _canonical_execution_events
+from server.journal import _canonical_execution_events
 
 _TIMESTAMP = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -327,10 +328,9 @@ def test_attaching_to_a_large_log_does_not_parse_the_whole_log(tmp_path):  # noq
         _generated_events(seed=31, count=count, legacy_invocations=True),
     )
 
-    supervisor = RunSupervisor()
-    supervisor.attach(log_dir)
+    parts = build_server_parts(log_dir)
 
-    store = supervisor._store  # noqa: SLF001  # accounting is the assertion
+    store = parts.journal._store  # noqa: SLF001  # accounting is the assertion
     assert store is not None
     # The eager tail, plus the SERVER_STARTED event attach records itself.
     assert store.parsed_record_count <= _EAGER_TAIL_RECORDS + 1
@@ -347,16 +347,15 @@ def test_attach_indexes_legacy_lifecycle_identity_without_parsing_history(tmp_pa
     )
     _write_events(path, events)
 
-    supervisor = RunSupervisor()
-    supervisor.attach(log_dir)
-    attached = supervisor.read_history_events()
+    parts = build_server_parts(log_dir)
+    attached = parts.journal.read_history()
 
     reference = _EagerEventStore(path, run_id="reference").read()
     expected = _canonical_execution_events(reference)
-    # attach appends its own SERVER_STARTED event on a fresh supervisor.
+    # Attaching appends its own SERVER_STARTED event on a fresh journal.
     assert _dump(attached[: len(expected)]) == _dump(expected)
-    assert supervisor._canonical_execution_ids == set()  # noqa: SLF001
-    assert supervisor._legacy_invocation_ids == {  # noqa: SLF001
+    assert parts.journal._canonical_execution_ids == set()  # noqa: SLF001
+    assert parts.journal._legacy_invocation_ids == {  # noqa: SLF001
         event.execution_id for event in reference if event.execution_id is not None
     }
 

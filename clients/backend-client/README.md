@@ -1,7 +1,7 @@
 # VibeSys backend client
 
-`@vibesys/backend-client` owns the TypeScript boundary to the Python supervision
-backend: generated protocol types, JSONL framing, request correlation, and event
+`@vibesys/backend-client` owns the TypeScript boundary to the Python backend
+server: generated protocol types, JSONL framing, request correlation, and event
 subscriptions.
 
 The package does not project events into application state and has no UI
