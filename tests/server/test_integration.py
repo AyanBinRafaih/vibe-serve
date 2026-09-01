@@ -128,6 +128,7 @@ def test_attach_run_installs_chat_with_isolated_session_state(tmp_path):  # noqa
         _attachment: RunAttachment,
         selection: AgentSelection,
         thread_id: str | None,
+        shared_state_dir: Path,
     ) -> ChatAgentResources:
         assert selection == AgentSelection(driver="agentshim", provider="codex", model="gpt-test")
         assert thread_id is None
@@ -138,6 +139,7 @@ def test_attach_run_installs_chat_with_isolated_session_state(tmp_path):  # noqa
             flush_logs=lambda: None,
             environment=dict,
             progress=lambda: None,
+            agent_shared_state_dir=str(shared_state_dir),
         )
 
     parts = build_server_parts(chat_agent_builder=build_agent)
@@ -160,11 +162,13 @@ def test_attach_run_installs_chat_with_isolated_session_state(tmp_path):  # noqa
     assert response.chat.answer == "It improved in round 2."
     assert client.calls[0]["reuse_session"] is False
     assert client.calls[0]["user_prompt"] == "what improved?"
-    transcript = project.root / ".vibesys/server/chat/conversation.jsonl"
+    transcript = project.state.log_directory(run_id).parent / "server/chat/conversation.jsonl"
     assert json.loads(transcript.read_text()) == {
         "question": "what improved?",
         "answer": "It improved in round 2.",
     }
+    assert not (project.root / ".vibesys/server").exists()
+    assert str(transcript.parent) in client.calls[0]["system_prompt"]
     detach()
     assert closed == ["closed"]
 
@@ -177,6 +181,7 @@ def test_non_cli_run_rejects_new_chat_threads(tmp_path):  # noqa: ANN001, ANN201
         _attachment: RunAttachment,
         _selection: AgentSelection,
         _thread_id: str | None,
+        shared_state_dir: Path,
     ) -> ChatAgentResources:
         return ChatAgentResources(
             client=client,
@@ -185,6 +190,7 @@ def test_non_cli_run_rejects_new_chat_threads(tmp_path):  # noqa: ANN001, ANN201
             flush_logs=lambda: None,
             environment=dict,
             progress=lambda: None,
+            agent_shared_state_dir=str(shared_state_dir),
         )
 
     parts = build_server_parts(chat_agent_builder=build_agent)

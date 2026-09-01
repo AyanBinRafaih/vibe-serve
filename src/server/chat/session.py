@@ -46,6 +46,8 @@ class ExperimentChatDependencies:
     agent_client: ChatAgentClient
     workspace: Path
     state_dir: Path
+    agent_shared_state_dir: str
+    agent_state_dir: str
     evidence: TrajectoryEvidence
     log: Callable[[str], None]
     environment: Callable[[], dict[str, str]]
@@ -80,10 +82,12 @@ class ExperimentChatSession:
         self._fallback = dependencies.fallback
         self._resources = resources
         self._lock = threading.Lock()
-        relative = self._state_dir.relative_to(self._workspace).as_posix()
-        self._system_prompt = experiment_chat_system_prompt(f"{relative}/conversation.jsonl")
+        self._system_prompt = experiment_chat_system_prompt(
+            dependencies.agent_shared_state_dir,
+            dependencies.agent_state_dir,
+        )
         self._continuation_prompt = experiment_chat_continuation_prompt(
-            f"{relative}/instructions.md", f"{relative}/conversation.jsonl"
+            dependencies.agent_state_dir
         )
         self._history = self._load_history()
 

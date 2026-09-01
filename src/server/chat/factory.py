@@ -13,15 +13,16 @@ from server.chat.manager import (
     ChatThreadHandle,
     TerminalChatResource,
 )
-from server.chat.prompts import CHAT_STATE_DIR
 from server.chat.session import (
     ExperimentChatDependencies,
     ExperimentChatSession,
 )
 from server.events import ChatThreadCreatedData
 from vibesys.agents import build_agent_client
+from vibesys.domains.environment import EnvironmentBindMount
 from vibesys.run import RunLogger
 from vibesys.run.integration import AgentSelection, RunAttachment
+from vs_sandbox import HostResource, HostResourceAccess
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -57,6 +58,7 @@ class ChatAgentResources:
     flush_logs: Callable[[], None]
     environment: Callable[[], dict[str, str]]
     progress: Callable[[], object | None]
+    agent_shared_state_dir: str
 
 
 class ChatAgentBuilder(Protocol):
@@ -67,6 +69,7 @@ class ChatAgentBuilder(Protocol):
         attachment: RunAttachment,
         selection: AgentSelection,
         instance_id: str | None,
+        shared_state_dir: Path,
         /,
     ) -> ChatAgentResources:
         """Build resources for one independently owned chat agent."""
@@ -77,6 +80,7 @@ def build_chat_agent(
     attachment: RunAttachment,
     selection: AgentSelection,
     instance_id: str | None,
+    shared_state_dir: Path,
 ) -> ChatAgentResources:
     """Build one chat agent without making the core aware of chat sessions."""
     runtime = attachment.agent_runtime
@@ -91,12 +95,26 @@ def build_chat_agent(
 
         backends: dict[str, Any] | None = None
         use_docker = False
+        agent_shared_state_dir = str(shared_state_dir)
         if attachment.agent_backend == "deepagents" or runtime.run_environment_sandboxed:
-            session = resources.enter_context(
-                runtime.environment.open(replace(runtime.environment_request, log=logger.lprint))
+            container_state_dir = "/opt/vibesys-chat"
+            environment_request = replace(
+                runtime.environment_request,
+                environment_bind_mounts=(
+                    *runtime.environment_request.environment_bind_mounts,
+                    EnvironmentBindMount(
+                        shared_state_dir,
+                        container_state_dir,
+                        read_only=True,
+                    ),
+                ),
+                log=logger.lprint,
             )
+            session = resources.enter_context(runtime.environment.open(environment_request))
             backends = {"chat": session.sandbox}
             use_docker = session.view.cli_sandboxed
+            if session.view.isolated:
+                agent_shared_state_dir = container_state_dir
 
         config = runtime.config.model_copy(
             update={"agent": runtime.config.agent.model_copy(update={"driver": selection.driver})}
@@ -116,7 +134,14 @@ def build_chat_agent(
             log_dir=attachment.log_dir,
             project_path_policy=runtime.project_path_policy,
             require_host_sandbox=not use_docker,
-            host_resources=runtime.host_resources,
+            host_resources=(
+                *runtime.host_resources,
+                HostResource(
+                    shared_state_dir,
+                    HostResourceAccess.READ_ONLY,
+                    "server chat evidence",
+                ),
+            ),
         )
         resources.callback(client.close)
         owner = resources.pop_all()
@@ -127,6 +152,7 @@ def build_chat_agent(
             flush_logs=logger.writer.flush,
             environment=dict,
             progress=lambda: None,
+            agent_shared_state_dir=agent_shared_state_dir,
         )
     except BaseException as construction_error:
         try:
@@ -236,10 +262,17 @@ class ExperimentChatFactory:
     def _build_session(
         self, thread_id: str | None, selection: AgentSelection
     ) -> ExperimentChatSession:
-        resources = self._build_agent(self._attachment, selection, thread_id)
-        shared_state_dir = self._workspace / CHAT_STATE_DIR
+        shared_state_dir = self._project.state.local_namespace(
+            self._run_id, "server"
+        ).external_directory("chat")
+        resources = self._build_agent(self._attachment, selection, thread_id, shared_state_dir)
         state_dir = (
             shared_state_dir if thread_id is None else shared_state_dir / "threads" / thread_id
+        )
+        agent_state_dir = (
+            resources.agent_shared_state_dir
+            if thread_id is None
+            else f"{resources.agent_shared_state_dir}/threads/{thread_id}"
         )
         evidence = TrajectoryEvidence(
             state_dir=state_dir,
@@ -257,6 +290,8 @@ class ExperimentChatFactory:
                 agent_client=resources.client,
                 workspace=self._workspace,
                 state_dir=state_dir,
+                agent_shared_state_dir=resources.agent_shared_state_dir,
+                agent_state_dir=agent_state_dir,
                 evidence=evidence,
                 log=resources.log,
                 environment=resources.environment,

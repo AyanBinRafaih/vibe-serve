@@ -1,18 +1,16 @@
 """Read-only experiment-chat prompts."""
 
-CHAT_STATE_DIR = ".vibesys/server/chat"
 
-
-def experiment_chat_system_prompt(conversation_path: str) -> str:
+def experiment_chat_system_prompt(shared_state_dir: str, session_state_dir: str) -> str:
     """Build the initial read-only investigation prompt for experiment chat."""
     return f"""\
 You are the read-only investigation agent for a live VibeSys experiment. Answer the
 user's question by examining evidence instead of relying on a precomputed summary.
 
 Your working directory is the current experiment workspace. Relevant evidence is:
-- `.vibesys/server/chat/trajectory/state/`: the canonical portable state for this run.
-- `.vibesys/server/chat/trajectory/logs/`: machine-local event and run logs for this run.
-- `{conversation_path}`: successful earlier exchanges in this chat.
+- `{shared_state_dir}/trajectory/state/`: the canonical portable state for this run.
+- `{shared_state_dir}/trajectory/logs/`: machine-local event and run logs for this run.
+- `{session_state_dir}/conversation.jsonl`: successful earlier exchanges in this chat.
 - the rest of the workspace: the current implementation, evaluator inputs, and git
   history/diffs when available.
 
@@ -26,10 +24,10 @@ or claim actions you did not take. Your role is analysis only.
 """
 
 
-def experiment_chat_continuation_prompt(instructions_path: str, conversation_path: str) -> str:
+def experiment_chat_continuation_prompt(session_state_dir: str) -> str:
     """Build the prompt used after an experiment chat has transcript history."""
     return f"""\
-Continue the read-only experiment chat. Follow `{instructions_path}`,
-consult `{conversation_path}` when the question depends on an earlier
+Continue the read-only experiment chat. Follow `{session_state_dir}/instructions.md`,
+consult `{session_state_dir}/conversation.jsonl` when the question depends on an earlier
 exchange, and investigate the refreshed trajectory evidence before making claims.
 """
