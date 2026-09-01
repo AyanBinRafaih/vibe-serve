@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import TypedDict, cast
 
 from vibesys.input_manifest import load_input_bundle
 
@@ -17,8 +18,34 @@ _CLIPS = (
 )
 
 
-def _trace_rows() -> list[dict[str, object]]:
-    return [json.loads(line) for line in _TRACE_PATH.read_text(encoding="utf-8").splitlines()]
+class _Asset(TypedDict):
+    path: str
+    sha256: str
+    media_type: str
+
+
+class _Input(TypedDict):
+    type: str
+    asset: _Asset
+
+
+class _Output(TypedDict):
+    type: str
+    max_tokens: int
+
+
+class _TraceRow(TypedDict):
+    id: str
+    arrival_time_ms: float
+    inputs: list[_Input]
+    outputs: list[_Output]
+
+
+def _trace_rows() -> list[_TraceRow]:
+    return [
+        cast("_TraceRow", json.loads(line))
+        for line in _TRACE_PATH.read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def _option(arguments: tuple[str, ...], name: str) -> str:
