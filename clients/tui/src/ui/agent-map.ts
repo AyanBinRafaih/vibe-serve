@@ -30,9 +30,9 @@ const STATUS_MARKER: Record<AgentPhase['status'], string> = {
 };
 
 /** Width the stacked fallback uses, and the width this pane had before. */
-const STACKED_WIDTH = 30;
+export const STACKED_WIDTH = 30;
 /** Columns the transcript needs to stay worth reading beside the graph. */
-const TRANSCRIPT_MIN = 42;
+export const TRANSCRIPT_MIN = 42;
 /** Share of the terminal the graph takes when there is room for it. */
 const GRAPH_SHARE = 0.55;
 

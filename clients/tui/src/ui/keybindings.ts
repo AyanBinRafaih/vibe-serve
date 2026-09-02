@@ -272,15 +272,22 @@ export function bindKeybindings(
     }
     if (key.name === 'up' || key.name === 'down') {
       if (!actions.navigateSuggestions(key.name === 'up' ? -1 : 1)) {
-        if (controller.state.roundFocus === 'rounds') {
+        // A resize can hide the rail while focus still reads `rounds`; stepping it
+        // then would move an invisible selection. Only drive the rail while it is
+        // on screen, otherwise `rounds` coerces to the agents pane (the side
+        // `focusedPane` already reports it as) so the keys stay on a live surface.
+        const railFocused =
+          controller.state.roundFocus === 'rounds' &&
+          roundRailVisible(controller.state, renderer.terminalWidth);
+        if (railFocused) {
           if (key.name === 'down') controller.selectNextRound();
           else controller.selectPreviousRound();
-        } else if (controller.state.roundFocus === 'agents') {
-          if (key.name === 'down') controller.selectNextAgent();
-          else controller.selectPreviousAgent();
-        } else {
+        } else if (controller.state.roundFocus === 'transcript') {
           controller.selectNextEntry(key.name === 'down' ? 1 : -1);
           actions.revealSelectedEntry();
+        } else {
+          if (key.name === 'down') controller.selectNextAgent();
+          else controller.selectPreviousAgent();
         }
       }
       key.preventDefault();

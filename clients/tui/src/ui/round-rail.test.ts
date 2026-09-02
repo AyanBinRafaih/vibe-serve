@@ -1,13 +1,17 @@
 import {describe, expect, test} from 'bun:test';
+import {createTestRenderer} from '@opentui/core/testing';
 import type {RoundSummary} from '@vibesys/core-state';
+import type {SessionController} from '../session-controller.js';
 import {initialSessionState, type SessionState} from '../session-model.js';
 import {
   RAIL_COMPACT_WIDTH,
   RAIL_FULL_WIDTH,
+  RoundRailView,
   railWindow,
   roundRailVisible,
   roundRailWidth,
 } from './round-rail.js';
+import {resolveTheme} from './theme.js';
 
 function rounds(count: number): RoundSummary[] {
   return Array.from({length: count}, (_, index) => ({
@@ -107,6 +111,15 @@ describe('railWindow', () => {
     const view = railWindow(rounds(100), 60, 3);
     expect(view.rounds.some(round => round.number === 60)).toBe(true);
   });
+
+  test('never returns more rounds than a one or two row rail can hold', () => {
+    for (const rows of [1, 2]) {
+      const view = railWindow(rounds(100), 50, rows);
+      expect(view.rounds.length).toBeLessThanOrEqual(rows);
+      expect(view.rounds.length).toBeGreaterThanOrEqual(1);
+      expect(view.rounds.some(round => round.number === 50)).toBe(true);
+    }
+  });
 });
 
 describe('roundRailWidth', () => {
@@ -117,11 +130,14 @@ describe('roundRailWidth', () => {
 
   test('falls back to the compact column between the thresholds', () => {
     expect(roundRailWidth(99)).toBe(RAIL_COMPACT_WIDTH);
-    expect(roundRailWidth(72)).toBe(RAIL_COMPACT_WIDTH);
+    expect(roundRailWidth(85)).toBe(RAIL_COMPACT_WIDTH);
   });
 
   test('collapses to nothing below the narrow threshold', () => {
-    expect(roundRailWidth(71)).toBe(0);
+    // 84 columns leave the agents fallback (30) and the transcript floor (42) no
+    // room beside the 13-column compact rail, so the rail hides rather than
+    // squeeze the transcript under its minimum.
+    expect(roundRailWidth(84)).toBe(0);
     expect(roundRailWidth(40)).toBe(0);
   });
 });
@@ -129,7 +145,7 @@ describe('roundRailWidth', () => {
 describe('roundRailVisible', () => {
   test('is on for a run that owns the round view at a usable width', () => {
     expect(roundRailVisible(railState(3), 120)).toBe(true);
-    expect(roundRailVisible(railState(3), 80)).toBe(true);
+    expect(roundRailVisible(railState(3), 90)).toBe(true);
   });
 
   test('is off before the run has any rounds', () => {
@@ -161,11 +177,50 @@ describe('roundRailVisible', () => {
     };
     // Wide enough for the split to open, so the rail yields the row to it.
     expect(roundRailVisible(split, 120)).toBe(false);
-    // Too narrow for the split, so the rail keeps the row.
-    expect(roundRailVisible(split, 80)).toBe(true);
+    // Too narrow for the split but wide enough for the rail, so it keeps the row.
+    expect(roundRailVisible(split, 90)).toBe(true);
   });
 
   test('is off below the collapse width even for a live run', () => {
+    expect(roundRailVisible(railState(3), 84)).toBe(false);
     expect(roundRailVisible(railState(3), 60)).toBe(false);
+  });
+});
+
+describe('RoundRailView row budget', () => {
+  async function railChildren(count: number, rows: number, selected: number): Promise<string[]> {
+    const {renderer} = await createTestRenderer({width: 120, height: 40});
+    const view = new RoundRailView(
+      renderer,
+      {} as unknown as SessionController,
+      resolveTheme(null),
+    );
+    view.render({...railState(count), selectedRound: selected}, RAIL_FULL_WIDTH, rows);
+    const lines = view.output.getChildren().map(child => {
+      const content = (child as {content?: {chunks?: {text?: string}[]}}).content;
+      return (content?.chunks ?? []).map(chunk => chunk.text ?? '').join('');
+    });
+    view.destroy();
+    return lines;
+  }
+
+  test('draws nothing when the box has no content rows', async () => {
+    // rows minus the two border rows leaves no room for a round or an indicator.
+    expect(await railChildren(100, 2, 50)).toHaveLength(0);
+    expect(await railChildren(100, 1, 50)).toHaveLength(0);
+  });
+
+  test('never emits more children than the content rows, dropping indicators first', async () => {
+    // One content row with the selection buried mid-run: the round wins the row
+    // and neither overflow indicator is drawn, because there is no row to spare.
+    const one = await railChildren(100, 3, 50);
+    expect(one).toHaveLength(1);
+    expect(one.some(line => line.includes('r50'))).toBe(true);
+    expect(one.some(line => line.startsWith('↑') || line.startsWith('↓'))).toBe(false);
+
+    // Two content rows: the round keeps one, a single indicator takes the other.
+    const two = await railChildren(100, 4, 50);
+    expect(two).toHaveLength(2);
+    expect(two.filter(line => line.startsWith('↑') || line.startsWith('↓'))).toHaveLength(1);
   });
 });

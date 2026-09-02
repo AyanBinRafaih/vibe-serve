@@ -8,6 +8,7 @@ import {
   stripRounds,
   visibleRoundNumber,
 } from '../session-model.js';
+import {STACKED_WIDTH, TRANSCRIPT_MIN} from './agent-map.js';
 import {elapsedLabel} from './previews.js';
 import {splitFits} from './right-pane.js';
 import type {Theme} from './theme.js';
@@ -16,10 +17,14 @@ import type {Theme} from './theme.js';
 export const RAIL_FULL_WIDTH = 28;
 /** Rail width for the narrow fallback: round number and status glyph only. */
 export const RAIL_COMPACT_WIDTH = 13;
+// The rail takes its column off the agents budget, so it may only appear at a
+// width where the agents pane and the transcript both keep their floors beside
+// it: rail + STACKED_WIDTH (the agents fallback) + TRANSCRIPT_MIN. Below that the
+// rail would push the transcript under its minimum, so it collapses instead.
 /** At or above this terminal width the rail shows full rows. */
-const RAIL_WIDE_MIN = 100;
+const RAIL_WIDE_MIN = RAIL_FULL_WIDTH + STACKED_WIDTH + TRANSCRIPT_MIN;
 /** Below this terminal width the rail is hidden and the round view is agents + transcript. */
-const RAIL_MIN = 72;
+const RAIL_MIN = RAIL_COMPACT_WIDTH + STACKED_WIDTH + TRANSCRIPT_MIN;
 /** Border top and bottom; the title rides the top border. */
 const RAIL_VCHROME = 2;
 
@@ -193,12 +198,28 @@ export class RoundRailView {
     const selected = visibleRoundNumber(state);
     const runningRound = latestActiveRoundNumber(rounds);
     const available = Math.max(0, rows - RAIL_VCHROME);
+    if (available <= 0) {
+      // No content rows: the box is all border, so there is nothing to draw and
+      // no overflow indicator to place.
+      this.#syncElapsedTimer();
+      return;
+    }
     const view = railWindow(rounds, selected, available);
-    if (view.hiddenBefore > 0) this.output.add(this.#indicator(`↑ ${view.hiddenBefore}`));
-    for (const round of view.rounds) {
+    // Rounds carry the selection, so they are placed first and never exceed the
+    // rows on hand; an overflow indicator is drawn only while a row is still free
+    // for it. A one or two row rail therefore never emits more children than it
+    // can show, and a rail with no spare row shows no indicator rather than one
+    // that would overflow.
+    const drawn = view.rounds.slice(0, available);
+    let spare = available - drawn.length;
+    const showBefore = view.hiddenBefore > 0 && spare > 0;
+    if (showBefore) spare -= 1;
+    const showAfter = view.hiddenAfter > 0 && spare > 0;
+    if (showBefore) this.output.add(this.#indicator(`↑ ${view.hiddenBefore}`));
+    for (const round of drawn) {
       this.output.add(this.#renderRound(round, {state, selected, runningRound, compact}));
     }
-    if (view.hiddenAfter > 0) this.output.add(this.#indicator(`↓ ${view.hiddenAfter}`));
+    if (showAfter) this.output.add(this.#indicator(`↓ ${view.hiddenAfter}`));
     this.#syncElapsedTimer();
   }
 

@@ -342,19 +342,11 @@ export function createOpenTuiApp(
     const railWidth = roundRailVisible(state, renderer.terminalWidth)
       ? roundRailWidth(renderer.terminalWidth)
       : 0;
-    const railRows =
-      renderer.terminalHeight -
-      header.height -
-      errorHeight -
-      todoStrip.output.height -
-      help.height -
-      commandInput.box.height;
     agentMap.output.visible = showAgents;
     transcriptFrame.visible = showTranscript;
     roundRail.output.visible = railWidth > 0;
     todoStrip.output.visible = !showLog && zoomedPane === null;
     if (!showLog) {
-      if (railWidth > 0) roundRail.render(state, railWidth, Math.max(0, railRows));
       agentMap.render(
         state,
         zoomedPane === 'agents' ? renderer.terminalWidth : undefined,
@@ -369,6 +361,18 @@ export function createOpenTuiApp(
         state,
         typeof agentWidth === 'number' ? todoStripWidth(agentWidth, renderer.terminalWidth) : null,
       );
+      // The rail's row budget is measured only now, after the todo strip has
+      // re-rendered this frame: a strip that grew or shrank changes its height
+      // here, and reading it before the render would bill the rail the previous
+      // frame's height and leave it a row long or short until the next paint.
+      const railRows =
+        renderer.terminalHeight -
+        header.height -
+        errorHeight -
+        todoStrip.output.height -
+        help.height -
+        commandInput.box.height;
+      if (railWidth > 0) roundRail.render(state, railWidth, Math.max(0, railRows));
       conversation.render(state);
     }
     // The agent map is the first thing to give up room: it is a summary the
