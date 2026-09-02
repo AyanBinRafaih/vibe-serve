@@ -116,26 +116,11 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    if (chatPaneFocused(controller.state)) {
-      if (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape') {
-        if (key.name === 'escape') controller.focusPane('left');
-        else actions.scrollChatPane(key.name === 'pageup' ? -1 : 1);
-        key.preventDefault();
-        return;
-      }
-      // The typed-command suggestions take Up/Down/Tab only while they are
-      // showing; otherwise the keys fall through to the editor underneath
-      // (multiline cursor movement, and Tab's ordinary no-op).
-      if (key.name === 'up' || key.name === 'down') {
-        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
-        return;
-      }
-      if (key.name === 'tab' && !key.shift) {
-        if (actions.completeChatInput()) key.preventDefault();
-        return;
-      }
-      return;
-    }
+    // Modal state is authoritative: the theme picker, the modal chat, and any
+    // overlay must contain input before the focused docked chat runs. Otherwise
+    // a modal opened while the docked chat has focus would leak printable keys
+    // into the hidden composer, let Up/Down drive chat suggestions, and route
+    // Escape to the left pane instead of closing the modal.
     if (controller.state.themePicker !== null) {
       if (key.name === 'up') controller.moveThemeSelection(-1);
       else if (key.name === 'down') controller.moveThemeSelection(1);
@@ -155,7 +140,7 @@ export function bindKeybindings(
         key.preventDefault();
         return;
       }
-      // Same suggestion-menu priority as the docked chat above.
+      // Same suggestion-menu priority as the docked chat below.
       if (key.name === 'up' || key.name === 'down') {
         if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
         return;
@@ -174,6 +159,26 @@ export function bindKeybindings(
       // The overlay is modal: everything it does not handle is swallowed so
       // keys cannot reach the panes or the hidden command input behind it.
       key.preventDefault();
+      return;
+    }
+    if (chatPaneFocused(controller.state)) {
+      if (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape') {
+        if (key.name === 'escape') controller.focusPane('left');
+        else actions.scrollChatPane(key.name === 'pageup' ? -1 : 1);
+        key.preventDefault();
+        return;
+      }
+      // The typed-command suggestions take Up/Down/Tab only while they are
+      // showing; otherwise the keys fall through to the editor underneath
+      // (multiline cursor movement, and Tab's ordinary no-op).
+      if (key.name === 'up' || key.name === 'down') {
+        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
+        return;
+      }
+      if (key.name === 'tab' && !key.shift) {
+        if (actions.completeChatInput()) key.preventDefault();
+        return;
+      }
       return;
     }
     // The experiment surface owns navigation while it is on screen. The index

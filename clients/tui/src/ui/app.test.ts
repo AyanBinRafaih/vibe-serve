@@ -2713,6 +2713,89 @@ describe('theming', () => {
     expect(controller.chatSubmissions).toEqual(['first line\nsecond line']);
   });
 
+  it('contains the theme picker over a focused docked chat', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    // Put the keys on the docked chat and start a draft in its composer.
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('keep this');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('chat');
+
+    // A global command opens the picker without moving focus off the chat, so
+    // the composer stays focused behind it.
+    controller.openThemePicker();
+    await testRenderer.waitForFrame(value => value.includes('Themes'));
+
+    // The picker is modal: arrows drive it rather than the chat suggestions.
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await frameAfter(testRenderer);
+    expect(controller.state.themePicker?.selected).toBe('light');
+
+    // A printable key is swallowed instead of leaking into the composer.
+    await testRenderer.mockInput.typeText('z');
+    await frameAfter(testRenderer);
+
+    // Escape closes the picker rather than focusing the left pane behind it.
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.themePicker).toBeNull();
+    expect(controller.state.layout.focus).toBe('chat');
+
+    // The draft is exactly what was typed before the picker opened: the arrow
+    // and the 'z' never reached the composer.
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual(['keep this']);
+    expect(controller.submissions).toEqual([]);
+  });
+
+  it('contains a help overlay over a focused docked chat', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('keep this');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('chat');
+
+    // /help opens an overlay without moving focus off the docked chat.
+    controller.publish({
+      ...controller.state,
+      overlay: {kind: 'help', content: 'Available commands'},
+    });
+    await testRenderer.waitForFrame(value => value.includes('Available commands'));
+
+    // The overlay is modal: a printable key is swallowed instead of leaking
+    // into the composer focused behind it.
+    await testRenderer.mockInput.typeText('z');
+    await frameAfter(testRenderer);
+
+    // Escape closes the overlay (goes live) rather than focusing the left pane.
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.overlay).toBeNull();
+    expect(controller.liveCalls).toBe(1);
+    expect(controller.state.layout.focus).toBe('chat');
+
+    // The draft still holds only what was typed before the overlay: the 'z'
+    // never reached the composer.
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual(['keep this']);
+  });
+
   it('preserves a draft when a resize moves chat from dock to modal', async () => {
     const testRenderer = await createTestRenderer({width: 140, height: 20});
     const controller = logController();
