@@ -276,6 +276,23 @@ function findCommand(token: string, surface: CommandSurface): CommandDef | undef
 }
 
 /**
+ * Enforces a command's `args` contract before dispatch. A `none` command rejects
+ * any trailing text, and a `required` command rejects an empty argument, so a
+ * slash-prefixed phrase like `/pause typo` cannot slip past a parser that ignores
+ * its argument. Returns the registry usage error, or `undefined` when the
+ * argument is admissible and the parser should run.
+ */
+function checkArgument(command: CommandDef, argument: string): ParsedCommand | undefined {
+  if (command.args === 'none' && argument !== '') {
+    return {kind: 'error', error: `Usage: ${command.usage ?? command.name}`};
+  }
+  if (command.args === 'required' && argument === '') {
+    return {kind: 'error', error: `Usage: ${command.usage ?? command.name}`};
+  }
+  return undefined;
+}
+
+/**
  * The commands a surface offers, in the order suggestions and help list them.
  * The chat leads with its own thread commands, then the run and view commands
  * it forwards; the command bar keeps registry order.
@@ -313,6 +330,8 @@ export function parseCommand(text: string, {surface}: SurfaceContext): ParsedCom
   const argument = text.slice(token.length).replace(/^\s+/, '').trimEnd();
   const command = findCommand(token, surface);
   if (command === undefined) return {kind: 'unknown', text};
+  const argumentError = checkArgument(command, argument);
+  if (argumentError !== undefined) return argumentError;
   return command.parse(argument);
 }
 

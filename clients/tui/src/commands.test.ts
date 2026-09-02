@@ -96,6 +96,54 @@ describe('parseCommand', () => {
   });
 });
 
+describe('argument-contract enforcement', () => {
+  it('rejects trailing text on no-argument commands on the command bar', () => {
+    // Before the registry refactor exact-match parsers rejected these; a
+    // no-argument parser must not silently ignore a slash-prefixed phrase.
+    expect(onCommand('/pause typo')).toEqual({kind: 'error', error: 'Usage: /pause'});
+    expect(onCommand('/perf extra')).toEqual({kind: 'error', error: 'Usage: /perf'});
+    expect(onCommand('/help ignored')).toEqual({kind: 'error', error: 'Usage: /help'});
+    expect(onCommand('/resume now')).toEqual({kind: 'error', error: 'Usage: /resume'});
+    expect(onCommand('/design later')).toEqual({kind: 'error', error: 'Usage: /design'});
+  });
+
+  it('rejects trailing text on no-argument commands in the chat', () => {
+    expect(onChat('/pause typo')).toEqual({kind: 'error', error: 'Usage: /pause'});
+    expect(onChat('/help ignored')).toEqual({kind: 'error', error: 'Usage: /help'});
+    // A chat-only, state-changing command must not fire from a phrase either.
+    expect(onChat('/clear definitely-not')).toEqual({kind: 'error', error: 'Usage: /clear'});
+    expect(onChat('/model gpt')).toEqual({kind: 'error', error: 'Usage: /model'});
+    expect(onChat('/switch elsewhere')).toEqual({kind: 'error', error: 'Usage: /switch'});
+  });
+
+  it('still accepts no-argument commands with no trailing text', () => {
+    expect(onCommand('/pause')).toEqual({kind: 'request', request: {type: 'command.pause'}});
+    // Trailing whitespace alone is not an argument.
+    expect(onCommand('/pause   ')).toEqual({kind: 'request', request: {type: 'command.pause'}});
+    expect(onChat('/clear')).toEqual({kind: 'chatClear'});
+  });
+
+  it('leaves commands that take arguments unaffected', () => {
+    expect(onCommand('/steer look at the cache')).toEqual({
+      kind: 'request',
+      request: {type: 'command.steer', text: 'look at the cache'},
+    });
+    expect(onCommand('/theme solarized-light')).toEqual({
+      kind: 'theme',
+      themeName: 'solarized-light',
+    });
+    expect(onCommand('/open-round 3')).toEqual({kind: 'openRound', round: 3});
+    // Optional-argument commands still resolve with no argument.
+    expect(onCommand('/theme')).toEqual({kind: 'theme'});
+    expect(onCommand('/open-round')).toEqual({kind: 'openRound'});
+  });
+
+  it('rejects an empty argument on required-argument commands with the registry usage', () => {
+    expect(onCommand('/steer')).toEqual({kind: 'error', error: 'Usage: /steer <message>'});
+    expect(onChat('/steer')).toEqual({kind: 'error', error: 'Usage: /steer <message>'});
+  });
+});
+
 describe('cross-surface parity', () => {
   it('resolves shared commands identically on the command bar and in the chat', () => {
     for (const text of SHARED) {
