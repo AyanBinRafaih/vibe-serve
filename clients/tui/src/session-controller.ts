@@ -1,10 +1,12 @@
 import {
   type EventSubscription,
+  PersistentEventStream,
   type ProtocolResponse,
   type RequestInput,
   type RunEvent,
   ServerError,
   type ServerMessage,
+  type StreamConnectionState,
   type SubscribeOptions,
 } from '@vibesys/backend-client';
 import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
@@ -184,7 +186,7 @@ const RECONNECT_DELAYS_MS: readonly number[] = [500, 1_000, 2_000, 4_000, 8_000]
 export class SocketSessionController implements SessionController {
   #state: SessionState;
   readonly #listeners = new Set<(state: SessionState) => void>();
-  #eventSubscription: EventSubscription | null = null;
+  #stream: PersistentEventStream;
   #chatMessageId = 0;
   readonly #chatQueue: Array<{id: string; text: string; threadId: string}> = [];
   #chatDrain: Promise<void> | null = null;
@@ -226,16 +228,6 @@ export class SocketSessionController implements SessionController {
    */
   #declaredFloor: number | null = null;
   #streamProtocolError = false;
-  /**
-   * True once the live subscription resumed from the client's own cursor
-   * instead of bootstrapping with a tail. A resumed subscription declares no
-   * history floor of its own, so its batches must not touch the floor
-   * bookkeeping the boot subscription established; see `#onMessage`.
-   */
-  #resumedStream = false;
-  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  #reconnectAttempt = 0;
-  #stopped = false;
 
   constructor(
     private readonly client: ServerTransport,
@@ -248,12 +240,16 @@ export class SocketSessionController implements SessionController {
     private readonly trace: StartupTrace = () => {},
     /**
      * Backoff schedule for stream reconnects; its length bounds the attempts
-     * per outage. Injected by tests so a retry is immediate instead of half a
-     * second away.
+     * per outage. Handed to the stream, and injected by tests so a retry is
+     * immediate instead of half a second away.
      */
-    private readonly reconnectDelaysMs: readonly number[] = RECONNECT_DELAYS_MS,
+    reconnectDelaysMs: readonly number[] = RECONNECT_DELAYS_MS,
   ) {
     this.#state = initialSessionState(themeName);
+    this.#stream = new PersistentEventStream(client, {
+      tail: BOOTSTRAP_TAIL,
+      reconnectDelaysMs,
+    });
   }
 
   get state(): SessionState {
@@ -276,8 +272,26 @@ export class SocketSessionController implements SessionController {
       // The log is the landing view, so it is populated before the first frame
       // rather than on demand.
       this.#loadExperiments(),
-      this.#openEventStream(),
+      // The stream owns its own dial/redial loop; the controller supplies where
+      // to resume from, whether a drop is worth reconnecting, and where the
+      // messages and connection changes land.
+      this.#stream.subscribe({
+        cursor: () => this.#state.core.sequence,
+        shouldReconnect: () => !this.#state.core.terminal && !this.#streamProtocolError,
+        onMessage: (message, {resumed}) => this.#onMessage(message, resumed),
+        onConnectionState: state => this.#onConnectionState(state),
+      }),
     ]);
+  }
+
+  #onConnectionState(state: StreamConnectionState): void {
+    if (state.status === 'connected') {
+      this.#setState(markEventStreamAvailable(this.#state));
+    } else {
+      this.#setState(
+        reportCaughtError(markEventStreamUnavailable(this.#state), state.error, 'transport'),
+      );
+    }
   }
 
   async #loadSnapshot(): Promise<void> {
@@ -287,135 +301,6 @@ export class SocketSessionController implements SessionController {
     } catch (error) {
       this.#setState(reportCaughtError(this.#state, error, 'request'));
     }
-  }
-
-  /**
-   * Subscribes to the tail of the stream, falling back to the whole history.
-   *
-   * A server that predates `tail` forbids the unknown field and rejects the
-   * subscription, so the rejection is the capability probe: there is nothing
-   * else to ask. Any other failure degrades the same way, because a full
-   * replay is only slow, never wrong. A run shorter than the tail needs no
-   * special case, since the server clamps the floor to 0 and the batch comes
-   * back with `history_after_sequence` 0, which is today's behavior exactly.
-   */
-  async #openEventStream(): Promise<boolean> {
-    const onMessage = (message: ServerMessage): void => this.#onMessage(message);
-    const onDisconnect = (error: Error): void => this.#onStreamDisconnect(error);
-    try {
-      const subscription = await this.client.subscribe(0, onMessage, onDisconnect, {
-        tail: BOOTSTRAP_TAIL,
-      });
-      return await this.#adoptSubscription(subscription);
-    } catch {
-      // Reported only if the full replay fails too: one boot must not put two
-      // banners up, and the first failure is expected against an old server.
-    }
-    try {
-      const subscription = await this.client.subscribe(0, onMessage, onDisconnect);
-      return await this.#adoptSubscription(subscription);
-    } catch (error) {
-      this.#setState(
-        reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
-      );
-      return false;
-    }
-  }
-
-  #onStreamDisconnect(error: Error): void {
-    // A terminal event already carries the actual outcome. The socket
-    // closing afterward is lifecycle cleanup, not a second failure that
-    // should replace the useful diagnostic in the banner. The same applies
-    // to reconnecting: a finished run has nothing more to stream.
-    if (this.#stopped || this.#state.core.terminal || this.#streamProtocolError) return;
-    this.#setState(reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'));
-    this.#scheduleReconnect();
-  }
-
-  #scheduleReconnect(): void {
-    if (this.#reconnectTimer !== null) return;
-    const delay = this.reconnectDelaysMs[this.#reconnectAttempt];
-    if (delay === undefined) return;
-    this.#reconnectAttempt += 1;
-    this.#reconnectTimer = setTimeout(() => {
-      this.#reconnectTimer = null;
-      void this.#resumeEventStream();
-    }, delay);
-  }
-
-  /**
-   * Re-opens the event stream after a disconnect, resuming from the client's
-   * own cursor: `core.sequence` is the last folded event, and the reducer
-   * skips anything at or below it, so a boundary event delivered twice folds
-   * once and an event the outage swallowed is replayed rather than lost.
-   *
-   * If the boot batch never arrived there is no cursor and no floor to
-   * preserve, so the resume is a fresh bootstrap instead, tail fallback and
-   * all.
-   */
-  async #resumeEventStream(): Promise<void> {
-    if (this.#stopped || this.#state.core.terminal || this.#streamProtocolError) return;
-    const stale = this.#eventSubscription;
-    this.#eventSubscription = null;
-    try {
-      await stale?.close();
-    } catch {
-      // The subscription is already dead; closing it owes nothing.
-    }
-    const recovered =
-      this.#declaredFloor === null ? await this.#openEventStream() : await this.#resubscribe();
-    if (this.#stopped) return;
-    if (recovered) {
-      this.#reconnectAttempt = 0;
-      this.#setState(markEventStreamAvailable(this.#state));
-    } else {
-      this.#scheduleReconnect();
-    }
-  }
-
-  async #resubscribe(): Promise<boolean> {
-    // Set resume mode before dialing, not after the await: the production
-    // ServerClient invokes onMessage before its subscribe promise resolves and
-    // can deliver `subscribed` and the first `event_batch` in one socket chunk.
-    // A flag raised only after the await would miss that first batch, which
-    // would then take the bootstrap branch, consume the resumed stream's
-    // phantom floor 0, and disable scroll-back. Every subscribe from here on is
-    // a resume, so leaving the flag set after a failed dial is correct too.
-    this.#resumedStream = true;
-    try {
-      const subscription = await this.client.subscribe(
-        this.#state.core.sequence,
-        message => this.#onMessage(message),
-        error => this.#onStreamDisconnect(error),
-      );
-      return await this.#adoptSubscription(subscription);
-    } catch {
-      // The disconnect banner is still up and still accurate; the next
-      // attempt, if the schedule has one, speaks for itself.
-      return false;
-    }
-  }
-
-  /**
-   * Takes ownership of a freshly dialed subscription, or closes it if the
-   * controller stopped while the dial was in flight.
-   *
-   * `stop()` nulls `#eventSubscription` and awaits its close, but a subscribe
-   * that has not resolved yet is not there to cancel. Without this the late
-   * subscription would be stored after shutdown and never closed, so its socket
-   * could outlive `stop()` and deliver state changes after it.
-   */
-  async #adoptSubscription(subscription: EventSubscription): Promise<boolean> {
-    if (!this.#stopped) {
-      this.#eventSubscription = subscription;
-      return true;
-    }
-    try {
-      await subscription.close();
-    } catch {
-      // A doomed socket that will not close cleanly still must not be kept.
-    }
-    return false;
   }
 
   /**
@@ -463,13 +348,7 @@ export class SocketSessionController implements SessionController {
   }
 
   async stop(): Promise<void> {
-    this.#stopped = true;
-    if (this.#reconnectTimer !== null) {
-      clearTimeout(this.#reconnectTimer);
-      this.#reconnectTimer = null;
-    }
-    await this.#eventSubscription?.close();
-    this.#eventSubscription = null;
+    await this.#stream.close();
     await this.client.close();
   }
 
@@ -1031,14 +910,14 @@ export class SocketSessionController implements SessionController {
     }
   }
 
-  #onMessage(message: ServerMessage): void {
+  #onMessage(message: ServerMessage, resumed: boolean): void {
     if (message.type === 'event') {
       this.#setState(applyEvent(this.#state, message.event));
       this.#refreshExperimentsFor([message.event]);
       this.#refreshPaneFor([message.event]);
     }
     if (message.type === 'event_batch') {
-      if (this.#resumedStream) {
+      if (resumed) {
         // A resumed subscription replays exactly the events after the
         // client's own cursor and declares no history floor of its own
         // (`history_after_sequence` 0 on every batch). Taking that literally
