@@ -116,6 +116,51 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
+    // Modal state is authoritative: the theme picker, the modal chat, and any
+    // overlay must contain input before the focused docked chat runs. Otherwise
+    // a modal opened while the docked chat has focus would leak printable keys
+    // into the hidden composer, let Up/Down drive chat suggestions, and route
+    // Escape to the left pane instead of closing the modal.
+    if (controller.state.themePicker !== null) {
+      if (key.name === 'up') controller.moveThemeSelection(-1);
+      else if (key.name === 'down') controller.moveThemeSelection(1);
+      else if (key.name === 'pageup') controller.moveThemeSelection(-10);
+      else if (key.name === 'pagedown') controller.moveThemeSelection(10);
+      else if (key.name === 'escape') controller.closeThemePicker();
+      else if (key.name === 'return' || key.name === 'enter') controller.applySelectedTheme();
+      // The picker is modal: keys it does not use are swallowed here so they
+      // cannot move panes or type into the still-focused input behind it.
+      key.preventDefault();
+      return;
+    }
+    if (controller.state.chatOpen) {
+      if (key.name === 'escape') {
+        if (controller.state.layout.right !== null) controller.closeOverlays();
+        else actions.closeChat();
+        key.preventDefault();
+        return;
+      }
+      // Same suggestion-menu priority as the docked chat below.
+      if (key.name === 'up' || key.name === 'down') {
+        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
+        return;
+      }
+      if (key.name === 'tab' && !key.shift) {
+        if (actions.completeChatInput()) key.preventDefault();
+        return;
+      }
+      return;
+    }
+    if (controller.state.overlay !== null) {
+      if (key.name === 'escape') {
+        controller.live();
+        viewport.scrollTo(viewport.scrollHeight);
+      }
+      // The overlay is modal: everything it does not handle is swallowed so
+      // keys cannot reach the panes or the hidden command input behind it.
+      key.preventDefault();
+      return;
+    }
     if (chatPaneFocused(controller.state)) {
       if (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape') {
         if (key.name === 'escape') controller.focusPane('left');
@@ -134,43 +179,6 @@ export function bindKeybindings(
         if (actions.completeChatInput()) key.preventDefault();
         return;
       }
-      return;
-    }
-    if (controller.state.themePicker !== null) {
-      if (key.name === 'up') controller.moveThemeSelection(-1);
-      else if (key.name === 'down') controller.moveThemeSelection(1);
-      else if (key.name === 'pageup') controller.moveThemeSelection(-10);
-      else if (key.name === 'pagedown') controller.moveThemeSelection(10);
-      else if (key.name === 'escape') controller.closeThemePicker();
-      else if (key.name === 'return' || key.name === 'enter') {
-        if (!actions.inputIsEmpty()) return;
-        controller.applySelectedTheme();
-      } else return;
-      key.preventDefault();
-      return;
-    }
-    if (controller.state.chatOpen) {
-      if (key.name === 'escape') {
-        if (controller.state.layout.right !== null) controller.closeOverlays();
-        else actions.closeChat();
-        key.preventDefault();
-        return;
-      }
-      // Same suggestion-menu priority as the docked chat above.
-      if (key.name === 'up' || key.name === 'down') {
-        if (actions.navigateChatSuggestions(key.name === 'up' ? -1 : 1)) key.preventDefault();
-        return;
-      }
-      if (key.name === 'tab' && !key.shift) {
-        if (actions.completeChatInput()) key.preventDefault();
-        return;
-      }
-      return;
-    }
-    if (key.name === 'escape' && controller.state.overlay !== null) {
-      controller.live();
-      viewport.scrollTo(viewport.scrollHeight);
-      key.preventDefault();
       return;
     }
     // The experiment surface owns navigation while it is on screen. The index
@@ -234,7 +242,9 @@ export function bindKeybindings(
         return;
       }
     }
-    if (key.name === 'left' || key.name === 'right') {
+    // Like Enter above, pane focus and round navigation yield to a typed
+    // command: cursor keys and brackets belong to a non-empty input.
+    if ((key.name === 'left' || key.name === 'right') && actions.inputIsEmpty()) {
       controller.focusRound(key.name === 'left' ? 'agents' : 'transcript');
       key.preventDefault();
       return;
@@ -279,13 +289,13 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    if (key.name === ']') {
+    if (key.name === ']' && actions.inputIsEmpty()) {
       actions.selectNextRound();
       viewport.scrollTo(viewport.scrollHeight);
       key.preventDefault();
       return;
     }
-    if (key.name === '[') {
+    if (key.name === '[' && actions.inputIsEmpty()) {
       actions.selectPreviousRound();
       viewport.scrollTo(viewport.scrollHeight);
       key.preventDefault();
