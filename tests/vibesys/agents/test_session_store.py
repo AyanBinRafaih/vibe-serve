@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from vibesys.agents.client import AgentClient
 from vibesys.agents.contracts import (
     AgentCapabilities,
@@ -156,6 +158,7 @@ class _SeedableSession:
     """A fake session that records seeds and returns queued turn results."""
 
     results: list[AgentTurnResult]
+    error: Exception | None = None
     seeded: list[str] = field(default_factory=list)
     close_calls: int = 0
 
@@ -164,6 +167,8 @@ class _SeedableSession:
         request: AgentTurnRequest,  # noqa: ARG002
         observer: AgentObserver | None = None,  # noqa: ARG002
     ) -> AgentTurnResult:
+        if self.error is not None:
+            raise self.error
         return self.results.pop(0)
 
     def seed_provider_session(self, session_id: str) -> None:
@@ -256,6 +261,46 @@ def test_seed_is_skipped_when_the_stored_provider_or_model_differs(tmp_path: Pat
     )
 
     assert session.seeded == []
+
+
+def test_failed_seeded_turn_invalidates_the_persisted_session(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.record("hypothesis:H-01", provider="codex", model="gpt-5.6-sol", session_id="thread-stale")
+    # A fresh client models a resumed process: the first turn seeds the stored
+    # ID, then raises (e.g. a deleted/invalid Claude session with no fallback).
+    failing = _SeedableSession(results=[], error=RuntimeError("resume failed: unknown session"))
+    fresh = _SeedableSession(results=[AgentTurnResult("fresh", provider_session_id="thread-new")])
+    client = AgentClient(_FakeDriver([failing, fresh]), session_store=store)
+
+    with pytest.raises(RuntimeError):
+        client.run(
+            session_spec=_spec(), turn=AgentTurnRequest("resume"), session_key="hypothesis:H-01"
+        )
+
+    assert failing.seeded == ["thread-stale"]
+    # The stale ID must be forgotten so the next attempt does not re-seed it.
+    assert store.get("hypothesis:H-01") is None
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("retry"), session_key="hypothesis:H-01")
+    assert fresh.seeded == []
+
+
+def test_failed_turn_on_a_proven_session_keeps_the_persisted_session(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    # Turn one succeeds (proving the resume), turn two on the same cached session
+    # fails transiently. The persisted ID stays: it named a valid rollout.
+    session = _SeedableSession(results=[AgentTurnResult("one", provider_session_id="thread-1")])
+    client = AgentClient(_FakeDriver([session]), session_store=store)
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="hypothesis:H-01")
+
+    session.error = RuntimeError("transient network error")
+    with pytest.raises(RuntimeError):
+        client.run(
+            session_spec=_spec(), turn=AgentTurnRequest("two"), session_key="hypothesis:H-01"
+        )
+
+    record = store.get("hypothesis:H-01")
+    assert record is not None
+    assert record.session_id == "thread-1"
 
 
 def test_reset_disposition_clears_the_persisted_session(tmp_path: Path) -> None:

@@ -451,6 +451,7 @@ class AgentClient:
             return self._run_ephemeral(session_spec, turn, observer)
 
         cached = self._sessions.get(session_key)
+        seeded = False
         if cached is not None and cached.spec != session_spec:
             # Provider/model/policy changed within this process: the persisted
             # provider session no longer matches the new configuration, so drop
@@ -464,13 +465,23 @@ class AgentClient:
             # conversation; seed the persisted provider session ID so the very
             # first turn resumes (``codex exec resume`` / ``claude --resume``)
             # instead of replaying the round.
-            self._seed_session(session, session_spec, session_key)
+            seeded = self._seed_session(session, session_spec, session_key)
             cached = _CachedSession(spec=session_spec, session=session)
             self._sessions[session_key] = cached
 
         try:
             result = cached.session.run_turn(turn, observer)
         except BaseException as error:
+            if seeded:
+                # The first turn of a session just resumed from a persisted
+                # provider ID failed. That ID is most likely stale or deleted
+                # (Claude has no missing-rollout fallback), so forget it too:
+                # a retry or restart must start a fresh session instead of
+                # re-seeding the same failing ``--resume <id>`` indefinitely.
+                # A session that survives to a later call always had a
+                # successful turn (failure evicts here), so ``seeded`` is never
+                # set for a transient mid-conversation failure on a proven ID.
+                self._session_store.clear(session_key)
             try:
                 self._evict(session_key)
             except Exception as cleanup_error:  # noqa: BLE001  # preserve the turn failure
@@ -489,22 +500,28 @@ class AgentClient:
         session: AgentSession,
         spec: AgentSessionSpec,
         session_key: str,
-    ) -> None:
-        """Seed a freshly created session with a matching persisted provider ID."""
+    ) -> bool:
+        """Seed a freshly created session with a matching persisted provider ID.
+
+        Return whether a stored ID was injected, so the caller can invalidate it
+        when the resumed session's first turn fails.
+        """
         record = self._session_store.get(session_key)
         if record is None:
-            return
+            return False
         if record.provider != spec.provider or record.model != spec.model:
             # A configuration change since the ID was stored: never resume with a
             # mismatched provider/model. Leave the fresh session cold; the store
             # is corrected once this turn persists a new ID.
-            return
+            return False
         # ``seed_provider_session`` is an optional session capability; a driver
         # whose provider cannot resume (or a session type without it) simply
         # starts fresh, and a stale/deleted rollout falls back inside the driver.
         seed = getattr(session, "seed_provider_session", None)
         if callable(seed):
             seed(record.session_id)
+            return True
+        return False
 
     def _persist_session(
         self,
