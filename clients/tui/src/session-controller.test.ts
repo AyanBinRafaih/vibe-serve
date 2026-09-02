@@ -1809,6 +1809,50 @@ describe('stream reconnect', () => {
     await settle();
     expect(stopped.subscribeCalls).toHaveLength(1);
   });
+
+  it('treats the first resumed batch as resumed even when it lands before subscribe resolves', async () => {
+    const transport = new SyncResumeTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0]);
+    await controller.start();
+    // A tail bootstrap: everything at or below sequence 5 is unread history.
+    transport.emitBatch([event(6, 'agent_output_chunk', 'six\n')], 5);
+    expect(controller.state.core.historyAfterSequence).toBe(5);
+
+    transport.sever();
+    // The resume subscribe delivers `subscribed` + `event_batch` in one chunk,
+    // before its promise resolves, so the batch reaches onMessage while the
+    // resume flag would still be unset if it were raised only after the await.
+    transport.deliverOnNextSubscribe([event(7, 'agent_output_chunk', 'seven\n')], 0);
+    await settle();
+
+    expect(controller.state.core.sequence).toBe(7);
+    // The resumed batch declares no floor of its own; its 0 must not lower the
+    // floor and disable scroll-back.
+    expect(controller.state.core.historyAfterSequence).toBe(5);
+  });
+
+  it('closes a reconnect subscription that resolves after stop', async () => {
+    const transport = new DeferredResumeTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0]);
+    await controller.start();
+    transport.emitBatch([event(1, 'agent_output_chunk', 'one\n')], 0);
+    expect(controller.state.core.sequence).toBe(1);
+
+    transport.deferNextSubscribe();
+    transport.sever();
+    await settle();
+    // The boot subscribe plus the resume dial, which is now pending.
+    expect(transport.subscribeCalls).toHaveLength(2);
+
+    await controller.stop();
+    // stop() cannot cancel a dial that has not resolved; let it land now.
+    transport.releasePendingSubscribe();
+    await settle();
+
+    // The late subscription is closed, not adopted, so its socket cannot
+    // outlive shutdown and deliver state after stop.
+    expect(transport.subscriptions[1]?.closed).toBe(true);
+  });
 });
 
 class FakeTransport implements ServerTransport {
@@ -1929,6 +1973,152 @@ class ReconnectTransport implements ServerTransport {
   }
 
   close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/**
+ * A backend whose resume subscribe delivers its first `event_batch`
+ * synchronously, before the subscribe promise resolves, exactly as the
+ * production ServerClient does when `subscribed` and the batch share one socket
+ * chunk. The ordinary reconnect fake emits only after the dial settles and so
+ * cannot exercise that window.
+ */
+class SyncResumeTransport implements ServerTransport {
+  readonly subscribeCalls: Array<{afterSequence: number; tail: number | undefined}> = [];
+  #message: ((message: ServerMessage) => void) | null = null;
+  #disconnect: ((error: Error) => void) | null = null;
+  #armed: {events: RunEvent[]; historyAfterSequence: number} | null = null;
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    return Promise.resolve({
+      protocol_version: 1,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true,
+      ...(input.type === 'query.experiments' ? {experiments: [], experiments_ready: true} : {}),
+    });
+  }
+
+  /** Arm the next subscribe to deliver this batch before its promise resolves. */
+  deliverOnNextSubscribe(events: readonly RunEvent[], historyAfterSequence: number): void {
+    this.#armed = {events: [...events], historyAfterSequence};
+  }
+
+  subscribe(
+    afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    onDisconnect: (error: Error) => void,
+    options?: SubscribeOptions,
+  ): Promise<EventSubscription> {
+    this.subscribeCalls.push({afterSequence, tail: options?.tail});
+    this.#message = onMessage;
+    this.#disconnect = onDisconnect;
+    const armed = this.#armed;
+    this.#armed = null;
+    if (armed !== null) {
+      // Faithful to ServerClient: onMessage runs inside subscribe, before the
+      // returned promise resolves.
+      onMessage({
+        type: 'event_batch',
+        events: armed.events,
+        history_after_sequence: armed.historyAfterSequence,
+      });
+    }
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  emitBatch(events: readonly RunEvent[], historyAfterSequence = 0): void {
+    this.#message?.({
+      type: 'event_batch',
+      events: [...events],
+      history_after_sequence: historyAfterSequence,
+    });
+  }
+
+  sever(message = 'Server event stream disconnected'): void {
+    this.#disconnect?.(new Error(message));
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/**
+ * A backend whose resume subscribe stays pending until the test releases it, so
+ * `stop()` can be called while the dial is in flight. It records every
+ * subscription it hands out so a test can see which were closed.
+ */
+class DeferredResumeTransport implements ServerTransport {
+  readonly subscribeCalls: Array<{afterSequence: number; tail: number | undefined}> = [];
+  readonly subscriptions: Array<{closed: boolean}> = [];
+  closed = false;
+  #message: ((message: ServerMessage) => void) | null = null;
+  #disconnect: ((error: Error) => void) | null = null;
+  #deferNext = false;
+  #release: (() => void) | null = null;
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    return Promise.resolve({
+      protocol_version: 1,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true,
+      ...(input.type === 'query.experiments' ? {experiments: [], experiments_ready: true} : {}),
+    });
+  }
+
+  /** Hold the next subscribe pending until `releasePendingSubscribe`. */
+  deferNextSubscribe(): void {
+    this.#deferNext = true;
+  }
+
+  releasePendingSubscribe(): void {
+    const release = this.#release;
+    this.#release = null;
+    release?.();
+  }
+
+  subscribe(
+    afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    onDisconnect: (error: Error) => void,
+    options?: SubscribeOptions,
+  ): Promise<EventSubscription> {
+    this.subscribeCalls.push({afterSequence, tail: options?.tail});
+    this.#message = onMessage;
+    this.#disconnect = onDisconnect;
+    const record = {closed: false};
+    this.subscriptions.push(record);
+    const subscription: EventSubscription = {
+      close: async () => {
+        record.closed = true;
+      },
+    };
+    if (this.#deferNext) {
+      this.#deferNext = false;
+      return new Promise<EventSubscription>(resolve => {
+        this.#release = () => resolve(subscription);
+      });
+    }
+    return Promise.resolve(subscription);
+  }
+
+  emitBatch(events: readonly RunEvent[], historyAfterSequence = 0): void {
+    this.#message?.({
+      type: 'event_batch',
+      events: [...events],
+      history_after_sequence: historyAfterSequence,
+    });
+  }
+
+  sever(message = 'Server event stream disconnected'): void {
+    this.#disconnect?.(new Error(message));
+  }
+
+  close(): Promise<void> {
+    this.closed = true;
     return Promise.resolve();
   }
 }

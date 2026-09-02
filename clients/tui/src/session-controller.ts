@@ -303,17 +303,17 @@ export class SocketSessionController implements SessionController {
     const onMessage = (message: ServerMessage): void => this.#onMessage(message);
     const onDisconnect = (error: Error): void => this.#onStreamDisconnect(error);
     try {
-      this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect, {
+      const subscription = await this.client.subscribe(0, onMessage, onDisconnect, {
         tail: BOOTSTRAP_TAIL,
       });
-      return true;
+      return await this.#adoptSubscription(subscription);
     } catch {
       // Reported only if the full replay fails too: one boot must not put two
       // banners up, and the first failure is expected against an old server.
     }
     try {
-      this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect);
-      return true;
+      const subscription = await this.client.subscribe(0, onMessage, onDisconnect);
+      return await this.#adoptSubscription(subscription);
     } catch (error) {
       this.#setState(
         reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
@@ -374,19 +374,48 @@ export class SocketSessionController implements SessionController {
   }
 
   async #resubscribe(): Promise<boolean> {
+    // Set resume mode before dialing, not after the await: the production
+    // ServerClient invokes onMessage before its subscribe promise resolves and
+    // can deliver `subscribed` and the first `event_batch` in one socket chunk.
+    // A flag raised only after the await would miss that first batch, which
+    // would then take the bootstrap branch, consume the resumed stream's
+    // phantom floor 0, and disable scroll-back. Every subscribe from here on is
+    // a resume, so leaving the flag set after a failed dial is correct too.
+    this.#resumedStream = true;
     try {
-      this.#eventSubscription = await this.client.subscribe(
+      const subscription = await this.client.subscribe(
         this.#state.core.sequence,
         message => this.#onMessage(message),
         error => this.#onStreamDisconnect(error),
       );
-      this.#resumedStream = true;
-      return true;
+      return await this.#adoptSubscription(subscription);
     } catch {
       // The disconnect banner is still up and still accurate; the next
       // attempt, if the schedule has one, speaks for itself.
       return false;
     }
+  }
+
+  /**
+   * Takes ownership of a freshly dialed subscription, or closes it if the
+   * controller stopped while the dial was in flight.
+   *
+   * `stop()` nulls `#eventSubscription` and awaits its close, but a subscribe
+   * that has not resolved yet is not there to cancel. Without this the late
+   * subscription would be stored after shutdown and never closed, so its socket
+   * could outlive `stop()` and deliver state changes after it.
+   */
+  async #adoptSubscription(subscription: EventSubscription): Promise<boolean> {
+    if (!this.#stopped) {
+      this.#eventSubscription = subscription;
+      return true;
+    }
+    try {
+      await subscription.close();
+    } catch {
+      // A doomed socket that will not close cleanly still must not be kept.
+    }
+    return false;
   }
 
   /**
