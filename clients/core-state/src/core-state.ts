@@ -345,7 +345,9 @@ export function reduceEventPrefix(
  * than sitting wholly before it.
  *
  * So the two sequence-ordered lists are merged in sequence order and each entry
- * re-folded through `foldTranscriptEntry`. That is exact: entries are already
+ * re-folded through `foldTranscriptEntry`, with terminal chat answers taking the
+ * `foldChatAnswer` step instead so an answer folds over the streamed turn it
+ * closes even when the two straddle the floor. That is exact: entries are already
  * maximally merged within each list and the step is idempotent over an
  * already merged entry, so re-folding in replay order reproduces replay.
  *
@@ -378,7 +380,20 @@ function mergeTranscriptPrefix(
             ? newer
             : older;
     const entry = source === older ? older[left++] : newer[right++];
-    if (entry !== undefined) foldTranscriptEntry(entries, entry, index);
+    if (entry === undefined) continue;
+    // A terminal chat answer carries no turn id and, in replay, folds over its
+    // own still-open streamed turn through `foldChatAnswer`. When the turn's
+    // chunks sit below the history floor and the answer above it, the two
+    // arrive from opposite lists, so reconcile them here as replay would; a
+    // second entry would otherwise survive. Anything else takes the normal step.
+    if (
+      entry.kind === 'assistant' &&
+      entry.turnId === undefined &&
+      foldChatAnswer(entries, entry)
+    ) {
+      continue;
+    }
+    foldTranscriptEntry(entries, entry, index);
   }
   return entries;
 }
