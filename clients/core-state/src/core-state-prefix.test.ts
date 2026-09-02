@@ -153,11 +153,32 @@ describe('prefix merges across the chunk boundary', () => {
         model: 'opus',
       },
     ]);
-    // Consecutive chat answers carry no turn id, so the fold concatenates them
-    // exactly as it does inside one batch. The point is that it still does when
-    // the two answers land on opposite sides of the boundary.
+    // Each chat answer is a complete turn and stays a separate entry. The point
+    // is that the prefix fold agrees with the in-batch fold even when the two
+    // answers land on opposite sides of the boundary.
     expect(merged.chatTranscripts['thread-a']?.map(entry => entry.content)).toEqual([
-      'first answersecond answer',
+      'first answer',
+      'second answer',
+    ]);
+  });
+
+  it('folds a tail answer over a streamed chat turn left in the chunk', () => {
+    const events = [
+      threadCreatedEvent(1, 'thread-a'),
+      chatChunkEvent(2, 'thread-a', 'partial '),
+      chatChunkEvent(3, 'thread-a', 'stream'),
+      chatEvent(4, 'thread-a', 'complete answer'),
+    ];
+
+    // The turn's streamed chunks fall below the floor; only its terminal answer
+    // lands in the tail. A full replay folds the answer over its streamed turn
+    // and renders it once, so the backfilled merge must too rather than leaving
+    // the streamed entry beside a second answer entry.
+    const merged = foldAsPrefix(events, 3);
+
+    expect(merged).toEqual(reduceEventBatch(initialCoreState(), events));
+    expect(merged.chatTranscripts['thread-a']?.map(entry => entry.content)).toEqual([
+      'complete answer',
     ]);
   });
 
@@ -758,6 +779,17 @@ function chatEvent(sequence: number, threadId: string, answer: string, title?: s
     chat_thread_id: threadId,
     status: 'answered',
     data: {kind: 'chat', answer, ...(title === undefined ? {} : {thread_title: title})},
+  };
+}
+
+function chatChunkEvent(sequence: number, threadId: string, content: string): RunEvent {
+  return {
+    ...baseEvent(sequence, 'agent_output_chunk'),
+    agent_kind: 'chat',
+    round_label: 'experiment-chat',
+    chat_thread_id: threadId,
+    invocation_id: `${threadId}-turn`,
+    data: {kind: 'agent_output_chunk', channel: 'assistant', content},
   };
 }
 
