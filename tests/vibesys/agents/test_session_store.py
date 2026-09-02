@@ -265,7 +265,9 @@ def test_seed_is_skipped_when_the_stored_provider_or_model_differs(tmp_path: Pat
 
 def test_failed_seeded_turn_invalidates_the_persisted_session(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.record("hypothesis:H-01", provider="codex", model="gpt-5.6-sol", session_id="thread-stale")
+    store.record(
+        "hypothesis:H-01", provider="codex", model="gpt-5.6-sol", session_id="thread-stale"
+    )
     # A fresh client models a resumed process: the first turn seeds the stored
     # ID, then raises (e.g. a deleted/invalid Claude session with no fallback).
     failing = _SeedableSession(results=[], error=RuntimeError("resume failed: unknown session"))
