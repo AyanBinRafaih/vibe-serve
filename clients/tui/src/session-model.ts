@@ -1283,6 +1283,17 @@ export function markEventStreamUnavailable(state: SessionState): SessionState {
   return state.eventStreamAvailable ? {...state, eventStreamAvailable: false} : state;
 }
 
+/**
+ * Record recovered transport health after a successful resubscribe. The
+ * transport banner describes a condition that no longer holds, so it retires
+ * with the outage; banners from other scopes stay untouched.
+ */
+export function markEventStreamAvailable(state: SessionState): SessionState {
+  const errorBanner = state.errorBanner?.scope === 'transport' ? null : state.errorBanner;
+  if (state.eventStreamAvailable && errorBanner === state.errorBanner) return state;
+  return {...state, eventStreamAvailable: true, errorBanner};
+}
+
 /** Active work is presentable only while its source stream remains trustworthy. */
 export function visibleActiveExecutions(state: SessionState): ActiveAgentExecution[] {
   if (!state.eventStreamAvailable) return [];

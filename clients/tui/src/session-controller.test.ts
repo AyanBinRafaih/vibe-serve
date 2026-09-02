@@ -213,7 +213,9 @@ describe('session controller', () => {
 
   it('preserves backend execution state but suppresses live activity after a disconnect', async () => {
     const transport = new FakeTransport();
-    const controller = new SocketSessionController(transport);
+    // An empty backoff schedule: this test is about the disconnected state
+    // itself, not the reconnect that would otherwise follow.
+    const controller = new SocketSessionController(transport, undefined, undefined, []);
     await controller.start();
     transport.emit({
       type: 'event',
@@ -1709,6 +1711,33 @@ describe('a stream that re-bootstraps at a raised floor', () => {
   });
 });
 
+describe('stream reconnect', () => {
+  /** Lets the zero-delay reconnect timer and its subscribe settle. */
+  const settle = () => new Promise<void>(resolve => setTimeout(resolve, 1));
+
+  // The reconnect loop itself lives in and is tested against
+  // PersistentEventStream; this checks only that the controller honors the
+  // resumed tag it hands back, since the history floor is the controller's to
+  // keep.
+  it('keeps the history floor a resumed stream cannot vouch for', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0]);
+    await controller.start();
+    // A tail bootstrap: everything at or below sequence 5 is unread history.
+    transport.emitBatch([event(6, 'agent_output_chunk', 'six\n')], 5);
+    expect(controller.state.core.historyAfterSequence).toBe(5);
+
+    transport.sever();
+    await settle();
+    // The resumed stream declares no floor of its own; taking its 0 literally
+    // would claim the unread history below 5 is already loaded.
+    transport.emitBatch([event(7, 'agent_output_chunk', 'seven\n')], 0);
+
+    expect(controller.state.core.sequence).toBe(7);
+    expect(controller.state.core.historyAfterSequence).toBe(5);
+  });
+});
+
 class FakeTransport implements ServerTransport {
   closed = false;
   /** Mutable so a test can change what a refetch returns mid-run. */
@@ -1771,6 +1800,63 @@ class FakeTransport implements ServerTransport {
 
   disconnect(error: Error): void {
     this.#disconnect?.(error);
+  }
+}
+
+/**
+ * A backend whose stream a test can sever and whose dials it can refuse:
+ * everything the reconnect path needs in order to be observed.
+ */
+class ReconnectTransport implements ServerTransport {
+  readonly requests: RequestInput[] = [];
+  /** Every subscribe: the cursor and tail it carried, in order. */
+  readonly subscribeCalls: Array<{afterSequence: number; tail: number | undefined}> = [];
+  /** How many upcoming subscribes to reject before letting one through. */
+  refuseSubscribes = 0;
+  #message: ((message: ServerMessage) => void) | null = null;
+  #disconnect: ((error: Error) => void) | null = null;
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    this.requests.push(input);
+    return Promise.resolve({
+      protocol_version: 1,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true,
+      ...(input.type === 'query.experiments' ? {experiments: [], experiments_ready: true} : {}),
+    });
+  }
+
+  subscribe(
+    afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    onDisconnect: (error: Error) => void,
+    options?: SubscribeOptions,
+  ): Promise<EventSubscription> {
+    this.subscribeCalls.push({afterSequence, tail: options?.tail});
+    if (this.refuseSubscribes > 0) {
+      this.refuseSubscribes -= 1;
+      return Promise.reject(new Error('connection refused'));
+    }
+    this.#message = onMessage;
+    this.#disconnect = onDisconnect;
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  emitBatch(events: readonly RunEvent[], historyAfterSequence = 0): void {
+    this.#message?.({
+      type: 'event_batch',
+      events: [...events],
+      history_after_sequence: historyAfterSequence,
+    });
+  }
+
+  sever(message = 'Server event stream disconnected'): void {
+    this.#disconnect?.(new Error(message));
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
   }
 }
 

@@ -1,10 +1,12 @@
 import {
   type EventSubscription,
+  PersistentEventStream,
   type ProtocolResponse,
   type RequestInput,
   type RunEvent,
   ServerError,
   type ServerMessage,
+  type StreamConnectionState,
   type SubscribeOptions,
 } from '@vibesys/backend-client';
 import {DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
@@ -41,6 +43,7 @@ import {
   initialSessionState,
   leaveExperimentDrilldown,
   leaveHypothesisDetail,
+  markEventStreamAvailable,
   markEventStreamUnavailable,
   moveChatMenuSelection,
   moveExperimentSelection,
@@ -171,10 +174,19 @@ export interface ServerTransport {
 const BOOTSTRAP_TAIL = 1_000;
 const BACKFILL_CHUNK = 1_000;
 
+/**
+ * Backoff between reconnect attempts after the event stream drops. The
+ * schedule is finite: a server that refuses this many dials in a row is not
+ * coming back on its own, and the disconnect banner stays up as the
+ * persistent answer. A successful resubscribe resets the count, so the next
+ * outage gets the full schedule again.
+ */
+const RECONNECT_DELAYS_MS: readonly number[] = [500, 1_000, 2_000, 4_000, 8_000];
+
 export class SocketSessionController implements SessionController {
   #state: SessionState;
   readonly #listeners = new Set<(state: SessionState) => void>();
-  #eventSubscription: EventSubscription | null = null;
+  #stream: PersistentEventStream;
   #chatMessageId = 0;
   readonly #chatQueue: Array<{id: string; text: string; threadId: string}> = [];
   #chatDrain: Promise<void> | null = null;
@@ -226,8 +238,18 @@ export class SocketSessionController implements SessionController {
      * (`boot-trace.ts`), which is why the default discards.
      */
     private readonly trace: StartupTrace = () => {},
+    /**
+     * Backoff schedule for stream reconnects; its length bounds the attempts
+     * per outage. Handed to the stream, and injected by tests so a retry is
+     * immediate instead of half a second away.
+     */
+    reconnectDelaysMs: readonly number[] = RECONNECT_DELAYS_MS,
   ) {
     this.#state = initialSessionState(themeName);
+    this.#stream = new PersistentEventStream(client, {
+      tail: BOOTSTRAP_TAIL,
+      reconnectDelaysMs,
+    });
   }
 
   get state(): SessionState {
@@ -250,8 +272,26 @@ export class SocketSessionController implements SessionController {
       // The log is the landing view, so it is populated before the first frame
       // rather than on demand.
       this.#loadExperiments(),
-      this.#openEventStream(),
+      // The stream owns its own dial/redial loop; the controller supplies where
+      // to resume from, whether a drop is worth reconnecting, and where the
+      // messages and connection changes land.
+      this.#stream.subscribe({
+        cursor: () => this.#state.core.sequence,
+        shouldReconnect: () => !this.#state.core.terminal && !this.#streamProtocolError,
+        onMessage: (message, {resumed}) => this.#onMessage(message, resumed),
+        onConnectionState: state => this.#onConnectionState(state),
+      }),
     ]);
+  }
+
+  #onConnectionState(state: StreamConnectionState): void {
+    if (state.status === 'connected') {
+      this.#setState(markEventStreamAvailable(this.#state));
+    } else {
+      this.#setState(
+        reportCaughtError(markEventStreamUnavailable(this.#state), state.error, 'transport'),
+      );
+    }
   }
 
   async #loadSnapshot(): Promise<void> {
@@ -260,46 +300,6 @@ export class SocketSessionController implements SessionController {
       if (response.snapshot) this.#setState(applySnapshot(this.#state, response.snapshot));
     } catch (error) {
       this.#setState(reportCaughtError(this.#state, error, 'request'));
-    }
-  }
-
-  /**
-   * Subscribes to the tail of the stream, falling back to the whole history.
-   *
-   * A server that predates `tail` forbids the unknown field and rejects the
-   * subscription, so the rejection is the capability probe: there is nothing
-   * else to ask. Any other failure degrades the same way, because a full
-   * replay is only slow, never wrong. A run shorter than the tail needs no
-   * special case, since the server clamps the floor to 0 and the batch comes
-   * back with `history_after_sequence` 0, which is today's behavior exactly.
-   */
-  async #openEventStream(): Promise<void> {
-    const onMessage = (message: ServerMessage): void => this.#onMessage(message);
-    const onDisconnect = (error: Error): void => {
-      // A terminal event already carries the actual outcome. The socket
-      // closing afterward is lifecycle cleanup, not a second failure that
-      // should replace the useful diagnostic in the banner.
-      if (!this.#state.core.terminal && !this.#streamProtocolError) {
-        this.#setState(
-          reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
-        );
-      }
-    };
-    try {
-      this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect, {
-        tail: BOOTSTRAP_TAIL,
-      });
-      return;
-    } catch {
-      // Reported only if the full replay fails too: one boot must not put two
-      // banners up, and the first failure is expected against an old server.
-    }
-    try {
-      this.#eventSubscription = await this.client.subscribe(0, onMessage, onDisconnect);
-    } catch (error) {
-      this.#setState(
-        reportCaughtError(markEventStreamUnavailable(this.#state), error, 'transport'),
-      );
     }
   }
 
@@ -348,8 +348,7 @@ export class SocketSessionController implements SessionController {
   }
 
   async stop(): Promise<void> {
-    await this.#eventSubscription?.close();
-    this.#eventSubscription = null;
+    await this.#stream.close();
     await this.client.close();
   }
 
@@ -911,30 +910,48 @@ export class SocketSessionController implements SessionController {
     }
   }
 
-  #onMessage(message: ServerMessage): void {
+  #onMessage(message: ServerMessage, resumed: boolean): void {
     if (message.type === 'event') {
       this.#setState(applyEvent(this.#state, message.event));
       this.#refreshExperimentsFor([message.event]);
       this.#refreshPaneFor([message.event]);
     }
     if (message.type === 'event_batch') {
-      const declared = message.history_after_sequence ?? 0;
-      const rebootstrap = this.#declaredFloor !== null && declared > this.#declaredFloor;
-      this.#declaredFloor = declared;
-      const floor = rebootstrap
-        ? this.#raiseHistoryFloor(declared)
-        : this.#lowerHistoryFloor(declared);
-      const apply = rebootstrap ? applyEventRebootstrap : applyEventBatch;
-      this.#setState(
-        apply(
-          this.#state,
-          message.events,
-          message.active_executions,
-          message.through_sequence,
-          floor,
-        ),
-      );
-      this.#recordSpine(message.events, declared);
+      if (resumed) {
+        // A resumed subscription replays exactly the events after the
+        // client's own cursor and declares no history floor of its own
+        // (`history_after_sequence` 0 on every batch). Taking that literally
+        // would mark history complete and quietly break scroll-back, so the
+        // floor bookkeeping keeps the boot subscription's answers and the
+        // batch folds at the floor already in state.
+        this.#setState(
+          applyEventBatch(
+            this.#state,
+            message.events,
+            message.active_executions,
+            message.through_sequence,
+            this.#state.core.historyAfterSequence,
+          ),
+        );
+      } else {
+        const declared = message.history_after_sequence ?? 0;
+        const rebootstrap = this.#declaredFloor !== null && declared > this.#declaredFloor;
+        this.#declaredFloor = declared;
+        const floor = rebootstrap
+          ? this.#raiseHistoryFloor(declared)
+          : this.#lowerHistoryFloor(declared);
+        const apply = rebootstrap ? applyEventRebootstrap : applyEventBatch;
+        this.#setState(
+          apply(
+            this.#state,
+            message.events,
+            message.active_executions,
+            message.through_sequence,
+            floor,
+          ),
+        );
+        this.#recordSpine(message.events, declared);
+      }
       this.#refreshExperimentsFor(message.events);
       this.#refreshPaneFor(message.events);
     }

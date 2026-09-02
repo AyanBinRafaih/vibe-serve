@@ -5,6 +5,13 @@ export {
   ServerError,
   type SubscribeOptions,
 } from './client.js';
+export {
+  PersistentEventStream,
+  type PersistentEventStreamCallbacks,
+  type PersistentEventStreamOptions,
+  type StreamConnectionState,
+  type StreamTransport,
+} from './persistent-event-stream.js';
 export type {
   ChatModelOption,
   ChatOptions,
