@@ -2766,6 +2766,15 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 for retry in range(first_retry, max_retries_per_round + 1):
                     ctx.lprint(f"\n--- attempt {retry}/{max_retries_per_round} ---\n")
                     final_attempt_reviewed = False
+                    # Reset alongside ``final_attempt_reviewed``: the persisted
+                    # record must reflect the final attempt, not an earlier
+                    # audit.  A cadence review of attempt N sets a verdict; if
+                    # the final attempt N+1 defers re-review (the sparse-review
+                    # break below), that stale verdict must not survive.
+                    # Otherwise the round is recorded with attempt N's
+                    # ``judge_verdict`` while ``reviewed=False``/outcome=continue,
+                    # and projection rejects a still-active hypothesis.
+                    judge_verdict = None
                     if inner_loop == "multi-agent":
                         prior_attempt_artifact_locations = tuple(
                             issue_board.display_path(path, ctx.workspace)
