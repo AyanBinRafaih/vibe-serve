@@ -74,6 +74,7 @@ describe('event batch projection', () => {
     ]);
 
     expect(state.core.status).toBe('running');
+    expect(state.core.terminal).toBe(false);
     expect(state.core.diagnostics).toHaveLength(1);
     expect(state.errorBanner).toEqual(before.errorBanner);
   });

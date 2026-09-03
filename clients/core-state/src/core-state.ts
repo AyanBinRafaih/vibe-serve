@@ -539,6 +539,7 @@ function foldEvent(state: CoreState, event: RunEvent, folder: TranscriptFolder |
 
   if (event.type === 'run_started') {
     next.status = 'running';
+    next.terminal = false;
     if (data?.kind === 'run_started') next.maxRounds = data.max_rounds;
   }
   if (event.type === 'configuration_failed') return terminate(next, 'failed');
