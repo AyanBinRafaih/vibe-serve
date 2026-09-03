@@ -26,12 +26,14 @@ from vibesys.loops.agent.loop import (
     _invoke_read_only_role,
     _missing_implementer_response,
     _official_evaluation_reason,
+    _pareto_archive_dominators,
     _pareto_archive_summary,
     _pareto_frontier_records,
     _provisional_candidates_since_official,
     _review_due,
     _run_framework_validation_gate,
     _terminal_workspace_notice,
+    _trusted_candidate_records,
     run_agent_loop,
 )
 from vibesys.loops.agent.model import Hypothesis, HypothesisResolution, HypothesisReview
@@ -963,8 +965,67 @@ def test_pareto_archive_distinguishes_trusted_and_pending_candidates():  # noqa:
 
     assert "Trusted frontier parents" in summary
     assert "round 49" in summary
-    assert "awaiting independent review" in summary
+    # The pending row is listed separately and told apart by *why* it is not a
+    # trusted parent. Both reasons are named, because after #535 a row can land
+    # here for failing review or for carrying an implementer-reported number.
+    assert "not yet usable as trusted parents" in summary
+    assert "independent review" in summary
+    assert "implementer's own report" in summary
     assert "round 51" in summary
+
+
+def _accuracy_row(
+    round_number: int,
+    accuracy: float,
+    *,
+    provenance: Literal["framework", "implementer"],
+) -> RoundRecord:
+    """A reviewed, accuracy-passing checkpoint with an objective row.
+
+    Models the finding's scenario: an objective-based task with an accuracy
+    command but no benchmark result contract, so the headline metric's
+    provenance is the only thing distinguishing a trusted framework
+    measurement from an implementer self-report.
+    """
+    return RoundRecord(
+        round_number,
+        str(round_number) * 40,
+        accuracy,
+        "accuracy",
+        True,  # noqa: FBT003  # tracked: #288
+        reviewed=True,
+        hypothesis_id="H-acc",
+        judge_verdict="pass",
+        hypothesis_outcome="proven",
+        metrics={"accuracy": accuracy},
+        official_evaluation=True,
+        candidate_disposition=CandidateDisposition.PARETO_FRONTIER.value,
+        candidate_retained=True,
+        perf_provenance=provenance,
+    )
+
+
+def test_implementer_report_cannot_seed_archive_or_dominate_candidates():  # noqa: ANN201  # tracked: #288
+    """Regression for #535: implementer provenance never becomes a trusted parent.
+
+    A reviewed, accuracy-passing implementer self-report that persisted
+    ``candidate_retained=True`` must not be selected by
+    ``_trusted_candidate_records`` and must not count as a dominator in a later
+    Pareto decision. A framework-provenance row of the same shape still does.
+    """
+    space = MetricSpace(objectives=(Objective(name="accuracy", direction="max"),))
+    implementer = _accuracy_row(1, 0.95, provenance="implementer")
+    framework = _accuracy_row(2, 0.95, provenance="framework")
+
+    # Trusted Pareto-parent selection is gated on framework provenance.
+    assert _trusted_candidate_records([implementer], space) == []
+    assert _trusted_candidate_records([framework], space) == [framework]
+
+    # A weaker later candidate is only dominated by the trusted framework row,
+    # never by the untrusted implementer self-report.
+    weaker = {"accuracy": 0.80}
+    assert _pareto_archive_dominators(weaker, [implementer], space) == []
+    assert _pareto_archive_dominators(weaker, [framework], space) == [framework]
 
 
 def test_official_evaluation_cadence_resets_at_verified_checkpoint():  # noqa: ANN201  # tracked: #288
@@ -2744,9 +2805,11 @@ def test_supported_hypothesis_is_reviewed_without_global_gates_and_closes(tmp_pa
     assert runner.counters["impl"] == 2
     assert runner.counters["judge"] == 2
     rounds = _round_payloads(tmp_path)
+    # A supportive declaration without a trusted measurement closes the
+    # hypothesis as unmeasured, never as proven.
     assert [round_data["hypothesis_outcome"] for round_data in rounds] == [
-        "proven",
-        "proven",
+        "unmeasured",
+        "unmeasured",
     ]
     assert [round_data["official_evaluation"] for round_data in rounds] == [False, True]
     assert rounds[-1]["official_evaluation_reason"] == "final_round"
@@ -2788,7 +2851,7 @@ def test_cadence_pass_keeps_a_continuing_hypothesis_active(tmp_path, ref_file): 
     assert [round_data["hypothesis_outcome"] for round_data in rounds] == [
         "continue",
         "continue",
-        "proven",
+        "unmeasured",
     ]
 
 
@@ -2826,7 +2889,7 @@ def test_implementation_failure_with_repair_keeps_hypothesis_active(tmp_path, re
     ]
     assert [round_data["hypothesis_outcome"] for round_data in rounds] == [
         "implementation_failed",
-        "proven",
+        "unmeasured",
     ]
 
 
@@ -2993,7 +3056,7 @@ def test_resolvable_inconclusive_result_keeps_hypothesis_active(tmp_path, ref_fi
     ]
     assert [round_data["hypothesis_outcome"] for round_data in rounds] == [
         "inconclusive",
-        "proven",
+        "unmeasured",
     ]
 
 
@@ -3153,7 +3216,7 @@ def test_unreviewed_terminal_outcome_returns_control_to_designer(tmp_path, ref_f
     ]
     assert [round_data["hypothesis_outcome"] for round_data in rounds] == [
         "disproven",
-        "proven",
+        "unmeasured",
     ]
     plan_calls = [
         call
@@ -3234,7 +3297,7 @@ def test_disproven_retry_after_failed_review_returns_control_to_designer(tmp_pat
     assert [round_data["reviewed"] for round_data in rounds] == [True, True]
     assert [round_data["hypothesis_outcome"] for round_data in rounds] == [
         "disproven",
-        "proven",
+        "unmeasured",
     ]
 
 
@@ -3300,7 +3363,7 @@ def test_role_session_policy_is_explicit_and_hypothesis_scoped(tmp_path, ref_fil
     ]
     assert [round_data["hypothesis_outcome"] for round_data in rounds] == [
         "continue",
-        "proven",
+        "unmeasured",
     ]
 
 
@@ -4349,8 +4412,8 @@ def test_loop_threads_roadmap_into_orchestrator_prompt(tmp_path, ref_file):  # n
 
 
 def test_loop_threads_plateau_warning_into_prompt(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
-    """When the prior rounds plateau on perf, the orchestrator's next prompt
-    must include the plateau warning."""
+    """When the prior rounds plateau on framework-measured perf, the
+    orchestrator's next prompt must include the plateau warning."""
     seen_prompts: list[str] = []
     # Five rounds: round 1 is cold-start (no profiler), rounds 2-4 produce
     # flat perf metrics, and round 5 is the round under test (its plan call
@@ -4395,7 +4458,6 @@ def test_loop_threads_plateau_warning_into_prompt(tmp_path, ref_file):  # noqa: 
                 perf_unit="tok/s",
             ),
         ],
-        implementer_perf_metrics=[None, 42.0, 42.1, 41.9, 42.05],
     )
     real = runner.invoke.side_effect
 
@@ -4406,13 +4468,31 @@ def test_loop_threads_plateau_warning_into_prompt(tmp_path, ref_file):  # noqa: 
 
     runner.invoke.side_effect = spy
 
-    _invoke_orchestrate(
-        tmp_path,
-        ref_file,
-        runner,
-        max_rounds=5,
-        official_eval_every=1,
-    )
+    # The plateau signal is built from framework measurements only, so the
+    # readings have to come from the benchmark gate. Round one measures
+    # nothing; rounds 2-5 are flat at 41.9-42.1.
+    with patch(
+        "vibesys.loops.agent.loop._run_framework_benchmark",
+        side_effect=[
+            FrameworkBenchmarkOutcome(),
+            *(
+                FrameworkBenchmarkOutcome(
+                    metric_name="total_ops_per_sec",
+                    metric_value=value,
+                    metric_direction="max",
+                )
+                for value in (42.0, 42.1, 41.9, 42.05)
+            ),
+        ],
+    ):
+        _invoke_orchestrate(
+            tmp_path,
+            ref_file,
+            runner,
+            max_rounds=5,
+            official_eval_every=1,
+            benchmark_result_protocol=2,
+        )
     assert len(seen_prompts) == 5
     # Rounds 1-4 have <3 valid perf records before each plan call → no
     # warning yet (round 1: 0 perf; round 2: 0 perf; round 3: 1 perf; round 4: 2 perf).
@@ -4425,6 +4505,53 @@ def test_loop_threads_plateau_warning_into_prompt(tmp_path, ref_file):  # noqa: 
     assert "Plateau detected" in seen_prompts[4]
     assert "Refresh an analytical performance model" in seen_prompts[4]
     assert "unexplained residual" in seen_prompts[4]
+
+
+def test_self_reported_numbers_do_not_raise_a_plateau_warning(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """The same flat trajectory, self-reported, is not evidence of a plateau.
+
+    Telling the orchestrator it has stopped making progress on the strength of
+    its own reports is a feedback loop: the agent would be reacting to numbers
+    it chose. The consequence is deliberate and worth stating -- a task that
+    declares no benchmark result contract gets no plateau warning at all,
+    because the framework has measured nothing to detect a plateau in.
+    """
+    seen_prompts: list[str] = []
+    plans = [
+        OrchestratorPlan(task=f"r{i}", pass_criteria="p", reasoning=f"r{i}")  # noqa: S106  # tracked: #288
+        for i in range(1, 6)  # noqa: RUF100, S106  # tracked: #288
+    ]
+    runner = _make_orchestrate_runner(
+        pre_decisions=[PreRoundDecision(need_profile=True, profile_focus="x", reasoning="ok")] * 4,
+        plans=plans,
+        profiler_responses=[
+            ProfilerSummary(
+                analysis="a",
+                bottlenecks="b",
+                suggestions="s",
+                perf_metric=value,
+                perf_unit="tok/s",
+            )
+            for value in (42.0, 42.1, 41.9, 42.05)
+        ],
+        implementer_perf_metrics=[None, 42.0, 42.1, 41.9, 42.05],
+    )
+    real = runner.invoke.side_effect
+
+    def spy(*, kind, response_cls, **kwargs):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
+        if kind == "orchestrator" and response_cls is OrchestratorPlan:
+            seen_prompts.append(kwargs.get("system_prompt", ""))
+        return real(kind=kind, response_cls=response_cls, **kwargs)
+
+    runner.invoke.side_effect = spy
+
+    _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=5, official_eval_every=1)
+
+    assert len(seen_prompts) == 5
+    assert [round_data["perf_provenance"] for round_data in _round_payloads(tmp_path)][1:] == [
+        "implementer"
+    ] * 4
+    assert all("Plateau detected" not in prompt for prompt in seen_prompts)
 
 
 def test_completed_round_records_which_implementer_produced_it(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
@@ -4568,3 +4695,76 @@ def test_single_agent_round_without_a_metric_carries_no_provenance(tmp_path, ref
     rounds = _round_payloads(tmp_path)
     assert rounds[0]["perf_metric"] is None
     assert rounds[0]["perf_provenance"] is None
+
+
+def test_framework_measured_improvement_resolves_proven(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """The positive case: a trusted measurement can still prove a hypothesis.
+
+    Every other end-to-end expectation in this file reads `unmeasured`,
+    because the harness's rounds carry no framework-owned number. Strictness
+    is only correct if the gate still opens: a framework-stamped reading that
+    beats its causal baseline must resolve `proven`, or this change would have
+    made the resolution unreachable rather than honest.
+    """
+    runner = _make_orchestrate_runner(
+        plans=[
+            OrchestratorPlan(
+                hypothesis_id="baseline-claim",
+                hypothesis="first causal claim",
+                task="establish the baseline",
+                pass_criteria="collect evidence",  # noqa: S106  # tracked: #288
+                reasoning="first experiment",
+            ),
+            OrchestratorPlan(
+                hypothesis_id="improvement-claim",
+                hypothesis="second causal claim",
+                task="beat the baseline",
+                pass_criteria="collect evidence",  # noqa: S106  # tracked: #288
+                reasoning="second experiment",
+            ),
+        ],
+        implementer_outcomes=[
+            HypothesisOutcome.NOMINATED,
+            HypothesisOutcome.NOMINATED,
+        ],
+    )
+
+    with patch(
+        "vibesys.loops.agent.loop._run_framework_benchmark",
+        side_effect=[
+            FrameworkBenchmarkOutcome(
+                metric_name="total_ops_per_sec",
+                metric_value=100.0,
+                metric_direction="max",
+            ),
+            FrameworkBenchmarkOutcome(
+                metric_name="total_ops_per_sec",
+                metric_value=200.0,
+                metric_direction="max",
+            ),
+        ],
+    ):
+        _invoke_orchestrate(
+            tmp_path,
+            ref_file,
+            runner,
+            max_rounds=2,
+            judge_every=1,
+            official_eval_every=1,
+            benchmark_result_protocol=2,
+        )
+
+    rounds = _round_payloads(tmp_path)
+    assert [round_data["perf_provenance"] for round_data in rounds] == [
+        "framework",
+        "framework",
+    ]
+    # Round one has no causal baseline to order against; round two beats it.
+    assert [round_data["perf_comparison"] for round_data in rounds] == [
+        "incomparable",
+        "better",
+    ]
+    assert [round_data["hypothesis_outcome"] for round_data in rounds] == [
+        "inconclusive",
+        "proven",
+    ]

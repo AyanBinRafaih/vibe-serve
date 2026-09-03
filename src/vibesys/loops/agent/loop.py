@@ -45,6 +45,7 @@ from vibesys.loops.agent.hypotheses import (
     resolve_hypothesis_outcome,
     scalar_candidate_retained,
     start_hypothesis,
+    trusted_perf_provenance,
     update_active_hypothesis,
 )
 from vibesys.loops.agent.model import (
@@ -305,6 +306,11 @@ def _trusted_candidate_records(records: list[RoundRecord], space: MetricSpace) -
             continue
         if not record.commit or not record.passed or not record.reviewed:
             continue
+        if not trusted_perf_provenance(record.perf_provenance):
+            # An implementer self-reported headline metric may keep its commit
+            # as a provisional claim, but it must never seed the archive as a
+            # trusted Pareto parent or dominate later candidates.
+            continue
         if _record_candidate_retained(record) is not True:
             continue
         trusted.append(record)
@@ -390,8 +396,10 @@ def _pareto_archive_summary(records: list[RoundRecord], space: MetricSpace) -> s
     ]
     if pending:
         lines.append(
-            "Measured frontier claims awaiting independent review (retain the commit, but "
-            "do not treat it as a trusted parent until its hard invariants pass):"
+            "Measured frontier claims not yet usable as trusted parents (retain the commit, "
+            "but do not treat it as a parent). A row lands here because its hard invariants "
+            "have not passed independent review, or because its numbers are the "
+            "implementer's own report rather than a framework measurement:"
         )
         for record in pending[-8:]:
             assert record.commit is not None  # noqa: S101  # tracked: #288
@@ -454,6 +462,10 @@ def _detect_plateau(
     Rules:
     - ``profile_skipped`` rounds don't count as fresh measurements (their
       perf was reused from earlier).
+    - Only rounds the framework measured itself count. An implementer's
+      self-reported number is not evidence that the search has stopped
+      making progress, and telling the orchestrator it has plateaued on
+      the strength of its own reports is a feedback loop.
     - Only rounds with the *same* ``perf_unit`` as the latest fresh round
       count toward the streak — comparing latency_ms against tok/s as raw
       floats is a category error.
@@ -468,6 +480,7 @@ def _detect_plateau(
         if r.passed
         and r.official_evaluation
         and r.perf_metric is not None
+        and trusted_perf_provenance(r.perf_provenance)
         and not r.profile_skipped
     ]
     if len(fresh) < min_streak:
@@ -564,7 +577,14 @@ def _provisional_candidates_since_official(records: list[RoundRecord]) -> int:
             and record.reviewed
             and (
                 _record_candidate_retained(record) is True
-                or record.hypothesis_outcome == HypothesisResolution.PROVEN.value
+                # An accepted-but-unmeasured hypothesis consumes cadence budget
+                # like a proven one: it is exactly the checkpoint the next
+                # official evaluation must measure.
+                or record.hypothesis_outcome
+                in {
+                    HypothesisResolution.PROVEN.value,
+                    HypothesisResolution.UNMEASURED.value,
+                }
             )
         ):
             count += 1
@@ -3119,10 +3139,21 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 baseline_metric = (
                     _metric_value(parent_record, metric_name) if parent_record is not None else None
                 )
+                # A headline metric is framework-owned unless the implementer
+                # self-reported it. This is the trust boundary the rest of the
+                # round applies: resolution, scalar and Pareto retention, the
+                # recorded delta, and trusted Pareto-parent selection all read
+                # it, so an untrusted number never drives a dominance decision.
+                framework_provenance = trusted_perf_provenance(perf_provenance)
                 # The round's headline reading is ordered against its causal
                 # baseline exactly once, here, and stored on the record. Every
                 # later reader -- resume reprojection and the server -- consumes
                 # the stored answer instead of re-deriving it.
+                #
+                # An implementer-reported number is never ordered at all: the
+                # comparison stays None, which is what makes the hypothesis
+                # resolve UNMEASURED rather than borrowing a verdict from a
+                # number the framework did not measure.
                 space = agent_run_state.metrics
                 official_reading = (
                     Measurement(
@@ -3144,7 +3175,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         if metric_name is not None and baseline_metric is not None
                         else None,
                     )
-                    if official_evaluation and official_metric is not None
+                    if official_evaluation and official_metric is not None and framework_provenance
                     else None
                 )
                 hypothesis_resolution = resolve_hypothesis_outcome(
@@ -3153,7 +3184,6 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         passed=passed,
                         reviewed=reviewed,
                         comparison=perf_comparison,
-                        benchmark_expected=framework_benchmark_configured,
                     )
                 )
                 disposition = CandidateDisposition(candidate_disposition)
@@ -3161,13 +3191,15 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     candidate_retained = _provisional_candidate_retained(disposition)
                 elif not passed:
                     candidate_retained = False
-                elif official_evaluation and objectives and accepted_metrics:
+                elif (
+                    official_evaluation and framework_provenance and objectives and accepted_metrics
+                ):
                     candidate_retained = not _pareto_archive_dominators(
                         accepted_metrics,
                         records,
                         space,
                     )
-                elif official_evaluation:
+                elif official_evaluation and framework_provenance:
                     prior_readings = [
                         Measurement(
                             metric=metric_name,
@@ -3177,16 +3209,21 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         for record in records
                         if metric_name is not None
                         and record.official_evaluation
+                        and trusted_perf_provenance(record.perf_provenance)
                         and (value := _metric_value(record, metric_name)) is not None
                     ]
                     candidate_retained = scalar_candidate_retained(
                         space.compare_to_best(official_reading, prior_readings)
                     )
                 else:
+                    # No trusted framework measurement (or an implementer
+                    # self-report): retain provisionally on the implementer's
+                    # disposition, never on the untrusted metric.
                     candidate_retained = _provisional_candidate_retained(disposition)
                 perf_delta_pct = None
                 if (
-                    official_metric is not None
+                    framework_provenance
+                    and official_metric is not None
                     and baseline_metric is not None
                     and baseline_metric != 0
                 ):
