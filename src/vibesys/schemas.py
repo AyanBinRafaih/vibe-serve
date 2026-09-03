@@ -623,8 +623,8 @@ class OrchestratorPlan(BaseModel):
     hypothesis_id: str = Field(
         default="",
         description=(
-            "Stable short identifier for the hypothesis. Reuse it across rounds while "
-            "the same implementer investigation remains active."
+            "Stable short identifier for this round's new hypothesis. Never reuse "
+            "an identifier used earlier in this run."
         ),
     )
     hypothesis_updates: list[HypothesisStrategyUpdate] = Field(

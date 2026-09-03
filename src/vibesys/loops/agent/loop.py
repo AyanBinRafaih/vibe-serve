@@ -1012,34 +1012,79 @@ def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
         provisional_candidates=provisional_candidates,
         official_eval_cadence_due=official_eval_cadence_due,
     )
-    plan = _invoke_read_only_role(
-        ctx,
-        role="orchestrator",
-        checkpoint_label=f"round-{round_number}-plan-input",
-        allowed_workspace_paths=(
-            f"{roadmap_location.rstrip('/')}/index.md"
-            if roadmap_location.endswith("/")
-            else roadmap_location,
-        ),
-        kind="orchestrator",
-        system_prompt=system_prompt,
-        user_prompt="Produce this round's plan. Return only the JSON object.",
-        response_cls=OrchestratorPlan,
-        fallback_factory=lambda: OrchestratorPlan(
-            task="Re-check minimal server boots and /health returns 200.",
-            pass_criteria="/health returns 200.",  # noqa: S106  # tracked: #288
-            reasoning="fallback: orchestrator produced no structured response",
-        ),
-        round_label=f"round-{round_number}-plan",
-        reuse_session=False,
-    )
-    plan.hypothesis_id = plan.hypothesis_id.strip() or f"hypothesis-{round_number:04d}"
-    plan.title = normalize_hypothesis_title(plan.title)
-    _validate_orchestrator_plan_state(plan, agent_run_state)
-    plan.recommended_skills, _ = _validate_skill_selections(ctx, plan.recommended_skills)
-    issue_board.write_plan_artifact(progress_path, round_number, plan)
-    issue_board.append_orchestrator_plan(progress_path, round_number, plan)
-    return plan
+    # One corrective reprompt: a plan that fails lifecycle validation (for
+    # example a hypothesis_id already used in this run) is a recoverable agent
+    # mistake, not a framework invariant violation.
+    #
+    # A rejected attempt writes no plan artifact and no progress note -- both
+    # happen after validation -- and leaves durable hypothesis state untouched,
+    # because `_validate_orchestrator_plan_state` applies strategy updates to a
+    # clone it discards. It is not a full rollback, though: the orchestrator's
+    # one allowlisted write, the roadmap index, is preserved by
+    # `_invoke_read_only_role` rather than reverted, so roadmap edits the
+    # rejected attempt made survive into the retry. That is deliberate. The
+    # roadmap is the orchestrator's own long-lived planning document, and the
+    # thinking it recorded there is not invalidated by the plan JSON being
+    # rejected for an identifier collision.
+    corrective_feedback: str | None = None
+    attempt = 0
+    while True:
+        attempt += 1
+        # `round-N-plan`, then `round-N-retry-1-plan`. Both the client's
+        # planning-stage matcher and `_attempt_from_label` parse this shape, so
+        # a reprompted plan still appears as a planning activity and still
+        # reports which attempt produced it.
+        label = f"round-{round_number}" + (f"-retry-{attempt - 1}" if attempt > 1 else "") + "-plan"
+        plan = _invoke_read_only_role(
+            ctx,
+            role="orchestrator",
+            checkpoint_label=f"{label}-input",
+            allowed_workspace_paths=(
+                f"{roadmap_location.rstrip('/')}/index.md"
+                if roadmap_location.endswith("/")
+                else roadmap_location,
+            ),
+            kind="orchestrator",
+            system_prompt=system_prompt,
+            user_prompt=(
+                corrective_feedback or "Produce this round's plan. Return only the JSON object."
+            ),
+            response_cls=OrchestratorPlan,
+            fallback_factory=lambda: OrchestratorPlan(
+                task="Re-check minimal server boots and /health returns 200.",
+                pass_criteria="/health returns 200.",  # noqa: S106  # tracked: #288
+                reasoning="fallback: orchestrator produced no structured response",
+            ),
+            round_label=label,
+            reuse_session=False,
+        )
+        plan.hypothesis_id = plan.hypothesis_id.strip() or f"hypothesis-{round_number:04d}"
+        plan.title = normalize_hypothesis_title(plan.title)
+        try:
+            _validate_orchestrator_plan_state(plan, agent_run_state)
+        except ValueError as error:
+            if corrective_feedback is not None:
+                raise
+            ctx.lprint(f"[orchestrator] plan rejected ({error}); reprompting once")
+            rejected_updates = ", ".join(
+                sorted({update.hypothesis_id for update in plan.hypothesis_updates})
+            )
+            corrective_feedback = (
+                f"Your previous plan was rejected: {error}. "
+                f"It proposed hypothesis_id {plan.hypothesis_id!r} and named "
+                f"{rejected_updates or '(no)'} in hypothesis_updates. "
+                "A hypothesis_id names one investigation permanently: never reuse "
+                "an identifier used earlier in this run, and choose one that has "
+                "not appeared before. hypothesis_updates may name each prior "
+                "hypothesis at most once, and never the new one. "
+                "Produce a corrected plan for this round. "
+                "Return only the JSON object."
+            )
+            continue
+        plan.recommended_skills, _ = _validate_skill_selections(ctx, plan.recommended_skills)
+        issue_board.write_plan_artifact(progress_path, round_number, plan)
+        issue_board.append_orchestrator_plan(progress_path, round_number, plan)
+        return plan
 
 
 def _validate_orchestrator_plan_state(
