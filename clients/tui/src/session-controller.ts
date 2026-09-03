@@ -11,7 +11,7 @@ import {
 } from '@vibesys/backend-client';
 import {DEFAULT_CHAT_THREAD_ID, hasRunEnded} from '@vibesys/core-state';
 import type {StartupTrace} from './boot-trace.js';
-import {chatHelpText, helpText, parseCommand} from './commands.js';
+import {chatHelpText, helpText, type ParsedCommand, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
   activeChatThreadSettings,
@@ -814,9 +814,12 @@ export class SocketSessionController implements SessionController {
         this.#showChatHelp();
         return Promise.resolve();
       default:
-        // Everything else is a command the chat forwards to the one command
-        // executor, so it behaves exactly as it does in the command bar.
-        return this.submitCommand(text);
+        // Everything else, including a usage error, goes to the one command
+        // executor as the action the chat's own registry lookup produced. The
+        // text is not re-parsed on the command surface, so a chat-only
+        // command's usage error stays a usage error instead of becoming
+        // "unknown command" for a name that surface does not offer.
+        return this.#dispatchCommand(action);
     }
   }
 
@@ -944,12 +947,22 @@ export class SocketSessionController implements SessionController {
     }
   }
 
-  async submitCommand(value: string): Promise<void> {
-    const text = value.trim();
-    const action = parseCommand(text, {
-      surface: 'command',
-      chatDocked: chatPaneVisible(this.#state),
-    });
+  submitCommand(value: string): Promise<void> {
+    return this.#dispatchCommand(
+      parseCommand(value.trim(), {
+        surface: 'command',
+        chatDocked: chatPaneVisible(this.#state),
+      }),
+    );
+  }
+
+  /**
+   * Applies one resolved command action. Both input surfaces end here, so the
+   * behavior of a shared command cannot depend on where it was typed. The
+   * switch is exhaustive, so registering a new action kind without handling it
+   * is a compile error.
+   */
+  async #dispatchCommand(action: ParsedCommand): Promise<void> {
     switch (action.kind) {
       case 'unknown':
         return this.#setState(

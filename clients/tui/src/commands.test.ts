@@ -1,7 +1,10 @@
 import {describe, expect, it} from 'bun:test';
+import {readFileSync} from 'node:fs';
 import {
   availableCommands,
   COMMAND_NAMES,
+  COMMAND_SPECS,
+  type CommandSurface,
   chatHelpText,
   helpText,
   type ParsedCommand,
@@ -141,6 +144,81 @@ describe('argument-contract enforcement', () => {
   it('rejects an empty argument on required-argument commands with the registry usage', () => {
     expect(onCommand('/steer')).toEqual({kind: 'error', error: 'Usage: /steer <message>'});
     expect(onChat('/steer')).toEqual({kind: 'error', error: 'Usage: /steer <message>'});
+  });
+
+  /**
+   * The cases above name the commands from the report. This one enumerates the
+   * registry instead, so a command registered later cannot be the one that
+   * still accepts a trailing phrase.
+   */
+  it('enforces the declared arity of every registered command on every surface', () => {
+    for (const spec of COMMAND_SPECS) {
+      const usage = `Usage: ${spec.usage ?? spec.name}`;
+      for (const surface of spec.surfaces as readonly CommandSurface[]) {
+        const parse = (text: string): ParsedCommand => parseCommand(text, {surface});
+        const where = `${spec.name} on ${surface}`;
+        if (spec.args === 'none') {
+          expect({where, ...parse(`${spec.name} trailing-text`)}).toEqual({
+            where,
+            kind: 'error',
+            error: usage,
+          });
+          // The bare command still resolves, so the check rejects arguments
+          // rather than the command.
+          expect({where, kind: parse(spec.name).kind}).not.toEqual({where, kind: 'error'});
+        } else if (spec.args === 'required') {
+          expect({where, ...parse(spec.name)}).toEqual({where, kind: 'error', error: usage});
+        } else {
+          expect({where, kind: parse(spec.name).kind}).not.toEqual({where, kind: 'error'});
+        }
+      }
+    }
+  });
+
+  it('covers every arity the registry declares, so the loop above is not vacuous', () => {
+    expect(new Set(COMMAND_SPECS.map(spec => spec.args))).toEqual(
+      new Set(['none', 'optional', 'required']),
+    );
+  });
+});
+
+/**
+ * The README is the only copy of the command list outside the registry, and it
+ * is what a reader consults before the help text. Asserting it against the
+ * registry is what keeps the two from drifting the way the pre-registry tables
+ * did.
+ */
+describe('README command tables', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+
+  /** The `/name` of every table row in a section, deduplicated in document order. */
+  const documentedCommands = (heading: string, nextHeading: string): string[] => {
+    const start = readme.indexOf(heading);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = readme.indexOf(nextHeading, start + heading.length);
+    expect(end).toBeGreaterThan(start);
+    const section = readme.slice(start, end);
+    const documented: string[] = [];
+    for (const line of section.split('\n')) {
+      const name = /^\|\s*`(\/[a-z][a-z0-9-]*)/.exec(line)?.[1];
+      if (name !== undefined && !documented.includes(name)) documented.push(name);
+    }
+    return documented;
+  };
+
+  const specNames = (predicate: (surfaces: readonly CommandSurface[]) => boolean): string[] =>
+    COMMAND_SPECS.filter(spec => predicate(spec.surfaces)).map(spec => spec.name);
+
+  it('documents exactly the commands the command bar offers, in registry order', () => {
+    expect(documentedCommands('| Command | Behavior |', 'The chat composer adds')).toEqual(
+      specNames(surfaces => surfaces.includes('command')),
+    );
+  });
+
+  it('documents exactly the chat-only commands, in registry order', () => {
+    expect(documentedCommands('The chat composer adds', '### Experiment log')).toEqual(
+      specNames(surfaces => !surfaces.includes('command')),
+    );
   });
 });
 

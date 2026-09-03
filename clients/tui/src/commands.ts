@@ -66,21 +66,33 @@ export interface SlashCommand {
   description: string;
 }
 
+/** How many arguments a command accepts, enforced before its parser runs. */
+export type CommandArity = 'none' | 'optional' | 'required';
+
+/**
+ * A command's declared contract, without its handler. This is what the
+ * suggestion menu, the help text, the README, and the argument check are all
+ * derived from, so tests can enumerate the contract without reaching into the
+ * parsers.
+ */
+export interface CommandSpec {
+  readonly id: CommandId;
+  readonly name: string;
+  readonly aliases?: readonly string[];
+  readonly description: string;
+  readonly args: CommandArity;
+  readonly usage?: string;
+  readonly surfaces: readonly CommandSurface[];
+  readonly section: CommandSection;
+}
+
 /**
  * The single definition of one slash command. `parse` is required, so a command
  * cannot be registered without a handler, and it is the only place the command's
  * behavior is spelled: parsers, suggestions, and help are all derived from this
  * table, so a match string can never drift from a registry name.
  */
-interface CommandDef {
-  readonly id: CommandId;
-  readonly name: string;
-  readonly aliases?: readonly string[];
-  readonly description: string;
-  readonly args: 'none' | 'optional' | 'required';
-  readonly usage?: string;
-  readonly surfaces: readonly CommandSurface[];
-  readonly section: CommandSection;
+interface CommandDef extends CommandSpec {
   /** Hides the command from suggestions and help in a context; parsing still accepts it. */
   readonly hiddenWhen?: (context: CommandContext) => boolean;
   readonly parse: (argument: string) => ParsedCommand;
@@ -258,6 +270,15 @@ const COMMAND_REGISTRY: readonly CommandDef[] = [
     parse: () => ({kind: 'chatSwitch'}),
   },
 ];
+
+/**
+ * Every registered command's declared contract, in registry order. Exposed so
+ * documentation and contract tests enumerate the same table the parser uses
+ * rather than restating it.
+ */
+export const COMMAND_SPECS: readonly CommandSpec[] = COMMAND_REGISTRY.map(
+  ({hiddenWhen: _hiddenWhen, parse: _parse, ...spec}) => spec,
+);
 
 /** The canonical name per command, so callers reference a command without a literal. */
 export const COMMAND_NAMES = Object.fromEntries(

@@ -1539,6 +1539,33 @@ describe('session controller', () => {
     expect(controller.state.chatMenu).toBeNull();
   });
 
+  it("reports a chat-only command's usage error rather than an unknown-command error", async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    // /clear takes no argument. The chat resolves it, so the error must be the
+    // registry usage error; re-parsing the text on the command bar, which does
+    // not offer /clear, would report "Unknown command" instead.
+    const before = transport.requests.length;
+    await controller.submitChat('/clear definitely-not');
+
+    expect(controller.state.errorBanner?.message).toBe('Usage: /clear');
+    // The phrase started no thread and sent no request.
+    expect(transport.requests.length).toBe(before);
+    expect(controller.state.chatMenu).toBeNull();
+  });
+
+  it('does not run a no-argument command typed with a trailing phrase', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submitCommand('/pause typo');
+
+    expect(controller.state.errorBanner).toMatchObject({scope: 'input', message: 'Usage: /pause'});
+    expect(transport.requests).toEqual([]);
+  });
+
   it('reports an unknown theme as an error without switching', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
