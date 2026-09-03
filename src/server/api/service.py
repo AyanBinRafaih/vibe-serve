@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
-from server.api.design import build_design_log
+from server.api.design import DesignLog
 from server.api.experiments import build_experiment_log
 from server.api.performance import (
     build_performance_context,
@@ -42,10 +42,12 @@ from server.events import EventType, RunEvent
 from vibesys.loops.agent.hypotheses import reproject_run_evidence
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.metrics import MetricSpace, Objective
+from vibesys.run.git_tracker import GitTracker
 from vs_project import ProjectStateError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from server.chat.manager import ChatManager
     from server.controller import RunController
@@ -80,6 +82,10 @@ class RunApi:
         self._tui_defaults_provider = tui_defaults
         self._tui_defaults: InteractiveSetupDefaults | None = None
         self._tui_defaults_lock = threading.Lock()
+        # Keyed by the attached run so the projection's diff cache survives
+        # across requests but never outlives the run it was built for.
+        self._design: tuple[tuple[Path, str], DesignLog] | None = None
+        self._design_lock = threading.Lock()
 
     def execute(self, request: ProtocolRequest) -> Response:  # noqa: C901, PLR0911
         """Execute one typed request and return its protocol response."""
@@ -271,12 +277,46 @@ class RunApi:
         state = self._agent_run_state()
         if project_run is None or state is None:
             return []
+        design = self._design_log(project_run.project.root, project_run.run_id)
         manifest = project_run.project.state.load_run(project_run.run_id)
-        return build_design_log(
-            state,
-            workspace=project_run.project.root,
-            baseline=manifest.trusted_input_baseline,
-        )
+        return design.rounds(state, baseline=manifest.trusted_input_baseline)
+
+    def _design_log(self, workspace: Path, run_id: str) -> DesignLog:
+        """Return the design projection for one run, building it once.
+
+        The projection caches a git diff per round commit range. Those ranges
+        are immutable, so keeping the projection alive across requests is what
+        turns a repeated ``query.design`` from one subprocess per round into
+        no subprocesses at all. It is rebuilt only if a different run attaches.
+        """
+        with self._design_lock:
+            cached = self._design
+            if cached is not None and cached[0] == (workspace, run_id):
+                return cached[1]
+            tracker = GitTracker(workspace, run_id=run_id, log=self._publish_git_diagnostic())
+            design = DesignLog(workspace=workspace, diff=tracker.diff_name_status)
+            self._design = ((workspace, run_id), design)
+            return design
+
+    def _publish_git_diagnostic(self) -> Callable[[str], None]:
+        """Return a sink that journals each distinct git failure once.
+
+        A failing checkpoint range is retried on every refresh, so without
+        deduplication one unreadable round would repeat its line for every
+        round of every refresh. Distinct messages stay bounded because the
+        set is capped; past the cap the sink stops, having already reported
+        every distinct fault it saw.
+        """
+        reported: set[str] = set()
+        limit = 32
+
+        def publish(message: str) -> None:
+            if message in reported or len(reported) >= limit:
+                return
+            reported.add(message)
+            self._journal.publish_output("stderr", message, source="design-log")
+
+        return publish
 
     def wait_for_events(
         self,

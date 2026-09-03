@@ -15,7 +15,7 @@ import {
   selectedExperimentIndexItem,
   unownedExperimentRounds,
 } from '../session-model.js';
-import {designStageSummary, formatFileChange} from './design-log.js';
+import {formatFileChange} from './design-log.js';
 import {elapsedLabel} from './previews.js';
 import type {Theme} from './theme.js';
 
@@ -318,9 +318,11 @@ export class ExperimentLogView {
   }
 
   /**
-   * The selected round's design log: what it changed in the workspace and how
-   * its stages concluded. Absent entirely until the design log has loaded, so
-   * the drill-down never shows a placeholder it cannot yet explain.
+   * The selected round's file changes. Only the files: every stage fact for
+   * the round is already on its row above, read from the same
+   * `HypothesisRound`, so there is nothing here for the two to disagree
+   * about. Absent entirely until the design log has loaded, so the drill-down
+   * never shows a placeholder it cannot yet explain.
    */
   #renderRoundDesign(state: SessionState, selectedRound: number | null): void {
     const design = designRoundFor(state, selectedRound);
@@ -330,21 +332,21 @@ export class ExperimentLogView {
     const files = design.files ?? null;
     if (files === null) {
       this.#line('File changes are not recorded for this round.', this.#theme.textSubtle);
-    } else if (files.length === 0) {
-      this.#line('No workspace files changed.', this.#theme.textSubtle);
-    } else {
-      for (const file of files) {
-        const color =
-          file.change === 'added'
-            ? this.#theme.success
-            : file.change === 'deleted'
-              ? this.#theme.error
-              : this.#theme.textPrimary;
-        this.#line(formatFileChange(file), color);
-      }
+      return;
     }
-    const summary = designStageSummary(design);
-    if (summary !== null) this.#wrappedLine(summary, this.#theme.textPrimary);
+    if (files.length === 0) {
+      this.#line('No workspace files changed.', this.#theme.textSubtle);
+      return;
+    }
+    for (const file of files) {
+      const color =
+        file.change === 'added'
+          ? this.#theme.success
+          : file.change === 'deleted'
+            ? this.#theme.error
+            : this.#theme.textPrimary;
+      this.#line(formatFileChange(file), color);
+    }
   }
 
   #renderActivity(
@@ -755,13 +757,21 @@ function measurementMetadata(entry: HypothesisEntry): string[] {
 
 function roundMetadata(roundNumber: number, round: HypothesisRound | undefined): string {
   const parts = [`Round ${roundNumber}`];
-  if (round !== undefined) {
-    parts.push(round.reviewed ? `Judge ${round.passed ? 'pass' : 'fail'}` : 'Judge pending');
-  }
+  if (round !== undefined) parts.push(`Judge ${judgeLabel(round)}`);
   if (typeof round?.perf_metric === 'number') {
     parts.push(`${trimNumber(round.perf_metric)}${round.perf_unit ? ` ${round.perf_unit}` : ''}`);
   }
   return parts.join(' · ');
+}
+
+/**
+ * The round's own review state. `judge_verdict` is authoritative; a record
+ * written before the framework stored one carries only `reviewed`, and
+ * `passed` is the closest thing it has to a verdict.
+ */
+function judgeLabel(round: HypothesisRound): string {
+  if (round.judge_verdict) return round.judge_verdict;
+  return round.reviewed ? (round.passed ? 'pass' : 'fail') : 'pending';
 }
 
 function planningHypothesisLabel(existingHypotheses: number): string {

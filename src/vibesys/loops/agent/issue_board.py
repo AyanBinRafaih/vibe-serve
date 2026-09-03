@@ -30,6 +30,8 @@ from vibesys.schemas import (
 )
 
 MEMORY_LAYOUTS = ("files", "directories")
+#: Workspace-relative roots of the loop's durable memory, layout aside.
+MEMORY_LAYOUTS_ROOTS = ("roadmap", "progress")
 # The roadmap carries durable strategy, while progress files are an audit trail.
 # Keep a bounded read helper for callers that explicitly request recent audit
 # text. Agent prompts receive only the durable path and inspect it with tools.
@@ -56,7 +58,8 @@ def resolve_paths(workspace: Path, layout: str) -> tuple[Path, Path]:
             return directory
         return directory if layout == "directories" else legacy
 
-    return resolve("roadmap"), resolve("progress")
+    roadmap, progress = MEMORY_LAYOUTS_ROOTS
+    return resolve(roadmap), resolve(progress)
 
 
 def display_path(path: Path, workspace: Path) -> str:
@@ -185,6 +188,23 @@ def pareto_archive_path(progress_path: Path) -> Path:
     if progress_path.suffix == ".md":
         return progress_path.with_name("pareto-frontier.md")
     return progress_path / "pareto-frontier.md"
+
+
+def framework_memory_paths(workspace: Path) -> tuple[Path, ...]:
+    """Return every memory location the framework writes into *workspace*.
+
+    Both layouts are returned because a projection over historical commits
+    cannot know which layout a past round used, and a resumed run may switch.
+    The artifact and Pareto roots are derived from the progress path rather
+    than restated, so a new framework-owned location under ``progress`` is
+    covered by construction. The paths need not exist.
+    """
+    paths: list[Path] = []
+    for name in MEMORY_LAYOUTS_ROOTS:
+        paths.extend((workspace / f"{name}.md", workspace / name))
+    for progress in (workspace / "progress.md", workspace / "progress"):
+        paths.extend((_structured_artifact_root(progress), pareto_archive_path(progress)))
+    return tuple(dict.fromkeys(paths))
 
 
 def write_pareto_archive(progress_path: Path, summary: str) -> Path:

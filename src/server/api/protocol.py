@@ -14,6 +14,9 @@ from server.events import RunEvent
 from server.execution import ActiveAgentExecution
 from server.run_lifecycle import RunStatus
 from server.settings import InteractiveSetupDefaults
+from vibesys.loops.agent.model import HypothesisResolution
+from vibesys.schemas import CandidateDisposition, HypothesisOutcome
+from vs_loop_state import JudgeVerdict
 
 PROTOCOL_VERSION = 1
 
@@ -215,17 +218,39 @@ class PerformanceContext(ProtocolModel):
 
 
 class HypothesisRound(ProtocolModel):
-    """One round belonging to a hypothesis, for the experiment-log drill-down."""
+    """One round belonging to a hypothesis, for the experiment-log drill-down.
+
+    This is the single source for every per-round fact the server publishes.
+    Surfaces that need more about a round (the design log's file list, for
+    example) join to this row by ``round`` rather than restating its fields.
+
+    ``hypothesis_outcome`` and ``candidate_disposition`` are closed sets, so
+    the generated client union is closed too. A round record written before a
+    member existed, or carrying a value the framework no longer defines, is
+    projected as ``None``: unreadable and unrecorded are the same thing to a
+    client, and a stale string must not take down the whole log.
+    """
 
     round: int
     passed: bool
     reviewed: bool
-    hypothesis_outcome: str | None = None
+    # Either vocabulary can reach a round record: the implementer declares an
+    # outcome, and the framework may overwrite it with its own resolution.
+    hypothesis_outcome: HypothesisOutcome | HypothesisResolution | None = None
+    # The round's own review state, decided by its final implementer attempt.
+    # ``deferred`` means sparse-review policy skipped the judge; None marks a
+    # legacy record written before the framework stored a verdict. This is
+    # per-round and distinct from ``HypothesisEntry.judge_verdict``, which is
+    # the hypothesis-level review.
+    judge_verdict: JudgeVerdict | None = None
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
+    # Causal delta the round recorded against its own baseline. None when the
+    # round made no comparable measurement.
+    perf_delta_pct: FiniteFloat | None = None
     commit: str | None = None
     official_evaluation: bool = False
-    candidate_disposition: str | None = None
+    candidate_disposition: CandidateDisposition | None = None
 
 
 class HypothesisEntry(ProtocolModel):
@@ -286,32 +311,23 @@ class DesignFileChange(ProtocolModel):
 
 
 class DesignRound(ProtocolModel):
-    """One round of the design log: what changed and how each stage concluded.
+    """What one round changed in the workspace.
 
-    Stage fields are copied from the authoritative round record, never
-    recomputed. ``files`` is derived from the run workspace's git history:
-    None means the round's commit range could not be resolved (no checkpoint
-    recorded, or the workspace history no longer has it), which is distinct
-    from an empty list, a resolved range that touched nothing outside
-    framework bookkeeping.
+    Deliberately narrow: every other per-round fact (outcome, review,
+    official evaluation, candidate disposition, measurement) already crosses
+    the protocol on ``HypothesisRound``, and a client joins the two by
+    ``round``. Publishing a second copy here let the two fetches disagree
+    about the same round.
+
+    ``files`` is derived from the run workspace's git history. None means the
+    round's commit range could not be resolved (no checkpoint recorded, or the
+    workspace history no longer has it), which is distinct from an empty list,
+    a resolved range that touched nothing outside framework bookkeeping.
     """
 
     round: int
+    # The round's end-of-round checkpoint, and the head of the diffed range.
     commit: str | None = None
-    hypothesis_id: str | None = None
-    # Display title of the owning hypothesis, same derivation as the
-    # experiment log's, so both surfaces name a hypothesis identically.
-    title: str | None = None
-    claim: str | None = None
-    task: str | None = None
-    passed: bool = False
-    hypothesis_outcome: str | None = None
-    judge_verdict: Literal["pass", "fail", "deferred"] | None = None
-    official_evaluation: bool = False
-    candidate_disposition: str | None = None
-    perf_metric: FiniteFloat | None = None
-    perf_unit: str | None = None
-    perf_delta_pct: FiniteFloat | None = None
     files: list[DesignFileChange] | None = None
 
 

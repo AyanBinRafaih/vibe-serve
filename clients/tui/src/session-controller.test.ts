@@ -831,6 +831,7 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
 
     await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
 
     expect(controller.state.designLog).toEqual(transport.design);
   });
@@ -841,17 +842,22 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
 
     await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
 
     expect(controller.state.designLog).toBeNull();
   });
 
-  it('shows the per-round design summary as an overlay for /design', async () => {
+  it('renders /design in the right pane, joining stage facts by round', async () => {
     const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {
+        title: 'Pad the ring indices',
+        rounds: [{round: 1, passed: true, reviewed: true, judge_verdict: 'pass'}],
+      }),
+    ];
     transport.design = [
       {
         round: 1,
-        hypothesis_id: 'H-01',
-        title: 'Pad the ring indices',
         files: [
           {path: 'src/ring.rs', change: 'added'},
           {path: 'src/lib.rs', change: 'modified'},
@@ -859,24 +865,32 @@ describe('session controller', () => {
       },
     ];
     const controller = new SocketSessionController(transport);
+    await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
 
     await controller.submitCommand('/design');
 
-    expect(transport.requests).toEqual([{type: 'query.design'}]);
-    expect(controller.state.overlay?.content).toContain('Design changes by round');
-    expect(controller.state.overlay?.content).toContain('Round 1 · H-01 · Pad the ring indices');
-    expect(controller.state.overlay?.content).toContain('src/ring.rs, src/lib.rs');
+    expect(controller.state.overlay).toBeNull();
+    expect(controller.state.layout.right?.view).toBe('design');
+    expect(controller.state.layout.right?.title).toBe('Design changes');
+    expect(controller.state.layout.right?.content).toContain('Design changes by round');
+    expect(controller.state.layout.right?.content).toContain(
+      'Round 1 · H-01 · Pad the ring indices',
+    );
+    expect(controller.state.layout.right?.content).toContain('src/ring.rs, src/lib.rs');
     expect(controller.state.designLog).toEqual(transport.design);
   });
 
-  it('says the design log is not ready instead of showing an empty summary', async () => {
+  it('says the design log is not ready instead of showing an empty pane', async () => {
     const transport = new FakeTransport();
     transport.designReady = false;
     const controller = new SocketSessionController(transport);
 
     await controller.submitCommand('/design');
 
-    expect(controller.state.overlay?.content).toContain('not available until a run is attached');
+    expect(controller.state.layout.right?.content).toContain(
+      'not available until a run is attached',
+    );
     expect(controller.state.designLog).toBeNull();
   });
 

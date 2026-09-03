@@ -1,8 +1,10 @@
 import type {
   ChatOptions,
+  DesignFileChange,
   DesignRound,
   Diagnostic,
   HypothesisEntry,
+  HypothesisRound,
   RunEvent,
   RunSnapshot,
 } from '@vibesys/backend-client';
@@ -174,7 +176,7 @@ export interface HypothesisScope {
  * over it. Content is pre-rendered text so the pane stays agnostic about which
  * command produced it and a new command needs no new layout code.
  */
-export type PaneView = 'perf';
+export type PaneView = 'perf' | 'design';
 
 export interface RightPane {
   view: PaneView;
@@ -724,6 +726,41 @@ export function designRoundFor(
   return state.designLog.find(round => round.round === roundNumber) ?? null;
 }
 
+/**
+ * One round as both surfaces know it: the experiment log owns every stage
+ * fact, the design log owns only the file list. The join is by round number,
+ * which is the identity both fetches agree on, so the two can never describe
+ * the same round differently.
+ */
+export interface DesignRoundView {
+  round: number;
+  files: DesignFileChange[] | null;
+  hypothesisId: string | null;
+  title: string | null;
+  /** The experiment log's row for this round, absent for a round it lost. */
+  record: HypothesisRound | null;
+}
+
+export function designRoundViews(
+  designLog: readonly DesignRound[],
+  entries: readonly HypothesisEntry[],
+): DesignRoundView[] {
+  const owners = new Map<number, {entry: HypothesisEntry; record: HypothesisRound}>();
+  for (const entry of entries) {
+    for (const record of entry.rounds ?? []) owners.set(record.round, {entry, record});
+  }
+  return designLog.map(design => {
+    const owner = owners.get(design.round) ?? null;
+    return {
+      round: design.round,
+      files: design.files ?? null,
+      hypothesisId: owner?.entry.hypothesis_id ?? null,
+      title: owner?.entry.title ?? owner?.entry.claim ?? null,
+      record: owner?.record ?? null,
+    };
+  });
+}
+
 export function moveExperimentSelection(state: SessionState, delta: number): SessionState {
   const log = state.experimentLog;
   if (log === null || state.hypothesisDetail !== null || state.hypothesisScope !== null)
@@ -1112,6 +1149,7 @@ function planningStage(
 
 export const PANE_TITLES: Record<PaneView, string> = {
   perf: 'Performance',
+  design: 'Design changes',
 };
 
 /**

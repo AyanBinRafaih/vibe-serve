@@ -371,6 +371,17 @@
       "title": "BenchmarkResultData",
       "type": "object"
     },
+    "CandidateDisposition": {
+      "description": "How a measured candidate should be retained independently of its hypothesis.\n\nHypothesis truth and checkpoint utility are different questions. A causal\nforecast can be disproven while its implementation still establishes a\nuseful throughput/latency tradeoff. These values keep that distinction\nexplicit without promoting provisional evidence to an official result.",
+      "enum": [
+        "unassessed",
+        "discard",
+        "prerequisite",
+        "pareto_frontier"
+      ],
+      "title": "CandidateDisposition",
+      "type": "string"
+    },
     "ChatData": {
       "properties": {
         "kind": {
@@ -936,7 +947,7 @@
     },
     "DesignRound": {
       "additionalProperties": false,
-      "description": "One round of the design log: what changed and how each stage concluded.\n\nStage fields are copied from the authoritative round record, never\nrecomputed. ``files`` is derived from the run workspace's git history:\nNone means the round's commit range could not be resolved (no checkpoint\nrecorded, or the workspace history no longer has it), which is distinct\nfrom an empty list, a resolved range that touched nothing outside\nframework bookkeeping.",
+      "description": "What one round changed in the workspace.\n\nDeliberately narrow: every other per-round fact (outcome, review,\nofficial evaluation, candidate disposition, measurement) already crosses\nthe protocol on ``HypothesisRound``, and a client joins the two by\n``round``. Publishing a second copy here let the two fetches disagree\nabout the same round.\n\n``files`` is derived from the run workspace's git history. None means the\nround's commit range could not be resolved (no checkpoint recorded, or the\nworkspace history no longer has it), which is distinct from an empty list,\na resolved range that touched nothing outside framework bookkeeping.",
       "properties": {
         "round": {
           "title": "Round",
@@ -953,141 +964,6 @@
           ],
           "default": null,
           "title": "Commit"
-        },
-        "hypothesis_id": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Hypothesis Id"
-        },
-        "title": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Title"
-        },
-        "claim": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Claim"
-        },
-        "task": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Task"
-        },
-        "passed": {
-          "default": false,
-          "title": "Passed",
-          "type": "boolean"
-        },
-        "hypothesis_outcome": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Hypothesis Outcome"
-        },
-        "judge_verdict": {
-          "anyOf": [
-            {
-              "enum": [
-                "pass",
-                "fail",
-                "deferred"
-              ],
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Judge Verdict"
-        },
-        "official_evaluation": {
-          "default": false,
-          "title": "Official Evaluation",
-          "type": "boolean"
-        },
-        "candidate_disposition": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Candidate Disposition"
-        },
-        "perf_metric": {
-          "anyOf": [
-            {
-              "type": "number"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Perf Metric"
-        },
-        "perf_unit": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Perf Unit"
-        },
-        "perf_delta_pct": {
-          "anyOf": [
-            {
-              "type": "number"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Perf Delta Pct"
         },
         "files": {
           "anyOf": [
@@ -1699,9 +1575,36 @@
       "title": "HypothesisEntry",
       "type": "object"
     },
+    "HypothesisOutcome": {
+      "description": "Implementer-owned status for the active experimental hypothesis.\n\n``SUPPORTED`` and ``NOMINATED`` are deliberately distinct from\n``PROVEN``: an implementer may submit evidence for independent review,\nbut only the judge can establish that the scoped hypothesis held.\n``NOMINATED`` additionally asks the framework to run its global gates for\nthe current candidate checkpoint. It does not imply that the overall\nobjective or terminal target has been achieved.",
+      "enum": [
+        "continue",
+        "supported",
+        "nominated",
+        "disproven",
+        "implementation_failed",
+        "inconclusive",
+        "blocked"
+      ],
+      "title": "HypothesisOutcome",
+      "type": "string"
+    },
+    "HypothesisResolution": {
+      "description": "Framework-owned resolution after all available evidence is known.",
+      "enum": [
+        "proven",
+        "disproven",
+        "inconclusive",
+        "implementation_failed",
+        "blocked",
+        "rejected"
+      ],
+      "title": "HypothesisResolution",
+      "type": "string"
+    },
     "HypothesisRound": {
       "additionalProperties": false,
-      "description": "One round belonging to a hypothesis, for the experiment-log drill-down.",
+      "description": "One round belonging to a hypothesis, for the experiment-log drill-down.\n\nThis is the single source for every per-round fact the server publishes.\nSurfaces that need more about a round (the design log's file list, for\nexample) join to this row by ``round`` rather than restating its fields.\n\n``hypothesis_outcome`` and ``candidate_disposition`` are closed sets, so\nthe generated client union is closed too. A round record written before a\nmember existed, or carrying a value the framework no longer defines, is\nprojected as ``None``: unreadable and unrecorded are the same thing to a\nclient, and a stale string must not take down the whole log.",
       "properties": {
         "round": {
           "title": "Round",
@@ -1718,7 +1621,10 @@
         "hypothesis_outcome": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/HypothesisOutcome"
+            },
+            {
+              "$ref": "#/$defs/HypothesisResolution"
             },
             {
               "type": "null"
@@ -1726,6 +1632,23 @@
           ],
           "default": null,
           "title": "Hypothesis Outcome"
+        },
+        "judge_verdict": {
+          "anyOf": [
+            {
+              "enum": [
+                "pass",
+                "fail",
+                "deferred"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Judge Verdict"
         },
         "perf_metric": {
           "anyOf": [
@@ -1751,6 +1674,18 @@
           "default": null,
           "title": "Perf Unit"
         },
+        "perf_delta_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Delta Pct"
+        },
         "commit": {
           "anyOf": [
             {
@@ -1771,14 +1706,13 @@
         "candidate_disposition": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/CandidateDisposition"
             },
             {
               "type": "null"
             }
           ],
-          "default": null,
-          "title": "Candidate Disposition"
+          "default": null
         }
       },
       "required": [

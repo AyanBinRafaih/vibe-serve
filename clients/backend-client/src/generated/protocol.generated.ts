@@ -378,18 +378,45 @@ export type LastRound = number;
 export type Round1 = number;
 export type Passed1 = boolean;
 export type Reviewed = boolean;
-export type HypothesisOutcome = string | null;
+export type HypothesisOutcome = HypothesisOutcome1 | HypothesisResolution | null;
+/**
+ * Implementer-owned status for the active experimental hypothesis.
+ *
+ * ``SUPPORTED`` and ``NOMINATED`` are deliberately distinct from
+ * ``PROVEN``: an implementer may submit evidence for independent review,
+ * but only the judge can establish that the scoped hypothesis held.
+ * ``NOMINATED`` additionally asks the framework to run its global gates for
+ * the current candidate checkpoint. It does not imply that the overall
+ * objective or terminal target has been achieved.
+ */
+export type HypothesisOutcome1 =
+  "continue" | "supported" | "nominated" | "disproven" | "implementation_failed" | "inconclusive" | "blocked";
+/**
+ * Framework-owned resolution after all available evidence is known.
+ */
+export type HypothesisResolution =
+  "proven" | "disproven" | "inconclusive" | "implementation_failed" | "blocked" | "rejected";
+export type JudgeVerdict1 = ("pass" | "fail" | "deferred") | null;
 export type PerfMetric2 = number | null;
 export type PerfUnit2 = string | null;
+export type PerfDeltaPct = number | null;
 export type Commit = string | null;
 export type OfficialEvaluation = boolean;
-export type CandidateDisposition = string | null;
+/**
+ * How a measured candidate should be retained independently of its hypothesis.
+ *
+ * Hypothesis truth and checkpoint utility are different questions. A causal
+ * forecast can be disproven while its implementation still establishes a
+ * useful throughput/latency tradeoff. These values keep that distinction
+ * explicit without promoting provisional evidence to an official result.
+ */
+export type CandidateDisposition = "unassessed" | "discard" | "prerequisite" | "pareto_frontier";
 export type Rounds = HypothesisRound[];
 export type ResolvedOutcome = string | null;
-export type JudgeVerdict1 = ("pass" | "fail") | null;
+export type JudgeVerdict2 = ("pass" | "fail") | null;
 export type PerfMetric3 = number | null;
 export type PerfUnit3 = string | null;
-export type PerfDeltaPct = number | null;
+export type PerfDeltaPct1 = number | null;
 export type PerfMetricName = string | null;
 export type PerfDirection = ("max" | "min") | null;
 export type PerfBaselineValue = number | null;
@@ -401,18 +428,6 @@ export type Experiments = HypothesisEntry[];
 export type ExperimentsReady = boolean | null;
 export type Round2 = number;
 export type Commit1 = string | null;
-export type HypothesisId1 = string | null;
-export type Title4 = string | null;
-export type Claim1 = string | null;
-export type Task = string | null;
-export type Passed2 = boolean;
-export type HypothesisOutcome1 = string | null;
-export type JudgeVerdict2 = ("pass" | "fail" | "deferred") | null;
-export type OfficialEvaluation1 = boolean;
-export type CandidateDisposition1 = string | null;
-export type PerfMetric4 = number | null;
-export type PerfUnit4 = string | null;
-export type PerfDeltaPct1 = number | null;
 export type Files = DesignFileChange[] | null;
 export type Path = string;
 export type Change = "added" | "modified" | "deleted" | "renamed";
@@ -992,10 +1007,10 @@ export interface HypothesisEntry {
   last_round: LastRound;
   rounds?: Rounds;
   resolved_outcome?: ResolvedOutcome;
-  judge_verdict?: JudgeVerdict1;
+  judge_verdict?: JudgeVerdict2;
   perf_metric?: PerfMetric3;
   perf_unit?: PerfUnit3;
-  perf_delta_pct?: PerfDeltaPct;
+  perf_delta_pct?: PerfDeltaPct1;
   perf_metric_name?: PerfMetricName;
   perf_direction?: PerfDirection;
   perf_baseline_value?: PerfBaselineValue;
@@ -1006,43 +1021,47 @@ export interface HypothesisEntry {
 }
 /**
  * One round belonging to a hypothesis, for the experiment-log drill-down.
+ *
+ * This is the single source for every per-round fact the server publishes.
+ * Surfaces that need more about a round (the design log's file list, for
+ * example) join to this row by ``round`` rather than restating its fields.
+ *
+ * ``hypothesis_outcome`` and ``candidate_disposition`` are closed sets, so
+ * the generated client union is closed too. A round record written before a
+ * member existed, or carrying a value the framework no longer defines, is
+ * projected as ``None``: unreadable and unrecorded are the same thing to a
+ * client, and a stale string must not take down the whole log.
  */
 export interface HypothesisRound {
   round: Round1;
   passed: Passed1;
   reviewed: Reviewed;
   hypothesis_outcome?: HypothesisOutcome;
+  judge_verdict?: JudgeVerdict1;
   perf_metric?: PerfMetric2;
   perf_unit?: PerfUnit2;
+  perf_delta_pct?: PerfDeltaPct;
   commit?: Commit;
   official_evaluation?: OfficialEvaluation;
-  candidate_disposition?: CandidateDisposition;
+  candidate_disposition?: CandidateDisposition | null;
 }
 /**
- * One round of the design log: what changed and how each stage concluded.
+ * What one round changed in the workspace.
  *
- * Stage fields are copied from the authoritative round record, never
- * recomputed. ``files`` is derived from the run workspace's git history:
- * None means the round's commit range could not be resolved (no checkpoint
- * recorded, or the workspace history no longer has it), which is distinct
- * from an empty list, a resolved range that touched nothing outside
- * framework bookkeeping.
+ * Deliberately narrow: every other per-round fact (outcome, review,
+ * official evaluation, candidate disposition, measurement) already crosses
+ * the protocol on ``HypothesisRound``, and a client joins the two by
+ * ``round``. Publishing a second copy here let the two fetches disagree
+ * about the same round.
+ *
+ * ``files`` is derived from the run workspace's git history. None means the
+ * round's commit range could not be resolved (no checkpoint recorded, or the
+ * workspace history no longer has it), which is distinct from an empty list,
+ * a resolved range that touched nothing outside framework bookkeeping.
  */
 export interface DesignRound {
   round: Round2;
   commit?: Commit1;
-  hypothesis_id?: HypothesisId1;
-  title?: Title4;
-  claim?: Claim1;
-  task?: Task;
-  passed?: Passed2;
-  hypothesis_outcome?: HypothesisOutcome1;
-  judge_verdict?: JudgeVerdict2;
-  official_evaluation?: OfficialEvaluation1;
-  candidate_disposition?: CandidateDisposition1;
-  perf_metric?: PerfMetric4;
-  perf_unit?: PerfUnit4;
-  perf_delta_pct?: PerfDeltaPct1;
   files?: Files;
 }
 /**

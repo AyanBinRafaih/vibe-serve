@@ -1,5 +1,6 @@
 import {describe, expect, it} from 'bun:test';
-import type {DesignRound} from '@vibesys/backend-client';
+import type {HypothesisRound} from '@vibesys/backend-client';
+import type {DesignRoundView} from '../session-model.js';
 import {
   designRoundHeading,
   designStageSummary,
@@ -9,8 +10,12 @@ import {
   renderDesignSummary,
 } from './design-log.js';
 
-function round(overrides: Partial<DesignRound> = {}): DesignRound {
-  return {round: 1, ...overrides};
+function record(overrides: Partial<HypothesisRound> = {}): HypothesisRound {
+  return {round: 1, passed: false, reviewed: false, ...overrides};
+}
+
+function view(overrides: Partial<DesignRoundView> = {}): DesignRoundView {
+  return {round: 1, files: null, hypothesisId: null, title: null, record: null, ...overrides};
 }
 
 describe('file change formatting', () => {
@@ -43,36 +48,40 @@ describe('file change formatting', () => {
 });
 
 describe('designStageSummary', () => {
-  it('lists only what the round recorded', () => {
+  it('reads every stage fact from the experiment log record', () => {
     expect(
       designStageSummary(
-        round({
-          hypothesis_outcome: 'proven',
-          judge_verdict: 'pass',
-          official_evaluation: true,
-          candidate_disposition: 'retained',
-          commit: '0123456789abcdef0123456789abcdef01234567',
+        view({
+          record: record({
+            hypothesis_outcome: 'proven',
+            judge_verdict: 'pass',
+            official_evaluation: true,
+            candidate_disposition: 'pareto_frontier',
+            commit: '0123456789abcdef0123456789abcdef01234567',
+          }),
         }),
       ),
     ).toBe(
-      'Outcome proven · Judge pass · Official evaluation · Candidate retained · Checkpoint 0123456789',
+      'Outcome proven · Judge pass · Official evaluation · Candidate pareto_frontier · Checkpoint 0123456789',
     );
   });
 
+  it('is absent for a round the experiment log has no row for', () => {
+    expect(designStageSummary(view())).toBeNull();
+  });
+
   it('is absent for a round with no recorded stages', () => {
-    expect(designStageSummary(round())).toBeNull();
+    expect(designStageSummary(view({record: record()}))).toBeNull();
   });
 });
 
 describe('designRoundHeading', () => {
-  it('prefers the title and falls back to the claim', () => {
-    expect(designRoundHeading(round({hypothesis_id: 'H-01', title: 'Pad the indices'}))).toBe(
+  it('names the owning hypothesis when the join found one', () => {
+    expect(designRoundHeading(view({hypothesisId: 'H-01', title: 'Pad the indices'}))).toBe(
       'Round 1 · H-01 · Pad the indices',
     );
-    expect(designRoundHeading(round({hypothesis_id: 'H-01', claim: 'Padding helps'}))).toBe(
-      'Round 1 · H-01 · Padding helps',
-    );
-    expect(designRoundHeading(round())).toBe('Round 1');
+    expect(designRoundHeading(view({hypothesisId: 'H-01'}))).toBe('Round 1 · H-01');
+    expect(designRoundHeading(view())).toBe('Round 1');
   });
 });
 
@@ -83,12 +92,10 @@ describe('renderDesignSummary', () => {
 
   it('renders a heading and a file line per round', () => {
     const rendered = renderDesignSummary([
-      round({
-        hypothesis_id: 'H-01',
+      view({
+        hypothesisId: 'H-01',
         title: 'Pad the indices',
-        perf_metric: 2400,
-        perf_unit: 'ops/s',
-        perf_delta_pct: 12.5,
+        record: record({perf_metric: 2400, perf_unit: 'ops/s', perf_delta_pct: 12.5}),
         files: [
           {path: 'src/ring.rs', change: 'added'},
           {path: 'src/lib.rs', change: 'modified'},
@@ -100,7 +107,7 @@ describe('renderDesignSummary', () => {
   });
 
   it('distinguishes unrecorded changes from a round that changed nothing', () => {
-    const rendered = renderDesignSummary([round({round: 1}), round({round: 2, files: []})]);
+    const rendered = renderDesignSummary([view({round: 1}), view({round: 2, files: []})]);
     expect(rendered).toContain('file changes not recorded');
     expect(rendered).toContain('no workspace files changed');
   });
@@ -110,16 +117,16 @@ describe('renderDesignSummary', () => {
       path: `src/file-${index}.rs`,
       change: 'modified' as const,
     }));
-    const rendered = renderDesignSummary([round({files})]);
+    const rendered = renderDesignSummary([view({files})]);
     expect(rendered).toContain('src/file-3.rs, +2 more');
     expect(rendered).not.toContain('src/file-4.rs');
   });
 
-  it('keeps the newest rounds and collapses the earlier ones into a count', () => {
-    const rounds = Array.from({length: 12}, (_, index) => round({round: index + 1}));
+  it('keeps every round, because the pane scrolls', () => {
+    const rounds = Array.from({length: 12}, (_, index) => view({round: index + 1}));
     const rendered = renderDesignSummary(rounds);
-    expect(rendered).toContain('(2 earlier rounds not shown)');
-    expect(rendered).toContain('Round 12');
-    expect(rendered).not.toContain('Round 2\n');
+    for (let number = 1; number <= 12; number += 1) {
+      expect(rendered).toContain(`Round ${number}`);
+    }
   });
 });

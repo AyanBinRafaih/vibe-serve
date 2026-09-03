@@ -63,6 +63,7 @@ import {
 } from '../session-model.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
+import {renderDesignSummary} from './design-log.js';
 import {resolveTheme, type ThemeName} from './theme.js';
 
 const cleanup: Array<() => void> = [];
@@ -3479,6 +3480,34 @@ describe('theming', () => {
     expect(untitled).not.toContain('Batch prefill to cut latency');
   });
 
+  it('keeps the newest design round on screen in the pane at 100x30', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 30});
+    const controller = logController();
+    controller.paneContent = renderDesignSummary(
+      Array.from({length: 10}, (_, index) => ({
+        round: index + 1,
+        files: [{path: `src/round-${index + 1}.rs`, change: 'modified' as const}],
+        hypothesisId: 'H-07',
+        title: 'Batch the prefill step',
+        record: null,
+      })),
+    );
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await controller.openPane('design');
+
+    // Ten rounds is 24 lines. The modal this replaced was 60% of 30 rows and
+    // did not scroll, so the newest rounds fell off the bottom; the pane is
+    // the full column and scrolls, so both ends are on screen.
+    const frame = await testRenderer.waitForFrame(value =>
+      value.includes('Design changes by round'),
+    );
+    expect(frame).toContain('Round 1 · H-07');
+    expect(frame).toContain('Round 10 · H-07');
+    expect(frame).toContain('src/round-10.rs');
+  });
+
   it('annotates the selected round with its design changes once the log loads', async () => {
     const testRenderer = await createTestRenderer({width: 200, height: 30});
     const controller = logController();
@@ -3499,9 +3528,6 @@ describe('theming', () => {
       designLog: [
         {
           round: 41,
-          hypothesis_id: 'H-07',
-          hypothesis_outcome: 'proven',
-          judge_verdict: 'pass',
           commit: 'abcdef1234567890',
           files: [
             {path: 'src/ring.rs', change: 'added'},
@@ -3516,7 +3542,8 @@ describe('theming', () => {
     expect(annotated).toContain('+ src/ring.rs');
     expect(annotated).toContain('→ src/lib.rs (was src/queue.rs)');
     expect(annotated).toContain('- src/ffi.rs');
-    expect(annotated).toContain('Outcome proven · Judge pass · Checkpoint abcdef1234');
+    // Stage facts stay on the round's own row, stated once.
+    expect(annotated).not.toContain('Outcome proven');
   });
 
   it('opens hypothesis detail from a row click and keeps pane clicks routed', async () => {

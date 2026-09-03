@@ -35,8 +35,12 @@ describe('parseCommand', () => {
       localView: 'chat',
       chatMessage: 'what changed in the latest round?',
     });
-    // The design summary is an overlay, so it routes to neither pane nor request.
-    expect(parseCommand('/design')).toEqual({designView: true});
+    // Every visualization goes through the one pane mechanism, so /design
+    // reaches the right pane exactly the way /perf does.
+    expect(parseCommand('/design')).toEqual({
+      request: {type: 'query.design'},
+      paneView: 'design',
+    });
     expect(SLASH_COMMANDS.map(command => command.name)).toContain('/design');
   });
 
