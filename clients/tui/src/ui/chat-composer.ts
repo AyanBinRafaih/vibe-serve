@@ -5,7 +5,7 @@ import {
   TextareaRenderable,
   TextRenderable,
 } from '@opentui/core';
-import {suggestChatSlashCommands} from '../commands.js';
+import {suggestSlashCommands} from '../commands.js';
 import type {ChatMenuRow, SessionState} from '../session-model.js';
 import {SuggestionMenu} from './suggestion-menu.js';
 import type {Theme} from './theme.js';
@@ -217,7 +217,9 @@ export class ChatComposerView {
 
   /** Recomputes the typed-command matches for the draft's current text. */
   #syncSuggestions(): void {
-    this.draft.suggestions.setMatches(suggestChatSlashCommands(this.draft.value.trim()));
+    this.draft.suggestions.setMatches(
+      suggestSlashCommands(this.draft.value.trim(), {surface: 'chat'}),
+    );
   }
 
   /** Makes this editor authoritative when its presentation becomes visible. */

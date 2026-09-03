@@ -1,196 +1,273 @@
 import {describe, expect, it} from 'bun:test';
+import {readFileSync} from 'node:fs';
 import {
   availableCommands,
+  COMMAND_NAMES,
+  COMMAND_SPECS,
+  type CommandSurface,
   chatHelpText,
   helpText,
-  parseChatCommand,
+  type ParsedCommand,
   parseCommand,
-  SLASH_COMMANDS,
   slashCommandRange,
-  suggestChatSlashCommands,
   suggestSlashCommands,
 } from './commands.js';
 
+const onCommand = (text: string): ParsedCommand => parseCommand(text, {surface: 'command'});
+const onChat = (text: string): ParsedCommand => parseCommand(text, {surface: 'chat'});
+const names = (commands: readonly {name: string}[]): string[] =>
+  commands.map(command => command.name);
+
+/** The commands both surfaces resolve identically, so parity is asserted once. */
+const SHARED = [
+  '/help',
+  '/pause',
+  '/resume',
+  '/steer look at the cache',
+  '/open-round',
+  '/perf',
+  '/design',
+  '/todos',
+  '/prompt',
+  '/theme',
+];
+
 describe('parseCommand', () => {
-  it('accepts the intentionally small slash-command surface', () => {
-    expect(parseCommand('/open-round')).toEqual({openRound: {}});
-    expect(parseCommand('/open-round --3')).toEqual({openRound: {round: 3}});
-    expect(parseCommand('/open-round 3')).toEqual({openRound: {round: 3}});
-    expect(parseCommand('/open-round latest').error).toContain('Unknown round: latest');
-    // Visualization commands opt into the right pane through one field.
-    expect(parseCommand('/perf')).toMatchObject({
-      request: {type: 'query.performance'},
-      paneView: 'perf',
+  it('parses the command surface into discriminated actions', () => {
+    expect(onCommand('/help')).toEqual({kind: 'help'});
+    expect(onCommand('/pause')).toEqual({kind: 'request', request: {type: 'command.pause'}});
+    expect(onCommand('/resume')).toEqual({kind: 'request', request: {type: 'command.resume'}});
+    expect(onCommand('/steer prioritize the KV cache path')).toEqual({
+      kind: 'request',
+      request: {type: 'command.steer', text: 'prioritize the KV cache path'},
     });
-    // Modal surfaces stay modal: no pane routing on any of them.
-    expect(parseCommand('/help').paneView).toBeUndefined();
-    expect(parseCommand('/theme').paneView).toBeUndefined();
-    expect(parseCommand('/chat').paneView).toBeUndefined();
-    expect(parseCommand('/nope').paneView).toBeUndefined();
-    expect(parseCommand('/perf')).toMatchObject({
+    expect(onCommand('/open-round')).toEqual({kind: 'openRound'});
+    expect(onCommand('/open-round --3')).toEqual({kind: 'openRound', round: 3});
+    expect(onCommand('/open-round 3')).toEqual({kind: 'openRound', round: 3});
+    expect(onCommand('/perf')).toMatchObject({
+      kind: 'request',
       request: {type: 'query.performance'},
       responseView: 'perf',
-    });
-    expect(parseCommand('/chat what changed in the latest round?')).toEqual({
-      localView: 'chat',
-      chatMessage: 'what changed in the latest round?',
+      paneView: 'perf',
     });
     // Every visualization goes through the one pane mechanism, so /design
     // reaches the right pane exactly the way /perf does.
-    expect(parseCommand('/design')).toEqual({
+    expect(onCommand('/design')).toEqual({
+      kind: 'request',
       request: {type: 'query.design'},
       paneView: 'design',
     });
-    expect(SLASH_COMMANDS.map(command => command.name)).toContain('/design');
-  });
-
-  it('parses run-control commands', () => {
-    expect(parseCommand('/pause')).toEqual({request: {type: 'command.pause'}});
-    expect(parseCommand('/resume')).toEqual({request: {type: 'command.resume'}});
-    expect(parseCommand('/steer prioritize the KV cache path')).toEqual({
-      request: {type: 'command.steer', text: 'prioritize the KV cache path'},
-    });
-  });
-
-  it('requires a message for /steer', () => {
-    expect(parseCommand('/steer').error).toContain('Usage: /steer');
-    expect(parseCommand('/steer   ').error).toContain('Usage: /steer');
-  });
-
-  it('rejects text that belongs to Experiment chat', () => {
-    expect(parseCommand('what is happening?')).toEqual({
-      error: 'Commands start with /. Use Experiment chat for questions.',
-    });
-    expect(parseCommand('')).toEqual({error: 'Enter a slash command. Use /help.'});
-  });
-
-  it('rejects the removed experiment-log commands', () => {
-    expect(parseCommand('/history').error).toContain('Unknown command: /history');
-    expect(parseCommand('/history rounds').error).toContain('Unknown command: /history rounds');
-    expect(parseCommand('/experiments').error).toContain('Unknown command: /experiments');
-  });
-
-  it('keeps inspection commands out of the public command surface', () => {
-    expect(parseCommand('/round 4').error).toContain('Unknown command');
-    expect(parseCommand('/invocation abc').error).toContain('Unknown command');
-    expect(parseCommand('/show workspace/file').error).toContain('Unknown command');
-  });
-
-  it('provides local help without a backend request', () => {
-    expect(parseCommand('/help')).toEqual({localView: 'help'});
-  });
-
-  it('opens chat without requiring an initial question', () => {
-    expect(parseCommand('/chat')).toEqual({localView: 'chat'});
-    expect(parseCommand('/chat   ')).toEqual({localView: 'chat'});
-  });
-
-  it('lists themes bare and selects a known theme by name', () => {
-    expect(parseCommand('/theme')).toEqual({localView: 'theme'});
-    expect(parseCommand('/theme   ')).toEqual({localView: 'theme'});
-    expect(parseCommand('/theme solarized-light')).toEqual({
-      localView: 'theme',
+    // Modal surfaces stay modal: no pane routing on any of them.
+    expect(onCommand('/help')).not.toHaveProperty('paneView');
+    expect(onCommand('/theme')).not.toHaveProperty('paneView');
+    expect(onCommand('/chat')).not.toHaveProperty('paneView');
+    expect(onCommand('/todos')).toEqual({kind: 'toggle', toggle: 'todos'});
+    expect(onCommand('/prompt')).toEqual({kind: 'toggle', toggle: 'prompt'});
+    expect(onCommand('/theme')).toEqual({kind: 'theme'});
+    expect(onCommand('/theme solarized-light')).toEqual({
+      kind: 'theme',
       themeName: 'solarized-light',
     });
+    expect(onCommand('/chat')).toEqual({kind: 'openChat'});
+    expect(onCommand('/chat what changed in the latest round?')).toEqual({
+      kind: 'openChat',
+      chatMessage: 'what changed in the latest round?',
+    });
   });
 
-  it('rejects an unknown theme name with the available list', () => {
-    const parsed = parseCommand('/theme monokai');
-    expect(parsed.error).toContain('Unknown theme: monokai');
-    expect(parsed.error).toContain('catppuccin-mocha');
-    expect(parsed.localView).toBeUndefined();
-  });
-});
-
-describe('command surface by view', () => {
-  it('drops /chat where the chat is already a pane of the view', () => {
-    const docked = availableCommands({chatDocked: true}).map(command => command.name);
-
-    expect(docked).not.toContain('/chat');
-    expect(docked).toContain('/perf');
-    expect(helpText({chatDocked: true})).not.toMatch(/\/chat\s/);
-    expect(suggestSlashCommands('/c', {chatDocked: true}).map(command => command.name)).toEqual([]);
+  it('reports usage and validation errors from the registry', () => {
+    expect(onCommand('/steer')).toEqual({kind: 'error', error: 'Usage: /steer <message>'});
+    expect(onCommand('/steer   ')).toEqual({kind: 'error', error: 'Usage: /steer <message>'});
+    expect(onCommand('/open-round latest')).toMatchObject({kind: 'error'});
+    const badTheme = onCommand('/theme monokai');
+    expect(badTheme.kind).toBe('error');
+    if (badTheme.kind === 'error') {
+      expect(badTheme.error).toContain('Unknown theme: monokai');
+      expect(badTheme.error).toContain('catppuccin-mocha');
+    }
   });
 
-  it('offers /chat everywhere the chat is not already on screen', () => {
-    expect(availableCommands().map(command => command.name)).toContain('/chat');
-    expect(helpText()).toMatch(/\/chat\s/);
-    expect(suggestSlashCommands('/c').map(command => command.name)).toEqual(['/chat']);
-  });
-
-  it('keeps chat control out of the global command surface', () => {
-    // Chat is controlled from the chat composer, so the global registry
-    // carries no thread commands at all and never claims to.
-    const names = SLASH_COMMANDS.map(command => command.name);
-    expect(names).not.toContain('/new-chat');
-    expect(names).not.toContain('/chats');
-    expect(names).not.toContain('/model');
-    expect(names).not.toContain('/clear');
-    expect(helpText()).not.toContain('/new-chat');
-    expect(helpText()).not.toContain('/chats');
-    expect(parseCommand('/new-chat').error).toContain('Unknown command');
-    expect(parseCommand('/chats').error).toContain('Unknown command');
-  });
-
-  it('reaches the todo and prompt toggles by name', () => {
-    // macOS keeps the function keys for itself and a terminal may keep a
-    // Control chord, so both toggles have to be reachable without either.
-    expect(parseCommand('/todos')).toEqual({toggle: 'todos'});
-    expect(parseCommand('/prompt')).toEqual({toggle: 'prompt'});
-  });
-
-  it('still accepts /chat when it is not offered, since the chat is the point', () => {
-    // Hidden from the list, not removed from the client.
-    expect(parseCommand('/chat')).toEqual({localView: 'chat'});
+  it('diagnoses non-command and unknown input on the command surface', () => {
+    expect(onCommand('')).toEqual({kind: 'error', error: 'Enter a slash command. Use /help.'});
+    expect(onCommand('what is happening?')).toEqual({
+      kind: 'error',
+      error: 'Commands start with /. Use Experiment chat for questions.',
+    });
+    expect(onCommand('/round 4')).toEqual({kind: 'unknown', text: '/round 4'});
+    expect(onCommand('/invocation abc')).toEqual({kind: 'unknown', text: '/invocation abc'});
+    expect(onCommand('/history')).toEqual({kind: 'unknown', text: '/history'});
   });
 });
 
-describe('chat composer commands', () => {
-  it('resolves the chat-scoped commands', () => {
-    expect(parseChatCommand('/clear')).toEqual({command: 'clear'});
-    expect(parseChatCommand('/model')).toEqual({command: 'model'});
-    expect(parseChatCommand('/resume')).toEqual({command: 'resume'});
+describe('argument-contract enforcement', () => {
+  it('rejects trailing text on no-argument commands on the command bar', () => {
+    // Before the registry refactor exact-match parsers rejected these; a
+    // no-argument parser must not silently ignore a slash-prefixed phrase.
+    expect(onCommand('/pause typo')).toEqual({kind: 'error', error: 'Usage: /pause'});
+    expect(onCommand('/perf extra')).toEqual({kind: 'error', error: 'Usage: /perf'});
+    expect(onCommand('/help ignored')).toEqual({kind: 'error', error: 'Usage: /help'});
+    expect(onCommand('/resume now')).toEqual({kind: 'error', error: 'Usage: /resume'});
+    expect(onCommand('/design later')).toEqual({kind: 'error', error: 'Usage: /design'});
   });
 
-  it('shadows /resume: in the chat it resumes a thread, not the run', () => {
-    // The global surface keeps /resume for a paused run; the composer's own
-    // command wins where it was typed, so the two never compete.
-    expect(parseChatCommand('/resume').command).toBe('resume');
-    expect(parseCommand('/resume')).toEqual({request: {type: 'command.resume'}});
+  it('rejects trailing text on no-argument commands in the chat', () => {
+    expect(onChat('/pause typo')).toEqual({kind: 'error', error: 'Usage: /pause'});
+    expect(onChat('/help ignored')).toEqual({kind: 'error', error: 'Usage: /help'});
+    // A chat-only, state-changing command must not fire from a phrase either.
+    expect(onChat('/clear definitely-not')).toEqual({kind: 'error', error: 'Usage: /clear'});
+    expect(onChat('/model gpt')).toEqual({kind: 'error', error: 'Usage: /model'});
+    expect(onChat('/switch elsewhere')).toEqual({kind: 'error', error: 'Usage: /switch'});
   });
 
-  it('forwards global commands the composer has always accepted', () => {
-    expect(parseChatCommand('/pause')).toEqual({global: true});
-    expect(parseChatCommand('/steer look at the cache')).toEqual({global: true});
-    expect(parseChatCommand('/perf')).toEqual({global: true});
+  it('still accepts no-argument commands with no trailing text', () => {
+    expect(onCommand('/pause')).toEqual({kind: 'request', request: {type: 'command.pause'}});
+    // Trailing whitespace alone is not an argument.
+    expect(onCommand('/pause   ')).toEqual({kind: 'request', request: {type: 'command.pause'}});
+    expect(onChat('/clear')).toEqual({kind: 'chatClear'});
   });
 
-  it('answers unknown slash input with the chat help, not the global error', () => {
-    const parsed = parseChatCommand('/threads');
-    expect(parsed.command).toBeUndefined();
-    expect(parsed.global).toBeUndefined();
-    expect(parsed.help).toBe(chatHelpText());
-    expect(parsed.help).toContain('/model');
-    expect(parsed.help).toContain('/resume');
-    expect(parsed.help).not.toContain('Unknown command');
+  it('leaves commands that take arguments unaffected', () => {
+    expect(onCommand('/steer look at the cache')).toEqual({
+      kind: 'request',
+      request: {type: 'command.steer', text: 'look at the cache'},
+    });
+    expect(onCommand('/theme solarized-light')).toEqual({
+      kind: 'theme',
+      themeName: 'solarized-light',
+    });
+    expect(onCommand('/open-round 3')).toEqual({kind: 'openRound', round: 3});
+    // Optional-argument commands still resolve with no argument.
+    expect(onCommand('/theme')).toEqual({kind: 'theme'});
+    expect(onCommand('/open-round')).toEqual({kind: 'openRound'});
   });
 
-  it('suggests only the chat commands from a slash prefix', () => {
-    expect(suggestChatSlashCommands('/').map(command => command.name)).toEqual([
-      '/clear',
-      '/model',
-      '/resume',
-    ]);
-    expect(suggestChatSlashCommands('/m').map(command => command.name)).toEqual(['/model']);
-    expect(suggestChatSlashCommands('/pa')).toEqual([]);
-    expect(suggestChatSlashCommands('/model ')).toEqual([]);
-    expect(suggestChatSlashCommands('what changed?')).toEqual([]);
+  it('rejects an empty argument on required-argument commands with the registry usage', () => {
+    expect(onCommand('/steer')).toEqual({kind: 'error', error: 'Usage: /steer <message>'});
+    expect(onChat('/steer')).toEqual({kind: 'error', error: 'Usage: /steer <message>'});
+  });
+
+  /**
+   * The cases above name the commands from the report. This one enumerates the
+   * registry instead, so a command registered later cannot be the one that
+   * still accepts a trailing phrase.
+   */
+  it('enforces the declared arity of every registered command on every surface', () => {
+    for (const spec of COMMAND_SPECS) {
+      const usage = `Usage: ${spec.usage ?? spec.name}`;
+      for (const surface of spec.surfaces as readonly CommandSurface[]) {
+        const parse = (text: string): ParsedCommand => parseCommand(text, {surface});
+        const where = `${spec.name} on ${surface}`;
+        if (spec.args === 'none') {
+          expect({where, ...parse(`${spec.name} trailing-text`)}).toEqual({
+            where,
+            kind: 'error',
+            error: usage,
+          });
+          // The bare command still resolves, so the check rejects arguments
+          // rather than the command.
+          expect({where, kind: parse(spec.name).kind}).not.toEqual({where, kind: 'error'});
+        } else if (spec.args === 'required') {
+          expect({where, ...parse(spec.name)}).toEqual({where, kind: 'error', error: usage});
+        } else {
+          expect({where, kind: parse(spec.name).kind}).not.toEqual({where, kind: 'error'});
+        }
+      }
+    }
+  });
+
+  it('covers every arity the registry declares, so the loop above is not vacuous', () => {
+    expect(new Set(COMMAND_SPECS.map(spec => spec.args))).toEqual(
+      new Set(['none', 'optional', 'required']),
+    );
   });
 });
 
-describe('slash-command input helpers', () => {
-  it('suggests available commands from a slash prefix', () => {
-    expect(suggestSlashCommands('/').map(command => command.name)).toEqual([
+/**
+ * The README is the only copy of the command list outside the registry, and it
+ * is what a reader consults before the help text. Asserting it against the
+ * registry is what keeps the two from drifting the way the pre-registry tables
+ * did.
+ */
+describe('README command tables', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+
+  /** The `/name` of every table row in a section, deduplicated in document order. */
+  const documentedCommands = (heading: string, nextHeading: string): string[] => {
+    const start = readme.indexOf(heading);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = readme.indexOf(nextHeading, start + heading.length);
+    expect(end).toBeGreaterThan(start);
+    const section = readme.slice(start, end);
+    const documented: string[] = [];
+    for (const line of section.split('\n')) {
+      const name = /^\|\s*`(\/[a-z][a-z0-9-]*)/.exec(line)?.[1];
+      if (name !== undefined && !documented.includes(name)) documented.push(name);
+    }
+    return documented;
+  };
+
+  const specNames = (predicate: (surfaces: readonly CommandSurface[]) => boolean): string[] =>
+    COMMAND_SPECS.filter(spec => predicate(spec.surfaces)).map(spec => spec.name);
+
+  it('documents exactly the commands the command bar offers, in registry order', () => {
+    expect(documentedCommands('| Command | Behavior |', 'The chat composer adds')).toEqual(
+      specNames(surfaces => surfaces.includes('command')),
+    );
+  });
+
+  it('documents exactly the chat-only commands, in registry order', () => {
+    expect(documentedCommands('The chat composer adds', '### Experiment log')).toEqual(
+      specNames(surfaces => !surfaces.includes('command')),
+    );
+  });
+});
+
+describe('cross-surface parity', () => {
+  it('resolves shared commands identically on the command bar and in the chat', () => {
+    for (const text of SHARED) {
+      expect(onChat(text)).toEqual(onCommand(text));
+    }
+  });
+
+  it('matches command names case-insensitively on both surfaces', () => {
+    const resume = {kind: 'request', request: {type: 'command.resume'}} as const;
+    expect(onCommand('/Pause')).toEqual(onCommand('/pause'));
+    expect(onChat('/PAUSE')).toEqual(onCommand('/pause'));
+    expect(onChat('/Resume')).toEqual(resume);
+  });
+
+  it('produces the same /steer usage error wherever it is typed', () => {
+    expect(onChat('/steer')).toEqual(onCommand('/steer'));
+  });
+});
+
+describe('chat-only commands', () => {
+  it('resolves the chat thread commands only in the chat', () => {
+    expect(onChat('/clear')).toEqual({kind: 'chatClear'});
+    expect(onChat('/model')).toEqual({kind: 'chatModel'});
+    expect(onChat('/switch')).toEqual({kind: 'chatSwitch'});
+    // On the command bar those names are not registered, so they are unknown.
+    expect(onCommand('/clear')).toEqual({kind: 'unknown', text: '/clear'});
+    expect(onCommand('/model')).toEqual({kind: 'unknown', text: '/model'});
+    expect(onCommand('/switch')).toEqual({kind: 'unknown', text: '/switch'});
+  });
+
+  it('resumes the paused run from /resume on both surfaces, and switches threads with /switch', () => {
+    // /resume no longer collides: it means the run everywhere, and the chat's
+    // own thread switch has its own name.
+    expect(onChat('/resume')).toEqual({kind: 'request', request: {type: 'command.resume'}});
+    expect(onChat('/switch')).toEqual({kind: 'chatSwitch'});
+  });
+
+  it('answers unknown slash input as unknown, leaving each surface to render its own help', () => {
+    expect(onChat('/threads')).toEqual({kind: 'unknown', text: '/threads'});
+    expect(onCommand('/threads')).toEqual({kind: 'unknown', text: '/threads'});
+  });
+});
+
+describe('suggestions filtered by surface', () => {
+  it('suggests the command-bar commands in registry order', () => {
+    expect(names(suggestSlashCommands('/', {surface: 'command'}))).toEqual([
       '/help',
       '/chat',
       '/pause',
@@ -203,11 +280,59 @@ describe('slash-command input helpers', () => {
       '/prompt',
       '/theme',
     ]);
-    expect(suggestSlashCommands('/h').map(command => command.name)).toEqual(['/help']);
-    expect(suggestSlashCommands('/e')).toEqual([]);
-    expect(suggestSlashCommands('/open').map(command => command.name)).toEqual(['/open-round']);
-    expect(suggestSlashCommands('/perf ')).toEqual([]);
-    expect(suggestSlashCommands('perf')).toEqual([]);
+    expect(names(suggestSlashCommands('/h', {surface: 'command'}))).toEqual(['/help']);
+    expect(names(suggestSlashCommands('/open', {surface: 'command'}))).toEqual(['/open-round']);
+    expect(suggestSlashCommands('/e', {surface: 'command'})).toEqual([]);
+    expect(suggestSlashCommands('/perf ', {surface: 'command'})).toEqual([]);
+    expect(suggestSlashCommands('perf', {surface: 'command'})).toEqual([]);
+  });
+
+  it('leads the chat with its thread commands, then the forwarded globals', () => {
+    const chat = names(suggestSlashCommands('/', {surface: 'chat'}));
+    expect(chat.slice(0, 3)).toEqual(['/clear', '/model', '/switch']);
+    // The headline fix: the chat now suggests the global commands it forwards.
+    expect(chat).toContain('/pause');
+    expect(chat).toContain('/perf');
+    // /chat is command-bar only: there is nothing for it to open inside the chat.
+    expect(chat).not.toContain('/chat');
+    expect(names(suggestSlashCommands('/pa', {surface: 'chat'}))).toEqual(['/pause']);
+    expect(names(suggestSlashCommands('/m', {surface: 'chat'}))).toEqual(['/model']);
+  });
+
+  it('drops /chat where the chat is already docked', () => {
+    const docked = names(availableCommands({surface: 'command', chatDocked: true}));
+    expect(docked).not.toContain('/chat');
+    expect(docked).toContain('/perf');
+    expect(suggestSlashCommands('/c', {surface: 'command', chatDocked: true})).toEqual([]);
+    // Hidden from the list, still parsed: the chat is the point.
+    expect(parseCommand('/chat', {surface: 'command', chatDocked: true})).toEqual({
+      kind: 'openChat',
+    });
+  });
+});
+
+describe('registry-derived help and helpers', () => {
+  it('generates command-bar help without the stale planned block', () => {
+    const help = helpText();
+    expect(help).toContain('/help');
+    expect(help).toContain('/design');
+    expect(help).not.toContain('Planned');
+    expect(help).not.toContain('/invocation');
+    expect(help).not.toContain('/round');
+  });
+
+  it('generates chat help from the chat surface', () => {
+    const help = chatHelpText();
+    expect(help).toContain('/clear');
+    expect(help).toContain('/model');
+    expect(help).toContain('/switch');
+    expect(help).toContain('/pause');
+  });
+
+  it('exposes the canonical name per command', () => {
+    expect(COMMAND_NAMES.todos).toBe('/todos');
+    expect(COMMAND_NAMES.prompt).toBe('/prompt');
+    expect(COMMAND_NAMES['open-round']).toBe('/open-round');
   });
 
   it('finds a leading slash-command token for syntax highlighting', () => {

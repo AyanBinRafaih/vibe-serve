@@ -8,7 +8,7 @@ import {
 } from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
 import type {ChatOptions, HypothesisEntry} from '@vibesys/backend-client';
-import {parseChatCommand} from '../commands.js';
+import {chatHelpText, parseCommand} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
   activeChatThreadSettings,
@@ -3170,7 +3170,7 @@ describe('theming', () => {
     expect(controller.createdThreads).toEqual([{provider: 'codex', model: 'gpt-5.5'}]);
   });
 
-  it('lists the chat threads for /resume and switches to the highlighted one', async () => {
+  it('lists the chat threads for /switch and switches to the highlighted one', async () => {
     const testRenderer = await createTestRenderer({width: 200, height: 30});
     const controller = new FakeController(initialSessionState());
     controller.publish({
@@ -3195,7 +3195,7 @@ describe('theming', () => {
     registerCleanup(testRenderer.renderer, app);
     await frameAfter(testRenderer);
 
-    await testRenderer.mockInput.typeText('/resume');
+    await testRenderer.mockInput.typeText('/switch');
     testRenderer.mockInput.pressEnter();
     const frame = await testRenderer.waitForFrame(value => value.includes('Chat threads'));
     // The implicit default is named by the client; a created thread shows the
@@ -3266,12 +3266,13 @@ describe('theming', () => {
     await frameAfter(testRenderer);
 
     await testRenderer.mockInput.typeText('/');
-    const frame = await testRenderer.waitForFrame(value => value.includes('/resume'));
+    const frame = await testRenderer.waitForFrame(value => value.includes('/switch'));
 
-    // Only the chat's own commands, and only beside the composer.
+    // The chat leads with its own thread commands, then the globals it forwards.
     expect(frame).toContain('/clear');
     expect(frame).toContain('/model');
-    expect(frame).toContain('/resume');
+    expect(frame).toContain('/switch');
+    expect(frame).toContain('/pause');
     const rows = frameRows(frame);
     expect(rows.findIndex(row => row.includes('/model'))).toBeLessThan(
       rows.findIndex(row => row.includes('Message')),
@@ -3286,7 +3287,7 @@ describe('theming', () => {
     registerCleanup(testRenderer.renderer, app);
     await frameAfter(testRenderer);
 
-    // /clear, /model, /resume: the composer's own command set, in that order.
+    // /clear, /model, /switch: the composer's own command set leads, in that order.
     await testRenderer.mockInput.typeText('/');
     const first = await testRenderer.waitForFrame(value => value.includes('[Tab]'));
     expect(first).toContain('› /clear');
@@ -3296,7 +3297,7 @@ describe('theming', () => {
     expect(second).not.toContain('› /clear');
 
     testRenderer.mockInput.pressArrow('down');
-    const third = await testRenderer.waitForFrame(value => value.includes('› /resume'));
+    const third = await testRenderer.waitForFrame(value => value.includes('› /switch'));
     expect(third).not.toContain('› /model');
   });
 
@@ -3361,7 +3362,7 @@ describe('theming', () => {
     const frame = await testRenderer.waitForFrame(value => value.includes('/zz'));
     expect(frame).not.toContain('/clear');
     expect(frame).not.toContain('/model');
-    expect(frame).not.toContain('/resume');
+    expect(frame).not.toContain('/switch');
 
     // Nothing to complete once the menu is gone: Tab is a no-op.
     testRenderer.mockInput.pressKey('TAB');
@@ -4371,16 +4372,22 @@ class FakeController implements SessionController {
   submitChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text.startsWith('/')) return this.sendChat(value);
-    const parsed = parseChatCommand(text);
-    if (parsed.command === 'clear') return this.clearChatThread();
-    if (parsed.command === 'model') return this.openChatModelMenu();
-    if (parsed.command === 'resume') {
-      this.openChatResumeMenu();
-      return Promise.resolve();
+    const action = parseCommand(text, {surface: 'chat'});
+    switch (action.kind) {
+      case 'chatClear':
+        return this.clearChatThread();
+      case 'chatModel':
+        return this.openChatModelMenu();
+      case 'chatSwitch':
+        this.openChatResumeMenu();
+        return Promise.resolve();
+      case 'help':
+      case 'unknown':
+        this.chatHelpShown.push(chatHelpText());
+        return Promise.resolve();
+      default:
+        return this.submitCommand(text);
     }
-    if (parsed.global === true) return this.submitCommand(text);
-    this.chatHelpShown.push(parsed.help ?? '');
-    return Promise.resolve();
   }
 
   sendChat(value: string): Promise<void> {

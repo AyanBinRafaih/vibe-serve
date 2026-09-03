@@ -11,7 +11,7 @@ import {
 } from '@vibesys/backend-client';
 import {DEFAULT_CHAT_THREAD_ID, hasRunEnded} from '@vibesys/core-state';
 import type {StartupTrace} from './boot-trace.js';
-import {helpText, parseChatCommand, parseCommand} from './commands.js';
+import {chatHelpText, helpText, type ParsedCommand, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
   activeChatThreadSettings,
@@ -798,16 +798,32 @@ export class SocketSessionController implements SessionController {
   submitChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text.startsWith('/')) return this.sendChat(value);
-    const parsed = parseChatCommand(text);
-    if (parsed.command === 'clear') return this.clearChatThread();
-    if (parsed.command === 'model') return this.openChatModelMenu();
-    if (parsed.command === 'resume') {
-      this.openChatResumeMenu();
-      return Promise.resolve();
+    const action = parseCommand(text, {surface: 'chat'});
+    switch (action.kind) {
+      case 'chatClear':
+        return this.clearChatThread();
+      case 'chatModel':
+        return this.openChatModelMenu();
+      case 'chatSwitch':
+        this.openChatResumeMenu();
+        return Promise.resolve();
+      case 'help':
+      case 'unknown':
+        // /help and any unrecognized slash input answer with the chat's own
+        // help rather than the global one or a global "unknown command" error.
+        this.#showChatHelp();
+        return Promise.resolve();
+      default:
+        // Everything else, including a usage error, goes to the one command
+        // executor as the action the chat's own registry lookup produced. The
+        // text is not re-parsed on the command surface, so a chat-only
+        // command's usage error stays a usage error instead of becoming
+        // "unknown command" for a name that surface does not offer.
+        return this.#dispatchCommand(action);
     }
-    if (parsed.global === true) return this.submitCommand(text);
-    // Unknown slash input answers with the chat's own help rather than
-    // falling through to a global "unknown command" error.
+  }
+
+  #showChatHelp(): void {
     this.#setState(
       updateChatConversation(this.#state, this.#state.activeChatThreadId, entries => [
         ...entries,
@@ -815,11 +831,10 @@ export class SocketSessionController implements SessionController {
           id: `chat-help-${++this.#chatMessageId}`,
           kind: 'status',
           label: 'Chat commands',
-          content: parsed.help ?? '',
+          content: chatHelpText(),
         },
       ]),
     );
-    return Promise.resolve();
   }
 
   sendChat(value: string): Promise<void> {
@@ -932,47 +947,67 @@ export class SocketSessionController implements SessionController {
     }
   }
 
-  async submitCommand(value: string): Promise<void> {
-    const parsed = parseCommand(value.trim());
-    if (parsed.error)
-      return this.#setState(reportError(this.#state, parsed.error, {scope: 'input'}));
-    if (parsed.localView === 'help') {
-      return this.#setState(
-        showDetail(this.#state, helpText({chatDocked: chatPaneVisible(this.#state)}), 'help'),
-      );
-    }
-    if (parsed.localView === 'chat') {
-      this.#setState(openChat(this.#state));
-      if (parsed.chatMessage) await this.sendChat(parsed.chatMessage);
-      return;
-    }
-    if (parsed.toggle === 'todos') {
-      this.toggleTodos();
-      return;
-    }
-    if (parsed.toggle === 'prompt') {
-      this.togglePrompt();
-      return;
-    }
-    if (parsed.openRound) {
-      this.openRound(parsed.openRound.round);
-      return;
-    }
-    if (parsed.localView === 'theme') {
-      if (parsed.themeName === undefined) return this.openThemePicker();
-      return this.setTheme(parsed.themeName);
-    }
-    if (!parsed.request) return;
-    if (parsed.paneView !== undefined) {
-      await this.openPane(parsed.paneView);
-      return;
-    }
-    try {
-      const response = await this.client.request(parsed.request);
-      const rendered = renderResponse(parsed.request, response, parsed.responseView);
-      if (rendered !== null) this.#setState(showDetail(this.#state, rendered));
-    } catch (error) {
-      this.#setState(reportCaughtError(this.#state, error, 'request'));
+  submitCommand(value: string): Promise<void> {
+    return this.#dispatchCommand(
+      parseCommand(value.trim(), {
+        surface: 'command',
+        chatDocked: chatPaneVisible(this.#state),
+      }),
+    );
+  }
+
+  /**
+   * Applies one resolved command action. Both input surfaces end here, so the
+   * behavior of a shared command cannot depend on where it was typed. The
+   * switch is exhaustive, so registering a new action kind without handling it
+   * is a compile error.
+   */
+  async #dispatchCommand(action: ParsedCommand): Promise<void> {
+    switch (action.kind) {
+      case 'unknown':
+        return this.#setState(
+          reportError(this.#state, `Unknown command: ${action.text}. Use /help.`, {scope: 'input'}),
+        );
+      case 'error':
+        return this.#setState(reportError(this.#state, action.error, {scope: 'input'}));
+      case 'help':
+        return this.#setState(
+          showDetail(this.#state, helpText({chatDocked: chatPaneVisible(this.#state)}), 'help'),
+        );
+      case 'openChat':
+        this.#setState(openChat(this.#state));
+        if (action.chatMessage) await this.sendChat(action.chatMessage);
+        return;
+      case 'toggle':
+        if (action.toggle === 'todos') this.toggleTodos();
+        else this.togglePrompt();
+        return;
+      case 'openRound':
+        this.openRound(action.round);
+        return;
+      case 'theme':
+        if (action.themeName === undefined) return this.openThemePicker();
+        return this.setTheme(action.themeName);
+      case 'chatClear':
+        return this.clearChatThread();
+      case 'chatModel':
+        return this.openChatModelMenu();
+      case 'chatSwitch':
+        this.openChatResumeMenu();
+        return;
+      case 'request': {
+        if (action.paneView !== undefined) return this.openPane(action.paneView);
+        try {
+          const response = await this.client.request(action.request);
+          const rendered = renderResponse(action.request, response, action.responseView);
+          if (rendered !== null) this.#setState(showDetail(this.#state, rendered));
+        } catch (error) {
+          this.#setState(reportCaughtError(this.#state, error, 'request'));
+        }
+        return;
+      }
+      default:
+        return assertNever(action);
     }
   }
 
@@ -1106,6 +1141,11 @@ function reportCaughtError(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Proves a switch over a discriminated union handles every case at compile time. */
+function assertNever(value: never): never {
+  throw new Error(`Unhandled command action: ${JSON.stringify(value)}`);
 }
 
 function renderResponse(

@@ -1,4 +1,5 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
+import {COMMAND_NAMES} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
   experimentLogVisible,
@@ -34,14 +35,10 @@ export interface OpenTuiApp {
 /** Which of the client's editors currently holds the cursor. */
 type FocusTarget = 'command' | 'chat' | 'modal';
 
-const KEY_HELP =
-  '[/]: round · ←→: pane · ↑↓/Tab: within it · F4: zoom · /todos · /prompt · Ctrl+L: live';
-const SCOPED_KEY_HELP =
-  '[/]: round · ←→: pane · ↑↓/Tab: within it · F4: zoom · /todos · /prompt · Esc: back';
-const LOG_KEY_HELP =
-  '↑↓ or scroll: select · Enter/click: open hypothesis · F4: zoom · /open-round --N';
-const LOG_CHAT_KEY_HELP =
-  '↑↓: select · Enter/click: hypothesis · Ctrl+W: chat · F4: zoom · /open-round --N';
+const KEY_HELP = `[/]: round · ←→: pane · ↑↓/Tab: within it · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Ctrl+L: live`;
+const SCOPED_KEY_HELP = `[/]: round · ←→: pane · ↑↓/Tab: within it · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Esc: back`;
+const LOG_KEY_HELP = `↑↓ or scroll: select · Enter/click: open hypothesis · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
+const LOG_CHAT_KEY_HELP = `↑↓: select · Enter/click: hypothesis · Ctrl+W: chat · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
 const HYPOTHESIS_KEY_HELP =
   '↑↓: select round · Enter/click: trajectory · PgUp/PgDn: scroll · Esc: hypotheses';
 const SPLIT_KEY_HELP =

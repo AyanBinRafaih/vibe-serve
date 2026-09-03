@@ -95,7 +95,7 @@ export function createCommandInputPanel(
       input.addHighlightByCharRange({...range, styleId: commandStyleId});
     }
 
-    menu.setMatches(suggestSlashCommands(value, context));
+    menu.setMatches(suggestSlashCommands(value, {surface: 'command', ...context}));
     suggestions.visible = menu.visible;
     suggestions.height = menu.matches.length + 2;
     suggestionList.height = Math.max(1, menu.matches.length);
