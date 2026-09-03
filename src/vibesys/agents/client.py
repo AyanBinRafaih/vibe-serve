@@ -31,7 +31,10 @@ from vibesys.agents.contracts import (
     AgentUsage,
     MCPServerSpec,
     SessionDisposition,
+    session_spec_fingerprint,
 )
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
+from vibesys.agents.session_store import NullSessionStore, SessionStore
 from vibesys.run.events import CommandResultPayload, JsonResultPayload
 
 if TYPE_CHECKING:
@@ -168,10 +171,12 @@ class AgentClient:
         containerized: bool = False,
         driver_log: AgentDiagnosticLog | None = None,
         driver_name: str | None = None,
+        session_store: SessionStore | None = None,
     ) -> None:
         """Create a client that owns ``driver`` and every session it creates."""
         self._driver = driver
         self._driver_name = driver_name
+        self._session_store: SessionStore = session_store or NullSessionStore()
         self._provider = provider
         self._skills = tuple(skills)
         self._compute_backend = compute_backend
@@ -189,7 +194,7 @@ class AgentClient:
             require_enforcement=require_host_sandbox,
             containerized=containerized,
         )
-        self._sessions: dict[str, _CachedSession] = {}
+        self._sessions: dict[AgentSessionKey, _CachedSession] = {}
         self._closed = False
 
     @property
@@ -238,7 +243,7 @@ class AgentClient:
         mcp_servers: list[LegacyMCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> T:
         """Run one turn and parse its structured response."""
         del tools  # In-process tools remain a deepagents-only compatibility path.
@@ -289,7 +294,7 @@ class AgentClient:
         mcp_servers: list[LegacyMCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> str:
         """Run one conversational turn without a structured-output requirement."""
         del tools
@@ -330,7 +335,7 @@ class AgentClient:
         progress: AgentProgress | None,
         mcp_servers: list[LegacyMCPServerSpec] | None,
         reuse_session: bool | None,
-        session_key: str | None,
+        session_key: AgentSessionKey | None,
     ) -> AgentTurnResult:
         label = agent_label(kind)
         model = self._role_models.get(kind, self._model_name)
@@ -375,7 +380,10 @@ class AgentClient:
         log_and_print("--- input ---", self._run_log_file)
         log_prompt_markdown_and_print(f"{system_prompt}\n\n{user_prompt}", self._run_log_file)
         reuse = reuse_session if reuse_session is not None else True
-        cache_key = session_key or kind
+        # An unscoped call still needs one live conversation per role, but a
+        # bare role is not a conversation a later process could identify, so the
+        # fallback key deliberately lands in a scope that is never checkpointed.
+        cache_key = session_key or AgentSessionKey(SessionScope.ROLE, kind)
         result: AgentTurnResult | None = None
         observer = _LoggerObserver(logger)
         try:
@@ -439,7 +447,7 @@ class AgentClient:
         *,
         session_spec: AgentSessionSpec,
         turn: AgentTurnRequest,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
         observer: AgentObserver | None = None,
     ) -> AgentTurnResult:
         """Run one raw turn, optionally retaining its session for reuse."""
@@ -447,19 +455,31 @@ class AgentClient:
         if session_key is None:
             return self._run_ephemeral(session_spec, turn, observer)
 
+        fingerprint = session_spec_fingerprint(session_spec)
         cached = self._sessions.get(session_key)
-        if cached is None or cached.spec != session_spec:
-            if cached is not None:
-                self._evict(session_key)
-            cached = _CachedSession(
-                spec=session_spec,
-                session=self._create_session(session_spec),
-            )
+        if cached is not None and cached.spec != session_spec:
+            # The configuration changed within this process. Drop the live
+            # session; the checkpoint is left alone because the fingerprint
+            # check below already refuses it, and this turn overwrites it.
+            self._evict(session_key)
+            cached = None
+        if cached is None:
+            session = self._create_session(session_spec)
+            # A fresh session in a resumed process holds no conversation. Offer
+            # it the checkpointed provider ID so its very first turn resumes
+            # (``codex exec resume`` / ``claude --resume``) instead of replaying
+            # the round from scratch.
+            self._resume_checkpoint(session, session_key, fingerprint)
+            cached = _CachedSession(spec=session_spec, session=session)
             self._sessions[session_key] = cached
 
         try:
             result = cached.session.run_turn(turn, observer)
         except BaseException as error:
+            # The checkpoint is deliberately kept. A turn can fail for reasons
+            # that say nothing about the conversation's validity (a timeout, a
+            # cancelled run), and a driver that finds its conversation
+            # unusable reports RESET_REQUIRED instead of raising.
             try:
                 self._evict(session_key)
             except Exception as cleanup_error:  # noqa: BLE001  # preserve the turn failure
@@ -467,8 +487,57 @@ class AgentClient:
             raise
 
         if result.disposition is SessionDisposition.RESET_REQUIRED:
+            # The driver restarted or abandoned the conversation this key names,
+            # so both the live session and the checkpoint describe history that
+            # no longer exists.
             self._evict(session_key)
+            self._session_store.clear(session_key)
+        else:
+            self._checkpoint(session_key, session_spec, fingerprint, result)
         return result
+
+    def _resume_checkpoint(
+        self,
+        session: AgentSession,
+        session_key: AgentSessionKey,
+        fingerprint: str,
+    ) -> None:
+        """Offer a freshly created session the checkpoint stored for its key."""
+        record = self._session_store.get(session_key)
+        if record is None:
+            return
+        if record.spec_fingerprint != fingerprint:
+            # Configuration drifted since the checkpoint was written. Refusing
+            # it is the same rule that evicts a live session whose spec no
+            # longer matches; this turn replaces the entry.
+            self._session_store.clear(session_key)
+            return
+        if not session.resume_provider_session(record.session_id):
+            # The driver refused the ID, so nothing will ever resume it: the
+            # provider cannot resume at all, or the session already holds a
+            # newer conversation. Either way the checkpoint is dead.
+            self._session_store.clear(session_key)
+
+    def _checkpoint(
+        self,
+        session_key: AgentSessionKey,
+        spec: AgentSessionSpec,
+        fingerprint: str,
+        result: AgentTurnResult,
+    ) -> None:
+        """Checkpoint the provider session ID a completed turn reported."""
+        if result.provider_session_id is None:
+            # No resumable ID this turn (e.g. a driver without provider session
+            # support); keep any prior ID rather than clobbering it with None.
+            return
+        self._session_store.record(
+            session_key,
+            spec_fingerprint=fingerprint,
+            provider=spec.provider,
+            model=spec.model,
+            session_id=result.provider_session_id,
+            role=spec.role,
+        )
 
     def close(self) -> None:
         """Close all cached sessions and the driver exactly once."""
@@ -511,7 +580,7 @@ class AgentClient:
                     raise
                 turn_error.add_note(f"agent session cleanup also failed: {cleanup_error}")
 
-    def _evict(self, key: str) -> None:
+    def _evict(self, key: AgentSessionKey) -> None:
         cached = self._sessions.pop(key, None)
         if cached is not None:
             cached.session.close()

@@ -126,6 +126,16 @@ class RoundRecord:
     # run's persisted metric space.
     perf_comparison: MetricComparison | None = None
 
+    # Implementer attribution: which driver/provider/model produced this round
+    # attempt. The provider session ID itself is machine-local and never lives
+    # on this portable record; ``vibesys.agents.session_store`` owns it, keyed
+    # by the round's hypothesis ID. These three fields describe the *latest*
+    # attempt at the round: a resumed run that re-attempts the same round
+    # overwrites the manifest entry, so they are not an append-only audit log.
+    implementer_driver: str | None = None
+    implementer_provider: str | None = None
+    implementer_model: str | None = None
+
     @model_validator(mode="after")
     def _normalize_review(self) -> RoundRecord:
         """Keep the review state expressible only through ``judge_verdict``.

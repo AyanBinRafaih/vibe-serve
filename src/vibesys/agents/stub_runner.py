@@ -13,6 +13,7 @@ from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #28
 from vibesys.agents.contracts import AgentCapabilities
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
 from vibesys.agents.scripted_rounds import round_number_from_label, scripted_round_payload
+from vibesys.agents.session_key import AgentSessionKey  # noqa: TC001  # tracked: #288
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool  # annotation only; avoid eager agent-stack import
@@ -86,7 +87,7 @@ class StubAgentClient:
         mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> str:
         """Return a deterministic answer for auxiliary-agent smoke tests."""
         del (

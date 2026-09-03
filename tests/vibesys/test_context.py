@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vibesys import boot_trace
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
+from vibesys.agents.session_store import DurableSessionStore
 from vibesys.config import Config
 from vibesys.context import (
     _resume_configuration_update,
@@ -847,3 +849,53 @@ def test_log_switch_retargets_stderr_tee(tmp_path):  # noqa: ANN001, ANN201
     assert sys.stderr is original_stderr
     assert "colored diagnostic" in ctx.run_log_path.read_text()
     assert "\033[31m" not in ctx.run_log_path.read_text()
+
+
+def test_agent_client_gets_a_machine_local_provider_session_store(tmp_path):  # noqa: ANN001, ANN201
+    """The run's agent client checkpoints provider sessions outside the repo.
+
+    Provider transcripts are host-local, so the map must live in the run's
+    machine-local namespace, never in the portable snapshot that travels
+    between machines.
+    """
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+
+    with (
+        patch("vibesys.context.build_agent_client", return_value=MagicMock()) as build_runner,
+        _create_context(project, evaluator=evaluator) as ctx,
+    ):
+        store = build_runner.call_args.kwargs["session_store"]
+        assert isinstance(store, DurableSessionStore)
+        store.record(
+            AgentSessionKey(SessionScope.HYPOTHESIS, "H-01"),
+            spec_fingerprint="fingerprint",
+            provider="codex",
+            model="gpt-test",
+            session_id="thread-1",
+        )
+        local_dir = ctx.state.local(RunStateNamespace.AGENT).external_directory()
+
+    assert (local_dir / "sessions.json").is_file()
+    assert not local_dir.is_relative_to(project)
+
+
+def test_evolve_candidate_clients_get_no_provider_session_store(tmp_path):  # noqa: ANN001, ANN201
+    """Candidates never name a durable conversation, so they checkpoint nothing."""
+    project = tmp_path / "queue"
+    evaluator = _write_project(project)
+
+    with _create_context(project, evaluator=evaluator) as parent:
+        parent_commit = parent.git.current_sha()
+        assert parent_commit is not None
+        with patch("vibesys.context.build_agent_client", return_value=MagicMock()) as build_runner:
+            candidate = create_candidate_context(
+                parent,
+                config=Config.model_validate({"model": {"name": "gpt-test"}}),
+                generation=2,
+                child_idx=3,
+                parent_commit=parent_commit,
+                agent_backend="stub",
+            )
+            assert "session_store" not in build_runner.call_args.kwargs
+            candidate.close()

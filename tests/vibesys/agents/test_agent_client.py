@@ -23,6 +23,7 @@ from vibesys.agents.contracts import (
     AgentUsage,
     SessionDisposition,
 )
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.render.sink import output_sink
 from vibesys.run.events import (
     AgentOutputChunkData,
@@ -44,6 +45,7 @@ class _FakeSession:
     error: BaseException | None = None
     observers: list[AgentObserver | None] = field(default_factory=list)
     events: list[AgentEvent] = field(default_factory=list)
+    resumed: list[str] = field(default_factory=list)
 
     def run_turn(
         self,
@@ -58,6 +60,11 @@ class _FakeSession:
         if self.error is not None:
             raise self.error
         return self.results.pop(0)
+
+    def resume_provider_session(self, session_id: str) -> bool:
+        """Adopt ``session_id``, recording it so tests can assert on it."""
+        self.resumed.append(session_id)
+        return True
 
     def close(self) -> None:
         self.close_calls += 1
@@ -79,6 +86,10 @@ class _FakeDriver:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+def _key(identifier: str) -> AgentSessionKey:
+    return AgentSessionKey(SessionScope.HYPOTHESIS, identifier)
 
 
 def _spec(
@@ -105,11 +116,15 @@ def test_keyed_turns_reuse_a_session() -> None:
     client = AgentClient(driver)
 
     assert (
-        client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl").text
+        client.run(
+            session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl")
+        ).text
         == "first"
     )
     assert (
-        client.run(session_spec=_spec(), turn=AgentTurnRequest("two"), session_key="impl").text
+        client.run(
+            session_spec=_spec(), turn=AgentTurnRequest("two"), session_key=_key("impl")
+        ).text
         == "second"
     )
 
@@ -131,8 +146,8 @@ def test_session_setup_materializes_skills_once(
     )
     spec = _spec(workspace=tmp_path, skills=(skill,))
 
-    client.run(session_spec=spec, turn=AgentTurnRequest("one"), session_key="impl")
-    client.run(session_spec=spec, turn=AgentTurnRequest("two"), session_key="impl")
+    client.run(session_spec=spec, turn=AgentTurnRequest("one"), session_key=_key("impl"))
+    client.run(session_spec=spec, turn=AgentTurnRequest("two"), session_key=_key("impl"))
 
     assert calls == [(tmp_path, [skill])]
 
@@ -338,11 +353,11 @@ def test_changed_session_spec_closes_and_replaces_cached_session() -> None:
     driver = _FakeDriver([old, new])
     client = AgentClient(driver)
 
-    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl")
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
     result = client.run(
         session_spec=_spec(model="changed"),
         turn=AgentTurnRequest("two"),
-        session_key="impl",
+        session_key=_key("impl"),
     )
 
     assert result.text == "new"
@@ -370,8 +385,8 @@ def test_reset_disposition_evicts_session(result: AgentTurnResult) -> None:
     driver = _FakeDriver([first, second])
     client = AgentClient(driver)
 
-    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl")
-    client.run(session_spec=_spec(), turn=AgentTurnRequest("two"), session_key="impl")
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("two"), session_key=_key("impl"))
 
     assert first.close_calls == 1
     assert len(driver.specs) == 2
@@ -384,8 +399,10 @@ def test_turn_exception_evicts_session() -> None:
     client = AgentClient(driver)
 
     with pytest.raises(ValueError, match="failed"):
-        client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl")
-    result = client.run(session_spec=_spec(), turn=AgentTurnRequest("two"), session_key="impl")
+        client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
+    result = client.run(
+        session_spec=_spec(), turn=AgentTurnRequest("two"), session_key=_key("impl")
+    )
 
     assert failed.close_calls == 1
     assert result.text == "ok"
@@ -395,7 +412,7 @@ def test_close_is_idempotent_and_rejects_future_turns() -> None:
     session = _FakeSession(results=[AgentTurnResult("ok")])
     driver = _FakeDriver([session])
     client = AgentClient(driver)
-    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl")
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
 
     client.close()
     client.close()
@@ -431,7 +448,7 @@ def test_invoke_builds_session_and_turn_contracts_and_records_usage(tmp_path: Pa
         fallback_factory=lambda: _Response(answer="fallback"),
         round_label="judge #1",
         env={"VISIBLE": "1"},
-        session_key="review",
+        session_key=_key("review"),
     )
 
     assert response == _Response(answer="done")

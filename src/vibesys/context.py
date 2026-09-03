@@ -22,6 +22,7 @@ from vibesys.agents.factory import (
 )
 from vibesys.agents.host_resource_declarations import task_agent_host_resources
 from vibesys.agents.progress import AgentProgress
+from vibesys.agents.session_store import AgentSessionState, DurableSessionStore
 from vibesys.backends.base import ComputeBackendImpl, ContentionMonitor
 from vibesys.config import Config, as_config
 from vibesys.constants import (
@@ -899,7 +900,18 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             evaluator_tool_roots=evaluator_tool_roots,
         )
 
+        run_state = RunState(project, git, run_id)
+
         with boot_trace.span("agent_client_build"):
+            # Checkpoint coding-agent provider session IDs in the run's
+            # machine-local namespace so a resumed run can continue the
+            # implementer's conversation instead of replaying the round. The
+            # map lives under the local (never snapshotted) namespace because
+            # the provider transcripts it names are host-local.
+            agent_session_store = DurableSessionStore(
+                run_state.local(RunStateNamespace.AGENT).slot("sessions.json", AgentSessionState),
+                log=logger.lprint,
+            )
             # Build the backend-agnostic agent client. Loops invoke this instead
             # of calling create_deep_agent / vibesys._agent_cli directly. The cli
             # backend is rejected if --docker is set; build_agent_client raises
@@ -908,6 +920,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 config,
                 agent_backend=agent_backend,
                 cli_provider=cli_provider,
+                session_store=agent_session_store,
                 backends={
                     "implementer": session.sandbox,
                     "judge": session.sandbox,
@@ -974,7 +987,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             device=device,
             agent_client=agent_client,
             project=project,
-            state=RunState(project, git, run_id),
+            state=run_state,
             run_id=run_id,
             round_transaction_coordinator=round_transaction_coordinator,
             agent_host_resources=agent_host_resources,
@@ -1160,6 +1173,11 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         profiler_benchmark_command=session.view.paths.benchmark_command,
     )
 
+    # No session store: an evolve candidate names no conversation narrower than
+    # an agent role, so every one of its turns lands on a role-scoped key, and
+    # role-scoped conversations are never checkpointed (they belong to one
+    # process). Candidates also share the parent's run ID and local namespace
+    # and run concurrently, so a single per-run map would alias them anyway.
     agent_client = build_agent_client(
         config,
         agent_backend=agent_backend,

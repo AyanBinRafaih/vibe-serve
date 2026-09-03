@@ -16,6 +16,52 @@ driver = "omnigent"
 The `omnigent` package is a base dependency (pinned exactly in
 `pyproject.toml`), so every install carries it; `uv sync` is enough.
 
+## Provider session resume
+
+`AgentClient` keeps one live session per session key and, for keys whose scope
+opts into durability, checkpoints that session's provider conversation ID in
+the run's machine-local state. A resumed process offers the checkpoint to the
+first session it builds for that key, so a quit run continues the
+implementer's conversation instead of replaying the round.
+
+Two contract members carry this:
+
+- `AgentCapabilities.provider_session_resume` says whether a driver can adopt a
+  conversation created by an earlier process. `session_reuse` only promises
+  reuse within one process.
+- `AgentSession.resume_provider_session(session_id) -> bool` offers one
+  checkpoint and returns whether it was adopted. A driver returns `False` when
+  its provider cannot resume, or when the session already holds a live
+  conversation whose history is newer than the checkpoint. A `False` answer
+  tells the client the checkpoint is dead, so it drops it.
+
+Cross-process resume is AgentShim-only today, and within AgentShim only for the
+providers whose CLI has a resume flag: `codex exec resume <thread>` and
+`claude --resume <session>`. Gemini and opencode declare no resume support, so
+they always refuse a checkpoint. Omnigent 0.10 owns its executor's conversation
+lifecycle internally and exposes no attach point, so `OmnigentSession` reports
+`provider_session_resume=False` and always refuses.
+
+### Drivers must report restarts
+
+A driver that drops and restarts the conversation a session names must return
+`SessionDisposition.RESET_REQUIRED` on that turn's `AgentTurnResult`. The client
+then evicts the live session and clears the checkpoint, so nothing later claims
+continuity with history that no longer exists. The AgentShim session reports a
+reset for all three of its restarts:
+
+- retiring an over-budget Codex thread (turn count or heavy-turn usage),
+  evaluated after the turn so the decision reads the usage it just produced;
+- retrying a turn whose Codex thread has no rollout on disk;
+- retrying a resumed Claude turn once from a fresh conversation, because Claude
+  Code reports a refused `--resume` as a bare nonzero exit that would otherwise
+  end the run.
+
+A turn that merely raises is not a restart. Timeouts and cancellations say
+nothing about whether the conversation is still resumable, so the client keeps
+the checkpoint and only a driver-reported reset (or a refused adoption) clears
+it.
+
 ## Mock driver
 
 `driver = "mock"` is test infrastructure. It satisfies the same driver

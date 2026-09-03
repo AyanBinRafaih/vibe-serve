@@ -520,6 +520,18 @@ class OmnigentSession:
                     self._failed = True
                 raise
 
+    def resume_provider_session(self, session_id: str) -> bool:
+        """Refuse the checkpoint: Omnigent executors have no resume entry point.
+
+        Omnigent 0.10 owns its executor's conversation lifecycle internally and
+        exposes no way to attach a thread created by an earlier process, so
+        there is nothing to adopt and the turn starts a fresh conversation.
+        Reported through ``provider_session_resume=False`` as well, so callers
+        can tell before they build a session.
+        """
+        del session_id
+        return False
+
     def close(self) -> None:
         """Release the executor exactly once."""
         if self.owns_current_loop_thread():

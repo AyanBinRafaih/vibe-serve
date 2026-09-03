@@ -60,6 +60,9 @@ class ClaudeCodeCodingAgent(CLICodingAgent[ClaudeGenerationSession]):
     """Coding agent implementation using the Claude Code CLI tool."""
 
     supports_native_output_schema = True
+    # ``claude --resume <session-id>`` continues a stored session, so a
+    # checkpointed session ID can be adopted before the next turn.
+    supports_session_resume = True
     # Claude Code's ``--json-schema`` flag takes the schema *inline*, not a
     # path, so the schema file must be read at command-build time. The runner
     # therefore hands this provider an absolute host path (readable on both the

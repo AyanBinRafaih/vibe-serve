@@ -29,6 +29,7 @@ from vibesys.agents.callbacks import AgentLogger
 from vibesys.agents.client import AgentClient
 from vibesys.agents.contracts import AgentCapabilities
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
+from vibesys.agents.session_key import AgentSessionKey  # noqa: TC001  # tracked: #288
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -87,7 +88,7 @@ class DeepAgentsClient(AgentClient):
         return checkpointer
 
     def _session(
-        self, *, kind: str, reuse_session: bool | None, session_key: str | None
+        self, *, kind: str, reuse_session: bool | None, session_key: AgentSessionKey | None
     ) -> tuple[MemorySaver, str]:
         """Return a fresh thread by default, or a durable thread for a key."""
         checkpointer = self._checkpointer(kind)
@@ -150,7 +151,7 @@ class DeepAgentsClient(AgentClient):
         mcp_servers: list[MCPServerSpec] | None = None,  # noqa: ARG002 — cli-only injection point; deepagents uses tools=
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> T:
         label = _agent_label(kind)
 
@@ -205,7 +206,7 @@ class DeepAgentsClient(AgentClient):
         mcp_servers: list[MCPServerSpec] | None = None,  # noqa: ARG002 — cli-only
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> str:
         """Run a conversational agent without imposing a response schema."""
         _, thread_id = self._session(

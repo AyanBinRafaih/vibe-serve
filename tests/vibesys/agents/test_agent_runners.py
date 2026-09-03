@@ -18,6 +18,7 @@ from vibesys.agents.client import AgentClient
 from vibesys.agents.deepagents_runner import DeepAgentsClient
 from vibesys.agents.drivers.agentshim import AgentShimDriver
 from vibesys.agents.progress import RoundProgress
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.config import Config
 from vibesys.constants import ComputeBackend
 from vibesys.schemas import (
@@ -201,12 +202,26 @@ class TestDeepAgentsClient:
             run_log_file=None,
         )
 
-        first = runner._session(kind="implementer", reuse_session=True, session_key="hypothesis:a")  # noqa: SLF001  # tracked: #288
-        continued = runner._session(  # noqa: SLF001  # tracked: #288
-            kind="implementer", reuse_session=True, session_key="hypothesis:a"
+        first = runner._session(  # noqa: SLF001  # tracked: #288
+            kind="implementer",
+            reuse_session=True,
+            session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"),
         )
-        other_role = runner._session(kind="judge", reuse_session=True, session_key="hypothesis:a")  # noqa: SLF001  # tracked: #288
-        fresh = runner._session(kind="implementer", reuse_session=False, session_key="hypothesis:a")  # noqa: SLF001  # tracked: #288
+        continued = runner._session(  # noqa: SLF001  # tracked: #288
+            kind="implementer",
+            reuse_session=True,
+            session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"),
+        )
+        other_role = runner._session(  # noqa: SLF001  # tracked: #288
+            kind="judge",
+            reuse_session=True,
+            session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"),
+        )
+        fresh = runner._session(  # noqa: SLF001  # tracked: #288
+            kind="implementer",
+            reuse_session=False,
+            session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"),
+        )
 
         assert continued is first
         assert other_role is not first
@@ -518,7 +533,7 @@ class TestCliAgentRunner:
         workspace = tmp_path / "ws"
         workspace.mkdir()
 
-        def invoke(*, session_key: str, reuse_session: bool) -> None:
+        def invoke(*, session_key: AgentSessionKey, reuse_session: bool) -> None:
             runner.invoke(
                 kind="judge",
                 workspace=workspace,
@@ -531,12 +546,12 @@ class TestCliAgentRunner:
                 session_key=session_key,
             )
 
-        invoke(session_key="hypothesis:a", reuse_session=True)
-        invoke(session_key="hypothesis:a", reuse_session=True)
+        invoke(session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"), reuse_session=True)
+        invoke(session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"), reuse_session=True)
         assert len(captured) == 1
-        invoke(session_key="hypothesis:b", reuse_session=True)
+        invoke(session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "b"), reuse_session=True)
         assert len(captured) == 2
-        invoke(session_key="hypothesis:a", reuse_session=False)
+        invoke(session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"), reuse_session=False)
         assert len(captured) == 3
 
     def test_codex_persistent_session_renews_before_third_turn(self, monkeypatch, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -577,7 +592,7 @@ class TestCliAgentRunner:
                 fallback_factory=_judge_fallback,
                 round_label="review",
                 reuse_session=True,
-                session_key="hypothesis:a",
+                session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"),
             )
 
         assert len(captured) == 1
@@ -640,7 +655,7 @@ class TestCliAgentRunner:
                 fallback_factory=_judge_fallback,
                 round_label="review",
                 reuse_session=True,
-                session_key="hypothesis:a",
+                session_key=AgentSessionKey(SessionScope.HYPOTHESIS, "a"),
             )
 
         assert session_ids == ["thread-1", "thread-2"]

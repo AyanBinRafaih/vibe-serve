@@ -99,6 +99,22 @@ class CodingAgent(ABC):
     back to the prompt-level schema instruction.
     """
 
+    supports_session_resume = False
+    """Whether this provider's CLI can continue an earlier conversation.
+
+    Set by the providers that override :meth:`CLICodingAgent._get_resume_command`
+    (Codex and Claude Code today). It is the declared capability behind
+    :meth:`resume_from`, so callers never have to probe for a resume flag or
+    branch on the provider name.
+    """
+
+    session_id: str | None = None
+    """The provider conversation the next :meth:`generate` continues.
+
+    ``None`` means the next turn starts a fresh conversation. Concrete CLI
+    agents assign it after each turn from the provider's own transcript ID.
+    """
+
     # Declared (not assigned) here: every concrete provider sets these in its
     # ``__init__``.  ``env`` is the subprocess environment the CLI is spawned
     # with; ``executor`` is the agentshim ``CommandExecutor`` (host, docker,
@@ -274,3 +290,25 @@ class CodingAgent(ABC):
         Idempotent. Default implementation is a no-op.
         """
         return
+
+    def resume_from(self, session_id: str) -> bool:
+        """Continue *session_id* on the next turn, reporting whether it stuck.
+
+        Returns ``False`` when the ID was not adopted, which happens when the
+        provider has no resume flag or when a live conversation is already
+        attached: an in-flight conversation is never replaced, because its
+        history is newer than any checkpoint a caller could hold. Callers use
+        the return value to decide whether the checkpoint is still usable.
+        """
+        if not self.supports_session_resume or self.session_id is not None:
+            return False
+        self.session_id = session_id
+        return True
+
+    def forget_session(self) -> None:
+        """Drop the current conversation so the next turn starts fresh.
+
+        Idempotent. The caller is responsible for telling its own callers that
+        the conversation restarted; this only mutates the agent.
+        """
+        self.session_id = None

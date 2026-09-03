@@ -19,6 +19,7 @@ from typing import Any, Literal
 from vibesys.agents.base import ResponseFallback
 from vibesys.agents.factory import resolve_agent_driver
 from vibesys.agents.progress import RoundProgress
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.config import Config, as_config
 from vibesys.constants import DEFAULT_AGENT_BACKEND, DEFAULT_COMPUTE_BACKEND, ComputeBackend
 from vibesys.context import create_run_context
@@ -1242,7 +1243,7 @@ def _run_implementer(  # noqa: PLR0913  # tracked: #288
             fallback_factory=fallback,
             round_label=f"round-{round_number}-retry-{retry}-implementer",
             reuse_session=True,
-            session_key=f"hypothesis:{plan.hypothesis_id}",
+            session_key=AgentSessionKey(SessionScope.HYPOTHESIS, plan.hypothesis_id),
         )
     except subprocess.TimeoutExpired as exc:
         timed_out = True
@@ -1530,7 +1531,7 @@ def _run_single_agent_round(  # noqa: PLR0913  # tracked: #288
         ),
         round_label=f"round-{round_number}-retry-{retry}-single-agent",
         reuse_session=True,
-        session_key=f"hypothesis:{plan.hypothesis_id}",
+        session_key=AgentSessionKey(SessionScope.HYPOTHESIS, plan.hypothesis_id),
     )
     response.skill_context_updates, _ = _validate_skill_selections(
         ctx, response.skill_context_updates
@@ -3249,6 +3250,9 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     perf_baseline_metric=baseline_metric,
                     perf_delta_pct=perf_delta_pct,
                     perf_comparison=perf_comparison,
+                    implementer_driver=ctx.agent_client.driver_name,
+                    implementer_provider=ctx.agent_client.provider,
+                    implementer_model=ctx.agent_client.model_for_kind("implementer"),
                 )
                 # Compute the completed lifecycle transition in memory so its
                 # exact representation can enter the write-ahead journal before

@@ -22,6 +22,7 @@ from vibesys._agent_cli.codex import (
     CodexGenerationSession,
     _shell_path_config_args,
 )
+from vibesys._agent_cli.gemini import GeminiCodingAgent
 
 
 def _agent() -> CodexCodingAgent:
@@ -380,3 +381,44 @@ class TestProcessStderr:
         session = _session(event_handler=handler)
         session._process_stderr("\n")  # noqa: SLF001  # tracked: #288
         handler.on_thinking.assert_not_called()
+
+
+def test_resume_from_adopts_a_checkpoint_when_no_conversation_is_live() -> None:
+    agent = _agent()
+    agent.session_id = None
+
+    assert agent.resume_from("thread-checkpoint") is True
+    assert agent.session_id == "thread-checkpoint"
+    assert agent._get_resume_command("prompt", "thread-checkpoint")[:4] == [  # noqa: SLF001
+        "/usr/local/bin/codex",
+        "exec",
+        "resume",
+        "thread-checkpoint",
+    ]
+
+
+def test_resume_from_refuses_to_replace_a_live_conversation() -> None:
+    agent = _agent()
+    agent.session_id = "thread-live"
+
+    assert agent.resume_from("thread-checkpoint") is False
+    assert agent.session_id == "thread-live"
+
+
+def test_forget_session_starts_the_next_turn_fresh() -> None:
+    agent = _agent()
+    agent.session_id = "thread-live"
+
+    agent.forget_session()
+    agent.forget_session()  # idempotent
+
+    assert agent.session_id is None
+
+
+def test_a_provider_without_a_resume_flag_never_adopts_a_checkpoint() -> None:
+    agent = GeminiCodingAgent.__new__(GeminiCodingAgent)
+    agent.session_id = None
+
+    assert agent.supports_session_resume is False
+    assert agent.resume_from("thread-checkpoint") is False
+    assert agent.session_id is None

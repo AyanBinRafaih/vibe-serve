@@ -53,6 +53,7 @@ from vibesys.agents.cli_common import (
 from vibesys.agents.contracts import AgentCapabilities
 from vibesys.agents.host_resource_declarations import declare_agent_host_resources
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
+from vibesys.agents.session_key import AgentSessionKey  # noqa: TC001  # tracked: #288
 from vibesys.constants import ComputeBackend  # noqa: TC001  # tracked: #288
 from vs_sandbox import HostResource, ProjectPathPolicy, build_host_sandbox
 
@@ -216,7 +217,7 @@ class CliAgentRunner:
         mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,  # noqa: ARG002 — deepagents-only injection point; cli uses mcp_servers
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> T:
         native_schema_path: str | None = None
         native_schema_supported = bool(
@@ -305,7 +306,7 @@ class CliAgentRunner:
         mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,  # noqa: ARG002 — deepagents-only
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> str:
         """Run a conversational CLI agent without requesting structured JSON."""
         text = self._generate(
@@ -345,7 +346,7 @@ class CliAgentRunner:
         progress: AgentProgress | None,
         mcp_servers: list[MCPServerSpec] | None,
         reuse_session: bool | None,
-        session_key: str | None,
+        session_key: AgentSessionKey | None,
         output_schema_path: str | None,
     ) -> str:
         """Run one CLI generation with shared setup, logging, and cleanup."""
