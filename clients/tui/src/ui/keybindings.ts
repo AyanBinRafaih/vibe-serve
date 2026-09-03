@@ -27,6 +27,7 @@ export interface KeybindingActions {
   scrollChatPane(delta: number): void;
   scrollExperimentDetail(delta: number): void;
   scrollErrorBanner(delta: number): void;
+  scrollOverlay(delta: number): void;
   clearTransientStatus(): void;
   showClipboardStatus(result: Exclude<ClipboardCopyResult, 'no-selection'>): void;
 }
@@ -155,6 +156,10 @@ export function bindKeybindings(
       if (key.name === 'escape') {
         controller.live();
         viewport.scrollTo(viewport.scrollHeight);
+      } else if (key.name === 'pageup' || key.name === 'pagedown') {
+        // Content taller than the box scrolls here rather than falling through
+        // to the transcript behind it.
+        actions.scrollOverlay(key.name === 'pageup' ? -1 : 1);
       }
       // The overlay is modal: everything it does not handle is swallowed so
       // keys cannot reach the panes or the hidden command input behind it.
