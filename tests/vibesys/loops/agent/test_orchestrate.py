@@ -11,6 +11,7 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 
 from vibesys.agents import AgentClient
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.config import Config, as_config
 from vibesys.constants import ComputeBackend
 from vibesys.domains.base import DomainName
@@ -2366,7 +2367,8 @@ def test_implementer_skill_updates_survive_a_renewed_continuation_prompt(tmp_pat
     calls = [
         call
         for call in runner.invoke.call_args_list
-        if call.kwargs.get("session_key") == "hypothesis:transport-boundary"
+        if call.kwargs.get("session_key")
+        == AgentSessionKey(SessionScope.HYPOTHESIS, "transport-boundary")
     ]
     assert len(calls) == 2
     assert "portable/references/transport.md" not in calls[0].kwargs["system_prompt"]
@@ -3237,7 +3239,7 @@ def test_role_session_policy_is_explicit_and_hypothesis_scoped(tmp_path, ref_fil
     assert all(call.kwargs["reuse_session"] is False for call in plan_calls)
     assert all(call.kwargs["reuse_session"] is True for call in implementer_calls)
     assert {call.kwargs["session_key"] for call in implementer_calls} == {
-        "hypothesis:stable-hypothesis"
+        AgentSessionKey(SessionScope.HYPOTHESIS, "stable-hypothesis")
     }
     assert (
         "Required continuation from the previous round"
@@ -3355,7 +3357,8 @@ def test_hypothesis_revert_is_applied_once_across_continuation_rounds(tmp_path, 
         call
         for call in runner.invoke.call_args_list
         if call.kwargs.get("response_cls") is ImplementerResponse
-        and call.kwargs.get("session_key") == "hypothesis:continued-repair"
+        and call.kwargs.get("session_key")
+        == AgentSessionKey(SessionScope.HYPOTHESIS, "continued-repair")
     ]
     assert len(repair_calls) == 2
     assert all(
@@ -3445,7 +3448,8 @@ def test_failed_hypothesis_revert_is_retried_and_not_claimed_as_applied(tmp_path
         call
         for call in runner.invoke.call_args_list
         if call.kwargs.get("response_cls") is ImplementerResponse
-        and call.kwargs.get("session_key") == "hypothesis:retry-rollback"
+        and call.kwargs.get("session_key")
+        == AgentSessionKey(SessionScope.HYPOTHESIS, "retry-rollback")
     ]
     assert len(retry_calls) == 2
     assert "framework already materialized" not in retry_calls[0].kwargs["system_prompt"].lower()
@@ -4377,3 +4381,25 @@ def test_loop_threads_plateau_warning_into_prompt(tmp_path, ref_file):  # noqa: 
     assert "Plateau detected" in seen_prompts[4]
     assert "Refresh an analytical performance model" in seen_prompts[4]
     assert "unexplained residual" in seen_prompts[4]
+
+
+def test_completed_round_records_which_implementer_produced_it(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """A round names the driver, provider, and model of its implementer.
+
+    The provider session ID itself stays machine-local in the session store;
+    the portable record carries only the attribution needed to tell whether a
+    resumed run is continuing the same configuration.
+    """
+    runner = _make_orchestrate_runner()
+    runner.driver_name = "agentshim"
+    runner.provider = "codex"
+    runner.model_for_kind.return_value = "gpt-5.6-sol"
+
+    _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=1)
+
+    round_one = _round_payloads(tmp_path)[0]
+    assert round_one["implementer_driver"] == "agentshim"
+    assert round_one["implementer_provider"] == "codex"
+    assert round_one["implementer_model"] == "gpt-5.6-sol"
+    # The record is portable state; a host-local session ID must never reach it.
+    assert not [key for key in round_one if "session" in key]

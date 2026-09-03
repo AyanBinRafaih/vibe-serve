@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
@@ -70,6 +71,10 @@ class AgentCapabilities:
     container_execution: bool = False
     timeouts: bool = False
     session_reuse: bool = True
+    # Whether a session can adopt a provider conversation ID produced by an
+    # earlier process, so a resumed run continues the same conversation instead
+    # of replaying it. ``session_reuse`` only promises reuse within one process.
+    provider_session_resume: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +122,19 @@ class AgentSessionSpec:
     reasoning_effort: str | None = None
 
 
+def session_spec_fingerprint(spec: AgentSessionSpec) -> str:
+    """Return a stable digest of the whole session spec.
+
+    ``AgentClient`` drops a cached session as soon as its spec stops matching
+    the requested one. A resumed process has no earlier spec object to compare
+    against, so it compares this digest instead: same inputs, same rule, so any
+    configuration change that would evict a live session also refuses a
+    checkpointed provider conversation. The digest is content-derived rather
+    than a Python ``hash``, which is not stable across processes.
+    """
+    return hashlib.sha256(repr(spec).encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class AgentTurnRequest:
     """Context added to an existing conversation for one agent turn."""
@@ -148,6 +166,21 @@ class AgentSession(Protocol):
         observer: AgentObserver | None = None,
     ) -> AgentTurnResult:
         """Add one turn to the conversation and return its raw result."""
+        ...
+
+    def resume_provider_session(self, session_id: str) -> bool:
+        """Continue ``session_id`` on this session's next turn.
+
+        Return whether the ID was actually adopted. A driver returns ``False``
+        when its provider cannot resume, or when the session already holds a
+        live conversation whose history is newer than the caller's checkpoint.
+        Callers must not assume adoption: the return value, not the call, is
+        what says the next turn resumes.
+
+        Implementations that report ``False`` must leave the session usable and
+        unchanged. Drivers whose capabilities set ``provider_session_resume``
+        to ``False`` always return ``False``.
+        """
         ...
 
     def close(self) -> None:

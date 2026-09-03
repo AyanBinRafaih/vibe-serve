@@ -34,6 +34,9 @@ class CodexCodingAgent(CLICodingAgent[CodexGenerationSession]):
     """Coding agent implementation using the Codex CLI tool."""
 
     supports_native_output_schema = True
+    # ``codex exec resume <thread-id>`` continues a stored rollout, so a
+    # checkpointed thread ID can be adopted before the next turn.
+    supports_session_resume = True
 
     def __init__(  # noqa: ANN204  # tracked: #288
         self,

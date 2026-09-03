@@ -29,6 +29,7 @@ from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #28
 from vibesys.agents.client import AgentClient
 from vibesys.agents.contracts import AgentCapabilities  # noqa: TC001
 from vibesys.agents.progress import AgentProgress  # noqa: TC001
+from vibesys.agents.session_key import AgentSessionKey  # noqa: TC001
 from vibesys.loops.plain.mcp_config import build_issue_mcp_spec
 from vibesys.loops.plain.tools import build_issue_tools
 from vs_issue_board import IssueBoard, IssueType
@@ -99,7 +100,7 @@ class PlainLoopAgentClient(AgentClient):
         mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> str:
         """Delegate an unstructured turn without changing tracker policy."""
         return self._inner.invoke_text(

@@ -20,6 +20,7 @@ from typing import Any, Literal
 from vibesys.agents.base import ResponseFallback
 from vibesys.agents.factory import resolve_agent_driver
 from vibesys.agents.progress import RoundProgress
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.config import Config, as_config
 from vibesys.constants import DEFAULT_AGENT_BACKEND, DEFAULT_COMPUTE_BACKEND, ComputeBackend
 from vibesys.context import create_run_context
@@ -1250,7 +1251,7 @@ def _run_implementer(  # noqa: PLR0913  # tracked: #288
             fallback_factory=fallback,
             round_label=f"round-{round_number}-retry-{retry}-implementer",
             reuse_session=True,
-            session_key=f"hypothesis:{plan.hypothesis_id}",
+            session_key=AgentSessionKey(SessionScope.HYPOTHESIS, plan.hypothesis_id),
         )
     except subprocess.TimeoutExpired as exc:
         timed_out = True
@@ -1538,7 +1539,7 @@ def _run_single_agent_round(  # noqa: PLR0913  # tracked: #288
         ),
         round_label=f"round-{round_number}-retry-{retry}-single-agent",
         reuse_session=True,
-        session_key=f"hypothesis:{plan.hypothesis_id}",
+        session_key=AgentSessionKey(SessionScope.HYPOTHESIS, plan.hypothesis_id),
     )
     response.skill_context_updates, _ = _validate_skill_selections(
         ctx, response.skill_context_updates

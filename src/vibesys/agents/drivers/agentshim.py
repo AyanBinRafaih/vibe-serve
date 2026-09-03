@@ -26,6 +26,7 @@ from vibesys.agents.contracts import (
     AgentTurnResult,
     AgentUsage,
     MCPServerSpec,
+    SessionDisposition,
 )
 from vibesys.agents.docker_executor import DockerCommandExecutor
 from vibesys.agents.host_resource_declarations import declare_agent_host_resources
@@ -38,6 +39,7 @@ AGENTSHIM_CAPABILITIES = AgentCapabilities(
     hidden_paths=True,
     timeouts=True,
     session_reuse=True,
+    provider_session_resume=True,
 )
 """Capabilities invariant across AgentShim host and container execution."""
 
@@ -212,6 +214,9 @@ class AgentShimSession:
         self._docker_sandboxes = docker_sandboxes
         self._log = log
         self._turn_count = 0
+        # Set when the provider conversation was dropped and restarted while
+        # serving the current turn, so the turn's result can report it.
+        self._restarted = False
         self._closed = False
 
     def run_turn(  # noqa: C901, D102, PLR0912  # tracked: #288
@@ -226,7 +231,7 @@ class AgentShimSession:
         self._refresh_container()
         prompt, schema_path = self._prepare_prompt(request)
         self._set_output_schema(schema_path)
-        self._renew_codex_thread_if_needed()
+        self._restarted = False
 
         in_container = self._docker_sandboxes is not None
         mcp_servers = [
@@ -243,7 +248,7 @@ class AgentShimSession:
 
         turn_error: BaseException | None = None
         try:
-            text = self._generate_with_stale_rollout_retry(
+            text = self._generate_with_restart_fallback(
                 prompt,
                 cwd=workspace_arg,
                 timeout=timeout,
@@ -280,10 +285,17 @@ class AgentShimSession:
             if turn_error is None and cleanup_error is not None:
                 raise cleanup_error
 
+        # Read the conversation ID before the thread-budget check, which may
+        # drop it: the caller still deserves to know which conversation ran.
+        provider_session_id = self._agent.session_id
+        restarted = self._restarted or self._renew_codex_thread_if_needed()
         return AgentTurnResult(
             text=text,
             usage=_usage_from_agent(self._agent),
-            provider_session_id=getattr(self._agent, "session_id", None),
+            provider_session_id=provider_session_id,
+            disposition=(
+                SessionDisposition.RESET_REQUIRED if restarted else SessionDisposition.REUSABLE
+            ),
         )
 
     def close(self) -> None:
@@ -291,20 +303,15 @@ class AgentShimSession:
         self._closed = True
         self._event_handler.observer = None
 
-    def seed_provider_session(self, session_id: str) -> None:
-        """Resume a prior provider conversation on the next turn.
+    def resume_provider_session(self, session_id: str) -> bool:
+        """Continue ``session_id`` on the next turn, if the agent accepts it.
 
-        Sets the underlying agent's ``session_id`` so the first ``generate``
-        takes the resume branch (``codex exec resume`` / ``claude --resume``).
-        A live in-memory ID (a mid-run continuation) is never overwritten, and
-        a stale or deleted rollout falls back to a fresh session inside
-        ``_generate_with_stale_rollout_retry``.
+        The agent adopts the ID only when its provider has a resume flag and no
+        conversation is already attached, so a mid-run continuation is never
+        overwritten by an older checkpoint. A stale or deleted transcript is
+        handled later, by the restart fallback around ``generate``.
         """
-        if hasattr(self._agent, "session_id") and self._agent.session_id is None:
-            # Mirror the stale-rollout retry's cast: the concrete session-capable
-            # agents (codex, claude) expose a writable ``session_id``, but the
-            # structural ``CodingAgent`` type does not declare it as assignable.
-            cast("CodexCodingAgent", self._agent).session_id = session_id
+        return self._agent.resume_from(session_id)
 
     def _prepare_prompt(self, request: AgentTurnRequest) -> tuple[str, str | None]:
         response_cls = request.output_schema
@@ -353,42 +360,70 @@ class AgentShimSession:
                 "without implementing set_output_schema_path()"
             )
 
-    def _renew_codex_thread_if_needed(self) -> None:
+    def _renew_codex_thread_if_needed(self) -> bool:
+        """Retire an over-budget Codex thread, reporting whether it was dropped.
+
+        Evaluated after a turn rather than before one, so the decision reads the
+        usage of the turn that just finished and the caller learns about the
+        restart from that turn's result instead of discovering it on the next.
+        """
         if self._provider != "codex":
-            return
+            return False
         reason = (
             f"{_MAX_CODEX_SESSION_TURNS} successful turns"
             if self._turn_count >= _MAX_CODEX_SESSION_TURNS
             else _heavy_codex_turn_reason(self._agent)
         )
         if reason is None:
-            return
+            return False
         self._log(
             f"renewing Codex thread after {reason}; durable workspace state remains authoritative."
         )
-        cast("CodexCodingAgent", self._agent).session_id = None
+        self._agent.forget_session()
         self._turn_count = 0
+        return True
 
-    def _generate_with_stale_rollout_retry(
+    def _generate_with_restart_fallback(
         self,
         prompt: str,
         *,
         cwd: str | None,
         timeout: int | None,
     ) -> str:
+        """Run one turn, retrying once from a fresh conversation if a resume failed.
+
+        Only a resumed turn is retried, and only once: with the conversation
+        dropped, the retry takes the fresh-session branch, so a second failure
+        is a real agent failure and propagates. The retry loses the earlier
+        conversation, which ``self._restarted`` reports to the caller.
+        """
         try:
             return self._agent.generate(prompt, cwd=cwd, timeout=timeout, silent=True)
         except RuntimeError as exc:
-            if not (
-                self._provider == "codex"
-                and getattr(self._agent, "session_id", None)
-                and _is_missing_codex_rollout(exc)
-            ):
+            if not self._is_failed_resume(exc):
                 raise
-            self._log("Codex session is no longer available; retrying with a fresh thread.")
-            cast("CodexCodingAgent", self._agent).session_id = None
+            self._log(
+                f"{self._provider} session is no longer available; "
+                "retrying this turn with a fresh conversation."
+            )
+            self._agent.forget_session()
             self._turn_count = 0
+            self._restarted = True
             return self._agent.generate(prompt, cwd=cwd, timeout=timeout, silent=True)
+
+    def _is_failed_resume(self, exc: RuntimeError) -> bool:
+        """Whether ``exc`` is a resumed turn failing because of the resume."""
+        if self._agent.session_id is None:
+            return False
+        if self._provider == "codex":
+            # Codex names the cause: the rollout the thread ID points at is gone.
+            return _is_missing_codex_rollout(exc)
+        # Claude Code reports a rejected ``--resume`` as a plain nonzero exit
+        # with no distinguishing message, and a session it will not resume is
+        # unrecoverable, so any failed resumed turn is retried once from a
+        # fresh conversation rather than being allowed to kill the run.
+        # Timeouts do not reach here: they raise ``subprocess.TimeoutExpired``.
+        return self._provider == "claude"
 
     def _refresh_container(self) -> None:
         if self._docker_sandboxes is None:

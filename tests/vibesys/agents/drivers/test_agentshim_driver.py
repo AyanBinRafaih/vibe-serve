@@ -50,6 +50,7 @@ class _FakeAgent:
     supports_native_output_schema = False
     native_output_schema_allows_arbitrary_keys = False
     native_output_schema_wants_absolute_path = False
+    supports_session_resume = True
 
     def __init__(
         self,
@@ -82,6 +83,17 @@ class _FakeAgent:
 
     def set_reasoning_effort(self, effort: str) -> None:
         self.reasoning_effort = effort
+
+    def resume_from(self, session_id: str) -> bool:
+        # Same rule as ``CodingAgent.resume_from``; see the dedicated tests in
+        # tests/vibesys/_agent_cli/test_session_resume.py for the real thing.
+        if not self.supports_session_resume or self.session_id is not None:
+            return False
+        self.session_id = session_id
+        return True
+
+    def forget_session(self) -> None:
+        self.session_id = None
 
     def set_output_schema_path(self, path: str | None) -> None:
         self.output_schema_paths.append(path)
@@ -360,3 +372,176 @@ def test_driver_and_session_close_are_idempotent(
         session.run_turn(AgentTurnRequest(message="later"))
     with pytest.raises(RuntimeError, match="closed"):
         driver.create_session(_spec(tmp_path))
+
+
+def test_capabilities_declare_cross_process_provider_session_resume() -> None:
+    assert subject.AgentShimDriver(provider="codex").capabilities.provider_session_resume
+
+
+def test_resume_adopts_a_checkpoint_when_no_conversation_is_live(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    driver = subject.AgentShimDriver(provider="codex")
+    session = driver.create_session(_spec(tmp_path))
+    fake_agent[0].session_id = None
+
+    assert session.resume_provider_session("thread-checkpoint") is True
+    assert fake_agent[0].session_id == "thread-checkpoint"
+
+
+def test_resume_refuses_when_a_conversation_is_already_live(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    driver = subject.AgentShimDriver(provider="codex")
+    session = driver.create_session(_spec(tmp_path))
+
+    # The live conversation is newer than any checkpoint the caller holds.
+    assert session.resume_provider_session("thread-checkpoint") is False
+    assert fake_agent[0].session_id == "session-1"
+
+
+def test_resume_refuses_when_the_provider_cannot_resume(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    driver = subject.AgentShimDriver(provider="codex")
+    session = driver.create_session(_spec(tmp_path))
+    fake_agent[0].session_id = None
+    fake_agent[0].supports_session_resume = False
+
+    assert session.resume_provider_session("thread-checkpoint") is False
+    assert fake_agent[0].session_id is None
+
+
+def test_a_turn_that_kept_its_conversation_stays_reusable(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    driver = subject.AgentShimDriver(provider="codex")
+    session = driver.create_session(_spec(tmp_path))
+
+    result = session.run_turn(AgentTurnRequest(message="one"))
+
+    assert result.disposition is subject.SessionDisposition.REUSABLE
+    assert fake_agent[0].session_id == "session-1"
+
+
+def test_codex_thread_budget_renewal_reports_a_reset(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    driver = subject.AgentShimDriver(provider="codex")
+    session = driver.create_session(_spec(tmp_path))
+
+    first = session.run_turn(AgentTurnRequest(message="one"))
+    second = session.run_turn(AgentTurnRequest(message="two"))
+
+    assert first.disposition is subject.SessionDisposition.REUSABLE
+    # The budget is spent, so the thread is retired and the caller is told the
+    # conversation this session named no longer exists.
+    assert second.disposition is subject.SessionDisposition.RESET_REQUIRED
+    assert second.provider_session_id == "session-1"
+    assert fake_agent[0].session_id is None
+
+
+def test_heavy_codex_turn_renewal_reports_a_reset(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    driver = subject.AgentShimDriver(provider="codex")
+    session = driver.create_session(_spec(tmp_path))
+    fake_agent[0]._last_session.final_usage = {"input_tokens": 20_000_000}  # noqa: SLF001
+
+    result = session.run_turn(AgentTurnRequest(message="one"))
+
+    assert result.disposition is subject.SessionDisposition.RESET_REQUIRED
+    assert fake_agent[0].session_id is None
+
+
+def test_missing_codex_rollout_retries_fresh_and_reports_a_reset(
+    fake_agent: list[_FakeAgent], tmp_path: Path
+) -> None:
+    driver = subject.AgentShimDriver(provider="codex")
+    session = driver.create_session(_spec(tmp_path))
+    agent = fake_agent[0]
+    attempts: list[str | None] = []
+
+    def generate(prompt: str, /, *, cwd: str | None, timeout: int | None, silent: bool) -> str:  # noqa: ARG001
+        attempts.append(agent.session_id)
+        if len(attempts) == 1:
+            raise RuntimeError(  # noqa: TRY003
+                "thread/resume failed: no rollout found for thread id session-1"
+            )
+        return "recovered"
+
+    agent.generate_override = generate
+
+    result = session.run_turn(AgentTurnRequest(message="one"))
+
+    assert result.text == "recovered"
+    assert attempts == ["session-1", None]
+    assert result.disposition is subject.SessionDisposition.RESET_REQUIRED
+
+
+def _claude_driver(
+    monkeypatch: pytest.MonkeyPatch, built: list[_FakeAgent]
+) -> subject.AgentShimDriver:
+    """Register the fake agent under ``claude`` and build a driver for it."""
+
+    def factory(
+        model: str | None = None,
+        event_handler: Any | None = None,  # noqa: ANN401  # tracked: #288
+        *,
+        executor: Any | None = None,  # noqa: ANN401  # tracked: #288
+    ) -> _FakeAgent:
+        agent = _FakeAgent(model, event_handler, executor=executor)
+        built.append(agent)
+        return agent
+
+    monkeypatch.setitem(subject._PROVIDER_CLASSES, "claude", factory)  # noqa: SLF001
+    monkeypatch.setattr(subject, "declare_agent_host_resources", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(subject, "build_host_sandbox", lambda *_args, **_kwargs: "sandbox")
+    return subject.AgentShimDriver(provider="claude")
+
+
+def test_stale_claude_session_retries_fresh_instead_of_killing_the_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    built: list[_FakeAgent] = []
+    driver = _claude_driver(monkeypatch, built)
+    session = driver.create_session(_spec(tmp_path, provider="claude"))
+    agent = built[0]
+    attempts: list[str | None] = []
+
+    def generate(prompt: str, /, *, cwd: str | None, timeout: int | None, silent: bool) -> str:  # noqa: ARG001
+        attempts.append(agent.session_id)
+        if len(attempts) == 1:
+            # Claude Code reports a refused resume as a bare nonzero exit.
+            raise RuntimeError("claude exited with code 1: ")  # noqa: TRY003
+        return "recovered"
+
+    agent.generate_override = generate
+
+    result = session.run_turn(AgentTurnRequest(message="one"))
+
+    assert result.text == "recovered"
+    assert attempts == ["session-1", None]
+    assert result.disposition is subject.SessionDisposition.RESET_REQUIRED
+
+
+def test_a_fresh_claude_turn_that_fails_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    built: list[_FakeAgent] = []
+    driver = _claude_driver(monkeypatch, built)
+    session = driver.create_session(_spec(tmp_path, provider="claude"))
+    agent = built[0]
+    agent.session_id = None
+    attempts: list[str | None] = []
+
+    def generate(prompt: str, /, *, cwd: str | None, timeout: int | None, silent: bool) -> str:  # noqa: ARG001
+        attempts.append(agent.session_id)
+        raise RuntimeError("claude exited with code 1: ")  # noqa: TRY003
+
+    agent.generate_override = generate
+
+    # Nothing was resumed, so the failure is the agent's own and propagates.
+    with pytest.raises(RuntimeError):
+        session.run_turn(AgentTurnRequest(message="one"))
+    assert attempts == [None]
