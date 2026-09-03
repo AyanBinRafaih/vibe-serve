@@ -61,6 +61,7 @@ import {
   switchChatThread,
   togglePaneZoom,
 } from '../session-model.js';
+import {TRANSCRIPT_MIN} from './agent-map.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 import {renderDesignSummary} from './design-log.js';
@@ -815,6 +816,105 @@ describe('OpenTUI presentation', () => {
     expect(controller.state.selectedAgentKind).not.toBe(firstAgent);
   });
 
+  /**
+   * The rail takes its column off the round view's width, so its breakpoints
+   * are only correct if the transcript still clears its floor beside it. This
+   * measures the laid-out transcript box rather than recomputing the width
+   * arithmetic, which is the only way a layout regression here shows up.
+   *
+   * 100 is the full-rail breakpoint and 80 is inside the range the review
+   * measured at 37 columns: with the rail's old 72-column collapse point the
+   * 13-column compact rail still appeared at 80 and squeezed the transcript
+   * under its minimum.
+   */
+  for (const width of [80, 100]) {
+    it(`keeps the transcript above its floor beside the rail at ${width} columns`, async () => {
+      const testRenderer = await createTestRenderer({width, height: 30});
+      const controller = new FakeController({
+        ...initialSessionState(),
+        selectedRound: 3,
+        core: {
+          ...initialSessionState().core,
+          rounds: [
+            {number: 1, status: 'completed'},
+            {number: 2, status: 'completed'},
+            {number: 3, status: 'active'},
+          ],
+          phases: [
+            {kind: 'implementer', status: 'completed', roundNumber: 3, roundLabel: 'round-3-impl'},
+            {kind: 'judge', status: 'active', roundNumber: 3, roundLabel: 'round-3-judge'},
+          ],
+          transcript: [
+            {
+              id: 'live',
+              kind: 'assistant',
+              label: 'judge',
+              content: 'live output',
+              agentKind: 'judge',
+              roundNumber: 3,
+            },
+          ],
+        },
+      });
+      const app = createOpenTuiApp(testRenderer.renderer, controller);
+      registerCleanup(testRenderer.renderer, app);
+      await testRenderer.waitForFrame(value => value.includes('live output'));
+
+      const transcript = testRenderer.renderer.root.findDescendantById('viewport');
+      if (transcript === undefined) throw new Error('round view was missing its transcript');
+      expect(transcript.width).toBeGreaterThanOrEqual(TRANSCRIPT_MIN);
+      // Whatever the rail decided, the three columns still add up to the terminal.
+      const rail = testRenderer.renderer.root.findDescendantById('round-rail');
+      const agents = testRenderer.renderer.root.findDescendantById('agent-map');
+      const railWidth = rail?.visible === true ? rail.width : 0;
+      expect(railWidth + (agents?.width ?? 0) + transcript.width).toBeLessThanOrEqual(width);
+    });
+  }
+
+  it("reads the rail's measured delta from the experiment log, not the design log", async () => {
+    // Per-round stage facts, the measured delta included, cross the protocol on
+    // `HypothesisRound`; the design log carries only each round's file list. The
+    // rail joins by round number so it and the experiments table cannot report
+    // different numbers for the same round.
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedRound: 2,
+      hypothesisScope: {id: 'H-01', label: 'H-01 · r1-r2', rounds: [1, 2]},
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'completed'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('▸r2'));
+    controller.publish({
+      ...controller.state,
+      experimentLog: {
+        entries: [
+          logEntry('H-01', 1, 2, {
+            rounds: [
+              {round: 1, passed: true, reviewed: true, perf_delta_pct: -3.5},
+              {round: 2, passed: true, reviewed: true, perf_delta_pct: 12.4},
+            ],
+          }),
+        ],
+        selectedId: null,
+        pending: false,
+        error: null,
+      },
+    });
+    const frame = await testRenderer.waitForFrame(value => value.includes('%'));
+
+    expect(frame).toContain('-3.5%');
+    expect(frame).toContain('+12%');
+  });
+
   it('leaves a stale rounds focus alone once a narrow width hides the rail', async () => {
     // A resize can hide the rail while `roundFocus` still reads `rounds`. At this
     // width the rail is gone, so Up/Down must drive a visible pane (the agents),
@@ -843,10 +943,12 @@ describe('OpenTUI presentation', () => {
     await testRenderer.waitForFrame(value => value.includes('implementer'));
 
     testRenderer.mockInput.pressKey('ARROW_DOWN');
-    await frameAfter(testRenderer);
+    const frame = await frameAfter(testRenderer);
     // The round selection did not move, and an agent carries the keys instead.
     expect(controller.state.selectedRound).toBe(1);
     expect(controller.state.selectedAgentKind).not.toBeNull();
+    // The pane taking the keys says so, so the view is never focus-less.
+    expect(frame).toContain('▸ Agents');
   });
 
   it('drives the rail with Up/Down while it is on screen', async () => {

@@ -35,10 +35,10 @@ export function todoStripWidth(agentPaneWidth: number, terminalWidth: number): n
  * rather than read back from the laid-out box. `output.height` reflects the last
  * committed layout, so it lags one paint behind a render that just changed it;
  * a sibling sized in the same paint (the rounds rail) needs the height the strip
- * is taking now, not the one it took last frame. Mirrors `render` exactly: no
- * visible todos means no strip, a collapsed strip is one summary row, and an
- * expanded strip is its capped items plus an optional overflow row inside a
- * border.
+ * is taking now, not the one it took last frame. `render` sets the box from this
+ * function, so the two cannot disagree: no visible todos means no strip, a
+ * collapsed strip is one summary row, and an expanded strip is its capped items
+ * plus an optional overflow row inside a border.
  */
 export function todoStripHeight(state: SessionState): number {
   const todos = visibleTodos(state);
@@ -132,6 +132,9 @@ export class TodoStripView {
     // The todos belong to the agent whose transcript is on the left, so the box
     // stops where that pane stops rather than running under the right pane.
     this.output.width = width ?? '100%';
+    // One source for the strip's height: siblings sized in this same paint read
+    // it from `todoStripHeight` too, so the box cannot end up a row off them.
+    this.output.height = todoStripHeight(state);
     if (
       todos === this.#renderedTodos &&
       state.todosExpanded === this.#renderedExpanded &&
@@ -150,7 +153,6 @@ export class TodoStripView {
   }
 
   #renderCollapsed(todos: TodoItem[]): void {
-    this.output.height = 1;
     this.output.add(
       new TextRenderable(this.renderer, {
         content: todoSummaryLine(todos, this.#contentWidth(false)),
@@ -165,7 +167,6 @@ export class TodoStripView {
     const shown = todos.slice(0, MAX_EXPANDED_ITEMS);
     const hidden = todos.length - shown.length;
     const height = shown.length + (hidden > 0 ? 1 : 0) + 2;
-    this.output.height = height;
     // The border belongs to a box that only exists while the list is open.
     // Toggling a border on a live box leaves a frame the layout has no rows
     // for, and the list then draws over it.

@@ -727,6 +727,24 @@ export function designRoundFor(
 }
 
 /**
+ * The experiment log's record for one round, or null before the log has it.
+ * Every stage fact about a round, including its measured delta, lives here:
+ * the design log carries only the file list, so a consumer that wants an
+ * outcome reads this rather than the design record.
+ */
+export function hypothesisRoundFor(
+  state: SessionState,
+  roundNumber: number | null,
+): HypothesisRound | null {
+  if (roundNumber === null) return null;
+  for (const entry of state.experimentLog?.entries ?? []) {
+    const record = entry.rounds?.find(candidate => candidate.round === roundNumber);
+    if (record !== undefined) return record;
+  }
+  return null;
+}
+
+/**
  * One round as both surfaces know it: the experiment log owns every stage
  * fact, the design log owns only the file list. The join is by round number,
  * which is the identity both fetches agree on, so the two can never describe

@@ -3,8 +3,8 @@ import {hasActiveAgentTiming, type RoundSummary, roundAgentElapsedMs} from '@vib
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {
-  designRoundFor,
   experimentLogVisible,
+  hypothesisRoundFor,
   stripRounds,
   visibleRoundNumber,
 } from '../session-model.js';
@@ -322,13 +322,14 @@ export class RoundRailView {
 /**
  * The per-round metric shown after the status word: the live elapsed time while
  * a round runs, its measured delta once resolved (the value the experiments
- * table reports, sourced from the same design record), or its wall duration
- * when no delta was measured. Planned rounds have nothing to measure.
+ * table reports, read from the same experiment-log record so the two cannot
+ * disagree), or its wall duration when no delta was measured. Planned rounds
+ * have nothing to measure.
  */
 function roundMetric(round: RoundSummary, state: SessionState, now: Date): string {
   if (round.status === 'planned') return '';
   if (round.status === 'active') return elapsedLabel(roundAgentElapsedMs(round, now));
-  const delta = designRoundFor(state, round.number)?.perf_delta_pct;
+  const delta = hypothesisRoundFor(state, round.number)?.perf_delta_pct;
   if (typeof delta === 'number') {
     return `${delta > 0 ? '+' : ''}${delta.toFixed(Math.abs(delta) >= 10 ? 0 : 1)}%`;
   }

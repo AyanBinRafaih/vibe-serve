@@ -73,6 +73,7 @@ export class AgentMapView {
   #theme: Theme;
   #renderedState: SessionState | null = null;
   #renderedWidth = 0;
+  #renderedFocus = false;
   #elapsedTimer: ReturnType<typeof setInterval> | null = null;
   #runningRound: {round: RoundSummary; text: TextRenderable} | null = null;
 
@@ -104,27 +105,43 @@ export class AgentMapView {
     this.#renderedState = null;
   }
 
-  render(state: SessionState, widthOverride?: number, availableWidth?: number): void {
+  /**
+   * `railWidth` is the column the rounds rail has taken, 0 when it is off
+   * screen. It sizes this pane against what is left, so the transcript keeps
+   * its floor beside a rail rather than being squeezed by it, and it says
+   * whether the rail is a surface the round keys can be on.
+   */
+  render(state: SessionState, widthOverride?: number, railWidth = 0): void {
     const phases = visiblePhases(state);
     // The pane's width follows the terminal, so a resize has to redraw even
-    // when the state is unchanged. `availableWidth` is the room left for the
-    // agents and transcript once the rounds rail has taken its column, so the
-    // transcript keeps its floor beside a rail rather than being squeezed by it.
+    // when the state is unchanged.
     const width =
       widthOverride ??
-      agentPaneWidth(availableWidth ?? this.renderer.terminalWidth, stageKinds(phases).length);
+      agentPaneWidth(this.renderer.terminalWidth - railWidth, stageKinds(phases).length);
     const paneWidth = width ?? STACKED_WIDTH;
-    if (state === this.#renderedState && paneWidth === this.#renderedWidth) return;
+    // A stale `rounds` focus lands here once the rail goes off screen, so the
+    // border follows the keys rather than the raw field: `keybindings` drives
+    // this pane in exactly that case, and a round view with no focus border on
+    // any pane is a view that does not say where its arrows go.
+    const focused =
+      state.roundFocus === 'agents' || (state.roundFocus === 'rounds' && railWidth === 0);
+    if (
+      state === this.#renderedState &&
+      paneWidth === this.#renderedWidth &&
+      focused === this.#renderedFocus
+    ) {
+      return;
+    }
     // Selection and focus are drawn into the nodes, so a change to either is a
     // reason to redraw even when the phases are identical.
     this.#renderedState = state;
     this.#renderedWidth = paneWidth;
+    this.#renderedFocus = focused;
     this.output.width = paneWidth;
     // The pane that owns the arrow keys says so, the way every other focusable
     // surface in the client does.
-    this.output.borderColor =
-      state.roundFocus === 'agents' ? this.#theme.borderFocus : this.#theme.border;
-    this.output.title = state.roundFocus === 'agents' ? ' ▸ Agents ' : ' Agents ';
+    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
+    this.output.title = focused ? ' ▸ Agents ' : ' Agents ';
     this.#clear();
     if (phases.length === 0) {
       // A round the run has not reached has no agents, and never will until it

@@ -350,7 +350,7 @@ export function createOpenTuiApp(
       agentMap.render(
         state,
         zoomedPane === 'agents' ? renderer.terminalWidth : undefined,
-        railWidth > 0 ? renderer.terminalWidth - railWidth : undefined,
+        railWidth,
       );
       // The todo box sits under the agent pane and stops where it stops: the
       // todos belong to an agent, so running them under the transcript would
