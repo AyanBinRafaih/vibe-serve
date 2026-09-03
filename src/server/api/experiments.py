@@ -10,7 +10,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 from server.api.protocol import HypothesisEntry, HypothesisRound
-from vibesys.schemas import derive_hypothesis_title
+from vibesys.loops.agent.model import HypothesisResolution
+from vibesys.schemas import CandidateDisposition, HypothesisOutcome, derive_hypothesis_title
 
 if TYPE_CHECKING:
     from vibesys.loops.agent.model import AgentRunState, Hypothesis
@@ -65,13 +66,40 @@ def _round(record: RoundRecord) -> HypothesisRound:
         round=record.round_number,
         passed=record.passed,
         reviewed=record.reviewed,
-        hypothesis_outcome=_text(record.hypothesis_outcome),
+        hypothesis_outcome=_outcome(record.hypothesis_outcome),
+        judge_verdict=record.judge_verdict,
         perf_metric=record.perf_metric,
         perf_unit=_text(record.perf_unit),
+        perf_delta_pct=record.perf_delta_pct,
         commit=_text(record.commit),
         official_evaluation=record.official_evaluation,
-        candidate_disposition=record.candidate_disposition,
+        candidate_disposition=_disposition(record.candidate_disposition),
     )
+
+
+def _outcome(value: str | None) -> HypothesisOutcome | HypothesisResolution | None:
+    """Read a stored outcome as one of the two vocabularies that produce it.
+
+    A round record holds the implementer's declared outcome unless the
+    framework resolved the hypothesis, in which case it holds the resolution
+    instead. Anything else is a legacy or retired value with no meaning for a
+    client, so it projects as "not recorded" rather than failing the log.
+    """
+    if not value:
+        return None
+    for vocabulary in (HypothesisOutcome, HypothesisResolution):
+        member = vocabulary.__members__.get(value.upper())
+        if member is not None and member.value == value:
+            return member
+    return None
+
+
+def _disposition(value: str | None) -> CandidateDisposition | None:
+    """Read a stored disposition, dropping values the framework retired."""
+    if not value:
+        return None
+    member = CandidateDisposition.__members__.get(value.upper())
+    return member if member is not None and member.value == value else None
 
 
 def _judge_verdict(hypothesis: Hypothesis) -> Literal["pass", "fail"] | None:

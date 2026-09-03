@@ -14,6 +14,9 @@ from server.events import RunEvent
 from server.execution import ActiveAgentExecution
 from server.run_lifecycle import RunStatus
 from server.settings import InteractiveSetupDefaults
+from vibesys.loops.agent.model import HypothesisResolution
+from vibesys.schemas import CandidateDisposition, HypothesisOutcome
+from vs_loop_state import JudgeVerdict
 
 PROTOCOL_VERSION = 1
 
@@ -102,6 +105,17 @@ class ExperimentQuery(Request):
     type: Literal["query.experiments"] = "query.experiments"
 
 
+class DesignQuery(Request):
+    """Request the per-round design log for the attached run.
+
+    The design log is the operator's view of what each round changed in the
+    system under optimization: the files the round touched and how each stage
+    of the round concluded.
+    """
+
+    type: Literal["query.design"] = "query.design"
+
+
 class EventsQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.events"] = "query.events"
     after_sequence: int = Field(default=0, ge=0)
@@ -133,6 +147,7 @@ ProtocolRequest = Annotated[
     | HistoryQuery
     | PerformanceQuery
     | ExperimentQuery
+    | DesignQuery
     | EventsQuery
     | SubscribeRequest,
     Field(discriminator="type"),
@@ -203,17 +218,39 @@ class PerformanceContext(ProtocolModel):
 
 
 class HypothesisRound(ProtocolModel):
-    """One round belonging to a hypothesis, for the experiment-log drill-down."""
+    """One round belonging to a hypothesis, for the experiment-log drill-down.
+
+    This is the single source for every per-round fact the server publishes.
+    Surfaces that need more about a round (the design log's file list, for
+    example) join to this row by ``round`` rather than restating its fields.
+
+    ``hypothesis_outcome`` and ``candidate_disposition`` are closed sets, so
+    the generated client union is closed too. A round record written before a
+    member existed, or carrying a value the framework no longer defines, is
+    projected as ``None``: unreadable and unrecorded are the same thing to a
+    client, and a stale string must not take down the whole log.
+    """
 
     round: int
     passed: bool
     reviewed: bool
-    hypothesis_outcome: str | None = None
+    # Either vocabulary can reach a round record: the implementer declares an
+    # outcome, and the framework may overwrite it with its own resolution.
+    hypothesis_outcome: HypothesisOutcome | HypothesisResolution | None = None
+    # The round's own review state, decided by its final implementer attempt.
+    # ``deferred`` means sparse-review policy skipped the judge; None marks a
+    # legacy record written before the framework stored a verdict. This is
+    # per-round and distinct from ``HypothesisEntry.judge_verdict``, which is
+    # the hypothesis-level review.
+    judge_verdict: JudgeVerdict | None = None
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
+    # Causal delta the round recorded against its own baseline. None when the
+    # round made no comparable measurement.
+    perf_delta_pct: FiniteFloat | None = None
     commit: str | None = None
     official_evaluation: bool = False
-    candidate_disposition: str | None = None
+    candidate_disposition: CandidateDisposition | None = None
 
 
 class HypothesisEntry(ProtocolModel):
@@ -264,6 +301,36 @@ class HypothesisEntry(ProtocolModel):
     active: bool = False
 
 
+class DesignFileChange(ProtocolModel):
+    """One workspace file a round's commit range touched."""
+
+    path: str
+    change: Literal["added", "modified", "deleted", "renamed"]
+    # The pre-rename path, present exactly when ``change`` is "renamed".
+    renamed_from: str | None = None
+
+
+class DesignRound(ProtocolModel):
+    """What one round changed in the workspace.
+
+    Deliberately narrow: every other per-round fact (outcome, review,
+    official evaluation, candidate disposition, measurement) already crosses
+    the protocol on ``HypothesisRound``, and a client joins the two by
+    ``round``. Publishing a second copy here let the two fetches disagree
+    about the same round.
+
+    ``files`` is derived from the run workspace's git history. None means the
+    round's commit range could not be resolved (no checkpoint recorded, or the
+    workspace history no longer has it), which is distinct from an empty list,
+    a resolved range that touched nothing outside framework bookkeeping.
+    """
+
+    round: int
+    # The round's end-of-round checkpoint, and the head of the diffed range.
+    commit: str | None = None
+    files: list[DesignFileChange] | None = None
+
+
 class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     protocol_version: Literal[1] = PROTOCOL_VERSION
     request_id: str
@@ -291,6 +358,9 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     # readiness marker separate preserves the protocol-v1 list contract while
     # distinguishing bootstrap from an authoritative empty experiment log.
     experiments_ready: bool | None = None
+    design: list[DesignRound] = Field(default_factory=list)
+    # Same bootstrap-versus-empty distinction as ``experiments_ready``.
+    design_ready: bool | None = None
 
     @classmethod
     def from_exception(

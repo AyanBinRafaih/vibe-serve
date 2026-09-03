@@ -371,6 +371,17 @@
       "title": "BenchmarkResultData",
       "type": "object"
     },
+    "CandidateDisposition": {
+      "description": "How a measured candidate should be retained independently of its hypothesis.\n\nHypothesis truth and checkpoint utility are different questions. A causal\nforecast can be disproven while its implementation still establishes a\nuseful throughput/latency tradeoff. These values keep that distinction\nexplicit without promoting provisional evidence to an official result.",
+      "enum": [
+        "unassessed",
+        "discard",
+        "prerequisite",
+        "pareto_frontier"
+      ],
+      "title": "CandidateDisposition",
+      "type": "string"
+    },
     "ChatData": {
       "properties": {
         "kind": {
@@ -865,6 +876,115 @@
         "exit_code"
       ],
       "title": "ConfigurationFailedData",
+      "type": "object"
+    },
+    "DesignFileChange": {
+      "additionalProperties": false,
+      "description": "One workspace file a round's commit range touched.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "change": {
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed"
+          ],
+          "title": "Change",
+          "type": "string"
+        },
+        "renamed_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Renamed From"
+        }
+      },
+      "required": [
+        "path",
+        "change"
+      ],
+      "title": "DesignFileChange",
+      "type": "object"
+    },
+    "DesignQuery": {
+      "additionalProperties": false,
+      "description": "Request the per-round design log for the attached run.\n\nThe design log is the operator's view of what each round changed in the\nsystem under optimization: the files the round touched and how each stage\nof the round concluded.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.design",
+          "default": "query.design",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "DesignQuery",
+      "type": "object"
+    },
+    "DesignRound": {
+      "additionalProperties": false,
+      "description": "What one round changed in the workspace.\n\nDeliberately narrow: every other per-round fact (outcome, review,\nofficial evaluation, candidate disposition, measurement) already crosses\nthe protocol on ``HypothesisRound``, and a client joins the two by\n``round``. Publishing a second copy here let the two fetches disagree\nabout the same round.\n\n``files`` is derived from the run workspace's git history. None means the\nround's commit range could not be resolved (no checkpoint recorded, or the\nworkspace history no longer has it), which is distinct from an empty list,\na resolved range that touched nothing outside framework bookkeeping.",
+      "properties": {
+        "round": {
+          "title": "Round",
+          "type": "integer"
+        },
+        "commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commit"
+        },
+        "files": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/DesignFileChange"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Files"
+        }
+      },
+      "required": [
+        "round"
+      ],
+      "title": "DesignRound",
       "type": "object"
     },
     "Diagnostic": {
@@ -1455,9 +1575,36 @@
       "title": "HypothesisEntry",
       "type": "object"
     },
+    "HypothesisOutcome": {
+      "description": "Implementer-owned status for the active experimental hypothesis.\n\n``SUPPORTED`` and ``NOMINATED`` are deliberately distinct from\n``PROVEN``: an implementer may submit evidence for independent review,\nbut only the judge can establish that the scoped hypothesis held.\n``NOMINATED`` additionally asks the framework to run its global gates for\nthe current candidate checkpoint. It does not imply that the overall\nobjective or terminal target has been achieved.",
+      "enum": [
+        "continue",
+        "supported",
+        "nominated",
+        "disproven",
+        "implementation_failed",
+        "inconclusive",
+        "blocked"
+      ],
+      "title": "HypothesisOutcome",
+      "type": "string"
+    },
+    "HypothesisResolution": {
+      "description": "Framework-owned resolution after all available evidence is known.",
+      "enum": [
+        "proven",
+        "disproven",
+        "inconclusive",
+        "implementation_failed",
+        "blocked",
+        "rejected"
+      ],
+      "title": "HypothesisResolution",
+      "type": "string"
+    },
     "HypothesisRound": {
       "additionalProperties": false,
-      "description": "One round belonging to a hypothesis, for the experiment-log drill-down.",
+      "description": "One round belonging to a hypothesis, for the experiment-log drill-down.\n\nThis is the single source for every per-round fact the server publishes.\nSurfaces that need more about a round (the design log's file list, for\nexample) join to this row by ``round`` rather than restating its fields.\n\n``hypothesis_outcome`` and ``candidate_disposition`` are closed sets, so\nthe generated client union is closed too. A round record written before a\nmember existed, or carrying a value the framework no longer defines, is\nprojected as ``None``: unreadable and unrecorded are the same thing to a\nclient, and a stale string must not take down the whole log.",
       "properties": {
         "round": {
           "title": "Round",
@@ -1474,7 +1621,10 @@
         "hypothesis_outcome": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/HypothesisOutcome"
+            },
+            {
+              "$ref": "#/$defs/HypothesisResolution"
             },
             {
               "type": "null"
@@ -1482,6 +1632,23 @@
           ],
           "default": null,
           "title": "Hypothesis Outcome"
+        },
+        "judge_verdict": {
+          "anyOf": [
+            {
+              "enum": [
+                "pass",
+                "fail",
+                "deferred"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Judge Verdict"
         },
         "perf_metric": {
           "anyOf": [
@@ -1507,6 +1674,18 @@
           "default": null,
           "title": "Perf Unit"
         },
+        "perf_delta_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Perf Delta Pct"
+        },
         "commit": {
           "anyOf": [
             {
@@ -1527,14 +1706,13 @@
         "candidate_disposition": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/CandidateDisposition"
             },
             {
               "type": "null"
             }
           ],
-          "default": null,
-          "title": "Candidate Disposition"
+          "default": null
         }
       },
       "required": [
@@ -2178,6 +2356,25 @@
           ],
           "default": null,
           "title": "Experiments Ready"
+        },
+        "design": {
+          "items": {
+            "$ref": "#/$defs/DesignRound"
+          },
+          "title": "Design",
+          "type": "array"
+        },
+        "design_ready": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Design Ready"
         }
       },
       "required": [
@@ -3114,6 +3311,7 @@
           "query.chat": "#/$defs/ChatQuery",
           "query.chat_options": "#/$defs/ChatOptionsQuery",
           "query.chat_thread_create": "#/$defs/ChatThreadCreateQuery",
+          "query.design": "#/$defs/DesignQuery",
           "query.events": "#/$defs/EventsQuery",
           "query.experiments": "#/$defs/ExperimentQuery",
           "query.history": "#/$defs/HistoryQuery",
@@ -3157,6 +3355,9 @@
         },
         {
           "$ref": "#/$defs/ExperimentQuery"
+        },
+        {
+          "$ref": "#/$defs/DesignQuery"
         },
         {
           "$ref": "#/$defs/EventsQuery"

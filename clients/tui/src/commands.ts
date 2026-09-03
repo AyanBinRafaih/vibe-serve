@@ -43,6 +43,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
     description: 'Open the selected hypothesis, or /open-round --N for round N',
   },
   {name: '/perf', description: 'Plot performance by round in the right pane'},
+  {name: '/design', description: 'Summarize each round’s file changes in the right pane'},
   {name: '/todos', description: "Expand or collapse the visible agent's todo list"},
   {name: '/prompt', description: 'Expand or collapse the latest prompt in view'},
   {name: '/theme', description: 'List themes, or switch with /theme <name>'},
@@ -188,6 +189,7 @@ export function parseCommand(text: string): ParsedCommand {
   if (text === '/perf') {
     return {request: {type: 'query.performance'}, responseView: 'perf', paneView: 'perf'};
   }
+  if (text === '/design') return {request: {type: 'query.design'}, paneView: 'design'};
   if (text.startsWith('/')) return {error: `Unknown command: ${text}. Use /help.`};
   if (text === '') return {error: 'Enter a slash command. Use /help.'};
   return {error: 'Commands start with /. Use Experiment chat for questions.'};

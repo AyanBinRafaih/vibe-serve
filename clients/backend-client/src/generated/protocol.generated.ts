@@ -12,6 +12,7 @@ export type Request =
   | HistoryQuery
   | PerformanceQuery
   | ExperimentQuery
+  | DesignQuery
   | EventsQuery
   | SubscribeRequest;
 export type ProtocolVersion = 1;
@@ -69,19 +70,23 @@ export type Type10 = "query.experiments";
 export type ProtocolVersion11 = 1;
 export type RequestId11 = string;
 export type Timestamp11 = string;
-export type Type11 = "query.events";
-export type AfterSequence = number;
-export type BeforeSequence = number | null;
-export type TimeoutMs = number;
+export type Type11 = "query.design";
 export type ProtocolVersion12 = 1;
 export type RequestId12 = string;
 export type Timestamp12 = string;
-export type Type12 = "subscribe";
-export type AfterSequence1 = number;
-export type Tail = number | null;
+export type Type12 = "query.events";
+export type AfterSequence = number;
+export type BeforeSequence = number | null;
+export type TimeoutMs = number;
 export type ProtocolVersion13 = 1;
 export type RequestId13 = string;
 export type Timestamp13 = string;
+export type Type13 = "subscribe";
+export type AfterSequence1 = number;
+export type Tail = number | null;
+export type ProtocolVersion14 = 1;
+export type RequestId14 = string;
+export type Timestamp14 = string;
 export type Ok = boolean;
 export type Error = string | null;
 export type Id = string;
@@ -141,7 +146,7 @@ export type TuiTheme =
   | "catppuccin-latte"
   | "high-contrast-dark"
   | "high-contrast-light";
-export type ProtocolVersion14 = 1;
+export type ProtocolVersion15 = 1;
 export type RunId = string;
 export type Sequence = number;
 /**
@@ -174,10 +179,10 @@ export type Provider3 = string | null;
 export type Model3 = string | null;
 export type ActiveExecutions = ActiveAgentExecution[];
 export type ChatThreads = ChatThreadInfo[];
-export type ProtocolVersion15 = 1;
+export type ProtocolVersion16 = 1;
 export type Sequence1 = number;
 export type RunId1 = string;
-export type Timestamp14 = string;
+export type Timestamp15 = string;
 export type EventType =
   | "server_started"
   | "server_ready"
@@ -373,18 +378,45 @@ export type LastRound = number;
 export type Round1 = number;
 export type Passed1 = boolean;
 export type Reviewed = boolean;
-export type HypothesisOutcome = string | null;
+export type HypothesisOutcome = HypothesisOutcome1 | HypothesisResolution | null;
+/**
+ * Implementer-owned status for the active experimental hypothesis.
+ *
+ * ``SUPPORTED`` and ``NOMINATED`` are deliberately distinct from
+ * ``PROVEN``: an implementer may submit evidence for independent review,
+ * but only the judge can establish that the scoped hypothesis held.
+ * ``NOMINATED`` additionally asks the framework to run its global gates for
+ * the current candidate checkpoint. It does not imply that the overall
+ * objective or terminal target has been achieved.
+ */
+export type HypothesisOutcome1 =
+  "continue" | "supported" | "nominated" | "disproven" | "implementation_failed" | "inconclusive" | "blocked";
+/**
+ * Framework-owned resolution after all available evidence is known.
+ */
+export type HypothesisResolution =
+  "proven" | "disproven" | "inconclusive" | "implementation_failed" | "blocked" | "rejected";
+export type JudgeVerdict1 = ("pass" | "fail" | "deferred") | null;
 export type PerfMetric2 = number | null;
 export type PerfUnit2 = string | null;
+export type PerfDeltaPct = number | null;
 export type Commit = string | null;
 export type OfficialEvaluation = boolean;
-export type CandidateDisposition = string | null;
+/**
+ * How a measured candidate should be retained independently of its hypothesis.
+ *
+ * Hypothesis truth and checkpoint utility are different questions. A causal
+ * forecast can be disproven while its implementation still establishes a
+ * useful throughput/latency tradeoff. These values keep that distinction
+ * explicit without promoting provisional evidence to an official result.
+ */
+export type CandidateDisposition = "unassessed" | "discard" | "prerequisite" | "pareto_frontier";
 export type Rounds = HypothesisRound[];
 export type ResolvedOutcome = string | null;
-export type JudgeVerdict1 = ("pass" | "fail") | null;
+export type JudgeVerdict2 = ("pass" | "fail") | null;
 export type PerfMetric3 = number | null;
 export type PerfUnit3 = string | null;
-export type PerfDeltaPct = number | null;
+export type PerfDeltaPct1 = number | null;
 export type PerfMetricName = string | null;
 export type PerfDirection = ("max" | "min") | null;
 export type PerfBaselineValue = number | null;
@@ -394,19 +426,27 @@ export type StrategyReason = string | null;
 export type Active = boolean;
 export type Experiments = HypothesisEntry[];
 export type ExperimentsReady = boolean | null;
+export type Round2 = number;
+export type Commit1 = string | null;
+export type Files = DesignFileChange[] | null;
+export type Path = string;
+export type Change = "added" | "modified" | "deleted" | "renamed";
+export type RenamedFrom = string | null;
+export type Design = DesignRound[];
+export type DesignReady = boolean | null;
 export type ServerMessage = SubscribedMessage | EventMessage | EventBatchMessage | ProtocolErrorMessage;
-export type Type13 = "subscribed";
-export type RequestId14 = string;
+export type Type14 = "subscribed";
+export type RequestId15 = string;
 export type RunId2 = string;
 export type LatestSequence = number;
-export type Type14 = "event";
-export type Type15 = "event_batch";
+export type Type15 = "event";
+export type Type16 = "event_batch";
 export type Events1 = RunEvent[];
 export type ThroughSequence = number;
 export type ActiveExecutions1 = ActiveAgentExecution[];
 export type HistoryAfterSequence = number;
-export type Type16 = "protocol_error";
-export type RequestId15 = string | null;
+export type Type17 = "protocol_error";
+export type RequestId16 = string | null;
 export type Code2 = string;
 export type Message1 = string;
 
@@ -514,27 +554,40 @@ export interface ExperimentQuery {
   timestamp?: Timestamp10;
   type?: Type10;
 }
-export interface EventsQuery {
+/**
+ * Request the per-round design log for the attached run.
+ *
+ * The design log is the operator's view of what each round changed in the
+ * system under optimization: the files the round touched and how each stage
+ * of the round concluded.
+ */
+export interface DesignQuery {
   protocol_version?: ProtocolVersion11;
   request_id?: RequestId11;
   timestamp?: Timestamp11;
   type?: Type11;
+}
+export interface EventsQuery {
+  protocol_version?: ProtocolVersion12;
+  request_id?: RequestId12;
+  timestamp?: Timestamp12;
+  type?: Type12;
   after_sequence?: AfterSequence;
   before_sequence?: BeforeSequence;
   timeout_ms?: TimeoutMs;
 }
 export interface SubscribeRequest {
-  protocol_version?: ProtocolVersion12;
-  request_id?: RequestId12;
-  timestamp?: Timestamp12;
-  type?: Type12;
+  protocol_version?: ProtocolVersion13;
+  request_id?: RequestId13;
+  timestamp?: Timestamp13;
+  type?: Type13;
   after_sequence?: AfterSequence1;
   tail?: Tail;
 }
 export interface Response {
-  protocol_version?: ProtocolVersion13;
-  request_id: RequestId13;
-  timestamp?: Timestamp13;
+  protocol_version?: ProtocolVersion14;
+  request_id: RequestId14;
+  timestamp?: Timestamp14;
   ok?: Ok;
   error?: Error;
   diagnostic?: Diagnostic | null;
@@ -549,6 +602,8 @@ export interface Response {
   performance_context?: PerformanceContext | null;
   experiments?: Experiments;
   experiments_ready?: ExperimentsReady;
+  design?: Design;
+  design_ready?: DesignReady;
 }
 /**
  * Structured, provider-neutral description of an operator diagnostic.
@@ -622,7 +677,7 @@ export interface InteractiveSetupDefaults {
   theme: TuiTheme;
 }
 export interface RunSnapshot {
-  protocol_version?: ProtocolVersion14;
+  protocol_version?: ProtocolVersion15;
   run_id: RunId;
   sequence: Sequence;
   status: RunStatus;
@@ -665,10 +720,10 @@ export interface AgentExecutionActivityData {
  * object, which lets ``EventStore`` replay history without copying it.
  */
 export interface RunEvent {
-  protocol_version?: ProtocolVersion15;
+  protocol_version?: ProtocolVersion16;
   sequence?: Sequence1;
   run_id?: RunId1;
-  timestamp: Timestamp14;
+  timestamp: Timestamp15;
   type: EventType;
   text?: Text2;
   diagnostic?: Diagnostic | null;
@@ -952,10 +1007,10 @@ export interface HypothesisEntry {
   last_round: LastRound;
   rounds?: Rounds;
   resolved_outcome?: ResolvedOutcome;
-  judge_verdict?: JudgeVerdict1;
+  judge_verdict?: JudgeVerdict2;
   perf_metric?: PerfMetric3;
   perf_unit?: PerfUnit3;
-  perf_delta_pct?: PerfDeltaPct;
+  perf_delta_pct?: PerfDeltaPct1;
   perf_metric_name?: PerfMetricName;
   perf_direction?: PerfDirection;
   perf_baseline_value?: PerfBaselineValue;
@@ -966,38 +1021,77 @@ export interface HypothesisEntry {
 }
 /**
  * One round belonging to a hypothesis, for the experiment-log drill-down.
+ *
+ * This is the single source for every per-round fact the server publishes.
+ * Surfaces that need more about a round (the design log's file list, for
+ * example) join to this row by ``round`` rather than restating its fields.
+ *
+ * ``hypothesis_outcome`` and ``candidate_disposition`` are closed sets, so
+ * the generated client union is closed too. A round record written before a
+ * member existed, or carrying a value the framework no longer defines, is
+ * projected as ``None``: unreadable and unrecorded are the same thing to a
+ * client, and a stale string must not take down the whole log.
  */
 export interface HypothesisRound {
   round: Round1;
   passed: Passed1;
   reviewed: Reviewed;
   hypothesis_outcome?: HypothesisOutcome;
+  judge_verdict?: JudgeVerdict1;
   perf_metric?: PerfMetric2;
   perf_unit?: PerfUnit2;
+  perf_delta_pct?: PerfDeltaPct;
   commit?: Commit;
   official_evaluation?: OfficialEvaluation;
-  candidate_disposition?: CandidateDisposition;
+  candidate_disposition?: CandidateDisposition | null;
+}
+/**
+ * What one round changed in the workspace.
+ *
+ * Deliberately narrow: every other per-round fact (outcome, review,
+ * official evaluation, candidate disposition, measurement) already crosses
+ * the protocol on ``HypothesisRound``, and a client joins the two by
+ * ``round``. Publishing a second copy here let the two fetches disagree
+ * about the same round.
+ *
+ * ``files`` is derived from the run workspace's git history. None means the
+ * round's commit range could not be resolved (no checkpoint recorded, or the
+ * workspace history no longer has it), which is distinct from an empty list,
+ * a resolved range that touched nothing outside framework bookkeeping.
+ */
+export interface DesignRound {
+  round: Round2;
+  commit?: Commit1;
+  files?: Files;
+}
+/**
+ * One workspace file a round's commit range touched.
+ */
+export interface DesignFileChange {
+  path: Path;
+  change: Change;
+  renamed_from?: RenamedFrom;
 }
 export interface SubscribedMessage {
-  type?: Type13;
-  request_id: RequestId14;
+  type?: Type14;
+  request_id: RequestId15;
   run_id: RunId2;
   latest_sequence: LatestSequence;
 }
 export interface EventMessage {
-  type?: Type14;
+  type?: Type15;
   event: RunEvent;
 }
 export interface EventBatchMessage {
-  type?: Type15;
+  type?: Type16;
   events: Events1;
   through_sequence?: ThroughSequence;
   active_executions?: ActiveExecutions1;
   history_after_sequence?: HistoryAfterSequence;
 }
 export interface ProtocolErrorMessage {
-  type?: Type16;
-  request_id?: RequestId15;
+  type?: Type17;
+  request_id?: RequestId16;
   code: Code2;
   message: Message1;
   diagnostic?: Diagnostic | null;

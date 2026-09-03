@@ -32,6 +32,7 @@ input accepts these slash commands:
 | `/open-round` | Open the rounds behind the selected hypothesis. |
 | `/open-round --N` | Open round N, inside whichever hypothesis owns it. |
 | `/perf` | Plot the recorded performance metric by round, in the right pane. |
+| `/design` | Summarize what each round changed in the workspace, in the right pane. |
 | `/theme` | Pick a theme from a keyboard-navigable list; `/theme <name>` switches immediately. |
 
 ### Experiment log
@@ -122,7 +123,7 @@ transcript behind it.
 ### Split panes
 
 Visualization commands render beside the current view rather than over it.
-`/perf` puts its output in a right pane and leaves the transcript, the chat,
+`/perf` and `/design` put their output in a right pane and leave the transcript, the chat,
 or the experiment log in the left one, both live at the same time. On the
 experiment log that makes three columns, chat, table, and visualization, each
 live. A second visualization command replaces the pane's contents rather than

@@ -18,7 +18,7 @@ from vibesys.loops.agent.model import (
 )
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.metrics import MetricSpace, Objective
-from vibesys.schemas import HypothesisOutcome, OrchestratorPlan
+from vibesys.schemas import CandidateDisposition, HypothesisOutcome, OrchestratorPlan
 from vs_loop_state import MetricComparison, RoundRecord
 from vs_project import AgentRunConfiguration, Project, RunEnvironmentRecord
 
@@ -125,6 +125,77 @@ def _hypothesis(
     }
     fields.update(overrides)
     return Hypothesis(**fields)
+
+
+def test_round_carries_its_own_verdict_and_causal_delta() -> None:
+    """Per-round review and delta cross once, on the experiment log's row."""
+    state = AgentRunState(
+        hypotheses=[
+            _hypothesis(
+                "H-01",
+                1,
+                rounds=[
+                    _round(
+                        1,
+                        hypothesis_id="H-01",
+                        judge_verdict="deferred",
+                        perf_delta_pct=12.5,
+                        hypothesis_outcome="proven",
+                        candidate_disposition="pareto_frontier",
+                    )
+                ],
+            )
+        ]
+    )
+
+    (entry,) = build_experiment_log(state)
+    (round_entry,) = entry.rounds
+
+    assert round_entry.judge_verdict == "deferred"
+    assert round_entry.perf_delta_pct == 12.5
+    assert round_entry.hypothesis_outcome == HypothesisResolution.PROVEN
+    assert round_entry.candidate_disposition == CandidateDisposition.PARETO_FRONTIER
+
+
+def test_round_reads_an_implementer_outcome_from_its_own_vocabulary() -> None:
+    """Both vocabularies reach a round record, and both stay closed sets."""
+    state = AgentRunState(
+        hypotheses=[
+            _hypothesis(
+                "H-01",
+                1,
+                rounds=[_round(1, hypothesis_id="H-01", hypothesis_outcome="nominated")],
+            )
+        ]
+    )
+
+    (entry,) = build_experiment_log(state)
+
+    assert entry.rounds[0].hypothesis_outcome == HypothesisOutcome.NOMINATED
+
+
+def test_round_drops_a_retired_outcome_rather_than_failing_the_log() -> None:
+    state = AgentRunState(
+        hypotheses=[
+            _hypothesis(
+                "H-01",
+                1,
+                rounds=[
+                    _round(
+                        1,
+                        hypothesis_id="H-01",
+                        hypothesis_outcome="retired_value",
+                        candidate_disposition="retained",
+                    )
+                ],
+            )
+        ]
+    )
+
+    (entry,) = build_experiment_log(state)
+
+    assert entry.rounds[0].hypothesis_outcome is None
+    assert entry.rounds[0].candidate_disposition is None
 
 
 def test_projection_uses_nested_rounds_and_one_official_measurement_tuple() -> None:

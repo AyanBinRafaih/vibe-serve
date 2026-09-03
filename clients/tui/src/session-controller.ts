@@ -31,6 +31,7 @@ import {
   closePane,
   closeThemePicker,
   cyclePaneFocus,
+  designRoundViews,
   dismissErrorBanner,
   enterExperimentDrilldown,
   enterExperimentRound,
@@ -76,6 +77,7 @@ import {
   setChatMenuCustomModel,
   setChatModelMenuOptions,
   setChatThreadPending,
+  setDesignLog,
   setExperiments,
   setPaneContent,
   setTheme,
@@ -86,6 +88,7 @@ import {
   toggleTodos,
   updateChatConversation,
 } from './session-model.js';
+import {renderDesignSummary} from './ui/design-log.js';
 import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
 
 export interface SessionController {
@@ -202,6 +205,8 @@ export class SocketSessionController implements SessionController {
   #experimentsRequestedAt: number | null = null;
   #experimentsLoadTraced = false;
   #paneFetch: Promise<void> | null = null;
+  /** Single-flight guard for the supplemental design-log refresh. */
+  #designFetch: Promise<void> | null = null;
   /** Single-flight guard for on-demand history backfill. */
   #historyFetch: Promise<boolean> | null = null;
   /**
@@ -631,17 +636,50 @@ export class SocketSessionController implements SessionController {
 
   async #requestPane(view: PaneView): Promise<void> {
     try {
-      const response = await this.client.request({type: 'query.performance'});
-      const content = renderPerformanceCurve(
-        response.performance ?? [],
-        response.events ?? [],
-        response.performance_context,
-      );
+      const content = await this.#renderPane(view);
       this.#setState(setPaneContent(this.#state, view, content));
     } catch (error) {
       const message = errorMessage(error);
       this.#setState(reportCaughtError(failPane(this.#state, view, message), error, 'request'));
     }
+  }
+
+  /** Exhaustive over PaneView, so a new visualization is a compile error. */
+  #renderPane(view: PaneView): Promise<string> {
+    switch (view) {
+      case 'perf':
+        return this.#renderPerfPane();
+      case 'design':
+        return this.#renderDesignPane();
+      default: {
+        const unreachable: never = view;
+        throw new Error(`Unknown pane view: ${String(unreachable)}`);
+      }
+    }
+  }
+
+  async #renderPerfPane(): Promise<string> {
+    const response = await this.client.request({type: 'query.performance'});
+    return renderPerformanceCurve(
+      response.performance ?? [],
+      response.events ?? [],
+      response.performance_context,
+    );
+  }
+
+  /**
+   * The design query carries only each round's file list. Every stage fact on
+   * the same row comes from the experiment log already in state, joined by
+   * round, so the pane and the drill-down cannot disagree about a round.
+   */
+  async #renderDesignPane(): Promise<string> {
+    const response = await this.client.request({type: 'query.design'});
+    if (response.design_ready === false) {
+      return 'The design log is not available until a run is attached.';
+    }
+    const rounds = response.design ?? [];
+    this.#setState(setDesignLog(this.#state, rounds));
+    return renderDesignSummary(designRoundViews(rounds, this.#state.experimentLog?.entries ?? []));
   }
 
   /**
@@ -712,6 +750,34 @@ export class SocketSessionController implements SessionController {
     } catch (error) {
       const message = errorMessage(error);
       this.#setState(reportCaughtError(failExperiments(this.#state, message), error, 'request'));
+    }
+    void this.#refreshDesignLog();
+  }
+
+  /**
+   * The design log annotates the hypothesis drill-down, so it rides the same
+   * triggers as the experiment fetch but never its promise: the query runs git
+   * over the run's history, and the landing view must not wait on that to
+   * report boot. Single-flighted on its own so overlapping refreshes collapse.
+   * Best effort: on failure the drill-down keeps whatever it last showed and
+   * stays quiet, because `/design` reports errors through the pane.
+   */
+  #refreshDesignLog(): Promise<void> {
+    if (this.#designFetch !== null) return this.#designFetch;
+    const fetch = this.#requestDesignLog().finally(() => {
+      this.#designFetch = null;
+    });
+    this.#designFetch = fetch;
+    return fetch;
+  }
+
+  async #requestDesignLog(): Promise<void> {
+    try {
+      const response = await this.client.request({type: 'query.design'});
+      if (response.design_ready === false) return;
+      this.#setState(setDesignLog(this.#state, response.design ?? []));
+    } catch {
+      // Supplemental data: no banner, no experiment-log error state.
     }
   }
 

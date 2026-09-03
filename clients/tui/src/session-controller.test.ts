@@ -97,7 +97,13 @@ describe('session controller', () => {
     // The event replay is the long pole; nothing waits behind it, and nothing
     // waits behind the two independent queries either.
     expect([...started].sort()).toEqual(['query.experiments', 'query.snapshot', 'subscribe']);
-    for (const resolve of pending) resolve();
+    for (const resolve of pending.splice(0)) resolve();
+
+    // The design log deliberately rides behind the experiments answer rather
+    // than the boot barrier, so it is the one follow-up request here.
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    expect(started).toContain('query.design');
+    for (const resolve of pending.splice(0)) resolve();
     await boot;
   });
 
@@ -720,7 +726,8 @@ describe('session controller', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(transport.requests.length - before).toBe(1);
+    const refetches = transport.requests.slice(before).filter(r => r.type === 'query.experiments');
+    expect(refetches).toHaveLength(1);
     expect(controller.state.experimentLog?.entries).toHaveLength(3);
     expect(controller.state.experimentLog?.selectedId).toBe('H-02');
     expect(controller.state.experimentLog?.entries[1]?.resolved_outcome).toBe('rejected');
@@ -809,9 +816,82 @@ describe('session controller', () => {
     expect(controller.state.experimentLog?.pending).toBe(true);
     await controller.start();
 
-    expect(transport.requests).toEqual([{type: 'query.snapshot'}, {type: 'query.experiments'}]);
+    expect(transport.requests).toEqual([
+      {type: 'query.snapshot'},
+      {type: 'query.experiments'},
+      {type: 'query.design'},
+    ]);
     expect(controller.state.experimentLog?.pending).toBe(false);
     expect(controller.state.experimentLog?.selectedId).toBe('H-01');
+  });
+
+  it('loads the design log with the experiments so the drill-down can annotate rounds', async () => {
+    const transport = new FakeTransport();
+    transport.design = [{round: 1, files: [{path: 'src/ring.rs', change: 'added'}]}];
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(controller.state.designLog).toEqual(transport.design);
+  });
+
+  it('leaves the design log unloaded until the backend reports it ready', async () => {
+    const transport = new FakeTransport();
+    transport.designReady = false;
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(controller.state.designLog).toBeNull();
+  });
+
+  it('renders /design in the right pane, joining stage facts by round', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {
+        title: 'Pad the ring indices',
+        rounds: [{round: 1, passed: true, reviewed: true, judge_verdict: 'pass'}],
+      }),
+    ];
+    transport.design = [
+      {
+        round: 1,
+        files: [
+          {path: 'src/ring.rs', change: 'added'},
+          {path: 'src/lib.rs', change: 'modified'},
+        ],
+      },
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    await controller.submitCommand('/design');
+
+    expect(controller.state.overlay).toBeNull();
+    expect(controller.state.layout.right?.view).toBe('design');
+    expect(controller.state.layout.right?.title).toBe('Design changes');
+    expect(controller.state.layout.right?.content).toContain('Design changes by round');
+    expect(controller.state.layout.right?.content).toContain(
+      'Round 1 · H-01 · Pad the ring indices',
+    );
+    expect(controller.state.layout.right?.content).toContain('src/ring.rs, src/lib.rs');
+    expect(controller.state.designLog).toEqual(transport.design);
+  });
+
+  it('says the design log is not ready instead of showing an empty pane', async () => {
+    const transport = new FakeTransport();
+    transport.designReady = false;
+    const controller = new SocketSessionController(transport);
+
+    await controller.submitCommand('/design');
+
+    expect(controller.state.layout.right?.content).toContain(
+      'not available until a run is attached',
+    );
+    expect(controller.state.designLog).toBeNull();
   });
 
   it('keeps bootstrap pending until attached experiments become ready', async () => {
@@ -936,7 +1016,8 @@ describe('session controller', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(transport.requests.length - before).toBe(1);
+    const refetches = transport.requests.slice(before).filter(r => r.type === 'query.experiments');
+    expect(refetches).toHaveLength(1);
   });
 
   it('refetches again when experiments change during an in-flight fetch', async () => {
@@ -950,13 +1031,13 @@ describe('session controller', () => {
     transport.emit(event(2, 'experiments_changed'));
     transport.emit(event(3, 'experiments_changed'));
     transport.resolveExperiment([entry('H-stale', 1, 1, {active: true})]);
-    await Promise.resolve();
-    await Promise.resolve();
+    // A macrotask, because the design refresh sits between the answer and the
+    // queued refetch and its length is not this test's concern.
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
 
     expect(transport.experimentRequests).toBe(3);
     transport.resolveExperiment([entry('H-current', 1, 2, {resolved_outcome: 'proven'})]);
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
 
     expect(controller.state.experimentLog?.selectedId).toBe('H-current');
     expect(transport.experimentRequests).toBe(3);
@@ -1705,9 +1786,9 @@ describe('a stream that re-bootstraps at a raised floor', () => {
     await Promise.resolve();
 
     expect(controller.state.core.historyAfterSequence).toBe(4);
-    expect(transport.requests.slice(before).map(request => request.type)).toEqual([
-      'query.experiments',
-    ]);
+    expect(
+      transport.requests.slice(before).filter(request => request.type === 'query.experiments'),
+    ).toHaveLength(1);
   });
 });
 
@@ -1743,6 +1824,8 @@ class FakeTransport implements ServerTransport {
   /** Mutable so a test can change what a refetch returns mid-run. */
   experiments: NonNullable<ProtocolResponse['experiments']> = [];
   experimentsReady = true;
+  design: NonNullable<ProtocolResponse['design']> = [];
+  designReady = true;
   readonly requests: RequestInput[] = [];
   #message: ((message: ServerMessage) => void) | null = null;
   #disconnect: ((error: Error) => void) | null = null;
@@ -1766,6 +1849,8 @@ class FakeTransport implements ServerTransport {
       performance: this.responsePerformance,
       experiments: this.experiments,
       experiments_ready: this.experimentsReady,
+      design: this.design,
+      design_ready: this.designReady,
       ...(input.type === 'query.chat'
         ? {
             chat: this.responseChat ?? {

@@ -84,6 +84,14 @@ class GitTracker:
 
     _CANDIDATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+    # Abbreviated or full object name. Deliberately not a revision expression:
+    # read helpers accept only values that cannot be read as a git option.
+    _OBJECT_NAME = re.compile(r"^[0-9a-f]{7,64}$")
+
+    # Bound on a read-only history query, so a wedged git cannot hold a
+    # caller's thread (a frontend request thread, for instance) open forever.
+    _READ_TIMEOUT_SECONDS = 10.0
+
     def __init__(  # noqa: D107  # tracked: #288
         self,
         root: Path,
@@ -129,15 +137,26 @@ class GitTracker:
         return result
 
     def run(
-        self, cmd: list[str], *, check: bool = True, env: dict[str, str] | None = None
+        self,
+        cmd: list[str],
+        *,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
-        """Run a git command in the workspace, logging stderr on failure."""
+        """Run a git command in the workspace, logging stderr on failure.
+
+        ``timeout`` bounds the call and raises ``subprocess.TimeoutExpired``,
+        which callers that must not block (a request thread, say) handle.
+        """
         if env is None:
             env = os.environ.copy()
             for variable in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
                 env.pop(variable, None)
             env.update(self._GIT_ENV)
-        result = subprocess.run(cmd, cwd=self.root, capture_output=True, env=env)  # noqa: PLW1510, S603  # tracked: #288
+        result = subprocess.run(  # noqa: PLW1510, S603  # tracked: #288
+            cmd, cwd=self.root, capture_output=True, env=env, timeout=timeout
+        )
         if check and result.returncode != 0:
             stderr = result.stderr.decode(errors="replace").strip()
             self._log(f"[git-tracking] command failed: {' '.join(cmd)}")
@@ -275,6 +294,44 @@ class GitTracker:
                 *self._state_integration.metadata_restore_exclusions,
             ]
         ).stdout.decode(errors="replace")
+
+    def diff_name_status(self, base: str, head: str) -> str | None:
+        """Return the NUL-delimited ``--name-status`` diff between two commits.
+
+        Read-only: nothing about the workspace, index, or refs changes. Rename
+        detection is on, so a rename arrives as one ``R<score>`` record with
+        both paths. Returns None when the range does not resolve in this
+        repository, when git is unavailable, or when the query outruns
+        ``_READ_TIMEOUT_SECONDS``; each of those is logged rather than
+        collapsing silently at the caller.
+
+        Both arguments must be commit-ish values, not revision expressions or
+        options. A value that is not a plain object name raises ``ValueError``
+        so a caller cannot smuggle a flag onto the git command line.
+        """
+        for value in (base, head):
+            if self._OBJECT_NAME.fullmatch(value) is None:
+                raise ValueError(f"not a commit object name: {value!r}")  # noqa: TRY003  # tracked: #288
+        command = [
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--name-status",
+            "--find-renames",
+            "-z",
+            base,
+            head,
+        ]
+        try:
+            result = self.run(command, check=False, timeout=self._READ_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self._log(f"[git-tracking] read-only diff failed: {' '.join(command)}: {error}")
+            return None
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace").strip()
+            self._log(f"[git-tracking] read-only diff exit {result.returncode}: {stderr}")
+            return None
+        return result.stdout.decode("utf-8", errors="replace")
 
     def _commit_staged(self, label: str) -> None:
         """Commit the current index, logging when it contains no changes."""

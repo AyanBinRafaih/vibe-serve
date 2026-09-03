@@ -35,6 +35,13 @@ describe('parseCommand', () => {
       localView: 'chat',
       chatMessage: 'what changed in the latest round?',
     });
+    // Every visualization goes through the one pane mechanism, so /design
+    // reaches the right pane exactly the way /perf does.
+    expect(parseCommand('/design')).toEqual({
+      request: {type: 'query.design'},
+      paneView: 'design',
+    });
+    expect(SLASH_COMMANDS.map(command => command.name)).toContain('/design');
   });
 
   it('parses run-control commands', () => {
@@ -191,6 +198,7 @@ describe('slash-command input helpers', () => {
       '/steer',
       '/open-round',
       '/perf',
+      '/design',
       '/todos',
       '/prompt',
       '/theme',
