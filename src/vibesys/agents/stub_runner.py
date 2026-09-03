@@ -37,6 +37,16 @@ class StubAgentClient:
     def close(self) -> None:
         """The deterministic stub owns no external resources."""
 
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Never name a conversation: the stub runs no provider at all."""
+        del session_key
+        return None
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Never name a conversation: the stub runs no provider at all."""
+        del session_key
+        return None
+
     def set_log_file(self, stream: object) -> None:
         """Accept log retargeting; the deterministic stub emits no file logs."""
         del stream

@@ -57,6 +57,10 @@ T = TypeVar("T", bound=BaseModel)
 class _CachedSession:
     spec: AgentSessionSpec
     session: AgentSession
+    #: The provider conversation the last completed turn on this session ran
+    #: in. Kept beside the live handle so a caller can name the conversation
+    #: its next turn continues without a durable store being wired.
+    provider_session_id: str | None = None
 
 
 class AgentDiagnosticLog:
@@ -195,6 +199,9 @@ class AgentClient:
             containerized=containerized,
         )
         self._sessions: dict[AgentSessionKey, _CachedSession] = {}
+        # Where each key's last completed turn ran, kept across evictions so a
+        # caller can tell a retired conversation from a replaced one.
+        self._last_turn_sessions: dict[AgentSessionKey, str | None] = {}
         self._closed = False
 
     @property
@@ -486,6 +493,9 @@ class AgentClient:
                 error.add_note(f"agent session cleanup also failed: {cleanup_error}")
             raise
 
+        # Recorded for both dispositions, and exactly as reported: this is where
+        # the turn ran, which a reset afterwards does not change.
+        self._last_turn_sessions[session_key] = result.provider_session_id
         if result.disposition is SessionDisposition.RESET_REQUIRED:
             # The driver restarted or abandoned the conversation this key names,
             # so both the live session and the checkpoint describe history that
@@ -493,8 +503,36 @@ class AgentClient:
             self._evict(session_key)
             self._session_store.clear(session_key)
         else:
+            if result.provider_session_id is not None:
+                cached.provider_session_id = result.provider_session_id
             self._checkpoint(session_key, session_spec, fingerprint, result)
         return result
+
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Name the provider conversation the next turn on ``session_key`` continues.
+
+        ``None`` means the next turn starts from no history at all: no live
+        session holds a conversation, and no checkpoint survives for the key.
+        A caller that shortens a prompt because a conversation already carries
+        its instructions asks this first.
+        """
+        cached = self._sessions.get(session_key)
+        if cached is not None and cached.provider_session_id is not None:
+            return cached.provider_session_id
+        record = self._session_store.get(session_key)
+        return None if record is None else record.session_id
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Name the provider conversation the last completed turn on the key ran in.
+
+        A driver-reported restart does not clear this, which is what separates
+        it from :meth:`provider_session_id`: a conversation retired *after* it
+        served a turn still answered that turn, while one replaced *while*
+        serving it did not. A caller that shortened a prompt compares this
+        against the conversation that justified the shortening; a difference
+        means the shortened prompt reached an agent without its instructions.
+        """
+        return self._last_turn_sessions.get(session_key)
 
     def _resume_checkpoint(
         self,

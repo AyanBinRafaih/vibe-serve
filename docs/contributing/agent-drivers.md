@@ -62,6 +62,26 @@ nothing about whether the conversation is still resumable, so the client keeps
 the checkpoint and only a driver-reported reset (or a refused adoption) clears
 it.
 
+### Retired after a turn, or replaced during one
+
+A reset says the conversation is gone, not when it went. The two cases differ
+for any caller that shortens a prompt because a conversation already carries
+its instructions, so `AgentClient` answers both questions separately:
+
+- `provider_session_id(key)` names the conversation the **next** turn
+  continues, or `None` when the next turn starts from nothing. A reset clears
+  it.
+- `last_turn_provider_session_id(key)` names the conversation the **last
+  completed** turn ran in. A reset does not clear it.
+
+An over-budget Codex thread is retired after it has answered, so the two
+disagree only from the next turn onward: that answer stands, and the next
+prompt is a cold one. A missing rollout or a refused `claude --resume` is
+replaced mid-turn, so the last turn ran somewhere the caller did not intend,
+and a caller that shortened its prompt has to ask again in full. The
+experiment chat is the caller that does this today
+(`src/server/chat/session.py`).
+
 ## Mock driver
 
 `driver = "mock"` is test infrastructure. It satisfies the same driver

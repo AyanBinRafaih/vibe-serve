@@ -86,6 +86,14 @@ class PlainLoopAgentClient(AgentClient):
         """Close the inner client."""
         self._inner.close()
 
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Report the inner client's conversation for ``session_key``."""
+        return self._inner.provider_session_id(session_key)
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Report where the inner client's last turn on ``session_key`` ran."""
+        return self._inner.last_turn_provider_session_id(session_key)
+
     def invoke_text(  # noqa: PLR0913
         self,
         *,

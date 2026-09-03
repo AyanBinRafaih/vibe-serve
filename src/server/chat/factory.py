@@ -19,6 +19,7 @@ from server.chat.session import (
 )
 from server.events import ChatThreadCreatedData
 from vibesys.agents import build_agent_client
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.domains.environment import EnvironmentBindMount
 from vibesys.run import RunLogger
 from vibesys.run.integration import AgentSelection, RunAttachment
@@ -32,6 +33,13 @@ if TYPE_CHECKING:
     from server.controller import RunController
     from server.execution import ExecutionTracker
     from vs_project import Project
+
+
+#: Session-key identifier for the run's default chat, which has no thread ID of
+#: its own. Threads are ``uuid4().hex``, so this cannot collide with one; it is
+#: the same name the client already shows the default thread under
+#: (``DEFAULT_CHAT_THREAD_ID`` in ``clients/core-state``).
+DEFAULT_CHAT_THREAD = "default"
 
 
 class SelectionResolver(Protocol):
@@ -288,6 +296,12 @@ class ExperimentChatFactory:
                 controller=self._controller,
                 executions=self._executions,
                 agent_client=resources.client,
+                # One conversation per thread. The run's default chat has no
+                # thread ID of its own, so it names the identifier the threads
+                # cannot collide with.
+                session_key=AgentSessionKey(
+                    SessionScope.CHAT, DEFAULT_CHAT_THREAD if thread_id is None else thread_id
+                ),
                 workspace=self._workspace,
                 state_dir=state_dir,
                 agent_shared_state_dir=resources.agent_shared_state_dir,
