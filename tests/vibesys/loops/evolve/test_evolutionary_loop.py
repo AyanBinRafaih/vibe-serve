@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,6 +36,7 @@ from vibesys.loops.evolve.loop import (
     _latest_wip_seed,
     _plan_candidate,
     _recent_failure_lessons,
+    _run_framework_benchmark_gate,
     _run_generation_parallel,
     _teardown_candidate_deployment,
     run_evolve_loop,
@@ -53,7 +54,7 @@ from vibesys.loops.evolve.search_policy import (
 from vibesys.loops.evolve.state import EvolutionStateStore
 from vibesys.loops.metrics import MetricSpace, Objective
 from vibesys.profilers import ProfilerKind
-from vibesys.run import GitTracker, LoopContext, RunState, RunStateNamespace
+from vibesys.run import EventJournal, GitTracker, LoopContext, RunState, RunStateNamespace
 from vibesys.sandbox.run_environment import CandidateRuntime, RunEnvironmentSpec
 from vibesys.schemas import JudgeResponse, MutatorResponse, ProfilerSummary, Verdict
 from vs_project import EvolveRunConfiguration, Project, RunEnvironmentRecord
@@ -62,7 +63,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from vibesys.constants import ComputeBackend
-    from vibesys.input_manifest import WorkspaceSource
+    from vibesys.input_manifest import BenchmarkResult, WorkspaceSource
     from vibesys.loops.evolve.search_policy import SearchPolicyName
     from vibesys.run import RepositoryVisibility
 
@@ -90,6 +91,9 @@ class _EvolveLoopKwargs(TypedDict, total=False):
     evaluator_path: Path | None
     evaluator_package_root: Path | None
     accuracy_timeout_seconds: int | None
+    benchmark_result: BenchmarkResult | None
+    benchmark_result_protocol: Literal[2] | None
+    benchmark_timeout_seconds: int | None
     max_generations: int
     children_per_generation: int
     k_top_inspirations: int
@@ -130,15 +134,18 @@ class _FakeLoopContext(LoopContext):
     that reaches past what the test set up fails loudly.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  # tracked: #288
         self,
         *,
         git: GitTracker | None = None,
         state: RunState | None = None,
         run_environment: object | None = None,
         run_environment_view: object | None = None,
+        events: EventJournal | None = None,
         log: Callable[[str], None] = _discard_log,
     ) -> None:
+        if events is not None:
+            self.events = events
         if git is not None:
             self.git = git
         if state is not None:
@@ -1505,3 +1512,265 @@ def test_loop_tears_down_candidate_on_pass_and_fail_paths(tmp_path, ref_file):  
 
     # 1 bootstrap attempt + 2 generation candidates = 3 teardown calls.
     assert teardown.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Declared benchmark result contract (framework-owned fitness)
+# ---------------------------------------------------------------------------
+
+
+def _passing_gate_result(  # noqa: ANN202
+    metric_value: float,
+    *,
+    unit: str | None = None,
+    row: dict[str, float] | None = None,
+):
+    from vibesys.loops.gates import (  # noqa: PLC0415  # tracked: #288
+        BenchmarkGateResult,
+        FrameworkBenchmarkOutcome,
+    )
+
+    return BenchmarkGateResult(
+        command="trusted-benchmark --json /tmp/result.json",
+        output="ok",
+        executed=True,
+        outcome=FrameworkBenchmarkOutcome(
+            metric_name="total_ops_per_sec",
+            metric_value=metric_value,
+            metric_direction="max",
+            metric_unit=unit,
+            row=row,
+        ),
+    )
+
+
+def test_benchmark_gate_extends_timeout_by_environment_setup_allowance():  # noqa: ANN201  # tracked: #288
+    """Environment-owned deployment/readiness time must not eat the benchmark
+    command's declared budget: the evolve gate forwards setup + contract, the
+    same setup-aware policy the agent path uses."""
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+    from vibesys.loops.gates import BenchmarkContract  # noqa: PLC0415  # tracked: #288
+
+    ctx = _FakeLoopContext(
+        run_environment_view=SimpleNamespace(framework_setup_timeout_seconds=90),
+        events=MagicMock(),
+    )
+    contract = BenchmarkContract(
+        result_spec=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+        timeout_seconds=120,
+    )
+    gate = MagicMock(return_value=_passing_gate_result(1.0))
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        _run_framework_benchmark_gate(
+            ctx,
+            generation=0,
+            child_idx=0,
+            contract=contract,
+            space=MetricSpace(),
+        )
+
+    # 120 (contract budget) + 90 (environment setup allowance), not the bare 120.
+    assert gate.call_args.kwargs["timeout_seconds"] == 210
+
+
+def test_benchmark_gate_timeout_unchanged_without_setup_allowance():  # noqa: ANN201  # tracked: #288
+    """With no setup allowance the forwarded budget is exactly the contract's."""
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+    from vibesys.loops.gates import BenchmarkContract  # noqa: PLC0415  # tracked: #288
+
+    ctx = _FakeLoopContext(
+        run_environment_view=SimpleNamespace(framework_setup_timeout_seconds=0),
+        events=MagicMock(),
+    )
+    contract = BenchmarkContract(
+        result_spec=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+        timeout_seconds=120,
+    )
+    gate = MagicMock(return_value=_passing_gate_result(1.0))
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        _run_framework_benchmark_gate(
+            ctx,
+            generation=0,
+            child_idx=0,
+            contract=contract,
+            space=MetricSpace(),
+        )
+
+    assert gate.call_args.kwargs["timeout_seconds"] == 120
+
+
+def test_benchmark_contract_owns_seed_and_child_fitness(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """A declared benchmark result contract, not the profiler agent's
+    self-report, records every candidate's fitness."""
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+
+    runner = _make_runner()
+    gate = MagicMock(side_effect=[_passing_gate_result(42.5), _passing_gate_result(43.75)])
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        result = _invoke_loop(
+            tmp_path,
+            ref_file,
+            runner,
+            max_generations=1,
+            children_per_generation=1,
+            benchmark_result=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+        )
+
+    assert result is True
+    assert gate.call_count == 2
+    assert gate.call_args.kwargs["result_spec"].metric == "total_ops_per_sec"
+    pop = _load_population(tmp_path)
+    assert [item.perf_metric for item in pop.all] == [42.5, 43.75]
+    # The scalar contract declares a metric name, not a unit, so the recorded
+    # unit stays the profiler's. A metric name is not a unit.
+    assert {item.perf_unit for item in pop.all} == {"tok/s"}
+    assert pop.all[0].metrics == {"total_ops_per_sec": 42.5}
+    # The profiler still ran for diagnostics; its self-report was not recorded.
+    assert runner.counters["profiler"] == 2
+
+
+def test_benchmark_contract_failure_fails_the_candidate_before_profiling(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+    from vibesys.loops.gates import (  # noqa: PLC0415  # tracked: #288
+        BenchmarkGateResult,
+        FrameworkBenchmarkOutcome,
+    )
+
+    runner = _make_runner()
+    failing = BenchmarkGateResult(
+        command="trusted-benchmark --json /tmp/result.json",
+        output="benchmark exploded",
+        executed=True,
+        outcome=FrameworkBenchmarkOutcome(
+            feedback="Framework benchmark failed.\nbenchmark exploded"
+        ),
+    )
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", MagicMock(return_value=failing)):
+        result = _invoke_bootstrap(
+            tmp_path,
+            ref_file,
+            runner,
+            benchmark_result=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+            bootstrap_max_attempts=1,
+        )
+
+    assert result is False
+    assert runner.counters["profiler"] == 0
+    pop = _load_population(tmp_path)
+    assert len(pop) == 1
+    failed = pop.all[0]
+    assert failed.passed is False
+    assert "Framework benchmark failed." in (failed.feedback or "")
+
+
+def test_no_benchmark_contract_keeps_profiler_fitness(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    runner = _make_runner()
+    gate = MagicMock()
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        result = _invoke_bootstrap(tmp_path, ref_file, runner)
+
+    assert result is True
+    gate.assert_not_called()
+    seed = _load_population(tmp_path).all[0]
+    assert seed.perf_metric == 10.0
+    assert seed.perf_unit == "tok/s"
+
+
+def test_scalar_contract_keeps_the_profilers_other_axes_on_the_frontier(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """Regression: a one-metric contract must not empty a two-axis frontier.
+
+    ``Population.frontier`` keeps only individuals carrying a value for every
+    configured axis. The scalar result contract reports one number, so writing
+    the trusted row *over* the profiler's row left every individual missing the
+    second axis and the frontier came back empty, which in turn starves Pareto
+    parent selection. The trusted row now overrides the axes it measures and
+    leaves the rest of the profiler's row in place.
+    """
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+
+    space = MetricSpace(
+        objectives=(
+            Objective(name="total_ops_per_sec", direction="max"),
+            Objective(name="p99_latency_ns", direction="min"),
+        )
+    )
+    profiler_responses = [
+        ProfilerSummary(
+            analysis="ok",
+            bottlenecks="none",
+            suggestions="none",
+            perf_metric=100.0,
+            perf_unit="ops/s",
+            metrics={"total_ops_per_sec": 100.0, "p99_latency_ns": 500.0},
+        ),
+        ProfilerSummary(
+            analysis="ok",
+            bottlenecks="none",
+            suggestions="none",
+            perf_metric=80.0,
+            perf_unit="ops/s",
+            metrics={"total_ops_per_sec": 80.0, "p99_latency_ns": 800.0},
+        ),
+    ]
+    runner = _make_runner(profiler_responses=profiler_responses)
+    gate = MagicMock(side_effect=[_passing_gate_result(42.5), _passing_gate_result(43.75)])
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        result = _invoke_loop(
+            tmp_path,
+            ref_file,
+            runner,
+            max_generations=1,
+            children_per_generation=1,
+            space=space,
+            frontier_bias=1.0,
+            benchmark_result=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+        )
+
+    assert result is True
+    pop = _load_population(tmp_path)
+    seed, child = pop.all
+    # The contract owns the axis it measures; the profiler keeps the other.
+    assert seed.metrics == {"total_ops_per_sec": 42.5, "p99_latency_ns": 500.0}
+    assert child.metrics == {"total_ops_per_sec": 43.75, "p99_latency_ns": 800.0}
+    # The two trade off on the second axis, so neither dominates and both are
+    # on the frontier. Before the fix neither carried `p99_latency_ns` at all
+    # and the frontier was empty.
+    assert {item.id for item in pop.frontier(space)} == {seed.id, child.id}
+
+
+def test_protocol_contract_records_the_evaluator_declared_unit(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """The recorded unit is the evaluator's declaration when it supplies one."""
+    runner = _make_runner()
+    gate = MagicMock(return_value=_passing_gate_result(42.5, unit="ops/s"))
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        result = _invoke_bootstrap(
+            tmp_path,
+            ref_file,
+            runner,
+            benchmark_result_protocol=2,
+        )
+
+    assert result is True
+    seed = _load_population(tmp_path).all[0]
+    assert seed.perf_metric == 42.5
+    assert seed.perf_unit == "ops/s"
+
+
+def test_evolve_accuracy_gate_extends_timeout_by_environment_setup_allowance():  # noqa: ANN201  # tracked: #288
+    """The accuracy gate charges environment setup the way the benchmark gate
+    does; otherwise a Modal/SkyPilot deployment eats the accuracy command's
+    declared budget and the candidate fails on a timeout it was never given
+    the time to avoid."""
+    ctx = _FakeLoopContext(
+        run_environment_view=SimpleNamespace(framework_setup_timeout_seconds=90),
+    )
+    gate = MagicMock(return_value=SimpleNamespace(feedback=None))
+    with patch("vibesys.loops.evolve.loop.run_accuracy_gate", gate):
+        evolve_loop._run_framework_accuracy_gate(  # noqa: SLF001  # tracked: #288
+            ctx,
+            generation=0,
+            child_idx=0,
+            timeout_seconds=120,
+        )
+
+    assert gate.call_args.kwargs["timeout_seconds"] == 210

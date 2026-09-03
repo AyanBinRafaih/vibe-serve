@@ -55,8 +55,9 @@ from vibesys.loops.agent.model import (
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.gates import (
     GATE_RECORD_TAIL_CHARS,
-    PROTOCOL_OUTPUT_FLAG,
+    BenchmarkContract,
     FrameworkBenchmarkOutcome,
+    framework_command_timeout,
     run_accuracy_gate,
     run_benchmark_gate,
 )
@@ -1783,17 +1784,6 @@ def _run_framework_validation_gate(  # noqa: C901, PLR0912, PLR0915  # tracked: 
     )
 
 
-def _framework_command_timeout(ctx: LoopContext, timeout_seconds: int | None) -> int | None:
-    """Add environment-owned setup time without weakening the command's own budget."""
-    if timeout_seconds is None:
-        return None
-    view = getattr(ctx, "run_environment_view", None)
-    setup_timeout = getattr(view, "framework_setup_timeout_seconds", 0)
-    if not isinstance(setup_timeout, int):
-        setup_timeout = 0
-    return timeout_seconds + setup_timeout
-
-
 def _deployment_release_env_var(ctx: LoopContext) -> str | None:
     return ctx.run_environment_view.deployment_release_env_var
 
@@ -1839,7 +1829,7 @@ def _run_framework_accuracy_gate(  # noqa: PLR0913  # tracked: #288
     result = run_accuracy_gate(
         ctx,
         process_id=f"accuracy-{round_number}-{retry}",
-        timeout_seconds=_framework_command_timeout(ctx, timeout_seconds),
+        timeout_seconds=framework_command_timeout(ctx, timeout_seconds),
         execution_command=execution_command,
     )
     if result.passed and not result.executed:
@@ -1890,7 +1880,7 @@ def _run_framework_benchmark(  # noqa: PLR0913  # tracked: #288
         objectives=objectives,
         process_id=f"benchmark-{round_number}-{retry}",
         output_slug=f"{round_number}-{retry}",
-        timeout_seconds=_framework_command_timeout(ctx, timeout_seconds),
+        timeout_seconds=framework_command_timeout(ctx, timeout_seconds),
         execution_base=execution_base,
     )
     if not result.executed:
@@ -1921,7 +1911,7 @@ def _run_framework_benchmark(  # noqa: PLR0913  # tracked: #288
             data=BenchmarkResultData(
                 metric=result.outcome.metric_name,
                 value=result.outcome.metric_value,
-                unit=result.outcome.metric_name,
+                unit=result.outcome.metric_unit or result.outcome.metric_name,
             ),
         )
     return result.outcome
@@ -2188,13 +2178,10 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         workspace_sources=workspace_sources,
         evaluator_path=evaluator_path,
         evaluator_package_root=evaluator_package_root,
-        benchmark_output_argument=(
-            benchmark_result.json_argument
-            if benchmark_result is not None
-            else PROTOCOL_OUTPUT_FLAG
-            if benchmark_result_protocol is not None
-            else None
-        ),
+        benchmark_output_argument=BenchmarkContract(
+            result_spec=benchmark_result,
+            result_protocol=benchmark_result_protocol,
+        ).output_argument,
         objective=objective,
         existing=existing,
         project_configuration=project_configuration,
