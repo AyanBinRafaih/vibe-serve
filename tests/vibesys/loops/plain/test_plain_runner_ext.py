@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from vibesys._agent_cli.base import MCPServerSpec
 from vibesys.agents.client import AgentClient
 from vibesys.agents.contracts import AgentCapabilities
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.loops.plain.runner_ext import PlainLoopAgentClient
 from vs_issue_board import IssueBoard
 
@@ -280,3 +281,18 @@ class TestBackendName:
         inner_cli = _mock_runner("cli")
         wrapper_cli = PlainLoopAgentClient(inner_cli, store=store, max_issues_per_perf_eval=3)
         assert wrapper_cli.backend_name == "cli"
+
+
+class TestProviderConversation:
+    def test_conversation_accessors_proxy_inner(self, tmp_path):  # noqa: ANN001, ANN201
+        store = _make_store(tmp_path)
+        inner = _mock_runner("cli")
+        inner.provider_session_id.return_value = "session-1"
+        inner.last_turn_provider_session_id.return_value = "session-2"
+        wrapper = PlainLoopAgentClient(inner, store=store, max_issues_per_perf_eval=3)
+        key = AgentSessionKey(SessionScope.CHAT, "thread-a")
+
+        assert wrapper.provider_session_id(key) == "session-1"
+        assert wrapper.last_turn_provider_session_id(key) == "session-2"
+        inner.provider_session_id.assert_called_once_with(key)
+        inner.last_turn_provider_session_id.assert_called_once_with(key)

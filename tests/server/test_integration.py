@@ -11,6 +11,7 @@ from tests.server.support import build_server_parts
 from server.api.protocol import ChatQuery, ChatThreadCreateQuery
 from server.chat.factory import ChatAgentResources
 from server.events import EventType
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.run.events import (
     AgentOutputChunkData,
     CoreEventType,
@@ -35,6 +36,16 @@ class _ChatClient:
     def invoke_text(self, **kwargs: Any) -> str:  # noqa: ANN401
         self.calls.append(kwargs)
         return "It improved in round 2."
+
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Report no conversation, so every turn carries the full prompt."""
+        del session_key
+        return None
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Report no conversation, matching ``provider_session_id``."""
+        del session_key
+        return None
 
 
 def _project_run(root: Path) -> tuple[Project, str]:
@@ -160,7 +171,8 @@ def test_attach_run_installs_chat_with_isolated_session_state(tmp_path):  # noqa
 
     assert response.chat is not None
     assert response.chat.answer == "It improved in round 2."
-    assert client.calls[0]["reuse_session"] is False
+    assert client.calls[0]["reuse_session"] is True
+    assert client.calls[0]["session_key"] == AgentSessionKey(SessionScope.CHAT, "default")
     assert client.calls[0]["user_prompt"] == "what improved?"
     transcript = project.state.log_directory(run_id).parent / "server/chat/conversation.jsonl"
     assert json.loads(transcript.read_text()) == {

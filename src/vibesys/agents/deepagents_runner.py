@@ -52,6 +52,22 @@ class DeepAgentsClient(AgentClient):
     def close(self) -> None:
         """Deepagents owns no resources beyond each invocation."""
 
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Never name a conversation: deepagents threads are in-process only.
+
+        A deepagents thread is a LangGraph checkpointer entry, not a provider
+        conversation another process could resume, and this client never runs
+        ``AgentClient.__init__``, so it owns neither a session cache nor a
+        store for the base implementation to read.
+        """
+        del session_key
+        return None
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Never name a conversation, for the reason above."""
+        del session_key
+        return None
+
     def set_log_file(self, stream: TextIO | None) -> None:
         """Direct subsequent logs to ``stream``."""
         self._run_log_file = stream

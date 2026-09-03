@@ -1,3 +1,4 @@
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.agents.stub_runner import StubAgentClient
 from vibesys.schemas import (
     ImplementerResponse,
@@ -49,3 +50,12 @@ def invoke(runner, workspace, kind, response_cls):  # noqa: ANN001, ANN201  # tr
         fallback_factory=lambda: None,
         round_label=f"stub-{kind}",
     )
+
+
+def test_stub_runner_names_no_provider_conversation():  # noqa: ANN201
+    runner = StubAgentClient()
+    key = AgentSessionKey(SessionScope.CHAT, "thread-a")
+
+    # The stub runs no provider, so nothing can be resumed or compared against.
+    assert runner.provider_session_id(key) is None
+    assert runner.last_turn_provider_session_id(key) is None

@@ -74,6 +74,22 @@ def test_json_emitter_preserves_raw_log(capsys):  # noqa: ANN001, ANN201  # trac
 class TestDeepAgentsClient:
     """Tests for :class:`DeepAgentsClient`."""
 
+    def test_deepagents_runner_names_no_provider_conversation(self) -> None:
+        runner = DeepAgentsClient(
+            model="m",
+            backends={"judge": MagicMock(name="judge-backend")},
+            skills=[],
+            model_name="m",
+            run_log_file=None,
+        )
+        key = AgentSessionKey(SessionScope.CHAT, "thread-a")
+
+        # A deepagents thread is a checkpointer entry, not a provider
+        # conversation, and this client never runs ``AgentClient.__init__``, so
+        # the inherited implementation would have no cache or store to read.
+        assert runner.provider_session_id(key) is None
+        assert runner.last_turn_provider_session_id(key) is None
+
     def test_deepagents_runner_invoke_returns_structured_response(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         pass_response = JudgeResponse(
             analysis="looks good",
