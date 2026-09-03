@@ -30,6 +30,25 @@ export function todoStripWidth(agentPaneWidth: number, terminalWidth: number): n
   return Math.min(terminalWidth, Math.max(agentPaneWidth, TODO_MIN_WIDTH));
 }
 
+/**
+ * The rows the strip is about to occupy for a state, derived from the state
+ * rather than read back from the laid-out box. `output.height` reflects the last
+ * committed layout, so it lags one paint behind a render that just changed it;
+ * a sibling sized in the same paint (the rounds rail) needs the height the strip
+ * is taking now, not the one it took last frame. Mirrors `render` exactly: no
+ * visible todos means no strip, a collapsed strip is one summary row, and an
+ * expanded strip is its capped items plus an optional overflow row inside a
+ * border.
+ */
+export function todoStripHeight(state: SessionState): number {
+  const todos = visibleTodos(state);
+  if (todos.length === 0) return 0;
+  if (!state.todosExpanded) return 1;
+  const shown = Math.min(todos.length, MAX_EXPANDED_ITEMS);
+  const hidden = todos.length - shown;
+  return shown + (hidden > 0 ? 1 : 0) + 2;
+}
+
 export function todoMarker(status: string): string {
   return STATUS_MARKER[status] ?? UNKNOWN_MARKER;
 }

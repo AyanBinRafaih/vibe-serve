@@ -26,7 +26,7 @@ import {RoundRailView, roundRailVisible, roundRailWidth} from './round-rail.js';
 import {createMarkdownStyle} from './styles.js';
 import {resolveTheme, type ThemeName} from './theme.js';
 import {ThemePickerView} from './theme-picker.js';
-import {TodoStripView, todoStripWidth} from './todo-strip.js';
+import {TodoStripView, todoStripHeight, todoStripWidth} from './todo-strip.js';
 
 export interface OpenTuiApp {
   destroy(): void;
@@ -361,15 +361,17 @@ export function createOpenTuiApp(
         state,
         typeof agentWidth === 'number' ? todoStripWidth(agentWidth, renderer.terminalWidth) : null,
       );
-      // The rail's row budget is measured only now, after the todo strip has
-      // re-rendered this frame: a strip that grew or shrank changes its height
-      // here, and reading it before the render would bill the rail the previous
-      // frame's height and leave it a row long or short until the next paint.
+      // The rail's row budget comes from the strip height the state implies, not
+      // from `todoStrip.output.height`: the box height reflects the last
+      // committed layout, so reading it back in the same paint that expanded or
+      // collapsed the strip bills the rail the previous frame's height and leaves
+      // it a row long or short (clipping the selected late round or the overflow
+      // indicator) until the next paint.
       const railRows =
         renderer.terminalHeight -
         header.height -
         errorHeight -
-        todoStrip.output.height -
+        todoStripHeight(state) -
         help.height -
         commandInput.box.height;
       if (railWidth > 0) roundRail.render(state, railWidth, Math.max(0, railRows));
