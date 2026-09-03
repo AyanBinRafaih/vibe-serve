@@ -69,7 +69,7 @@ Arrow keys move the selection, and the wheel and trackpad scroll the table
 independently of it. Clicking a hypothesis, or pressing Enter on an empty input,
 opens its summary. The summary gives the full wrapped hypothesis text first,
 then brief decision metadata and its rounds. Arrow keys select a round; clicking
-it or pressing Enter opens the ordinary transcript, rounds strip, and agent map.
+it or pressing Enter opens the ordinary transcript, rounds rail, and agent map.
 Escape returns from a round to its hypothesis, then from the hypothesis to the
 index. The input keeps Enter whenever something is typed, so a command entered
 from the log runs on its first Enter. `/open-round` and `/open-round --N` remain
@@ -77,7 +77,7 @@ explicit shortcuts directly to the selected or numbered round.
 
 The agent strip is headed `Round N flow · 45s` for the round on screen. That
 elapsed time is agent-active: wall clock minus the gaps where no agent was
-running, the same measure the rounds strip reports under `r2`. It ticks once a
+running, the same measure the rounds rail reports beside `r2`. It ticks once a
 second while an agent is running and holds its final value once the round
 finishes. `Run flow` heads the strip when no round is selected, and a round
 with no recorded agent time is headed `Round N flow` alone.
@@ -186,10 +186,12 @@ over the view as before, carrying the same input at the foot of the modal. It
 is one conversation either way: the transcript survives docking, undocking, and
 the pane closing.
 
-Inside a hypothesis the footer shows keyboard navigation. `[` and `]` select
-rounds, Tab and Shift+Tab select agents, the arrow keys move a cursor through
-the transcript's entries, Page Up/Page Down scroll it, and F2 (or Ctrl+T)
-expands the todo box, which then takes the arrow keys until Escape closes it.
+Inside a hypothesis the footer shows keyboard navigation. `←` and `→` step
+focus across the rounds rail, the agents graph, and the transcript, `↑` and `↓`
+move within whichever holds it, `[` and `]` select rounds from anywhere, Tab and
+Shift+Tab select agents, Page Up/Page Down scroll the transcript, and F2 (or
+Ctrl+T) expands the todo box, which then takes the arrow keys until Escape closes
+it.
 F3 (or Ctrl+P) expands the latest prompt in the current selection. Function keys
 are offered alongside the Control chords because a terminal is free to keep a
 Control chord for itself, and on macOS several do.
@@ -200,13 +202,20 @@ anywhere. Drag to select rendered text, then press Ctrl+C to copy it through
 OSC52; Ctrl+C exits when there is no nonempty selection. If the terminal does
 not support OSC52, VibeSys keeps the selection and shows a status explaining
 that the terminal's native copy command is the fallback. Rounds and agents can
-also be clicked: a round chip
-selects its round, an agent node filters the transcript to that agent, and
+also be clicked: a round row in the rail selects its round, an agent node filters
+the transcript to that agent, and
 clicking the selected node clears the filter.
 
-The rounds strip covers the whole run, including rounds it has not reached yet,
-and windows onto the part that fits. The selected round is always in view, and
-`‹ n` and `n ›` say how many rounds sit past each edge.
+The rounds rail runs down the left of the round view, one round per row, and
+covers the whole run including rounds it has not reached yet. It is a window onto
+the part that fits: the selected round is always in view, and `↑ n` and `↓ n` say
+how many rounds sit past each edge. Each row carries the round's status word and
+glyph and a metric, the live agent-active time while it runs, the measured delta
+once it resolves, or its duration when no delta was recorded. A wide terminal
+gets the full rows; between 85 and 100 columns the rail falls back to a
+number-and-glyph column, and narrower than that it collapses so the agents graph
+and transcript keep their width. The fallback threshold is the width at which the
+rail's column still leaves the agents pane and the transcript their floors.
 
 The launcher retains terminal results until the operator exits. If the backend
 fails to start, its log tail is printed before the temporary session directory

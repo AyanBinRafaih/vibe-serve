@@ -61,6 +61,7 @@ import {
   switchChatThread,
   togglePaneZoom,
 } from '../session-model.js';
+import {TRANSCRIPT_MIN} from './agent-map.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 import {renderDesignSummary} from './design-log.js';
@@ -106,9 +107,11 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('fast_path()'));
     expect(frame).toContain('running · optimizer · round 2');
-    // No round is selected, so the agent strip is headed by the run.
+    // No round is selected, so the agent strip is headed by the run. The run has
+    // no rounds yet, so the rounds rail stays off and leaves the width to the
+    // agents graph and transcript.
     expect(frame).toContain('Run flow');
-    expect(frame).toContain('Rounds');
+    expect(frame).not.toContain('Rounds');
     expect(frame).toContain('● optimizer');
     expect(frame).toContain('Result');
     expect(frame).toContain('Command');
@@ -192,7 +195,7 @@ describe('OpenTUI presentation', () => {
     expect(frame).not.toContain('A later failure.');
   });
 
-  it('renders quiet round labels without status text or symbols', async () => {
+  it('renders each round on its own rail row with a status word, glyph, and time', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const activeStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
@@ -217,14 +220,13 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('r2'));
 
-    expect(frame).toContain('r1');
-    expect(frame).toContain('r2');
-    expect(frame).toMatch(/r2\s+1m\s+\d+s/);
-    expect(frame).toContain('r3');
+    // Each round is a rail row carrying its number, a status word and glyph, and
+    // its elapsed time; the active round's time is measured from its agent start.
+    expect(frame).toMatch(/r1\s+✓\s+done/);
+    expect(frame).toMatch(/▸r2\s+⟳\s+run\s+1m\s+\d+s/);
+    expect(frame).toMatch(/r3\s+✗\s+fail/);
+    // Status is a word plus a glyph, never a spinner that reads as motion frozen.
     expect(frame).not.toMatch(/[◐◓◑◒]/);
-    expect(frame).not.toContain('done');
-    expect(frame).not.toContain(':run');
-    expect(frame).not.toContain('fail');
   });
 
   it('heads the agent strip with the elapsed time of the running round', async () => {
@@ -631,12 +633,12 @@ describe('OpenTUI presentation', () => {
     registerCleanup(testRenderer.renderer, app);
 
     const frame = await testRenderer.waitForFrame(value => value.includes('r12'));
-    // Rounds the run has not reached are still part of the strip, and the strip
-    // says how many it could not fit.
+    // Rounds the run has not reached are still part of the rail, and the rail
+    // says how many it could not fit below the window.
     expect(frame).toMatch(/r1[34]/);
-    expect(frame).toMatch(/\d+ ›/);
+    expect(frame).toMatch(/↓ \d+/);
 
-    // `[` walks back to the first round, and the strip follows the selection
+    // `[` walks back to the first round, and the rail follows the selection
     // rather than leaving it hidden past the edge.
     let early = frame;
     for (let step = 0; step < 11; step += 1) {
@@ -644,7 +646,7 @@ describe('OpenTUI presentation', () => {
       early = await frameAfter(testRenderer);
     }
     expect(controller.state.selectedRound).toBe(1);
-    expect(early).toContain('[ r1 ]');
+    expect(early).toMatch(/▸r1\s+✓\s+done/);
   });
 
   it('leaves brackets and cursor keys to a typed command', async () => {
@@ -814,6 +816,214 @@ describe('OpenTUI presentation', () => {
     expect(controller.state.selectedAgentKind).not.toBe(firstAgent);
   });
 
+  /**
+   * The rail takes its column off the round view's width, so its breakpoints
+   * are only correct if the transcript still clears its floor beside it. This
+   * measures the laid-out transcript box rather than recomputing the width
+   * arithmetic, which is the only way a layout regression here shows up.
+   *
+   * 100 is the full-rail breakpoint and 80 is inside the range the review
+   * measured at 37 columns: with the rail's old 72-column collapse point the
+   * 13-column compact rail still appeared at 80 and squeezed the transcript
+   * under its minimum.
+   */
+  for (const width of [80, 100]) {
+    it(`keeps the transcript above its floor beside the rail at ${width} columns`, async () => {
+      const testRenderer = await createTestRenderer({width, height: 30});
+      const controller = new FakeController({
+        ...initialSessionState(),
+        selectedRound: 3,
+        core: {
+          ...initialSessionState().core,
+          rounds: [
+            {number: 1, status: 'completed'},
+            {number: 2, status: 'completed'},
+            {number: 3, status: 'active'},
+          ],
+          phases: [
+            {kind: 'implementer', status: 'completed', roundNumber: 3, roundLabel: 'round-3-impl'},
+            {kind: 'judge', status: 'active', roundNumber: 3, roundLabel: 'round-3-judge'},
+          ],
+          transcript: [
+            {
+              id: 'live',
+              kind: 'assistant',
+              label: 'judge',
+              content: 'live output',
+              agentKind: 'judge',
+              roundNumber: 3,
+            },
+          ],
+        },
+      });
+      const app = createOpenTuiApp(testRenderer.renderer, controller);
+      registerCleanup(testRenderer.renderer, app);
+      await testRenderer.waitForFrame(value => value.includes('live output'));
+
+      const transcript = testRenderer.renderer.root.findDescendantById('viewport');
+      if (transcript === undefined) throw new Error('round view was missing its transcript');
+      expect(transcript.width).toBeGreaterThanOrEqual(TRANSCRIPT_MIN);
+      // Whatever the rail decided, the three columns still add up to the terminal.
+      const rail = testRenderer.renderer.root.findDescendantById('round-rail');
+      const agents = testRenderer.renderer.root.findDescendantById('agent-map');
+      const railWidth = rail?.visible === true ? rail.width : 0;
+      expect(railWidth + (agents?.width ?? 0) + transcript.width).toBeLessThanOrEqual(width);
+    });
+  }
+
+  it("reads the rail's measured delta from the experiment log, not the design log", async () => {
+    // Per-round stage facts, the measured delta included, cross the protocol on
+    // `HypothesisRound`; the design log carries only each round's file list. The
+    // rail joins by round number so it and the experiments table cannot report
+    // different numbers for the same round.
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedRound: 2,
+      hypothesisScope: {id: 'H-01', label: 'H-01 · r1-r2', rounds: [1, 2]},
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'completed'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('▸r2'));
+    controller.publish({
+      ...controller.state,
+      experimentLog: {
+        entries: [
+          logEntry('H-01', 1, 2, {
+            rounds: [
+              {round: 1, passed: true, reviewed: true, perf_delta_pct: -3.5},
+              {round: 2, passed: true, reviewed: true, perf_delta_pct: 12.4},
+            ],
+          }),
+        ],
+        selectedId: null,
+        pending: false,
+        error: null,
+      },
+    });
+    const frame = await testRenderer.waitForFrame(value => value.includes('%'));
+
+    expect(frame).toContain('-3.5%');
+    expect(frame).toContain('+12%');
+  });
+
+  it('leaves a stale rounds focus alone once a narrow width hides the rail', async () => {
+    // A resize can hide the rail while `roundFocus` still reads `rounds`. At this
+    // width the rail is gone, so Up/Down must drive a visible pane (the agents),
+    // not step an invisible round selection.
+    const testRenderer = await createTestRenderer({width: 70, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedRound: 1,
+      roundFocus: 'rounds',
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'completed'},
+          {number: 3, status: 'active'},
+        ],
+        phases: [
+          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
+          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('implementer'));
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    const frame = await frameAfter(testRenderer);
+    // The round selection did not move, and an agent carries the keys instead.
+    expect(controller.state.selectedRound).toBe(1);
+    expect(controller.state.selectedAgentKind).not.toBeNull();
+    // The pane taking the keys says so, so the view is never focus-less.
+    expect(frame).toContain('▸ Agents');
+  });
+
+  it('drives the rail with Up/Down while it is on screen', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedRound: 1,
+      roundFocus: 'rounds',
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'completed'},
+          {number: 3, status: 'completed'},
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('▸r1'));
+
+    testRenderer.mockInput.pressKey('ARROW_DOWN');
+    await frameAfter(testRenderer);
+    // The rail is visible, so Down steps the round selection rather than an agent.
+    expect(controller.state.selectedRound).toBe(2);
+    expect(controller.state.selectedAgentKind).toBeNull();
+  });
+
+  it('resizes the rail from the todo strip’s current height, not the last frame’s', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 40});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedRound: 1,
+      core: {
+        ...initialSessionState().core,
+        rounds: Array.from({length: 60}, (_, index) => ({
+          number: index + 1,
+          status: 'completed' as const,
+        })),
+        todos: [
+          {
+            agentKind: null,
+            roundNumber: null,
+            items: Array.from({length: 10}, (_, index) => ({
+              content: `task ${index + 1}`,
+              status: 'completed' as const,
+            })),
+          },
+        ],
+        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    const collapsedFrame = await testRenderer.waitForFrame(value => value.includes('▸r1'));
+    const collapsedHidden = hiddenAfterCount(collapsedFrame);
+    expect(collapsedHidden).toBeGreaterThan(0);
+
+    // Expanding the todos grows the strip in the same paint, so the rail must be
+    // billed the new height and show fewer rounds; sizing it from the previous
+    // (collapsed) height would overrun the shorter rail and clip its rounds.
+    controller.toggleTodos();
+    const expandedFrame = await frameAfter(testRenderer);
+    expect(expandedFrame).toMatch(/▸r1\b/);
+    const expandedHidden = hiddenAfterCount(expandedFrame);
+    expect(expandedHidden).toBeGreaterThan(collapsedHidden);
+
+    // Collapsing restores the taller rail in one paint, back to the first budget.
+    controller.toggleTodos();
+    const recollapsedFrame = await frameAfter(testRenderer);
+    expect(recollapsedFrame).toMatch(/▸r1\b/);
+    expect(hiddenAfterCount(recollapsedFrame)).toBe(collapsedHidden);
+  });
+
   it('focuses round panes from blank and interactive click targets', async () => {
     const testRenderer = await createTestRenderer({width: 150, height: 26});
     const controller = new FakeController({
@@ -977,8 +1187,8 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('has not run yet'));
     expect(frame).toContain('Round 9 has not run yet.');
-    // The strip still shows it as a round of this run, marked as the one open.
-    expect(frame).toContain('[ r9 ]');
+    // The rail still shows it as a round of this run, marked as the one open.
+    expect(frame).toMatch(/▸r9\s+·\s+plan/);
   });
 
   it('closes a visualization and the chat together on one Escape', async () => {
@@ -1095,12 +1305,17 @@ describe('OpenTUI presentation', () => {
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
 
-    const frame = await testRenderer.waitForFrame(value => value.includes('orchestrator'));
+    // The rounds rail takes its column and the transcript keeps its floor, so at
+    // this width the graph sits at its minimum node size and the first stage's
+    // name truncates; wait on the last column instead to know the graph drew.
+    const frame = await testRenderer.waitForFrame(value => value.includes('profiler'));
 
     expect(frame).toContain('7 agents');
     expect(frame).toContain('2 active');
-    // Every stage is drawn, and the fan-out rows do not collapse onto each other.
-    const nodeRows = frame.split('\n').filter(line => line.includes('implementer'));
+    // Every stage is drawn, and the fan-out rows do not collapse onto each
+    // other. The label truncates to "implement…" once the rail narrows the
+    // graph, so match the stem the truncation keeps.
+    const nodeRows = frame.split('\n').filter(line => line.includes('implement'));
     expect(nodeRows.length).toBeGreaterThanOrEqual(3);
     expect(frame).toContain('▶');
   });
@@ -1421,7 +1636,8 @@ describe('OpenTUI presentation', () => {
 
     const overlay = await testRenderer.waitForFrame(value => value.includes('Esc: close dialog'));
     expect(overlay).toContain('Available commands');
-    expect(overlay).toContain('Rounds');
+    // No round has landed yet, so the rail stays hidden and the round view is
+    // just the agents graph and the transcript behind the overlay.
     expect(overlay).toContain('Agents');
     testRenderer.mockInput.pressKey('ESCAPE');
     await testRenderer.waitForFrame(value => !value.includes('Esc: close dialog'));
@@ -1474,7 +1690,9 @@ describe('OpenTUI presentation', () => {
     const frame = await testRenderer.waitForFrame(value => value.includes('2 passed'));
     expect(frame).toContain('→ Bash(command="pytest")');
     expect(frame).toContain('← 2 passed');
-    expect(frame.match(/╭/g)).toHaveLength(5);
+    // Agents pane, transcript frame, and the card's call and result regions: the
+    // rail is absent because this fixture has no rounds.
+    expect(frame.match(/╭/g)).toHaveLength(4);
   });
 
   it('renders a typed command payload with labeled stderr and exit code', async () => {
@@ -4099,6 +4317,12 @@ async function frameAfter(testRenderer: TestRendererSetup): Promise<string> {
 /** A captured frame as its screen rows, for asserting where something sits. */
 function frameRows(frame: string): string[] {
   return frame.split('\n');
+}
+
+/** The count the rail's `↓ n` overflow indicator reports, or 0 when it is absent. */
+function hiddenAfterCount(frame: string): number {
+  const value = frame.match(/↓\s+(\d+)/)?.[1];
+  return value === undefined ? 0 : Number(value);
 }
 
 /** The landing view, which is where the chat is a docked pane. */

@@ -119,7 +119,7 @@ export interface ErrorBannerState {
 }
 
 /** The agent graph on the left, or the transcript on the right. */
-export type RoundFocus = 'agents' | 'transcript';
+export type RoundFocus = 'rounds' | 'agents' | 'transcript';
 
 /**
  * The experiment log is open when this is non-null. Selection is held as a
@@ -727,6 +727,24 @@ export function designRoundFor(
 }
 
 /**
+ * The experiment log's record for one round, or null before the log has it.
+ * Every stage fact about a round, including its measured delta, lives here:
+ * the design log carries only the file list, so a consumer that wants an
+ * outcome reads this rather than the design record.
+ */
+export function hypothesisRoundFor(
+  state: SessionState,
+  roundNumber: number | null,
+): HypothesisRound | null {
+  if (roundNumber === null) return null;
+  for (const entry of state.experimentLog?.entries ?? []) {
+    const record = entry.rounds?.find(candidate => candidate.round === roundNumber);
+    if (record !== undefined) return record;
+  }
+  return null;
+}
+
+/**
  * One round as both surfaces know it: the experiment log owns every stage
  * fact, the design log owns only the file list. The join is by round number,
  * which is the identity both fetches agree on, so the two can never describe
@@ -1262,7 +1280,12 @@ export function focusedPane(state: SessionState): PaneId {
   if (state.layout.right !== null) {
     return state.layout.focus === 'right' ? 'performance' : 'transcript';
   }
-  return state.roundFocus;
+  // The rounds rail is a selector on the left of the round view, not one of the
+  // zoomable content panes, so it reports as the agents side for pane-level
+  // focus: no content pane lights its border, and F4 zooms the agents pane
+  // rather than a rail that has nothing to enlarge. The rail draws its own
+  // focus border from `roundFocus` directly.
+  return state.roundFocus === 'rounds' ? 'agents' : state.roundFocus;
 }
 
 /**
