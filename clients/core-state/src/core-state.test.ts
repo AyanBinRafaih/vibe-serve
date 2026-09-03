@@ -1,7 +1,10 @@
 import {describe, expect, it} from 'bun:test';
 import type {RunEvent, RunSnapshot} from '@vibesys/backend-client';
 import {
+  type CoreRunStatus,
+  type CoreState,
   DEFAULT_CHAT_THREAD_ID,
+  hasRunEnded,
   initialCoreState,
   latestDiagnosticChange,
   reconcileActiveExecutions,
@@ -542,7 +545,7 @@ describe('core state projection', () => {
       },
     });
 
-    expect(state.terminal).toBe(true);
+    expect(hasRunEnded(state)).toBe(true);
     expect(state.diagnostics).toMatchObject([
       {id: 'diag-1', summary: 'Agent failed.', severity: 'fatal', sequence: 3},
     ]);
@@ -660,6 +663,44 @@ describe('core state projection', () => {
 
     expect(state.experimentsRevision).toBe(12);
     expect('experimentLog' in state).toBe(false);
+  });
+});
+
+describe('whether a run has ended', () => {
+  const withStatus = (status: CoreRunStatus): CoreState => ({...initialCoreState(), status});
+
+  it('classifies every run status the projection can hold', () => {
+    expect(hasRunEnded(withStatus('completed'))).toBe(true);
+    expect(hasRunEnded(withStatus('failed'))).toBe(true);
+    expect(hasRunEnded(withStatus('connecting'))).toBe(false);
+    expect(hasRunEnded(withStatus('starting'))).toBe(false);
+    expect(hasRunEnded(withStatus('running'))).toBe(false);
+    expect(hasRunEnded(withStatus('paused'))).toBe(false);
+  });
+
+  it('reads an ended run from a bootstrapped snapshot', () => {
+    const snapshot = {run_id: 'run', status: 'completed', sequence: 4} satisfies RunSnapshot;
+
+    const state = reduceSnapshot(initialCoreState(), snapshot);
+
+    expect(hasRunEnded(state)).toBe(true);
+  });
+
+  // A resumed run replays the previous process's failure ahead of its own
+  // start. Whether the run has ended is derived from the status, so the later
+  // `run_started` cannot leave the projection looking finished while the run
+  // is live.
+  it('has not ended after a resumed run replays a failure then a start', () => {
+    const state = reduceEventBatch(initialCoreState(), [
+      baseEvent(1, 'run_failed'),
+      {
+        ...baseEvent(2, 'run_started'),
+        data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+      },
+    ]);
+
+    expect(state.status).toBe('running');
+    expect(hasRunEnded(state)).toBe(false);
   });
 });
 
