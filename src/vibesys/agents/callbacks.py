@@ -288,9 +288,15 @@ class AgentLogger(BaseCallbackHandler):
             # No typed tool_call to close; the diagnostic above is the whole
             # record, and fabricating an orphan tool_result would mislead.
             return
+        pending = self._pending_tool_calls.get(name)
+        if not pending or (call_id is not None and call_id not in pending):
+            # A streamed turn emits no typed tool_call (``on_llm_end`` returns
+            # before the emission), so a failure whose call was never queued
+            # has no lifecycle to close either.
+            return
         self._emit_tool_result(
             name,
-            f"{type(error).__name__}: {error}",
+            f"{type(error).__name__}: {error}" if str(error) else type(error).__name__,
             call_id=call_id,
             is_error=True,
         )

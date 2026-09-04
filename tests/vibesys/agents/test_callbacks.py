@@ -360,6 +360,50 @@ class TestOnToolErrorResult:
         assert results[0].is_error is True
         assert not logger._pending_tool_calls["shell"]  # noqa: SLF001  # tracked: #288
 
+    def test_streamed_turn_error_emits_no_orphan_result(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            # A streamed turn: ``on_llm_end`` returns before emitting typed
+            # tool calls, so the tool run starts with nothing queued.
+            logger.on_llm_new_token("tok")
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            run_id = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=run_id, tool_call_id="call-1")
+            logger.on_tool_error(RuntimeError("boom"), run_id=run_id, tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        calls = [event.data for event in seen if isinstance(event.data, ToolCallData)]
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert calls == []
+        assert results == []
+        assert "Tool error" in capsys.readouterr().out
+
+    def test_empty_message_error_content_has_no_trailing_colon(self) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            run_id = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=run_id, tool_call_id="call-1")
+            logger.on_tool_error(KeyboardInterrupt(), run_id=run_id, tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert len(results) == 1
+        assert results[0].content == "KeyboardInterrupt"
+        assert results[0].is_error is True
+
     def test_error_without_tool_context_emits_no_result(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
