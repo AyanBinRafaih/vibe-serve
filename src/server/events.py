@@ -477,6 +477,11 @@ class EventStore:
             self._records = _records_from_events(_repair_legacy_sequences(events))
         else:
             self._records, self._malformed_tail_offset = scanned
+        # A valid final record whose line was never terminated must gain its
+        # newline before ``append`` writes anything after it.
+        self._missing_tail_newline = self._malformed_tail_offset is None and _ends_without_newline(
+            self.path
+        )
         self._sequences = [record.header.sequence for record in self._records]
         self._next_sequence = self._sequences[-1] + 1 if self._sequences else 1
 
@@ -486,6 +491,12 @@ class EventStore:
                 with self.path.open("r+b") as stream:
                     stream.truncate(self._malformed_tail_offset)
                 self._malformed_tail_offset = None
+            if self._missing_tail_newline:
+                # Terminate the valid final record so the new record starts
+                # its own line instead of concatenating onto it.
+                with self.path.open("a", encoding="utf-8") as stream:
+                    stream.write("\n")
+                self._missing_tail_newline = False
             event = event.model_copy(
                 update={"sequence": self._next_sequence, "run_id": self.run_id}
             )
@@ -658,7 +669,10 @@ class EventStore:
             offset += len(line)
             header_fields = _scan_header_fields(line)
             if header_fields is None:
-                if index != len(lines) - 1:
+                # A complete final record the header scan cannot classify must
+                # be judged by full validation, so it also falls to the eager
+                # path; only a torn (non-JSON) tail is set aside for repair.
+                if index != len(lines) - 1 or _is_complete_json(line):
                     return None
                 # Preserve access to earlier audit history if a process was
                 # interrupted during its final append.
@@ -680,28 +694,26 @@ class EventStore:
                     raw_sequence=raw_sequence,
                 )
             )
-        tail_offset = self._parse_eager_tail(raw, records, malformed_tail_offset)
-        return records, tail_offset
+        self._parse_eager_tail(raw, records, malformed_tail_offset)
+        return records, malformed_tail_offset
 
     def _parse_eager_tail(
         self, raw: bytes, records: list[_StoredRecord], malformed_tail_offset: int | None
-    ) -> int | None:
-        """Validate the trailing window, reproducing today's tail semantics.
+    ) -> None:
+        """Validate the trailing window, raising on any record that fails.
 
-        A final record that scans as JSON but fails validation is still an
-        interrupted append; anything earlier is still a hard failure.
+        Every record here scanned as complete JSON, which a torn append can
+        never leave behind, so a validation failure on the final record is
+        corruption to surface, not an interrupted write to set aside.
         """
         for position in range(max(0, len(records) - _EAGER_TAIL_RECORDS), len(records)):
             record = records[position]
             try:
                 self._parse_record(record, raw[record.offset : record.offset + record.length])
-            except ValidationError:
+            except ValidationError as error:
                 if position != len(records) - 1 or malformed_tail_offset is not None:
                     raise
-                offset = record.offset
-                del records[position]
-                return offset
-        return malformed_tail_offset
+                raise _complete_invalid_tail_error(self.path, record.offset) from error
 
     def _read_unlocked(self) -> tuple[list[RunEvent], int | None]:
         if not self.path.exists():
@@ -716,12 +728,14 @@ class EventStore:
                 self._parsed_records += 1
                 event = RunEvent.model_validate_json(line)
                 events.append(event)
-            except ValidationError:
+            except ValidationError as error:
+                if index != len(lines) - 1:
+                    raise
+                if _is_complete_json(line):
+                    raise _complete_invalid_tail_error(self.path, record_offset) from error
                 # Preserve access to earlier audit history if a process was
                 # interrupted during its final append.
-                if index == len(lines) - 1:
-                    return events, record_offset
-                raise
+                return events, record_offset
         return events, None
 
 
@@ -759,6 +773,41 @@ def _scan_header_fields(line: bytes) -> tuple[int, EventType, str | None, str | 
 
 def _is_optional_str(value: Any) -> bool:  # noqa: ANN401  # scanning untyped JSON
     return value is None or isinstance(value, str)
+
+
+def _is_complete_json(line: bytes) -> bool:
+    """Whether the bytes parse as one complete JSON value.
+
+    A torn append leaves a strict prefix of the record plus its newline, and
+    no strict prefix of a serialized object is complete JSON, so this
+    discriminates an interrupted write from a fully written record.
+    """
+    try:
+        json.loads(line)
+    except ValueError:
+        return False
+    return True
+
+
+def _ends_without_newline(path: Path) -> bool:
+    """Whether the file's final byte leaves its last record unterminated."""
+    if not path.exists():
+        return False
+    size = path.stat().st_size
+    if size == 0:
+        return False
+    with path.open("rb") as stream:
+        stream.seek(size - 1)
+        return stream.read(1) != b"\n"
+
+
+def _complete_invalid_tail_error(path: Path, offset: int) -> ValueError:
+    """Corruption error for a fully written final record that fails validation.
+
+    Unlike a torn append, the record is complete, so silently truncating it
+    would erase a durable fact; the operator must inspect the file instead.
+    """
+    return ValueError(f"complete final record at byte offset {offset} in {path} failed validation")
 
 
 def _header_from_event(event: RunEvent, sequence: int) -> EventHeader:
