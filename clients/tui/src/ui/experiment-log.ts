@@ -16,6 +16,7 @@ import {
   unownedExperimentRounds,
 } from '../session-model.js';
 import {formatFileChange} from './design-log.js';
+import {applyPaneFocus, paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
 import {elapsedLabel} from './previews.js';
 import type {Theme} from './theme.js';
 
@@ -37,6 +38,7 @@ const HINT_MIN_WIDTH = 60;
 const CLAIM_MIN_WIDTH = 90;
 const MEASURED_MIN_WIDTH = 62;
 const KEPT_MIN_WIDTH = 104;
+const EXPERIMENTS_TITLE = 'Experiments';
 
 /**
  * Panel width at which the table still shows the claim, which is the row's
@@ -80,11 +82,11 @@ export class ExperimentLogView {
       paddingLeft: 1,
       paddingRight: 1,
       border: true,
-      borderStyle: 'rounded',
-      borderColor: theme.border,
+      borderStyle: paneBorderStyle(false),
+      borderColor: paneBorderColor(theme, false),
       backgroundColor: theme.elevatedSurface,
       visible: false,
-      title: ' Experiments ',
+      title: paneTitle(EXPERIMENTS_TITLE, false),
       onMouseUp: () => this.controller.focusPane('left'),
     });
     this.#header = new TextRenderable(renderer, {
@@ -154,9 +156,18 @@ export class ExperimentLogView {
       return;
     }
     this.output.visible = true;
-    const focused = focusedPane(state) === 'experiments';
-    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
-    this.output.title = focused ? ' ▸ Experiments ' : ' Experiments ';
+    // Both the label and the focus channels are derived from the state being
+    // rendered, so this runs on every notification, including the ones the
+    // cache below returns from. Naming the panel `Experiments` here and
+    // correcting it during detail rendering left a same-state notification
+    // titling a hypothesis body with the index's title.
+    const detail = detailedHypothesis(state);
+    applyPaneFocus(
+      this.output,
+      this.#theme,
+      detail === null ? EXPERIMENTS_TITLE : `Hypothesis ${detail.hypothesis_id}`,
+      focusedPane(state) === 'experiments',
+    );
     const width = this.#availableWidth ?? this.renderer.terminalWidth;
     if (state === this.#renderedState && width === this.#renderedWidth) return;
     const previousDetailKey = this.#renderedState?.hypothesisDetail?.entryKey ?? null;
@@ -164,7 +175,6 @@ export class ExperimentLogView {
     this.#renderedWidth = width;
     this.#clear();
 
-    const detail = detailedHypothesis(state);
     if (detail !== null) {
       this.#renderDetail(detail, state);
       if (previousDetailKey !== state.hypothesisDetail?.entryKey) this.#rows.scrollTo(0);
@@ -276,7 +286,9 @@ export class ExperimentLogView {
 
   #renderDetail(entry: HypothesisEntry, state: SessionState): void {
     const selectedRound = state.hypothesisDetail?.selectedRound ?? null;
-    this.output.title = ` ${focusedTitlePrefix(state)}Hypothesis ${entry.hypothesis_id} `;
+    // The frame, its colour, and the title are `render`'s: it is the one place
+    // that runs on every notification, so it is the one place that can keep
+    // them in step with what the panel is showing.
     this.#header.content = hypothesisMetadata(entry);
     const title = entry.title?.trim();
     if (title) this.#line(title, this.#theme.textStrong);
@@ -708,10 +720,6 @@ export function measuredDirection(entries: readonly HypothesisEntry[]): 'max' | 
     else if (direction !== candidate) return null;
   }
   return direction;
-}
-
-function focusedTitlePrefix(state: SessionState): string {
-  return focusedPane(state) === 'experiments' ? '▸ ' : '';
 }
 
 export function hypothesisMetadata(entry: HypothesisEntry): string {

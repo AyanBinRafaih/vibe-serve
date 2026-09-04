@@ -8,6 +8,7 @@ import {
 import {suggestSlashCommands} from '../commands.js';
 import type {ChatMenuRow, SessionState} from '../session-model.js';
 import {SPINNER_FRAMES, SPINNER_INTERVAL_MS} from './activity-bar.js';
+import {applyPaneFocus, paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
 import {elapsedLabel} from './previews.js';
 import {SuggestionMenu} from './suggestion-menu.js';
 import type {Theme} from './theme.js';
@@ -19,13 +20,15 @@ const EDITOR_HORIZONTAL_CHROME = 4;
 /** Rows the menu shows at once before it scrolls its selection into view. */
 const MAX_MENU_ROWS = 10;
 const MENU_CHROME = 2;
-
-const IDLE_TITLE = ' Message ';
-
-/** Composer title while a question is in flight: spinner plus wait time. */
-export function pendingComposerTitle(frame: number, elapsedMs: number): string {
+const COMPOSER_TITLE = 'Message';
+/**
+ * Composer label while a question is in flight: spinner plus wait time. It is
+ * unpadded because the pane frame owns the padding and the focus gutter, so
+ * the wait and the focus marker compose instead of overwriting each other.
+ */
+export function pendingComposerLabel(frame: number, elapsedMs: number): string {
   const spinner = SPINNER_FRAMES[frame % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0];
-  return ` Message · ${spinner} ${elapsedLabel(elapsedMs)} `;
+  return `${COMPOSER_TITLE} · ${spinner} ${elapsedLabel(elapsedMs)}`;
 }
 
 class ChatTextareaRenderable extends TextareaRenderable {
@@ -78,10 +81,10 @@ export class ChatComposerView {
   readonly #hint: TextRenderable;
   readonly #menuList: TextRenderable;
   #availableWidth = 1;
-  #focused = false;
   #theme: Theme;
   #renderedMenu: string | null = null;
   #lastState: SessionState | null = null;
+  /** Whether the agent still owes an answer, which the title says. */
   #pending = false;
   #onScreen = false;
   #pendingSince = 0;
@@ -109,9 +112,9 @@ export class ChatComposerView {
       width: '100%',
       height: MIN_EDITOR_ROWS + 2,
       border: true,
-      borderStyle: 'rounded',
-      borderColor: theme.border,
-      title: IDLE_TITLE,
+      borderStyle: paneBorderStyle(false),
+      borderColor: paneBorderColor(theme, false),
+      title: paneTitle(COMPOSER_TITLE, false),
       paddingLeft: 1,
       paddingRight: 1,
       onMouseUp: this.onFocusRequest,
@@ -244,7 +247,8 @@ export class ChatComposerView {
       this.#editor.setText(this.draft.value);
       this.#syncSuggestions();
     }
-    this.setFocused(focused);
+    this.#pending = pending;
+    this.#applyChrome();
     this.#hint.content = pending
       ? 'Awaiting the agent · Enter: queue follow-up'
       : focused
@@ -302,9 +306,7 @@ export class ChatComposerView {
   }
 
   #refreshTitle(): void {
-    this.#box.title = this.#pending
-      ? pendingComposerTitle(this.#frame, Date.now() - this.#pendingSince)
-      : IDLE_TITLE;
+    this.#applyChrome();
   }
 
   isEmpty(): boolean {
@@ -315,14 +317,25 @@ export class ChatComposerView {
     this.#editor.focus();
   }
 
-  setFocused(focused: boolean): void {
-    this.#focused = focused;
-    this.#box.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
+  /**
+   * The composer's frame, always the resting one.
+   *
+   * The focus treatment names the pane the keys are on, and this box is inside
+   * that pane rather than being one. Wearing it here drew the marker and the
+   * focused border twice, one nested in the other, which is the ambiguity the
+   * treatment exists to remove. Which composer has the cursor is carried by the
+   * cursor itself and by the hint line under the box, both non-colour channels.
+   */
+  #applyChrome(): void {
+    const label = this.#pending
+      ? pendingComposerLabel(this.#frame, Date.now() - this.#pendingSince)
+      : COMPOSER_TITLE;
+    applyPaneFocus(this.#box, this.#theme, label, false);
   }
 
   applyTheme(theme: Theme): void {
     this.#theme = theme;
-    this.#box.borderColor = this.#focused ? theme.borderFocus : theme.border;
+    this.#applyChrome();
     this.#editor.textColor = theme.textStrong;
     this.#editor.focusedTextColor = theme.textStrong;
     this.#hint.fg = theme.textSubtle;
