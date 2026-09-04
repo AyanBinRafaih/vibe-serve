@@ -10,6 +10,20 @@ import {ChatComposerView, type ChatDraft} from './chat-composer.js';
 import {ConversationView} from './conversation.js';
 import type {Theme} from './theme.js';
 
+/**
+ * The centred modal's four edges as fractions of the terminal: 80% of the
+ * columns, centred, and 76% of the rows starting a tenth of the way down.
+ */
+const MODAL_LEFT = 0.1;
+const MODAL_RIGHT = 0.9;
+const MODAL_TOP = 0.1;
+const MODAL_BOTTOM = 0.86;
+
+/** Columns the modal's border and padding take from every child. */
+const MODAL_CHROME = 4;
+/** A border, one row to type on, and a border. */
+const MIN_MODAL_HEIGHT = 3;
+
 /** Screen rectangle the chat occupies when it shares the row with a pane. */
 export interface PaneBounds {
   left: number;
@@ -34,9 +48,17 @@ export class ChatOverlayView {
   readonly #conversation: ConversationView;
   readonly #composer: ChatComposerView;
   #bounds: PaneBounds | null = null;
+  /**
+   * Columns inside the modal's chrome, as the geometry below just set them.
+   * `output.width` answers with the last width the layout computed rather than
+   * the one assigned, so after a resize it still describes the previous
+   * rectangle; the composer would wrap its draft against a stale width for as
+   * long as no state change happened to ask again.
+   */
+  #contentWidth = 1;
 
   constructor(
-    renderer: CliRenderer,
+    private readonly renderer: CliRenderer,
     controller: SessionController,
     markdownStyle: SyntaxStyle,
     theme: Theme,
@@ -44,11 +66,7 @@ export class ChatOverlayView {
   ) {
     this.output = new BoxRenderable(renderer, {
       id: 'chat-overlay',
-      width: '80%',
-      height: '76%',
       position: 'absolute',
-      left: '10%',
-      top: '10%',
       flexDirection: 'column',
       paddingLeft: 1,
       paddingRight: 1,
@@ -86,6 +104,7 @@ export class ChatOverlayView {
       theme,
       'chat-modal',
     );
+    this.#applyModalGeometry();
     this.#transcript.add(this.#conversation.output);
     this.output.add(this.#transcript);
     // Anchored to the composer, matching the docked pane: the same commands
@@ -100,19 +119,62 @@ export class ChatOverlayView {
    * ``null`` restores the centred modal geometry.
    */
   setPaneBounds(bounds: PaneBounds | null): void {
-    if (samePaneBounds(this.#bounds, bounds)) return;
-    this.#bounds = bounds;
+    // The modal measures itself against the terminal, so it is recomputed even
+    // when the bounds did not change: a resize changes the answer.
     if (bounds === null) {
-      this.output.left = '10%';
-      this.output.width = '80%';
-      this.output.top = '10%';
-      this.output.height = '76%';
+      this.#bounds = null;
+      this.#applyModalGeometry();
       return;
     }
-    this.output.left = bounds.left;
-    this.output.width = Math.max(1, bounds.width);
-    this.output.top = bounds.top;
-    this.output.height = Math.max(3, bounds.height);
+    if (samePaneBounds(this.#bounds, bounds)) return;
+    this.#bounds = bounds;
+    this.#applyGeometry(
+      bounds.left,
+      bounds.top,
+      Math.max(1, bounds.width),
+      Math.max(MIN_MODAL_HEIGHT, bounds.height),
+    );
+  }
+
+  /**
+   * Places the centred modal on whole cells. Left as percentages, its edges
+   * land mid-row at most terminal heights, and the layout rounds a child's
+   * offset from its parent separately from that child's size: at a fractional
+   * offset the two disagree and the transcript either runs a row into the
+   * composer or leaves a row of the modal's floor blank.
+   *
+   * Rounding the four edges reproduces the rectangle the percentages already
+   * produced, so the modal is the same size and in the same place as before;
+   * only the offsets inside it become whole. That equivalence is a property of
+   * how the layout rounds, which is per edge and not per size: it rounds a
+   * node's absolute left and its absolute right, then takes the width from the
+   * difference. So the width was already `round(0.9W) - round(0.1W)` and never
+   * `round(0.8W)`, which disagrees with it at 104 of the 261 widths from 40 to
+   * 300. `pins the modal rectangle across a width sweep` holds this.
+   */
+  #applyModalGeometry(): void {
+    const {terminalWidth, terminalHeight} = this.renderer;
+    const left = Math.round(terminalWidth * MODAL_LEFT);
+    const top = Math.round(terminalHeight * MODAL_TOP);
+    this.#applyGeometry(
+      left,
+      top,
+      Math.max(1, Math.round(terminalWidth * MODAL_RIGHT) - left),
+      Math.max(MIN_MODAL_HEIGHT, Math.round(terminalHeight * MODAL_BOTTOM) - top),
+    );
+  }
+
+  /**
+   * The one place the modal's rectangle is written, so the width its children
+   * are told is the width just assigned rather than a read back out of the
+   * layout.
+   */
+  #applyGeometry(left: number, top: number, width: number, height: number): void {
+    this.output.left = left;
+    this.output.top = top;
+    this.output.width = width;
+    this.output.height = height;
+    this.#contentWidth = Math.max(1, width - MODAL_CHROME);
   }
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
@@ -129,7 +191,7 @@ export class ChatOverlayView {
     this.#composer.syncPending(state.chatPending, state.chatOpen);
     if (!state.chatOpen) return;
     this.output.title = ` ${chatThreadHeading(state)} `;
-    this.#composer.activate(Math.max(1, this.output.width - 4), true, state.chatPending);
+    this.#composer.activate(this.#contentWidth, true, state.chatPending);
     this.#composer.renderMenu(state);
     this.#conversation.render(state);
     this.#transcript.scrollTo(this.#transcript.scrollHeight);
