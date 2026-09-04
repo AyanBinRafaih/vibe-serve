@@ -22,6 +22,7 @@ from server.api.protocol import (
     SubscribedMessage,
     SubscribeRequest,
 )
+from server.transport.subscriptions import SubscriptionTracker
 from vibesys.unix_socket import validate_socket_path
 
 if TYPE_CHECKING:
@@ -55,15 +56,13 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 request_id = str(raw.get("request_id", request_id))
                 request = _REQUEST_ADAPTER.validate_python(raw)
                 if isinstance(request, SubscribeRequest):
-                    self.server.client_subscribed.set()
-                    try:
-                        self._stream(request)
-                    except (BrokenPipeError, ConnectionResetError):
-                        pass
-                    except Exception as exc:  # noqa: BLE001  # tracked: #288
-                        self._write_stream_error(request.request_id, exc)
-                    finally:
-                        self.server.client_disconnected.set()
+                    with self.server.subscriptions.track():
+                        try:
+                            self._stream(request)
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                        except Exception as exc:  # noqa: BLE001  # tracked: #288
+                            self._write_stream_error(request.request_id, exc)
                     return
                 response = api.execute(request)
             except Exception as exc:  # noqa: BLE001  # tracked: #288
@@ -170,12 +169,10 @@ class _JsonlUnixServer(socketserver.ThreadingUnixStreamServer):
         self,
         path: Path,
         api: RunApi,
-        client_subscribed: threading.Event,
-        client_disconnected: threading.Event,
+        subscriptions: SubscriptionTracker,
     ):
         self.api = api
-        self.client_subscribed = client_subscribed
-        self.client_disconnected = client_disconnected
+        self.subscriptions = subscriptions
         super().__init__(str(path), _RequestHandler)
 
 
@@ -187,19 +184,13 @@ class UnixJsonlServer:
         self.api = api
         self._server: _JsonlUnixServer | None = None
         self._thread: threading.Thread | None = None
-        self._client_subscribed = threading.Event()
-        self._client_disconnected = threading.Event()
+        self._subscriptions = SubscriptionTracker()
 
     def start(self) -> None:  # noqa: D102  # tracked: #288
         validate_socket_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.unlink(missing_ok=True)
-        self._server = _JsonlUnixServer(
-            self.path,
-            self.api,
-            self._client_subscribed,
-            self._client_disconnected,
-        )
+        self._server = _JsonlUnixServer(self.path, self.api, self._subscriptions)
         os.chmod(self.path, 0o600)  # noqa: PTH101  # tracked: #288
         self._thread = threading.Thread(
             target=self._server.serve_forever,
@@ -209,12 +200,12 @@ class UnixJsonlServer:
         self._thread.start()
 
     def wait_for_subscriber(self, timeout: float) -> bool:
-        """Wait until the presentation client has established its event stream."""
-        return self._client_subscribed.wait(timeout)
+        """Wait until a presentation client has established its event stream."""
+        return self._subscriptions.wait_for_subscriber(timeout)
 
     def wait_for_subscriber_disconnect(self) -> None:
-        """Keep terminal events queryable until the attached client exits."""
-        self._client_disconnected.wait()
+        """Keep terminal events queryable until the last active subscriber exits."""
+        self._subscriptions.wait_for_none_active()
 
     def close(self) -> None:  # noqa: D102  # tracked: #288
         if self._server is not None:
