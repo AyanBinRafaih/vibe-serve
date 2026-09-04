@@ -36,8 +36,9 @@ from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.input_manifest import load_input_bundle
 from vibesys.loops.metrics import MetricSpace, Objective
+from vibesys.loops.roles import EXPECTED_AGENT_ROLES
 from vibesys.profilers import ProfilerKind
-from vibesys.run.events import CoreEventType
+from vibesys.run.events import CoreEventType, RunStartedData
 from vibesys.run.integration import LocalRunIntegration
 from vibesys.sandbox.run_environment import run_environment_record
 from vs_project import (
@@ -1871,3 +1872,31 @@ def test_non_microservice_task_is_unaffected_by_trace_arguments(tmp_path: Path) 
     cli._apply_bundle_profiler_default(args)  # noqa: SLF001
 
     assert args.profiler is ProfilerKind.AUTO
+
+
+def test_expected_role_registry_covers_every_outer_loop() -> None:
+    """The advertised contract must name every loop dispatch can select."""
+    import entrypoints.headless as cli  # noqa: PLC0415
+
+    assert set(EXPECTED_AGENT_ROLES) == set(cli._OUTER_LOOPS)  # noqa: SLF001
+    assert set(EXPECTED_AGENT_ROLES) == set(cli._LOOP_COMMANDS)  # noqa: SLF001
+    assert all(EXPECTED_AGENT_ROLES.values())
+
+
+@pytest.mark.parametrize("loop", ["agent", "plain", "evolve"])
+def test_dispatch_advertises_expected_roles_on_run_started(loop: str, tmp_path: Path) -> None:
+    import entrypoints.headless as cli  # noqa: PLC0415
+
+    project = _write_input_project(tmp_path)
+    integration = LocalRunIntegration()
+    events = []
+    integration.events.subscribe(events.append)
+    runner = Mock()
+
+    with _patch_loop_runner(loop, runner):
+        cli.dispatch(["--outer-loop", loop, "--input", str(project)], integration=integration)
+
+    started = next(event for event in events if event.type is CoreEventType.RUN_STARTED)
+    assert isinstance(started.data, RunStartedData)
+    assert started.data.expected_roles == EXPECTED_AGENT_ROLES[loop]
+    assert started.data.expected_roles

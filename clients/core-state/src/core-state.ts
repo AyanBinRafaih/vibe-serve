@@ -132,6 +132,11 @@ export interface CoreState {
   agentKind: string | null;
   roundLabel: string | null;
   outerLoop: string | null;
+  /**
+   * The agent roles the backend advertised in `run_started`; null on
+   * recordings that predate the field (see `expectedRolesForSeeding`).
+   */
+  expectedRoles: readonly string[] | null;
   maxRounds: number | null;
   rounds: RoundSummary[];
   phases: AgentPhase[];
@@ -169,6 +174,7 @@ export function initialCoreState(): CoreState {
     agentKind: null,
     roundLabel: null,
     outerLoop: null,
+    expectedRoles: null,
     maxRounds: null,
     rounds: [],
     phases: [],
@@ -350,6 +356,7 @@ export function reduceEventPrefix(
     agentKind: state.agentKind ?? older.agentKind,
     roundLabel: state.roundLabel ?? older.roundLabel,
     outerLoop: state.outerLoop ?? older.outerLoop,
+    expectedRoles: state.expectedRoles ?? older.expectedRoles,
     maxRounds: state.maxRounds ?? older.maxRounds,
     rounds: mergeRoundLists(older.rounds, state.rounds),
     phases: mergePhaseLists(older.phases, state.phases),
@@ -541,6 +548,7 @@ function foldEvent(state: CoreState, event: RunEvent, folder: TranscriptFolder |
   if (event.round_label) next.roundLabel = event.round_label;
   const runMap = applyRunMapEvent(next, event);
   next.outerLoop = runMap.outerLoop;
+  next.expectedRoles = runMap.expectedRoles;
   next.rounds = runMap.rounds;
   next.phases = runMap.phases;
 

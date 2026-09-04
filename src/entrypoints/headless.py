@@ -38,6 +38,7 @@ from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.input_manifest import InputBundle, load_input_bundle, load_project_task
 from vibesys.loops.metrics import MetricSpace, Objective
+from vibesys.loops.roles import expected_agent_roles
 from vibesys.profilers import CLI_PROFILER_CHOICES, ProfilerKind, coerce_profiler_kind
 from vibesys.render.headless import HeadlessRenderer
 from vibesys.repository import (
@@ -2600,6 +2601,7 @@ def dispatch(argv: list[str], integration: RunIntegration | None = None) -> None
                     outer_loop=loop_kind,
                     input=str(args.input_bundle.root),
                     max_rounds=max_rounds,
+                    expected_roles=expected_agent_roles(loop_kind),
                 ),
             )
         runner(args, run_integration)

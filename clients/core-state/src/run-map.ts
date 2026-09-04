@@ -39,18 +39,26 @@ export interface AgentPhase {
 
 export interface RunMapState {
   outerLoop: string | null;
+  /**
+   * The agent roles the backend advertised in `run_started`; null on
+   * recordings that predate the field, where `legacyExpectedRoles` applies.
+   */
+  expectedRoles: readonly string[] | null;
   rounds: RoundSummary[];
   phases: AgentPhase[];
 }
 
 export function applyRunMapEvent(state: RunMapState, event: RunEvent): RunMapState {
-  const outerLoop =
-    event.type === 'run_started' && event.data?.kind === 'run_started'
-      ? event.data.outer_loop
-      : state.outerLoop;
+  const started =
+    event.type === 'run_started' && event.data?.kind === 'run_started' ? event.data : null;
+  const outerLoop = started === null ? state.outerLoop : started.outer_loop;
+  const expectedRoles =
+    started?.expected_roles !== undefined && started.expected_roles.length > 0
+      ? started.expected_roles
+      : state.expectedRoles;
   const rounds = applyRoundEvent(state.rounds, state.phases, event);
-  const phases = applyPhaseEvent({...state, outerLoop, rounds}, event);
-  return {outerLoop, rounds, phases};
+  const phases = applyPhaseEvent({...state, outerLoop, expectedRoles, rounds}, event);
+  return {outerLoop, expectedRoles, rounds, phases};
 }
 
 export function roundNumberFromLabel(label: string | null | undefined): number | null {
@@ -165,8 +173,9 @@ function applyPhaseEvent(state: RunMapState, event: RunEvent): AgentPhase[] {
   if (!kind) return state.phases;
   const roundNumber = roundNumberFromLabel(event.round_label);
   let phases = state.phases;
-  if (roundNumber !== null && state.outerLoop !== null) {
-    phases = seedExpectedPhases(state.outerLoop, phases, roundNumber);
+  const roles = expectedRolesForSeeding(state);
+  if (roundNumber !== null && roles !== null) {
+    phases = seedExpectedPhases(roles, phases, roundNumber);
   }
   if (event.type === 'run_failed' || event.type === 'run_interrupted') {
     return phases.map(phase =>
@@ -231,22 +240,42 @@ function applyRoundEvent(
 }
 
 function seedExpectedPhases(
-  outerLoop: string,
+  roles: readonly string[],
   current: AgentPhase[],
   roundNumber: number,
 ): AgentPhase[] {
   let phases = current;
-  for (const kind of expectedRoles(outerLoop)) {
+  for (const kind of roles) {
     phases = ensurePhase(phases, kind, roundNumber);
   }
   return phases;
 }
 
-function expectedRoles(outerLoop: string): string[] {
+/**
+ * The roles a round seeds pending placeholders for: the set the backend
+ * advertised in `run_started`, else the legacy table for recordings that
+ * predate the advertised contract. Null when neither knows the loop, in which
+ * case nothing is seeded and the round degrades gracefully to the phases its
+ * events actually carry (`ensurePhase` still creates each observed role).
+ */
+export function expectedRolesForSeeding(
+  state: Pick<RunMapState, 'outerLoop' | 'expectedRoles'>,
+): readonly string[] | null {
+  if (state.expectedRoles !== null) return state.expectedRoles;
+  if (state.outerLoop === null) return null;
+  return legacyExpectedRoles(state.outerLoop);
+}
+
+/**
+ * Role tables for recordings whose `run_started` predates the backend's
+ * advertised `expected_roles` contract. Frozen: the backend now owns which
+ * roles a loop runs, so this table must never gain new loops or roles.
+ */
+function legacyExpectedRoles(outerLoop: string): readonly string[] | null {
   if (outerLoop === 'agent') return ['orchestrator', 'implementer', 'judge', 'profiler'];
   if (outerLoop === 'plain') return ['implementer', 'judge', 'perf_eval'];
   if (outerLoop === 'evolve') return ['implementer', 'judge', 'profiler'];
-  return [];
+  return null;
 }
 
 function ensurePhase(phases: AgentPhase[], kind: string, roundNumber: number | null): AgentPhase[] {

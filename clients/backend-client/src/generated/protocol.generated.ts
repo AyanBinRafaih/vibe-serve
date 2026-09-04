@@ -285,6 +285,7 @@ export type Kind9 = "run_started";
 export type OuterLoop = string;
 export type Input = string;
 export type MaxRounds = number;
+export type ExpectedRoles = string[];
 export type Kind10 = "run_interrupted";
 export type Reason = string;
 export type Signal = string | null;
@@ -816,6 +817,7 @@ export interface RunStartedData {
   outer_loop: OuterLoop;
   input: Input;
   max_rounds: MaxRounds;
+  expected_roles?: ExpectedRoles;
   [k: string]: unknown;
 }
 export interface RunInterruptedData {

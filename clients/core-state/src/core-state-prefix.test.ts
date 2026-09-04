@@ -268,6 +268,9 @@ describe('prefix merges across the chunk boundary', () => {
     expect(full.status).toBe('running');
     expect(merged.status).toBe('connecting');
     expect(merged.outerLoop).toBe('plain');
+    // `runStartedEvent` advertises no roles, so this also pins the legacy
+    // table fallback for recordings that predate `expected_roles`.
+    expect(full.expectedRoles).toBeNull();
     expect(full.phases.map(phase => phase.kind)).toEqual(['implementer', 'judge', 'perf_eval']);
     expect(merged.phases.map(phase => phase.kind)).toEqual(['implementer']);
     expect(merged.transcript.map(entry => entry.content)).toEqual(['work more']);
@@ -414,6 +417,7 @@ function generateRunEvents(seed: number, options: {typedTools: boolean}, rounds 
       outer_loop: 'agent',
       input: '/synthetic/target',
       max_rounds: rounds,
+      expected_roles: [...AGENT_KINDS],
     },
   });
 
