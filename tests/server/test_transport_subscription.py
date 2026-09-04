@@ -1,4 +1,4 @@
-"""Tail subscription, bounded backfill, and late-attach transport contracts."""
+"""Tail subscription, bounded backfill, late-attach, and lifetime transport contracts."""
 
 import json
 import socket
@@ -124,16 +124,23 @@ def _attach(tmp_path: Path, events: list[RunEvent]) -> ServerParts:
 
 
 @contextmanager
-def _live_subscription(api: RunApi, request: SubscribeRequest) -> Generator[Callable[[], dict]]:
-    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108
-    with UnixJsonlServer(socket_path, api):  # noqa: SIM117
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(10)
-            client.connect(str(socket_path))
-            stream = client.makefile("rwb")
+def _subscribed_client(
+    socket_path: Path, request: SubscribeRequest
+) -> Generator[Callable[[], dict]]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(10)
+        client.connect(str(socket_path))
+        with client.makefile("rwb") as stream:
             stream.write(request.model_dump_json().encode() + b"\n")
             stream.flush()
             yield lambda: json.loads(stream.readline())
+
+
+@contextmanager
+def _live_subscription(api: RunApi, request: SubscribeRequest) -> Generator[Callable[[], dict]]:
+    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108
+    with UnixJsonlServer(socket_path, api), _subscribed_client(socket_path, request) as read:
+        yield read
 
 
 def _subscribe(api: RunApi, request: SubscribeRequest) -> tuple[dict, dict]:
@@ -408,6 +415,38 @@ def test_live_append_keeps_existing_tail_floor(tmp_path):  # noqa: ANN001, ANN20
 
     assert batch["history_after_sequence"] == floor
     assert [event["type"] for event in batch["events"]] == ["output"]
+
+
+def test_disconnect_wait_blocks_until_last_subscriber_closes(tmp_path: Path) -> None:
+    parts = build_server_parts(tmp_path / "logs")
+    socket_path = Path("/tmp") / f"vibesys-test-{uuid.uuid4().hex}.sock"  # noqa: S108
+    request = SubscribeRequest(after_sequence=0)
+
+    with UnixJsonlServer(socket_path, parts.api) as server:
+        with _subscribed_client(socket_path, request) as read:
+            assert read()["type"] == "subscribed"
+        parts.journal.publish_output("stdout", "wake the first handler")
+        # With no subscriber left, the wait returns; it must not poison later waits.
+        server.wait_for_subscriber_disconnect()
+
+        with _subscribed_client(socket_path, request) as read:
+            assert read()["type"] == "subscribed"
+            unblocked = threading.Event()
+
+            def wait_for_disconnect() -> None:
+                server.wait_for_subscriber_disconnect()
+                unblocked.set()
+
+            waiter = threading.Thread(target=wait_for_disconnect, daemon=True)
+            waiter.start()
+            # The first client's earlier disconnect must not unblock the wait
+            # while the second subscription is still streaming.
+            assert not unblocked.wait(timeout=1.0)
+        parts.journal.publish_output("stdout", "wake the second handler")
+
+        assert unblocked.wait(timeout=5)
+        waiter.join(timeout=5)
+        assert not waiter.is_alive()
 
 
 def test_wait_for_change_does_not_parse_events(tmp_path):  # noqa: ANN001, ANN201

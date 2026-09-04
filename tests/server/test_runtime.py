@@ -4,6 +4,8 @@ import json
 import socket
 import threading
 import time
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -20,19 +22,28 @@ from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.run.events import CoreEventType, EventStatus
 
 
-def _collect_until(socket_path: Path, terminal_type: str, received: list[dict]) -> None:
+def _await_socket(socket_path: Path) -> None:
     deadline = time.monotonic() + 5
     while not socket_path.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
+
+
+@contextmanager
+def _subscription(socket_path: Path) -> Generator[Callable[[], dict]]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(5)
         client.connect(str(socket_path))
-        stream = client.makefile("rwb")
-        stream.write(SubscribeRequest(after_sequence=0).model_dump_json().encode() + b"\n")
-        stream.flush()
+        with client.makefile("rwb") as stream:
+            stream.write(SubscribeRequest(after_sequence=0).model_dump_json().encode() + b"\n")
+            stream.flush()
+            yield lambda: json.loads(stream.readline())
+
+
+def _collect_until(socket_path: Path, terminal_type: str, received: list[dict]) -> None:
+    _await_socket(socket_path)
+    with _subscription(socket_path) as read:
         while True:
-            message = json.loads(stream.readline())
-            events = message.get("events", [])
+            events = read().get("events", [])
             received.extend(events)
             if any(event["type"] == terminal_type for event in events):
                 return
@@ -69,6 +80,46 @@ def test_runtime_streams_success_before_client_disconnect(tmp_path):  # noqa: AN
     assert not subscriber.is_alive()
     assert any(event["type"] == "server_ready" for event in received)
     assert sum(event["type"] == "run_finished" for event in received) == 1
+    assert not socket_path.exists()
+
+
+def test_runtime_waits_for_reconnected_subscriber_before_teardown(tmp_path: Path) -> None:
+    """A subscriber that reconnects must outlive the run's terminal event.
+
+    The first subscription drops before the run finishes; the runtime must not
+    treat that as "the client is gone" while the second subscription is live.
+    """
+    socket_path = tmp_path / "control.sock"
+    runtime = ServerRuntime(socket_path=socket_path)
+    release_run = threading.Event()
+    run_returned = threading.Event()
+    returned_while_attached: list[bool] = []
+
+    def drive_reconnect() -> None:
+        _await_socket(socket_path)
+        with _subscription(socket_path) as read:
+            assert read()["type"] == "subscribed"
+        with _subscription(socket_path) as read:
+            assert read()["type"] == "subscribed"
+            release_run.set()
+            while not any(event["type"] == "run_finished" for event in read().get("events", [])):
+                pass
+            returned_while_attached.append(run_returned.wait(timeout=1.0))
+
+    clients = threading.Thread(target=drive_reconnect)
+    clients.start()
+
+    def run() -> str:
+        assert release_run.wait(timeout=5)
+        return "ran"
+
+    value = runtime.run(run)
+
+    run_returned.set()
+    clients.join(timeout=5)
+    assert value == "ran"
+    assert not clients.is_alive()
+    assert returned_while_attached == [False]
     assert not socket_path.exists()
 
 
