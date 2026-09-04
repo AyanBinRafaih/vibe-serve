@@ -169,3 +169,32 @@ def test_round_finished_rejects_non_finite_perf_metric(value):  # noqa: ANN001, 
             perf_metric=value,
             perf_unit="req/s",
         )
+
+
+class TestRoundFinishedProfileSkipped:
+    def test_flag_round_trips_when_true(self):  # noqa: ANN201  # tracked: #288
+        event = make_event(
+            EventType.ROUND_FINISHED,
+            data=RoundFinishedData(
+                attempts=1,
+                judge_verdict="pass",
+                perf_metric=100.0,
+                perf_unit="req/s",
+                profile_skipped=True,
+            ),
+        )
+        restored = _round_trip(event)
+        assert isinstance(restored.data, RoundFinishedData)
+        assert restored.data.profile_skipped is True
+
+    def test_payload_without_flag_defaults_false(self):  # noqa: ANN201  # tracked: #288
+        """Events recorded before the field existed must keep replaying."""
+        raw = (
+            '{"protocol_version": 1, "sequence": 7, "run_id": "r", '
+            '"timestamp": "2026-01-01T00:00:00Z", "type": "round_finished", '
+            '"data": {"kind": "round_finished", "attempts": 2, "judge_verdict": "pass", '
+            '"perf_metric": 100.0, "perf_unit": "req/s"}}'
+        )
+        event = RunEvent.model_validate_json(raw)
+        assert isinstance(event.data, RoundFinishedData)
+        assert event.data.profile_skipped is False

@@ -218,7 +218,10 @@ covers the whole run including rounds it has not reached yet. It is a window ont
 the part that fits: the selected round is always in view, and `↑ n` and `↓ n` say
 how many rounds sit past each edge. Each row carries the round's status word and
 glyph and a metric, the live agent-active time while it runs, the measured delta
-once it resolves, or its duration when no delta was recorded. A wide terminal
+once it resolves, or its duration when no delta was recorded. A completed round
+where no fresh profile ran shows a hollow `○` in place of the solid check and
+dims like a planned round; such a round records no perf reading, so it never
+carries a delta or a point in the perf chart. A wide terminal
 gets the full rows; between 85 and 100 columns the rail falls back to a
 number-and-glyph column, and narrower than that it collapses so the agents graph
 and transcript keep their width. The fallback threshold is the width at which the

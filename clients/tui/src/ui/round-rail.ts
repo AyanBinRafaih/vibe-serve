@@ -1,5 +1,5 @@
 import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
-import {hasActiveAgentTiming, type RoundSummary, roundAgentElapsedMs} from '@vibesys/core-state';
+import {hasActiveAgentTiming, type RoundState, roundAgentElapsedMs} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {
@@ -28,18 +28,28 @@ const RAIL_MIN = RAIL_COMPACT_WIDTH + STACKED_WIDTH + TRANSCRIPT_MIN;
 /** Border top and bottom; the title rides the top border. */
 const RAIL_VCHROME = 2;
 
-const STATUS_GLYPH: Record<RoundSummary['status'], string> = {
+const STATUS_GLYPH: Record<RoundState['status'], string> = {
   active: '⟳',
   completed: '✓',
   failed: '✗',
   planned: '·',
 };
-const STATUS_WORD: Record<RoundSummary['status'], string> = {
+const STATUS_WORD: Record<RoundState['status'], string> = {
   active: 'run',
   completed: 'done',
   failed: 'fail',
   planned: 'plan',
 };
+
+/**
+ * A completed round where no fresh profile ran trades the solid check for a
+ * hollow ring, so it never reads as a freshly measured one. A failed round
+ * keeps its cross: how the round ended outranks how it measured.
+ */
+function statusGlyph(round: RoundState): string {
+  if (round.status === 'completed' && round.profileSkipped === true) return '○';
+  return STATUS_GLYPH[round.status];
+}
 
 /**
  * The rail width for a terminal width, or 0 when the rail should collapse.
@@ -71,7 +81,7 @@ export function roundRailVisible(state: SessionState, terminalWidth: number): bo
 }
 
 export interface RailWindow {
-  rounds: RoundSummary[];
+  rounds: RoundState[];
   hiddenBefore: number;
   hiddenAfter: number;
 }
@@ -86,7 +96,7 @@ export interface RailWindow {
  * `↑ n` / `↓ n` indicators so the counts never overlap a round.
  */
 export function railWindow(
-  rounds: RoundSummary[],
+  rounds: RoundState[],
   selected: number | null,
   availableRows: number,
   rowHeight = 1,
@@ -132,7 +142,7 @@ export class RoundRailView {
   #renderedWidth = 0;
   #renderedRows = 0;
   #elapsedTimer: ReturnType<typeof setInterval> | null = null;
-  #runningRound: {round: RoundSummary; state: SessionState; text: TextRenderable} | null = null;
+  #runningRound: {round: RoundState; state: SessionState; text: TextRenderable} | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
@@ -241,7 +251,7 @@ export class RoundRailView {
   }
 
   #renderRound(
-    round: RoundSummary,
+    round: RoundState,
     viewState: {
       state: SessionState;
       selected: number | null;
@@ -272,7 +282,7 @@ export class RoundRailView {
    * alone is easy to lose in a long rail.
    */
   #roundColors(
-    round: RoundSummary,
+    round: RoundState,
     isSelected: boolean,
     isRunning: boolean,
   ): {fg: string; bg?: string} {
@@ -280,17 +290,20 @@ export class RoundRailView {
     if (isRunning) return {fg: this.#theme.success};
     if (round.status === 'planned') return {fg: this.#theme.textSubtle};
     if (round.status === 'failed') return {fg: this.#theme.error};
+    // A profile-skipped round completed without measuring anything, so it dims
+    // like a planned round rather than claiming a fresh result.
+    if (round.profileSkipped === true) return {fg: this.#theme.textSubtle};
     return {fg: this.#theme.textPrimary};
   }
 
   #roundLabel(
-    round: RoundSummary,
+    round: RoundState,
     state: SessionState,
     isSelected: boolean,
     compact: boolean,
   ): string {
     const marker = isSelected ? '▸' : ' ';
-    const glyph = STATUS_GLYPH[round.status];
+    const glyph = statusGlyph(round);
     if (compact) return `${marker}r${round.number}${glyph}`;
     const metric = roundMetric(round, state, new Date());
     const parts = [`${marker}r${round.number}`, glyph, STATUS_WORD[round.status]];
@@ -326,7 +339,7 @@ export class RoundRailView {
  * disagree), or its wall duration when no delta was measured. Planned rounds
  * have nothing to measure.
  */
-function roundMetric(round: RoundSummary, state: SessionState, now: Date): string {
+function roundMetric(round: RoundState, state: SessionState, now: Date): string {
   if (round.status === 'planned') return '';
   if (round.status === 'active') return elapsedLabel(roundAgentElapsedMs(round, now));
   const delta = hypothesisRoundFor(state, round.number)?.perf_delta_pct;
@@ -337,6 +350,6 @@ function roundMetric(round: RoundSummary, state: SessionState, now: Date): strin
   return elapsedLabel(roundAgentElapsedMs(round, end));
 }
 
-function latestActiveRoundNumber(rounds: RoundSummary[]): number | null {
+function latestActiveRoundNumber(rounds: RoundState[]): number | null {
   return [...rounds].reverse().find(round => round.status === 'active')?.number ?? null;
 }

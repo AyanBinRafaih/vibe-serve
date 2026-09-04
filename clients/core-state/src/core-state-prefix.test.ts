@@ -200,6 +200,22 @@ describe('prefix merges across the chunk boundary', () => {
     ]);
   });
 
+  it('keeps the carried-forward flag on a round the chunk finished', () => {
+    const events = [
+      chunkEvent(1, 'work'),
+      roundFinishedEvent(2, {profile_skipped: true}),
+      {...chunkEvent(3, 'next'), round_label: 'round-2-implementer'},
+    ];
+
+    // The flag lands in the chunk fold; the tail only touches round 2, so the
+    // boundary merge must hand round 1 through with the flag intact.
+    const merged = foldAsPrefix(events, 2);
+
+    expect(merged).toEqual(reduceEventBatch(initialCoreState(), events));
+    expect(merged.rounds[0]?.profileSkipped).toBe(true);
+    expect(merged.rounds[1]?.profileSkipped).toBeUndefined();
+  });
+
   it('merges a chunk diagnostic with its tail update by id', () => {
     const events = [
       diagnosticEvent(1, 'diag-1', 'warning', 'Agent stalled', null),
@@ -708,7 +724,7 @@ function runStartedEvent(sequence: number): RunEvent {
   };
 }
 
-function roundFinishedEvent(sequence: number): RunEvent {
+function roundFinishedEvent(sequence: number, extra: {profile_skipped?: boolean} = {}): RunEvent {
   return {
     sequence,
     timestamp: timestamp(sequence),
@@ -721,6 +737,7 @@ function roundFinishedEvent(sequence: number): RunEvent {
       judge_verdict: 'pass',
       perf_metric: null,
       perf_unit: null,
+      ...extra,
     },
   };
 }

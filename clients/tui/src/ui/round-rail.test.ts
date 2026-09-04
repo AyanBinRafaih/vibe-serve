@@ -1,4 +1,5 @@
 import {describe, expect, test} from 'bun:test';
+import {rgbToHex, type TextRenderable} from '@opentui/core';
 import {createTestRenderer} from '@opentui/core/testing';
 import type {RoundSummary} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
@@ -28,6 +29,25 @@ function railState(count: number): SessionState {
     experimentLog: null,
     core: {...base.core, rounds: rounds(count)},
   };
+}
+
+/** Renders the rail for `state` and returns each row's text and fg colour. */
+async function renderedRows(
+  state: SessionState,
+  rows: number,
+): Promise<{text: string; fg: string}[]> {
+  const {renderer} = await createTestRenderer({width: 120, height: 40});
+  const view = new RoundRailView(renderer, {} as unknown as SessionController, resolveTheme(null));
+  view.render(state, RAIL_FULL_WIDTH, rows);
+  const rendered = view.output.getChildren().map(child => {
+    const content = (child as {content?: {chunks?: {text?: string}[]}}).content;
+    return {
+      text: (content?.chunks ?? []).map(chunk => chunk.text ?? '').join(''),
+      fg: rgbToHex((child as TextRenderable).fg).toLowerCase(),
+    };
+  });
+  view.destroy();
+  return rendered;
 }
 
 describe('railWindow', () => {
@@ -189,19 +209,8 @@ describe('roundRailVisible', () => {
 
 describe('RoundRailView row budget', () => {
   async function railChildren(count: number, rows: number, selected: number): Promise<string[]> {
-    const {renderer} = await createTestRenderer({width: 120, height: 40});
-    const view = new RoundRailView(
-      renderer,
-      {} as unknown as SessionController,
-      resolveTheme(null),
-    );
-    view.render({...railState(count), selectedRound: selected}, RAIL_FULL_WIDTH, rows);
-    const lines = view.output.getChildren().map(child => {
-      const content = (child as {content?: {chunks?: {text?: string}[]}}).content;
-      return (content?.chunks ?? []).map(chunk => chunk.text ?? '').join('');
-    });
-    view.destroy();
-    return lines;
+    const rendered = await renderedRows({...railState(count), selectedRound: selected}, rows);
+    return rendered.map(row => row.text);
   }
 
   test('draws nothing when the box has no content rows', async () => {
@@ -222,5 +231,57 @@ describe('RoundRailView row budget', () => {
     const two = await railChildren(100, 4, 50);
     expect(two).toHaveLength(2);
     expect(two.filter(line => line.startsWith('↑') || line.startsWith('↓'))).toHaveLength(1);
+  });
+});
+
+describe('RoundRailView profile-skipped rounds', () => {
+  test('marks a completed profile-skipped round hollow and dim', async () => {
+    const base = railState(3);
+    const state: SessionState = {
+      ...base,
+      selectedRound: 3,
+      core: {
+        ...base.core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'completed', profileSkipped: true},
+          {number: 3, status: 'completed'},
+        ],
+      },
+    };
+    const rows = await renderedRows(state, 10);
+    const theme = resolveTheme(null);
+
+    const skipped = rows.find(row => row.text.includes('r2'));
+    expect(skipped?.text).toContain('○');
+    expect(skipped?.text).not.toContain('✓');
+    expect(skipped?.fg).toBe(theme.textSubtle.toLowerCase());
+
+    // A freshly measured round keeps the solid check and the primary colour.
+    const fresh = rows.find(row => row.text.includes('r1'));
+    expect(fresh?.text).toContain('✓');
+    expect(fresh?.text).not.toContain('○');
+    expect(fresh?.fg).toBe(theme.textPrimary.toLowerCase());
+  });
+
+  test('keeps the failure cross on a failed round that also skipped profiling', async () => {
+    const base = railState(2);
+    const state: SessionState = {
+      ...base,
+      selectedRound: 1,
+      core: {
+        ...base.core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          // How the round ended outranks how it measured: no hollow ring here.
+          {number: 2, status: 'failed', profileSkipped: true},
+        ],
+      },
+    };
+    const rows = await renderedRows(state, 10);
+
+    const failed = rows.find(row => row.text.includes('r2'));
+    expect(failed?.text).toContain('✗');
+    expect(failed?.text).not.toContain('○');
   });
 });

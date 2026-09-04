@@ -3463,6 +3463,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         ),
                         perf_metric=perf_metric,
                         perf_unit=perf_unit,
+                        profile_skipped=profile_skipped,
                     ),
                 )
 

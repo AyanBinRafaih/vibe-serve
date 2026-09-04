@@ -4892,3 +4892,32 @@ def test_reprompted_plan_is_labelled_as_a_retry_of_the_same_round(tmp_path, ref_
     corrective = plan_calls[2].kwargs["user_prompt"]
     assert "already-used" in corrective
     assert "never reuse an identifier used earlier in this run" in corrective.lower()
+
+
+def test_round_finished_events_carry_profile_skipped(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """The emitted event mirrors the round record's profile_skipped flag."""
+    # Round 1 reports no metric: no fresh profile ran, so the round is marked
+    # skipped with no perf reading. Round 2 is the final round, whose forced
+    # official evaluation records a fresh 321.5.
+    runner = _make_orchestrate_runner(implementer_perf_metrics=[None, 321.5])
+
+    _invoke_orchestrate(
+        tmp_path,
+        ref_file,
+        runner,
+        max_rounds=2,
+        judge_every=10,
+    )
+
+    rounds = _round_payloads(tmp_path)
+    assert [round_data["profile_skipped"] for round_data in rounds] == [True, False]
+
+    project = _created_project(tmp_path)
+    journal = Project.open(project).state.log_directory(_run_id(project)) / "core-events.jsonl"
+    finished = [
+        event
+        for event in (json.loads(line) for line in journal.read_text().splitlines())
+        if event["type"] == "round_finished"
+    ]
+    assert [event["round_label"] for event in finished] == ["round-1", "round-2"]
+    assert [event["data"]["profile_skipped"] for event in finished] == [True, False]
