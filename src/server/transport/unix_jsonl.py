@@ -64,7 +64,24 @@ class _RequestHandler(socketserver.StreamRequestHandler):
 
     def _stream(self, request: SubscribeRequest) -> None:
         api = self.server.api
-        bootstrap = api.subscription_bootstrap(request.after_sequence, request.tail)
+        try:
+            bootstrap = api.subscription_bootstrap(request.after_sequence, request.tail)
+        except Exception:
+            # A bootstrap failure must not reject the dial: the client probes
+            # ``tail`` support by dialing and treats a pre-handshake failure
+            # as a server without the field, so it would retry the whole
+            # history against the same fault. Acknowledge the accepted
+            # subscribe first; the failure then reaches the client as a
+            # stream error, exactly as it did when the replay was read after
+            # the handshake.
+            self._write_message(
+                SubscribedMessage(
+                    request_id=request.request_id,
+                    run_id=api.snapshot().run_id,
+                    latest_sequence=api.latest_sequence,
+                )
+            )
+            raise
         self._write_message(
             SubscribedMessage(
                 request_id=request.request_id,

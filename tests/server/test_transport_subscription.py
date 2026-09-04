@@ -197,19 +197,19 @@ def test_bootstrap_tail_stays_bounded_when_events_land_mid_bootstrap(  # noqa: A
 ):
     tail = 40
     parts = _attach(tmp_path, _round_log(200))
-    original_snapshot = parts.api.snapshot
-    snapshot_watermarks: list[int] = []
+    original_bootstrap = parts.api.subscription_bootstrap
+    pre_burst_watermarks: list[int] = []
 
-    def stale_snapshot():  # noqa: ANN202
+    def bursty_bootstrap(after_sequence: int, tail_bound: int | None):  # noqa: ANN202
         # Reproduce the bootstrap race deterministically: a burst of appends
-        # lands after the subscription's snapshot but before its checkpoint.
-        snapshot = original_snapshot()
-        snapshot_watermarks.append(snapshot.sequence)
+        # lands after the handler commits to bootstrapping but before the
+        # bootstrap's own locked read.
+        pre_burst_watermarks.append(parts.api.latest_sequence)
         for index in range(3000):
             parts.journal.publish_output("stdout", f"burst-{index}")
-        return snapshot
+        return original_bootstrap(after_sequence, tail_bound)
 
-    monkeypatch.setattr(parts.api, "snapshot", stale_snapshot)
+    monkeypatch.setattr(parts.api, "subscription_bootstrap", bursty_bootstrap)
 
     subscribed, batch = _subscribe(parts.api, SubscribeRequest(after_sequence=0, tail=tail))
 
@@ -217,9 +217,11 @@ def test_bootstrap_tail_stays_bounded_when_events_land_mid_bootstrap(  # noqa: A
     through = batch["through_sequence"]
     ordinary = [event for event in batch["events"] if event["sequence"] > floor]
     context = (
-        f"snapshot watermark {snapshot_watermarks or None}, checkpoint watermark {through}, "
+        f"pre-burst watermarks {pre_burst_watermarks or None}, checkpoint watermark {through}, "
         f"requested tail {tail}, ordinary bootstrap events {len(ordinary)}"
     )
+    assert len(pre_burst_watermarks) == 1, context
+    assert through == pre_burst_watermarks[0] + 3000, context
     assert len(ordinary) <= tail, context
     assert through == parts.api.latest_sequence, context
     assert floor == through - tail, context
@@ -227,6 +229,30 @@ def test_bootstrap_tail_stays_bounded_when_events_land_mid_bootstrap(  # noqa: A
     pre_floor = [event for event in batch["events"] if event["sequence"] <= floor]
     assert all(event["type"] in _spine_type_values() for event in pre_floor), context
     assert all(event["sequence"] <= through for event in batch["events"]), context
+
+
+def test_bootstrap_failure_surfaces_after_the_handshake(  # noqa: ANN201
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    parts = _attach(tmp_path, _round_log(50))
+    latest = parts.api.latest_sequence
+
+    def failing_bootstrap(_after_sequence: int, _tail: int | None):  # noqa: ANN202
+        raise RuntimeError
+
+    monkeypatch.setattr(parts.api, "subscription_bootstrap", failing_bootstrap)
+
+    with _live_subscription(parts.api, SubscribeRequest(after_sequence=0, tail=40)) as read:
+        subscribed = read()
+        failure = read()
+
+    # The dial itself must succeed: the client probes tail support by dialing
+    # and treats a pre-handshake failure as a server without the field, so a
+    # transient replay fault would otherwise trigger a full-history retry.
+    assert subscribed["type"] == "subscribed"
+    assert subscribed["latest_sequence"] == latest
+    assert failure["type"] == "protocol_error"
+    assert failure["code"] == "stream_failed"
 
 
 def test_subscription_bootstrap_captures_one_atomic_state(tmp_path):  # noqa: ANN001, ANN201
