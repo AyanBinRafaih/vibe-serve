@@ -493,9 +493,13 @@ class EventStore:
                 self._malformed_tail_offset = None
             if self._missing_tail_newline:
                 # Terminate the valid final record so the new record starts
-                # its own line instead of concatenating onto it.
-                with self.path.open("a", encoding="utf-8") as stream:
-                    stream.write("\n")
+                # its own line instead of concatenating onto it. The flag is a
+                # construction-time observation, so recheck the file itself: if
+                # it was removed or replaced since, a blind "\n" would corrupt
+                # the fresh file's first record.
+                if _ends_without_newline(self.path):
+                    with self.path.open("a", encoding="utf-8") as stream:
+                        stream.write("\n")
                 self._missing_tail_newline = False
             event = event.model_copy(
                 update={"sequence": self._next_sequence, "run_id": self.run_id}
@@ -669,10 +673,11 @@ class EventStore:
             offset += len(line)
             header_fields = _scan_header_fields(line)
             if header_fields is None:
-                # A complete final record the header scan cannot classify must
-                # be judged by full validation, so it also falls to the eager
-                # path; only a torn (non-JSON) tail is set aside for repair.
-                if index != len(lines) - 1 or _is_complete_json(line):
+                # A final line holding complete JSON the header scan cannot
+                # classify must be judged by full validation, so it falls to
+                # the eager path; only a tail with no complete JSON prefix (a
+                # torn append) is set aside for repair.
+                if index != len(lines) - 1 or _starts_with_complete_json(line):
                     return None
                 # Preserve access to earlier audit history if a process was
                 # interrupted during its final append.
@@ -731,7 +736,7 @@ class EventStore:
             except ValidationError as error:
                 if index != len(lines) - 1:
                     raise
-                if _is_complete_json(line):
+                if _starts_with_complete_json(line):
                     raise _complete_invalid_tail_error(self.path, record_offset) from error
                 # Preserve access to earlier audit history if a process was
                 # interrupted during its final append.
@@ -775,15 +780,22 @@ def _is_optional_str(value: Any) -> bool:  # noqa: ANN401  # scanning untyped JS
     return value is None or isinstance(value, str)
 
 
-def _is_complete_json(line: bytes) -> bool:
-    """Whether the bytes parse as one complete JSON value.
+def _starts_with_complete_json(line: bytes) -> bool:
+    """Whether the bytes begin with one complete JSON value.
 
     A torn append leaves a strict prefix of the record plus its newline, and
-    no strict prefix of a serialized object is complete JSON, so this
-    discriminates an interrupted write from a fully written record.
+    no strict prefix of a serialized object contains a complete JSON value, so
+    this discriminates an interrupted write from fully written bytes: a lone
+    record, or complete records concatenated onto one line by a writer that
+    never terminated it. Truncating the latter would erase durable facts, so
+    it must be surfaced as corruption, not repaired as a torn tail.
     """
     try:
-        json.loads(line)
+        text = line.decode()
+    except UnicodeDecodeError:
+        return False
+    try:
+        json.JSONDecoder().raw_decode(text)
     except ValueError:
         return False
     return True

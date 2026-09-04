@@ -217,6 +217,30 @@ class TestEventStore:
             "third",
         ]
 
+    def test_append_after_external_removal_starts_the_new_file_cleanly(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        path.write_text(_persisted_event(1, "unterminated").model_dump_json())
+        store = EventStore(path, run_id="active-run")
+        path.unlink()
+
+        appended = store.append(make_event(EventType.OUTPUT, "fresh"))
+
+        assert path.read_bytes() == (appended.model_dump_json() + "\n").encode()
+        assert [event.text for event in EventStore(path, run_id="reopened-run").read()] == ["fresh"]
+
+    def test_concatenated_final_records_raise_instead_of_truncating(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        first = _persisted_event(1, "first").model_dump_json()
+        second = _persisted_event(2, "second").model_dump_json()
+        third = _persisted_event(3, "third").model_dump_json()
+        path.write_text(first + "\n" + second + third + "\n")
+        original = path.read_bytes()
+
+        with pytest.raises(ValueError, match=f"byte offset {len(first) + 1} "):
+            EventStore(path, run_id="active-run")
+
+        assert path.read_bytes() == original
+
     def test_a_complete_but_invalid_final_record_raises_instead_of_truncating(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"
         valid = _persisted_event(1, "complete").model_dump_json()

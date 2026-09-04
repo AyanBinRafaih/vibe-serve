@@ -305,6 +305,21 @@ def test_lazy_store_matches_eager_store_for_a_complete_invalid_tail(tmp_path):  
     assert path.read_bytes() == original
 
 
+def test_lazy_store_matches_eager_store_for_a_concatenated_tail(tmp_path):  # noqa: ANN001, ANN201
+    path = tmp_path / "events.jsonl"
+    serialized = [event.model_dump_json() for event in _generated_events(seed=53, count=12)]
+    path.write_text("\n".join(serialized[:-2]) + "\n" + serialized[-2] + serialized[-1] + "\n")
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="complete final record") as lazy_error:
+        EventStore(path, run_id="active-run")
+    with pytest.raises(ValueError, match="complete final record") as eager_error:
+        _EagerEventStore(path, run_id="reference")
+
+    assert str(lazy_error.value) == str(eager_error.value)
+    assert path.read_bytes() == original
+
+
 def test_a_bounded_read_only_parses_the_records_it_returns(tmp_path):  # noqa: ANN001, ANN201
     path = tmp_path / "events.jsonl"
     count = 6 * _EAGER_TAIL_RECORDS
