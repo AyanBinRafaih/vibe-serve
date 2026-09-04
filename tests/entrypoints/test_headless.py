@@ -1900,3 +1900,27 @@ def test_dispatch_advertises_expected_roles_on_run_started(loop: str, tmp_path: 
     assert isinstance(started.data, RunStartedData)
     assert started.data.expected_roles == EXPECTED_AGENT_ROLES[loop]
     assert started.data.expected_roles
+
+
+@pytest.mark.parametrize("loop", ["agent", "evolve"])
+def test_dispatch_omits_profiler_role_when_profiler_is_disabled(loop: str, tmp_path: Path) -> None:
+    """A disabled profiler never runs, so its placeholder must not be seeded."""
+    import entrypoints.headless as cli  # noqa: PLC0415
+
+    project = _write_input_project(tmp_path)
+    integration = LocalRunIntegration()
+    events = []
+    integration.events.subscribe(events.append)
+    runner = Mock()
+
+    with _patch_loop_runner(loop, runner):
+        cli.dispatch(
+            ["--outer-loop", loop, "--input", str(project), "--profiler", "none"],
+            integration=integration,
+        )
+
+    started = next(event for event in events if event.type is CoreEventType.RUN_STARTED)
+    assert "profiler" not in started.data.expected_roles
+    assert started.data.expected_roles == tuple(
+        role for role in EXPECTED_AGENT_ROLES[loop] if role != "profiler"
+    )
