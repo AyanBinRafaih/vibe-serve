@@ -104,37 +104,6 @@ describe('renderPerformanceCurve', () => {
     expect(chart.endsWith('No performance data yet.')).toBe(true);
   });
 
-  it('plots a carried-forward round hollow and appends the legend note', () => {
-    const chart = renderPerformanceCurve([
-      performance(1, 1000),
-      {...performance(2, 1000), profile_skipped: true},
-      performance(3, 1500),
-    ]);
-
-    expect(chart.match(/●/g)).toHaveLength(2);
-    // One hollow point plus the glyph the legend line repeats.
-    expect(chart.match(/○/g)).toHaveLength(2);
-    expect(chart).toContain('○ carried forward, no fresh profile');
-  });
-
-  it('keeps fresh measurements solid and omits the carried-forward legend', () => {
-    const chart = renderPerformanceCurve([performance(1, 1000), performance(2, 2000)]);
-
-    expect(chart.match(/●/g)).toHaveLength(2);
-    expect(chart).not.toContain('○');
-    expect(chart).not.toContain('carried forward');
-  });
-
-  it('marks a carried-forward reading hollow in the event fallback', () => {
-    const chart = renderPerformanceCurve(
-      [],
-      [roundFinished(1, 1, 1000, false), roundFinished(2, 2, 1000, true)],
-    );
-
-    expect(chart.match(/●/g)).toHaveLength(1);
-    expect(chart).toContain('○ carried forward, no fresh profile');
-  });
-
   it('shows the objective before the first measurement', () => {
     const chart = renderPerformanceCurve(
       [],
@@ -165,28 +134,6 @@ function performance(
     perf_unit: 'total_ops_per_sec',
     passed: true,
     profile_skipped: false,
-  };
-}
-
-function roundFinished(
-  sequence: number,
-  round: number,
-  value: number,
-  profileSkipped: boolean,
-): RunEvent {
-  return {
-    sequence,
-    timestamp: '2026-01-01T00:00:00Z',
-    type: 'round_finished',
-    round_label: `round-${round}`,
-    data: {
-      kind: 'round_finished',
-      attempts: 1,
-      judge_verdict: 'pass',
-      perf_metric: value,
-      perf_unit: 'ops/s',
-      profile_skipped: profileSkipped,
-    },
   };
 }
 

@@ -6,8 +6,6 @@ interface PerfPoint {
   metric: string;
   value: number;
   unit: string;
-  /** True when the round reused an earlier measurement instead of profiling afresh. */
-  carriedForward: boolean;
 }
 
 type PerformanceContext = NonNullable<ProtocolResponse['performance_context']>;
@@ -44,9 +42,7 @@ export function renderPerformanceCurve(
     const x = scale(point.round, minRound, maxRound, 0, PLOT_WIDTH - 1);
     const y = PLOT_HEIGHT - 1 - scale(point.value, minValue, maxValue, 0, PLOT_HEIGHT - 1);
     const row = grid[y];
-    // The pane colors a whole line at once, so a per-point color cannot mark a
-    // carried-forward reading; the hollow glyph carries the distinction alone.
-    if (row) row[x] = point.carriedForward ? '○' : '●';
+    if (row) row[x] = '●';
   }
 
   const lines = [`Performance · ${metric}`, ...contextLines];
@@ -64,9 +60,6 @@ export function renderPerformanceCurve(
       `best r${best.round} ${formatValue(best.value)} ${unit} · latest r${latest.round} ${formatValue(latest.value)} ${unit}`,
     );
   }
-  if (visible.some(point => point.carriedForward)) {
-    lines.push('○ carried forward, no fresh profile');
-  }
   return lines.join('\n');
 }
 
@@ -81,7 +74,6 @@ function performancePoints(
       metric: round.perf_unit,
       value: round.perf_metric,
       unit: round.perf_unit,
-      carriedForward: round.profile_skipped === true,
     });
   }
   for (const event of events ?? []) {
@@ -89,13 +81,11 @@ function performancePoints(
     if (round === null) continue;
     const data = event.data;
     if (data?.kind === 'benchmark_result') {
-      // A benchmark result is by definition a fresh measurement.
       byRound.set(round, {
         round,
         metric: data.metric,
         value: data.value,
         unit: data.unit,
-        carriedForward: false,
       });
     }
     if (data?.kind === 'round_finished' && typeof data.perf_metric === 'number') {
@@ -104,7 +94,6 @@ function performancePoints(
         metric: data.perf_unit ?? 'performance',
         value: data.perf_metric,
         unit: data.perf_unit ?? 'performance',
-        carriedForward: data.profile_skipped === true,
       });
     }
   }

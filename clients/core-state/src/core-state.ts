@@ -54,8 +54,8 @@ export interface BenchmarkRecord {
 /**
  * A round as core state carries it: the run map's timing and status summary
  * plus round facts folded outside the run map. `profileSkipped` is set from a
- * `round_finished` event whose round reused an earlier measurement instead of
- * profiling afresh; readers treat an absent flag as false, which also covers
+ * `round_finished` event whose round ran no fresh profile (such a round records
+ * no perf reading); readers treat an absent flag as false, which also covers
  * events recorded before the field existed.
  */
 export interface RoundState extends RoundSummary {

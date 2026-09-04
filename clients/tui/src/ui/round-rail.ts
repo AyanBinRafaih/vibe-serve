@@ -42,10 +42,9 @@ const STATUS_WORD: Record<RoundState['status'], string> = {
 };
 
 /**
- * A completed round that reused an earlier measurement instead of profiling
- * afresh trades the solid check for a hollow ring, so a carried-forward number
- * never reads as a fresh one. A failed round keeps its cross: how the round
- * ended outranks how it measured.
+ * A completed round where no fresh profile ran trades the solid check for a
+ * hollow ring, so it never reads as a freshly measured one. A failed round
+ * keeps its cross: how the round ended outranks how it measured.
  */
 function statusGlyph(round: RoundState): string {
   if (round.status === 'completed' && round.profileSkipped === true) return '○';
@@ -291,8 +290,8 @@ export class RoundRailView {
     if (isRunning) return {fg: this.#theme.success};
     if (round.status === 'planned') return {fg: this.#theme.textSubtle};
     if (round.status === 'failed') return {fg: this.#theme.error};
-    // A carried-forward round completed without measuring anything new, so it
-    // dims like a planned round rather than claiming a fresh result.
+    // A profile-skipped round completed without measuring anything, so it dims
+    // like a planned round rather than claiming a fresh result.
     if (round.profileSkipped === true) return {fg: this.#theme.textSubtle};
     return {fg: this.#theme.textPrimary};
   }
@@ -345,12 +344,7 @@ function roundMetric(round: RoundState, state: SessionState, now: Date): string 
   if (round.status === 'active') return elapsedLabel(roundAgentElapsedMs(round, now));
   const delta = hypothesisRoundFor(state, round.number)?.perf_delta_pct;
   if (typeof delta === 'number') {
-    // A delta computed from a carried-forward reading is approximate at best;
-    // the '~' says so. Only the round's own measurement is knowable here: the
-    // baseline round's identity never reaches the client, so a delta whose
-    // baseline was itself carried forward still renders unmarked.
-    const approximate = round.profileSkipped === true ? '~' : '';
-    return `${approximate}${delta > 0 ? '+' : ''}${delta.toFixed(Math.abs(delta) >= 10 ? 0 : 1)}%`;
+    return `${delta > 0 ? '+' : ''}${delta.toFixed(Math.abs(delta) >= 10 ? 0 : 1)}%`;
   }
   const end = round.finishedAt ? new Date(round.finishedAt) : now;
   return elapsedLabel(roundAgentElapsedMs(round, end));

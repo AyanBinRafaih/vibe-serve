@@ -4895,10 +4895,10 @@ def test_reprompted_plan_is_labelled_as_a_retry_of_the_same_round(tmp_path, ref_
 
 
 def test_round_finished_events_carry_profile_skipped(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
-    """The emitted event mirrors the round record's carried-forward flag."""
-    # Round 1 reports no metric, so its round carries the old reading forward;
-    # round 2 is the final round, whose forced official evaluation records a
-    # fresh 321.5.
+    """The emitted event mirrors the round record's profile_skipped flag."""
+    # Round 1 reports no metric: no fresh profile ran, so the round is marked
+    # skipped with no perf reading. Round 2 is the final round, whose forced
+    # official evaluation records a fresh 321.5.
     runner = _make_orchestrate_runner(implementer_perf_metrics=[None, 321.5])
 
     _invoke_orchestrate(
