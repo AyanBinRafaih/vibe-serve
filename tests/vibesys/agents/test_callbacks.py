@@ -3,6 +3,9 @@ import re
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
+from uuid import uuid4
+
+import pytest
 
 from vibesys.agents.callbacks import AgentLogger
 from vibesys.agents.progress import RoundProgress
@@ -278,6 +281,143 @@ class TestOnToolError:
         logger.on_tool_error(Exception("fail"), run_id=uuid4())
         out = capsys.readouterr().out
         assert DIM not in out
+
+
+class TestOnToolErrorResult:
+    """A tool failure must close the typed tool_call emitted from ``on_llm_end``."""
+
+    def test_error_emits_failure_result_and_clears_pending(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            run_id = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=run_id, tool_call_id="call-1")
+            logger.on_tool_error(RuntimeError("boom"), run_id=run_id, tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert len(results) == 1
+        result = results[0]
+        assert result.tool == "shell"
+        assert result.call_id == "call-1"
+        assert result.is_error is True
+        assert "RuntimeError" in result.content
+        assert "boom" in result.content
+        assert not logger._pending_tool_calls["shell"]  # noqa: SLF001  # tracked: #288
+        # The free-text diagnostic (with traceback detail) is still published.
+        assert "Tool error" in capsys.readouterr().out
+
+    def test_error_does_not_misattribute_next_same_tool_result(self) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "a"}}])
+            )
+            first_run = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=first_run, tool_call_id="call-1")
+            logger.on_tool_error(RuntimeError("boom"), run_id=first_run, tool_call_id="call-1")
+
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-2", "name": "shell", "args": {"cmd": "b"}}])
+            )
+            second_run = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=second_run, tool_call_id="call-2")
+            # No tool_call_id on the output: correlation falls back to the
+            # FIFO head, which must be call-2 because the failure consumed
+            # call-1.
+            logger.on_tool_end(SimpleNamespace(name="shell", content="ok"), run_id=second_run)
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert [(r.call_id, r.is_error) for r in results] == [("call-1", True), ("call-2", False)]
+
+    def test_tool_call_id_fallback_resolves_name_without_tool_start(self) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            logger.on_tool_error(RuntimeError("boom"), run_id=uuid4(), tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert len(results) == 1
+        assert results[0].tool == "shell"
+        assert results[0].call_id == "call-1"
+        assert results[0].is_error is True
+        assert not logger._pending_tool_calls["shell"]  # noqa: SLF001  # tracked: #288
+
+    def test_streamed_turn_error_emits_no_orphan_result(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            # A streamed turn: ``on_llm_end`` returns before emitting typed
+            # tool calls, so the tool run starts with nothing queued.
+            logger.on_llm_new_token("tok")
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            run_id = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=run_id, tool_call_id="call-1")
+            logger.on_tool_error(RuntimeError("boom"), run_id=run_id, tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        calls = [event.data for event in seen if isinstance(event.data, ToolCallData)]
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert calls == []
+        assert results == []
+        assert "Tool error" in capsys.readouterr().out
+
+    def test_empty_message_error_content_has_no_trailing_colon(self) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            run_id = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=run_id, tool_call_id="call-1")
+            logger.on_tool_error(KeyboardInterrupt(), run_id=run_id, tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert len(results) == 1
+        assert results[0].content == "KeyboardInterrupt"
+        assert results[0].is_error is True
+
+    def test_error_without_tool_context_emits_no_result(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_tool_error(RuntimeError("boom"), run_id=uuid4())
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert results == []
+        assert "Tool error" in capsys.readouterr().out
 
 
 class TestStateManagement:

@@ -100,6 +100,11 @@ class AgentLogger(BaseCallbackHandler):
         self._context_window_lookup = context_window_lookup or _default_context_window_lookup
         self._context_window = self._context_window_lookup(model_name)
         self._pending_tool_calls: dict[str, deque[str]] = defaultdict(deque)
+        # In-flight langchain tool runs keyed by run_id: (tool name,
+        # tool_call_id). Recorded in ``on_tool_start`` solely so
+        # ``on_tool_error`` can attribute a failure to the typed tool_call
+        # already emitted from ``on_llm_end``.
+        self._tool_runs: dict[uuid.UUID, tuple[str | None, str | None]] = {}
         self._agent_kind = agent_kind
         self._round_label = round_label
         self._invocation_id = invocation_id
@@ -237,14 +242,19 @@ class AgentLogger(BaseCallbackHandler):
     def on_tool_start(  # noqa: D102  # tracked: #288
         self,
         serialized: dict[str, Any],
-        input_str: str,
+        input_str: str,  # noqa: ARG002 - protocol parity
         *,
-        inputs: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,  # noqa: ARG002 - protocol parity
         **kwargs: Any,  # noqa: ANN401  # tracked: #288
     ) -> None:
-        pass  # tool call already logged in on_llm_end
+        # The tool call itself was already emitted from ``on_llm_end``; record
+        # the run only so ``on_tool_error`` can attribute a failure to it.
+        run_id = kwargs.get("run_id")
+        if run_id is not None:
+            self._tool_runs[run_id] = ((serialized or {}).get("name"), kwargs.get("tool_call_id"))
 
-    def on_tool_end(self, output: Any, **kwargs: Any) -> None:  # noqa: ANN401, ARG002, D102  # tracked: #288
+    def on_tool_end(self, output: Any, **kwargs: Any) -> None:  # noqa: ANN401, D102  # tracked: #288
+        self._tool_runs.pop(kwargs.get("run_id"), None)
         content = output.content if hasattr(output, "content") else str(output)
         name = getattr(output, "name", None) or "unknown"
         call_id = getattr(output, "tool_call_id", None)
@@ -254,7 +264,7 @@ class AgentLogger(BaseCallbackHandler):
             call_id=call_id if isinstance(call_id, str) and call_id else None,
         )
 
-    def on_tool_error(self, error: Any, **kwargs: Any) -> None:  # noqa: ANN401, ARG002, D102  # tracked: #288
+    def on_tool_error(self, error: Any, **kwargs: Any) -> None:  # noqa: ANN401, D102  # tracked: #288
         lines = [f"Tool error: {error!r}"]
         if isinstance(error, BaseException):
             tb = traceback.format_exception(type(error), error, error.__traceback__)
@@ -263,6 +273,33 @@ class AgentLogger(BaseCallbackHandler):
         text = "\n".join(lines)
         self._publish(text + "\n", "diagnostic")
         self._log_line(text)
+
+        # Close the typed tool_call emitted from ``on_llm_end`` so consumers
+        # don't show the tool as running forever. Attribution comes from the
+        # run recorded in ``on_tool_start``, else from the provider call id.
+        name, recorded_call_id = self._tool_runs.pop(kwargs.get("run_id"), (None, None))
+        call_id = kwargs.get("tool_call_id") or recorded_call_id
+        if name is None and call_id is not None:
+            name = next(
+                (n for n, pending in self._pending_tool_calls.items() if call_id in pending),
+                None,
+            )
+        if name is None:
+            # No typed tool_call to close; the diagnostic above is the whole
+            # record, and fabricating an orphan tool_result would mislead.
+            return
+        pending = self._pending_tool_calls.get(name)
+        if not pending or (call_id is not None and call_id not in pending):
+            # A streamed turn emits no typed tool_call (``on_llm_end`` returns
+            # before the emission), so a failure whose call was never queued
+            # has no lifecycle to close either.
+            return
+        self._emit_tool_result(
+            name,
+            f"{type(error).__name__}: {error}" if str(error) else type(error).__name__,
+            call_id=call_id,
+            is_error=True,
+        )
 
     # --- Event emission + log formatting ---
 
