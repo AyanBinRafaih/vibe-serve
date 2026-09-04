@@ -25,22 +25,9 @@ from server.api.protocol import (
 from vibesys.unix_socket import validate_socket_path
 
 if TYPE_CHECKING:
-    from server.api.service import RunApi
+    from server.api.service import RunApi, SubscriptionBootstrap
 
 _REQUEST_ADAPTER = TypeAdapter(ProtocolRequest)
-
-
-def _history_floor(request: SubscribeRequest, latest_sequence: int) -> tuple[int, int]:
-    """Return the replay floor, and the floor to report until the next bootstrap.
-
-    Without ``tail`` the reported floor stays 0: the client asked for
-    everything from its own cursor onward, so nothing was withheld and old
-    clients see the field's default.
-    """
-    if request.tail is None:
-        return request.after_sequence, 0
-    floor = max(request.after_sequence, latest_sequence - request.tail)
-    return floor, floor
 
 
 class _RequestHandler(socketserver.StreamRequestHandler):
@@ -77,29 +64,30 @@ class _RequestHandler(socketserver.StreamRequestHandler):
 
     def _stream(self, request: SubscribeRequest) -> None:
         api = self.server.api
-        snapshot = api.snapshot()
+        bootstrap = api.subscription_bootstrap(request.after_sequence, request.tail)
         self._write_message(
             SubscribedMessage(
                 request_id=request.request_id,
-                run_id=snapshot.run_id,
-                latest_sequence=snapshot.sequence,
+                run_id=bootstrap.run_id,
+                latest_sequence=bootstrap.through_sequence,
             )
         )
-        cursor, reported_floor = self._write_bootstrap(api, request, snapshot.sequence)
+        cursor, reported_floor = self._write_bootstrap(request, bootstrap)
         while True:
             if not api.wait_for_change(cursor, timeout=1.0):
                 if self._client_disconnected():
                     return
                 time.sleep(0.05)
                 continue
-            latest_sequence = api.latest_sequence
-            if request.tail is not None and latest_sequence - cursor > request.tail:
+            if request.tail is not None and api.latest_sequence - cursor > request.tail:
                 # The run's durable event store is attached after the client
                 # subscribes, so a subscription that bootstrapped against the
                 # near-empty server store now faces the whole history as if it
                 # were live output. Bootstrap again at a fresh tail rather than
                 # replay a window the tail bound was meant to exclude.
-                cursor, reported_floor = self._write_bootstrap(api, request, latest_sequence)
+                cursor, reported_floor = self._write_bootstrap(
+                    request, api.subscription_bootstrap(request.after_sequence, request.tail)
+                )
                 continue
             # ``wait_for_change`` only tells us that the stream changed. Take
             # one watermark-consistent snapshot before writing so a resumed
@@ -118,24 +106,25 @@ class _RequestHandler(socketserver.StreamRequestHandler):
 
     def _write_bootstrap(
         self,
-        api: RunApi,
         request: SubscribeRequest,
-        latest_sequence: int,
+        bootstrap: SubscriptionBootstrap,
     ) -> tuple[int, int]:
-        """Send one tail-bounded replay batch; return the new cursor and floor."""
-        history_after, reported_floor = _history_floor(request, latest_sequence)
-        through_sequence, replay, active_executions = api.subscription_checkpoint(
-            history_after, bootstrap_spine=request.tail is not None
-        )
+        """Send one tail-bounded replay batch; return the new cursor and floor.
+
+        Without ``tail`` the reported floor stays 0: the client asked for
+        everything from its own cursor onward, so nothing was withheld and old
+        clients see the field's default.
+        """
+        reported_floor = 0 if request.tail is None else bootstrap.floor
         self._write_message(
             EventBatchMessage(
-                events=replay,
-                through_sequence=through_sequence,
-                active_executions=active_executions,
+                events=bootstrap.events,
+                through_sequence=bootstrap.through_sequence,
+                active_executions=bootstrap.active_executions,
                 history_after_sequence=reported_floor,
             )
         )
-        return through_sequence, reported_floor
+        return bootstrap.through_sequence, reported_floor
 
     def _write_stream_error(self, request_id: str, error: Exception) -> None:
         """Report a replay or stream failure without hiding a live connection."""

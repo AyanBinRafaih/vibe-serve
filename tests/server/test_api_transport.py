@@ -141,9 +141,12 @@ def test_subscription_reports_structured_stream_failure(
             stream.write(SubscribeRequest(after_sequence=0).model_dump_json().encode() + b"\n")
             stream.flush()
             subscribed = json.loads(stream.readline())
+            bootstrap = json.loads(stream.readline())
+            parts.journal.record(EventType.CHAT, "hello", status="answered")
             failure = json.loads(stream.readline())
 
     assert subscribed["type"] == "subscribed"
+    assert bootstrap["type"] == "event_batch"
     assert failure["type"] == "protocol_error"
     assert failure["request_id"] == subscribed["request_id"]
     assert failure["code"] == "stream_failed"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from server.api.design import DesignLog
@@ -56,6 +57,17 @@ if TYPE_CHECKING:
     from server.journal import EventJournal
     from server.settings import InteractiveSetupDefaults
     from vibesys.loops.agent.model import AgentRunState
+
+
+@dataclass(frozen=True)
+class SubscriptionBootstrap:
+    """One journal state captured atomically for a subscription bootstrap."""
+
+    run_id: str
+    floor: int
+    through_sequence: int
+    events: list[RunEvent]
+    active_executions: list[ActiveAgentExecution]
 
 
 class RunApi:
@@ -226,6 +238,29 @@ class RunApi:
                 after_sequence, bootstrap_spine=bootstrap_spine
             )
             return through_sequence, events, self._executions.active_locked()
+
+    def subscription_bootstrap(
+        self, after_sequence: int, tail: int | None
+    ) -> SubscriptionBootstrap:
+        """Capture one atomic bootstrap state for a new or restarted subscription.
+
+        Appends acquire the same condition, so computing the tail floor and
+        reading the checkpoint under one acquisition keeps the replay bounded
+        by ``tail`` no matter how many events land during the bootstrap.
+        """
+        with self._condition:
+            latest = self._journal.latest_sequence_locked()
+            floor = after_sequence if tail is None else max(after_sequence, latest - tail)
+            through_sequence, events = self._journal.checkpoint_locked(
+                floor, bootstrap_spine=tail is not None
+            )
+            return SubscriptionBootstrap(
+                run_id=self._journal.run_id_locked(),
+                floor=floor,
+                through_sequence=through_sequence,
+                events=events,
+                active_executions=self._executions.active_locked(),
+            )
 
     def events(self, after_sequence: int = 0, before_sequence: int | None = None) -> list[RunEvent]:
         """Read journal events within the requested sequence bounds."""

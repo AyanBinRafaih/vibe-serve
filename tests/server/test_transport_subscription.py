@@ -2,6 +2,7 @@
 
 import json
 import socket
+import threading
 import uuid
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from server.events import (
     RunEvent,
     RunStartedData,
 )
+from server.journal import _BOOTSTRAP_SPINE_TYPES
 from server.transport.unix_jsonl import UnixJsonlServer
 
 _TIMESTAMP = datetime(2026, 1, 1, tzinfo=UTC)
@@ -184,6 +186,98 @@ def test_tail_without_spine_events_delivers_only_suffix(tmp_path):  # noqa: ANN0
     _subscribed, batch = _subscribe(parts.api, SubscribeRequest(after_sequence=0, tail=20))
 
     assert [event["sequence"] for event in batch["events"]] == list(range(latest - 19, latest + 1))
+
+
+def _spine_type_values() -> set[str]:
+    return {event_type.value for event_type in _BOOTSTRAP_SPINE_TYPES}
+
+
+def test_bootstrap_tail_stays_bounded_when_events_land_mid_bootstrap(  # noqa: ANN201
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    tail = 40
+    parts = _attach(tmp_path, _round_log(200))
+    original_snapshot = parts.api.snapshot
+    snapshot_watermarks: list[int] = []
+
+    def stale_snapshot():  # noqa: ANN202
+        # Reproduce the bootstrap race deterministically: a burst of appends
+        # lands after the subscription's snapshot but before its checkpoint.
+        snapshot = original_snapshot()
+        snapshot_watermarks.append(snapshot.sequence)
+        for index in range(3000):
+            parts.journal.publish_output("stdout", f"burst-{index}")
+        return snapshot
+
+    monkeypatch.setattr(parts.api, "snapshot", stale_snapshot)
+
+    subscribed, batch = _subscribe(parts.api, SubscribeRequest(after_sequence=0, tail=tail))
+
+    floor = batch["history_after_sequence"]
+    through = batch["through_sequence"]
+    ordinary = [event for event in batch["events"] if event["sequence"] > floor]
+    context = (
+        f"snapshot watermark {snapshot_watermarks or None}, checkpoint watermark {through}, "
+        f"requested tail {tail}, ordinary bootstrap events {len(ordinary)}"
+    )
+    assert len(ordinary) <= tail, context
+    assert through == parts.api.latest_sequence, context
+    assert floor == through - tail, context
+    assert subscribed["latest_sequence"] == through, context
+    pre_floor = [event for event in batch["events"] if event["sequence"] <= floor]
+    assert all(event["type"] in _spine_type_values() for event in pre_floor), context
+    assert all(event["sequence"] <= through for event in batch["events"]), context
+
+
+def test_subscription_bootstrap_captures_one_atomic_state(tmp_path):  # noqa: ANN001, ANN201
+    parts = _attach(tmp_path, _round_log(200))
+    latest = parts.api.latest_sequence
+
+    bootstrap = parts.api.subscription_bootstrap(0, 40)
+
+    assert bootstrap.run_id == parts.api.snapshot().run_id
+    assert bootstrap.through_sequence == latest
+    assert bootstrap.floor == latest - 40
+    ordinary = [event.sequence for event in bootstrap.events if event.sequence > bootstrap.floor]
+    assert ordinary == list(range(bootstrap.floor + 1, bootstrap.through_sequence + 1))
+    pre_floor = [event for event in bootstrap.events if event.sequence <= bootstrap.floor]
+    assert [event.type for event in pre_floor] == [EventType.RUN_STARTED] + [
+        EventType.ROUND_FINISHED
+    ] * (bootstrap.floor // _ROUND_EVERY)
+    assert bootstrap.active_executions == []
+
+    full = parts.api.subscription_bootstrap(0, None)
+    assert full.floor == 0
+    assert full.through_sequence == latest
+    assert [event.sequence for event in full.events] == list(range(1, latest + 1))
+
+
+def test_bootstrap_tail_stays_bounded_under_concurrent_appends(tmp_path):  # noqa: ANN001, ANN201
+    tail = 10
+    parts = _attach(tmp_path, _round_log(200))
+    stop = threading.Event()
+
+    def append_live_output() -> None:
+        index = 0
+        while not stop.is_set() and index < 20_000:
+            parts.journal.publish_output("stdout", f"live-{index}")
+            index += 1
+
+    writer = threading.Thread(target=append_live_output)
+    writer.start()
+    try:
+        _subscribed, batch = _subscribe(parts.api, SubscribeRequest(after_sequence=0, tail=tail))
+    finally:
+        stop.set()
+        writer.join(timeout=5)
+    assert not writer.is_alive()
+
+    floor = batch["history_after_sequence"]
+    ordinary = [event for event in batch["events"] if event["sequence"] > floor]
+    assert len(ordinary) <= tail
+    pre_floor = [event for event in batch["events"] if event["sequence"] <= floor]
+    assert all(event["type"] in _spine_type_values() for event in pre_floor)
+    assert all(event["sequence"] <= batch["through_sequence"] for event in batch["events"])
 
 
 def test_checkpoint_parses_only_tail_and_spine(tmp_path):  # noqa: ANN001, ANN201
