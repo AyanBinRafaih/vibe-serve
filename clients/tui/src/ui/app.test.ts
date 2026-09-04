@@ -8,6 +8,7 @@ import {
 } from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
 import type {ChatOptions, HypothesisEntry} from '@vibesys/backend-client';
+import type {CoreRunStatus} from '@vibesys/core-state';
 import {chatHelpText, parseCommand} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
@@ -65,7 +66,8 @@ import {TRANSCRIPT_MIN} from './agent-map.js';
 import {createOpenTuiApp, type OpenTuiApp} from './app.js';
 import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 import {renderDesignSummary} from './design-log.js';
-import {resolveTheme, type ThemeName} from './theme.js';
+import {headerBackground} from './header.js';
+import {contrastRatio, listThemes, resolveTheme, type ThemeName} from './theme.js';
 
 const cleanup: Array<() => void> = [];
 
@@ -106,7 +108,11 @@ describe('OpenTUI presentation', () => {
     registerCleanup(testRenderer.renderer, app);
 
     const frame = await testRenderer.waitForFrame(value => value.includes('fast_path()'));
-    expect(frame).toContain('running · optimizer · round 2');
+    // The header names the run state and the activity, never the backend's
+    // round label. `round 2` is not a label this loop emits, so the agent kind
+    // supplies the word.
+    expect(frame).toContain('VibeSys · running · optimizer');
+    expect(frame).not.toContain('running · optimizer · round 2');
     // No round is selected, so the agent strip is headed by the run. The run has
     // no rounds yet, so the rounds rail stays off and leaves the width to the
     // agents graph and transcript.
@@ -880,7 +886,7 @@ describe('OpenTUI presentation', () => {
     const controller = new FakeController({
       ...initialSessionState(),
       selectedRound: 2,
-      hypothesisScope: {id: 'H-01', label: 'H-01 · r1-r2', rounds: [1, 2]},
+      hypothesisScope: {id: 'H-01', label: 'H-01 · r1-r2', title: 'H-01', rounds: [1, 2]},
       core: {
         ...initialSessionState().core,
         rounds: [
@@ -1195,7 +1201,7 @@ describe('OpenTUI presentation', () => {
     const testRenderer = await createTestRenderer({width: 130, height: 22});
     const controller = new FakeController({
       ...initialSessionState(),
-      hypothesisScope: {id: 'H-01', label: 'H-01 · r1', rounds: [1]},
+      hypothesisScope: {id: 'H-01', label: 'H-01 · r1', title: 'H-01', rounds: [1]},
       selectedRound: 1,
       core: {
         ...initialSessionState().core,
@@ -1690,13 +1696,15 @@ describe('OpenTUI presentation', () => {
     const frame = await testRenderer.waitForFrame(value => value.includes('2 passed'));
     expect(frame).toContain('→ Bash(command="pytest")');
     expect(frame).toContain('← 2 passed');
-    // Agents pane, transcript frame, and the card's call and result regions: the
-    // rail is absent because this fixture has no rounds.
-    expect(frame.match(/╭/g)).toHaveLength(4);
+    // Header housing, agents pane, transcript frame, and the card's call and
+    // result regions: the rail is absent because this fixture has no rounds.
+    expect(frame.match(/╭/g)).toHaveLength(5);
   });
 
   it('renders a typed command payload with labeled stderr and exit code', async () => {
-    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    // 18 rows, not 16: the header is a three-row pane, so a 16-row terminal
+    // leaves the transcript too short to hold the whole payload card.
+    const testRenderer = await createTestRenderer({width: 80, height: 18});
     const controller = new FakeController({
       ...initialSessionState(),
       core: {
@@ -2009,9 +2017,12 @@ describe('OpenTUI presentation', () => {
 
     await testRenderer.waitForFrame(value => value.includes('checking behavior'));
     testRenderer.mockInput.pressKey('TAB');
+    // The header names the selection in the same words as the phase segment,
+    // never as the backend phase kind it is stored as.
     const filtered = await testRenderer.waitForFrame(value =>
-      value.includes('selected implementer'),
+      value.includes('filtered to implementing'),
     );
+    expect(filtered).not.toContain('selected implementer');
     expect(filtered).toContain('edited files');
     expect(filtered).not.toContain('checking behavior');
   });
@@ -2739,7 +2750,10 @@ describe('theming', () => {
     expect(trajectory).toContain('r43');
     expect(trajectory).toContain('regression found');
     expect(trajectory).not.toContain('unrelated round 41');
-    expect(trajectory).toContain('H-08 · r42-43');
+    // The header names the hypothesis; the round range beside it duplicated
+    // the rounds strip directly below, so only the title is up there now.
+    expect(trajectory).toContain('H-08');
+    expect(trajectory).not.toContain('H-08 · r42-43');
     expect(trajectory).toContain('r42');
     expect(trajectory).toContain('r43');
     // The strip covers the whole run, so rounds outside this hypothesis are
@@ -3805,7 +3819,7 @@ describe('theming', () => {
     expect(untitled).not.toContain('Batch prefill to cut latency');
   });
 
-  it('keeps the newest design round on screen in the pane at 100x30', async () => {
+  it('keeps the newest design round reachable in the pane at 100x30', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 30});
     const controller = logController();
     controller.paneContent = renderDesignSummary(
@@ -3823,14 +3837,22 @@ describe('theming', () => {
     await controller.openPane('design');
 
     // Ten rounds is 24 lines. The modal this replaced was 60% of 30 rows and
-    // did not scroll, so the newest rounds fell off the bottom; the pane is
-    // the full column and scrolls, so both ends are on screen.
+    // did not scroll, so the newest rounds were unreachable; the pane is the
+    // full column and scrolls, so every round can be read.
+    //
+    // Both ends no longer sit on screen together at 30 rows: the curated
+    // header is housed in a bordered box, which costs two rows the bare status
+    // line did not. The oldest round is there on open and the newest is a page
+    // away, rather than lost as it was in the modal.
     const frame = await testRenderer.waitForFrame(value =>
       value.includes('Design changes by round'),
     );
     expect(frame).toContain('Round 1 · H-07');
-    expect(frame).toContain('Round 10 · H-07');
-    expect(frame).toContain('src/round-10.rs');
+
+    for (let index = 0; index < 3; index += 1) testRenderer.mockInput.pressKey('\x1B[6~');
+    const scrolled = await frameAfter(testRenderer);
+    expect(scrolled).toContain('Round 10 · H-07');
+    expect(scrolled).toContain('src/round-10.rs');
   });
 
   it('annotates the selected round with its design changes once the log loads', async () => {
@@ -4302,6 +4324,103 @@ describe('theming', () => {
     await controller.openExperimentLog();
 
     expect(await frameAfter(testRenderer)).toContain('Profile before Hypothesis 1');
+  });
+});
+
+describe('header hierarchy', () => {
+  const runState = (status: CoreRunStatus): SessionState => ({
+    ...initialSessionState(),
+    core: {
+      ...initialSessionState().core,
+      status,
+      agentKind: 'implementer',
+      roundLabel: 'round-1-retry-2-implementer',
+      usage: {inputTokens: 223_000, contextWindow: 400_000, model: 'claude-opus-5'},
+    },
+  });
+
+  it('draws each header role in its own tone rather than all in one accent', async () => {
+    const theme = resolveTheme('dark');
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const controller = new FakeController(runState('completed'));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('223k/400k context'));
+
+    // Four tones on one line, which is the point: before this the renderer
+    // reported one accent-coloured span for the whole header.
+    expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(theme.accent);
+    expect(spanColors(testRenderer, 'completed')?.fg).toBe(theme.success);
+    expect(spanColors(testRenderer, 'implementing')?.fg).toBe(theme.textPrimary);
+    expect(spanColors(testRenderer, '223k/400k context')?.fg).toBe(theme.textMuted);
+  });
+
+  it('recolours the run state when the run ends badly', async () => {
+    const theme = resolveTheme('dark');
+    const testRenderer = await createTestRenderer({width: 100, height: 20});
+    const controller = new FakeController(runState('running'));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('223k/400k context'));
+    expect(spanColors(testRenderer, 'running')?.fg).toBe(theme.textPrimary);
+
+    controller.publish({
+      ...controller.state,
+      core: {...controller.state.core, status: 'failed'},
+    });
+    await testRenderer.waitForVisualIdle();
+
+    expect(spanColors(testRenderer, 'failed')?.fg).toBe(theme.error);
+  });
+
+  it('reads the header against the cell it is actually drawn on, in every theme', async () => {
+    // The frame paints a surface of its own, so `theme.canvas` is not what the
+    // header's text sits on and a floor measured against it checks a
+    // background nothing draws. The background here is read back off the
+    // rendered cell rather than named, which is also what pins `app.ts` and
+    // `headerSpanStyle` to one answer about where the header sits.
+    const themes = listThemes();
+    expect(themes).toHaveLength(8);
+    for (const theme of themes) {
+      const testRenderer = await createTestRenderer({width: 90, height: 20});
+      const controller = new FakeController({
+        ...initialSessionState(theme.name),
+        core: {...initialSessionState(theme.name).core, status: 'completed'},
+      });
+      const app = createOpenTuiApp(testRenderer.renderer, controller);
+      registerCleanup(testRenderer.renderer, app);
+      await testRenderer.waitForFrame(value => value.includes('VibeSys'));
+
+      const floor = theme.name.startsWith('high-contrast') ? 7 : 4.5;
+      for (const word of ['VibeSys', 'completed']) {
+        const drawn = spanColors(testRenderer, word);
+        expect({theme: theme.name, word, bg: drawn?.bg}).toEqual({
+          theme: theme.name,
+          word,
+          bg: headerBackground(theme),
+        });
+        const ratio = drawn === undefined ? 0 : contrastRatio(drawn.fg, drawn.bg);
+        expect({theme: theme.name, word, readable: ratio >= floor}).toEqual({
+          theme: theme.name,
+          word,
+          readable: true,
+        });
+      }
+    }
+  });
+
+  it('keeps the header whole in a terminal too narrow for all of it', async () => {
+    // One renderable per span means the row can shrink, and a shrinking row
+    // puts an ellipsis through every span at once (`V...ys·r...ng`) instead of
+    // the single cut the width budget decided on.
+    const testRenderer = await createTestRenderer({width: 24, height: 20});
+    const controller = new FakeController(runState('running'));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const frame = await testRenderer.waitForFrame(value => value.includes('VibeSys'));
+    expect(frame).toContain('VibeSys · running');
+    expect(frame).not.toContain('V...');
   });
 });
 

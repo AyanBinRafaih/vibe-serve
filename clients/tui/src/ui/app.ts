@@ -1,11 +1,16 @@
-import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
+import {
+  BoxRenderable,
+  type CliRenderer,
+  ScrollBoxRenderable,
+  TextAttributes,
+  TextRenderable,
+} from '@opentui/core';
 import {COMMAND_NAMES} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
   experimentLogVisible,
   focusedPane,
   type SessionState,
-  statusText,
   stripRounds,
   visibleRoundNumber,
 } from '../session-model.js';
@@ -19,6 +24,13 @@ import {createCommandInputPanel} from './command-input.js';
 import {ConversationView} from './conversation.js';
 import {ErrorBannerView} from './error-banner.js';
 import {ExperimentLogView} from './experiment-log.js';
+import {
+  type HeaderSpan,
+  headerBackground,
+  headerSpanStyle,
+  MAX_HEADER_SPANS,
+  renderHeader,
+} from './header.js';
 import {bindKeybindings} from './keybindings.js';
 import {OverlayView} from './overlay.js';
 import {RightPaneView, rightPaneWidth, splitFits} from './right-pane.js';
@@ -41,6 +53,12 @@ const LOG_KEY_HELP = `↑↓ or scroll: select · Enter/click: open hypothesis �
 const LOG_CHAT_KEY_HELP = `↑↓: select · Enter/click: hypothesis · Ctrl+W: chat · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
 const HYPOTHESIS_KEY_HELP =
   '↑↓: select round · Enter/click: trajectory · PgUp/PgDn: scroll · Esc: hypotheses';
+/** Bezel, one content row, bezel. See the header frame below. */
+const HEADER_FRAME_HEIGHT = 3;
+
+/** Two border cells plus a cell of padding on each side. */
+const HEADER_CHROME = 4;
+
 const SPLIT_KEY_HELP =
   'Ctrl+W: switch pane · F4: zoom focused pane · PgUp/PgDn: scroll · Esc: close pane';
 
@@ -70,12 +88,82 @@ export function createOpenTuiApp(
     flexDirection: 'column',
     backgroundColor: theme.canvas,
   });
-  const header = new TextRenderable(renderer, {
-    id: 'header',
-    height: 1,
-    fg: theme.accent,
-    content: 'VibeSys · connecting',
+  // The header is a pane, not a caption. Every other region on screen sits in
+  // a bordered box, so a bare line above them reads as floating rather than as
+  // part of the same housing. Three rows: bezel, one content row, bezel. The
+  // border rows are the breathing room, so there is no internal padding and no
+  // blank row beneath: the header's bottom bezel meets the next pane's top one,
+  // and two adjacent rules read as a seam between two objects.
+  //
+  // No background fill. A partial-width fill is what reads as a floating band
+  // in a terminal, and a full-width one has nothing to sit against.
+  const headerFrame = new BoxRenderable(renderer, {
+    id: 'header-frame',
+    width: '100%',
+    height: HEADER_FRAME_HEIGHT,
+    flexDirection: 'column',
+    paddingLeft: 1,
+    paddingRight: 1,
+    border: true,
+    borderStyle: 'rounded',
+    borderColor: theme.border,
+    // The same surface every other pane sits on. Without this the frame falls
+    // through to the root's `canvas`, which is a different shade, so the header
+    // read as a band laid over the UI rather than a pane within it. That is
+    // the exact quality the housing exists to remove. Through
+    // `headerBackground` because `headerSpanStyle` derives the text tones
+    // against the same call: the fill and the contrast basis are one fact.
+    backgroundColor: headerBackground(theme),
   });
+  // One renderable per span, because a terminal cell carries one foreground
+  // colour and the header's roles do not share one. The row is allocated once
+  // at its maximum and repainted in place: the spans change on every frame, and
+  // rebuilding thirteen renderables that often is churn the header does not
+  // need.
+  //
+  // `flexShrink: 0` because `renderHeader` has already budgeted the line to this
+  // width, so a row that still overruns is a bug rather than something to
+  // absorb. Shrinking spans put an ellipsis through every one of them at once
+  // (`V...ys·r...ng`) instead of leaving the single cut the budget decided on.
+  const headerLine = new BoxRenderable(renderer, {
+    id: 'header',
+    width: '100%',
+    height: 1,
+    flexDirection: 'row',
+  });
+  const headerSpans = Array.from(
+    {length: MAX_HEADER_SPANS},
+    (_unused, index) =>
+      new TextRenderable(renderer, {
+        id: `header-span-${index}`,
+        content: '',
+        fg: theme.textPrimary,
+        wrapMode: 'none',
+        flexShrink: 0,
+      }),
+  );
+  for (const span of headerSpans) headerLine.add(span);
+  headerFrame.add(headerLine);
+  /**
+   * Paints the budgeted spans onto the row. The tones come from the theme in
+   * scope, so a theme change is picked up by the next paint and needs no
+   * separate application.
+   *
+   * A span the current header does not use is hidden rather than emptied: an
+   * empty text renderable still measures one cell, and thirteen of those are
+   * most of a narrow terminal's header.
+   */
+  const paintHeader = (spans: HeaderSpan[]): void => {
+    for (const [index, cell] of headerSpans.entries()) {
+      const span = spans[index];
+      cell.visible = span !== undefined;
+      if (span === undefined) continue;
+      const style = headerSpanStyle(theme, span);
+      cell.content = span.text;
+      cell.fg = style.fg;
+      cell.attributes = style.bold ? TextAttributes.BOLD : TextAttributes.NONE;
+    }
+  };
   const focusTranscript = (): void => {
     controller.focusPane('left');
     controller.focusRound('transcript');
@@ -224,7 +312,7 @@ export function createOpenTuiApp(
   commandColumn.add(commandInput.suggestions);
   commandColumn.add(commandInput.box);
   bottom.add(commandColumn);
-  root.add(header);
+  root.add(headerFrame);
   root.add(errorBanner.output);
   body.add(chatPane.output);
   workspace.add(main);
@@ -244,7 +332,8 @@ export function createOpenTuiApp(
     const previousMarkdownStyle = markdownStyle;
     markdownStyle = createMarkdownStyle(theme);
     root.backgroundColor = theme.canvas;
-    header.fg = theme.accent;
+    headerFrame.borderColor = theme.border;
+    headerFrame.backgroundColor = headerBackground(theme);
     transcriptFrame.borderColor = theme.border;
     help.fg = theme.textSubtle;
     roundRail.applyTheme(theme);
@@ -309,13 +398,7 @@ export function createOpenTuiApp(
         : chatPaneWidth(renderer.terminalWidth, rightWidth)
       : 0;
     const showExperimentLog = showLog && (zoomedPane === null || zoomedPane === 'experiments');
-    const dialogOpen = state.chatOpen || state.overlay !== null || state.themePicker !== null;
-    const returnHint = dialogOpen ? ' · Esc: close dialog' : '';
-    const selection = state.selectedAgentKind ? ` · selected ${state.selectedAgentKind}` : '';
-    const scope = state.hypothesisScope === null ? '' : ` · ${state.hypothesisScope.label}`;
-    header.content = showLog
-      ? `VibeSys · ${statusText(state)} · experiments`
-      : `VibeSys · ${statusText(state)}${scope}${selection}${returnHint}`;
+    paintHeader(renderHeader(state, showLog, renderer.terminalWidth - HEADER_CHROME));
     errorBanner.render(state);
     // The log carries its own key hints in its footer, so when it shares the
     // row with a pane the global line is the place for the pane's keys.
@@ -369,7 +452,7 @@ export function createOpenTuiApp(
       // indicator) until the next paint.
       const railRows =
         renderer.terminalHeight -
-        header.height -
+        headerFrame.height -
         errorHeight -
         todoStripHeight(state) -
         help.height -
@@ -391,7 +474,7 @@ export function createOpenTuiApp(
     if (showSplit) {
       // The rounds rail lives inside the row, not above it, so the chat pane
       // starts just below the header and error banner.
-      const top = header.height + errorHeight;
+      const top = headerFrame.height + errorHeight;
       const below = todoStrip.output.height + help.height + commandInput.box.height;
       chat.setPaneBounds({
         left: 1,
