@@ -2456,6 +2456,11 @@
           ],
           "default": null,
           "title": "Perf Unit"
+        },
+        "profile_skipped": {
+          "default": false,
+          "title": "Profile Skipped",
+          "type": "boolean"
         }
       },
       "required": [

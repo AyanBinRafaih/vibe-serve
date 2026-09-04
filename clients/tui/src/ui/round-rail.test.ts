@@ -210,6 +210,62 @@ describe('RoundRailView row budget', () => {
     expect(await railChildren(100, 1, 50)).toHaveLength(0);
   });
 
+  test('marks a carried-forward round with a hollow glyph and an approximate delta', async () => {
+    const {renderer} = await createTestRenderer({width: 120, height: 40});
+    const view = new RoundRailView(
+      renderer,
+      {} as unknown as SessionController,
+      resolveTheme(null),
+    );
+    const base = railState(3);
+    const state: SessionState = {
+      ...base,
+      selectedRound: 3,
+      core: {
+        ...base.core,
+        rounds: [
+          {number: 1, status: 'completed'},
+          {number: 2, status: 'completed', profileSkipped: true},
+          {number: 3, status: 'completed'},
+        ],
+      },
+      experimentLog: {
+        entries: [
+          {
+            hypothesis_id: 'hyp-1',
+            first_round: 1,
+            last_round: 2,
+            rounds: [
+              {round: 1, passed: true, reviewed: true, perf_delta_pct: 4.2},
+              {round: 2, passed: true, reviewed: true, perf_delta_pct: 4.2},
+            ],
+          },
+        ],
+        selectedId: null,
+        pending: false,
+        error: null,
+      },
+    };
+    view.render(state, RAIL_FULL_WIDTH, 10);
+    const lines = view.output.getChildren().map(child => {
+      const content = (child as {content?: {chunks?: {text?: string}[]}}).content;
+      return (content?.chunks ?? []).map(chunk => chunk.text ?? '').join('');
+    });
+    view.destroy();
+
+    const carried = lines.find(line => line.includes('r2'));
+    expect(carried).toContain('○');
+    expect(carried).not.toContain('✓');
+    expect(carried).toContain('~+4.2%');
+
+    // A freshly measured round keeps the solid check and the unmarked delta.
+    const fresh = lines.find(line => line.includes('r1'));
+    expect(fresh).toContain('✓');
+    expect(fresh).not.toContain('○');
+    expect(fresh).toContain('+4.2%');
+    expect(fresh).not.toContain('~');
+  });
+
   test('never emits more children than the content rows, dropping indicators first', async () => {
     // One content row with the selection buried mid-run: the round wins the row
     // and neither overflow indicator is drawn, because there is no row to spare.

@@ -51,6 +51,17 @@ export interface BenchmarkRecord {
   unit: string;
 }
 
+/**
+ * A round as core state carries it: the run map's timing and status summary
+ * plus round facts folded outside the run map. `profileSkipped` is set from a
+ * `round_finished` event whose round reused an earlier measurement instead of
+ * profiling afresh; readers treat an absent flag as false, which also covers
+ * events recorded before the field existed.
+ */
+export interface RoundState extends RoundSummary {
+  profileSkipped?: boolean;
+}
+
 type RunEventData = NonNullable<RunEvent['data']>;
 export type TypedToolResult = Extract<RunEventData, {kind?: 'tool_result'}>;
 /** Typed structure a producer preserved alongside the raw tool-result text. */
@@ -133,7 +144,7 @@ export interface CoreState {
   roundLabel: string | null;
   outerLoop: string | null;
   maxRounds: number | null;
-  rounds: RoundSummary[];
+  rounds: RoundState[];
   phases: AgentPhase[];
   activeExecutions: Record<string, ActiveAgentExecution>;
   transcript: TranscriptEntry[];
@@ -545,6 +556,15 @@ function foldEvent(state: CoreState, event: RunEvent, folder: TranscriptFolder |
   next.phases = runMap.phases;
 
   const data = event.data;
+  // The run map owns a round's status and timing; the carried-forward flag is
+  // a round fact folded here, like benchmarks, so it lands on the summary the
+  // run map just settled.
+  if (data?.kind === 'round_finished' && data.profile_skipped === true) {
+    const finishedRound = roundNumberFromLabel(event.round_label);
+    next.rounds = next.rounds.map(round =>
+      round.number === finishedRound ? {...round, profileSkipped: true} : round,
+    );
+  }
   if (data?.kind === 'tool_call' || data?.kind === 'tool_result') next.typedToolEvents = true;
   if (data?.kind === 'todo_update') next.todos = updateTodos(next.todos, event);
   if (data?.kind === 'usage_update') {

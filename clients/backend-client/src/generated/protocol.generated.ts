@@ -326,6 +326,7 @@ export type Attempts = number;
 export type JudgeVerdict = "pass" | "fail" | "skipped";
 export type PerfMetric = number | null;
 export type PerfUnit = string | null;
+export type ProfileSkipped = boolean;
 export type Kind20 = "tool_call";
 export type Tool1 = string;
 export type CallId = string | null;
@@ -359,7 +360,7 @@ export type Round = number;
 export type PerfMetric1 = number;
 export type PerfUnit1 = string;
 export type Passed = boolean;
-export type ProfileSkipped = boolean;
+export type ProfileSkipped1 = boolean;
 export type Performance = PerformanceRound[];
 export type ObjectiveMetric = string | null;
 export type ObjectiveUnit = string | null;
@@ -909,6 +910,7 @@ export interface RoundFinishedData {
   judge_verdict: JudgeVerdict;
   perf_metric?: PerfMetric;
   perf_unit?: PerfUnit;
+  profile_skipped?: ProfileSkipped;
   [k: string]: unknown;
 }
 export interface ToolCallData {
@@ -972,7 +974,7 @@ export interface PerformanceRound {
   perf_metric: PerfMetric1;
   perf_unit: PerfUnit1;
   passed: Passed;
-  profile_skipped?: ProfileSkipped;
+  profile_skipped?: ProfileSkipped1;
 }
 /**
  * What the performance plot measures and how to read it.

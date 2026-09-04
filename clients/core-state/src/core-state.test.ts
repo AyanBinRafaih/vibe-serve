@@ -895,6 +895,23 @@ describe('batched transcript folding', () => {
   });
 });
 
+describe('the carried-forward profile flag', () => {
+  it('lands on the round whose round_finished event skipped profiling', () => {
+    const state = reduceEvent(initialCoreState(), roundFinishedEvent(1, {profile_skipped: true}));
+
+    expect(state.rounds).toHaveLength(1);
+    expect(state.rounds[0]?.status).toBe('completed');
+    expect(state.rounds[0]?.profileSkipped).toBe(true);
+  });
+
+  it('stays unset when the event lacks the field, as legacy streams do', () => {
+    const state = reduceEvent(initialCoreState(), roundFinishedEvent(1, {}));
+
+    expect(state.rounds[0]?.status).toBe('completed');
+    expect(state.rounds[0]?.profileSkipped).toBeUndefined();
+  });
+});
+
 /** One stream touching every transcript merge rule, plus both chat threads. */
 function mixedTranscriptEvents(): RunEvent[] {
   return [
@@ -935,6 +952,21 @@ function roundToolEvent(
   return {
     ...toolEvent(sequence, kind, callId, content),
     round_label: 'round-2-implementer',
+  };
+}
+
+function roundFinishedEvent(sequence: number, extra: {profile_skipped?: boolean}): RunEvent {
+  return {
+    ...baseEvent(sequence, 'round_finished'),
+    round_label: 'round-1',
+    data: {
+      kind: 'round_finished',
+      attempts: 1,
+      judge_verdict: 'pass',
+      perf_metric: 900,
+      perf_unit: 'ops/s',
+      ...extra,
+    },
   };
 }
 

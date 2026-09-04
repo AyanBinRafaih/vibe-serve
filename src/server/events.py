@@ -327,6 +327,10 @@ class RoundFinishedData(EventPayload):  # noqa: D101  # tracked: #288
     judge_verdict: Literal["pass", "fail", "skipped"]
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
+    # True when no fresh profile ran this round, so any perf reading was
+    # carried forward from an earlier measurement. Defaults False so legacy
+    # persisted events stay valid.
+    profile_skipped: bool = False
 
 
 EventData = Annotated[

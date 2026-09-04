@@ -22,7 +22,7 @@ import {
   initialCoreState,
   latestDiagnosticChange,
   phasesForRound,
-  type RoundSummary,
+  type RoundState,
   reconcileActiveExecutions,
   reduceEvent,
   reduceEventBatch,
@@ -1956,7 +1956,7 @@ export function visibleRoundNumber(state: SessionState): number | null {
 }
 
 /** The rounds owned by the hypothesis on screen, or every round outside one. */
-export function scopedRounds(state: SessionState): RoundSummary[] {
+export function scopedRounds(state: SessionState): RoundState[] {
   const scope = state.hypothesisScope;
   if (scope === null) return state.core.rounds;
   return state.core.rounds.filter(round => scope.rounds.includes(round.number));
@@ -1970,7 +1970,7 @@ export function scopedRounds(state: SessionState): RoundSummary[] {
  * what has happened carry ``planned`` and open an empty view, which is the
  * honest thing to show for a round that has not run.
  */
-export function stripRounds(state: SessionState): RoundSummary[] {
+export function stripRounds(state: SessionState): RoundState[] {
   const highest = Math.max(
     state.core.maxRounds ?? 0,
     ...state.core.rounds.map(round => round.number),
@@ -1978,7 +1978,7 @@ export function stripRounds(state: SessionState): RoundSummary[] {
   );
   if (highest === 0) return state.core.rounds;
   const known = new Map(state.core.rounds.map(round => [round.number, round]));
-  const rounds: RoundSummary[] = [];
+  const rounds: RoundState[] = [];
   for (let number = 1; number <= highest; number += 1) {
     rounds.push(known.get(number) ?? {number, status: 'planned'});
   }
