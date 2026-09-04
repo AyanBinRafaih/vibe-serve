@@ -1,5 +1,6 @@
 """Persistence and cursor tests for the run-event store."""
 
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -167,6 +168,92 @@ class TestEventStore:
             (1, "complete"),
             (2, "after repair"),
         ]
+
+    def test_append_preserves_a_valid_unterminated_final_record(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        path.write_text(_persisted_event(1, "unterminated").model_dump_json())
+        store = EventStore(path, run_id="active-run")
+        assert [event.text for event in store.read()] == ["unterminated"]
+
+        store.append(make_event(EventType.OUTPUT, "appended"))
+
+        assert [event.text for event in store.read()] == ["unterminated", "appended"]
+        reopened = EventStore(path, run_id="reopened-run")
+        assert [(event.sequence, event.text) for event in reopened.read()] == [
+            (1, "unterminated"),
+            (2, "appended"),
+        ]
+        raw = path.read_text()
+        assert raw.endswith("\n")
+        assert [json.loads(line)["text"] for line in raw.splitlines()] == [
+            "unterminated",
+            "appended",
+        ]
+
+    def test_append_writes_no_repair_newline_after_a_terminated_tail(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        _write_events(path, [_persisted_event(1, "one")])
+        original = path.read_bytes()
+        store = EventStore(path, run_id="active-run")
+
+        appended = store.append(make_event(EventType.OUTPUT, "two"))
+
+        assert path.read_bytes() == original + (appended.model_dump_json() + "\n").encode()
+
+    def test_a_missing_final_newline_is_repaired_exactly_once(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        path.write_text(_persisted_event(1, "unterminated").model_dump_json())
+        store = EventStore(path, run_id="active-run")
+
+        store.append(make_event(EventType.OUTPUT, "second"))
+        store.append(make_event(EventType.OUTPUT, "third"))
+
+        raw = path.read_text()
+        assert "\n\n" not in raw
+        assert len(raw.splitlines()) == 3
+        assert [event.text for event in EventStore(path, run_id="reopened-run").read()] == [
+            "unterminated",
+            "second",
+            "third",
+        ]
+
+    def test_append_after_external_removal_starts_the_new_file_cleanly(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        path.write_text(_persisted_event(1, "unterminated").model_dump_json())
+        store = EventStore(path, run_id="active-run")
+        path.unlink()
+
+        appended = store.append(make_event(EventType.OUTPUT, "fresh"))
+
+        assert path.read_bytes() == (appended.model_dump_json() + "\n").encode()
+        assert [event.text for event in EventStore(path, run_id="reopened-run").read()] == ["fresh"]
+
+    def test_concatenated_final_records_raise_instead_of_truncating(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        first = _persisted_event(1, "first").model_dump_json()
+        second = _persisted_event(2, "second").model_dump_json()
+        third = _persisted_event(3, "third").model_dump_json()
+        path.write_text(first + "\n" + second + third + "\n")
+        original = path.read_bytes()
+
+        with pytest.raises(ValueError, match=f"byte offset {len(first) + 1} "):
+            EventStore(path, run_id="active-run")
+
+        assert path.read_bytes() == original
+
+    def test_a_complete_but_invalid_final_record_raises_instead_of_truncating(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        path = tmp_path / "events.jsonl"
+        valid = _persisted_event(1, "complete").model_dump_json()
+        record = json.loads(_persisted_event(2, "terminal").model_dump_json())
+        record["data"] = {"kind": "output", "stream": "stdout", "content": 5}
+        path.write_text(valid + "\n" + json.dumps(record) + "\n")
+        original = path.read_bytes()
+
+        with pytest.raises(ValueError, match=f"byte offset {len(valid) + 1} ") as excinfo:
+            EventStore(path, run_id="active-run")
+
+        assert str(path) in str(excinfo.value)
+        assert path.read_bytes() == original
 
     def test_rejects_a_malformed_record_before_the_tail(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         path = tmp_path / "events.jsonl"

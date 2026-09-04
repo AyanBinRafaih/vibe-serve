@@ -260,6 +260,66 @@ def test_a_corrupt_final_record_is_ignored_and_repaired_by_append(tmp_path):  # 
     assert len(reopened.read()) == len(events) + 1
 
 
+def test_lazy_store_matches_eager_store_for_a_valid_unterminated_tail(tmp_path):  # noqa: ANN001, ANN201
+    serialized = "".join(
+        event.model_dump_json() + "\n" for event in _generated_events(seed=43, count=12)
+    )
+    path = tmp_path / "events.jsonl"
+    path.write_text(serialized.rstrip("\n"))
+
+    _assert_matches_eager_store(path)
+
+    lazy_path = tmp_path / "lazy.jsonl"
+    eager_path = tmp_path / "eager.jsonl"
+    lazy_path.write_text(serialized.rstrip("\n"))
+    eager_path.write_text(serialized.rstrip("\n"))
+    appended = make_event(EventType.OUTPUT, "after repair")
+    EventStore(lazy_path, run_id="reference").append(appended)
+    _EagerEventStore(eager_path, run_id="reference").append(appended)
+
+    assert lazy_path.read_bytes() == eager_path.read_bytes()
+    # The repair terminates the final record instead of concatenating onto it.
+    assert lazy_path.read_bytes().startswith(serialized.encode())
+
+
+def test_lazy_store_matches_eager_store_for_a_complete_invalid_tail(tmp_path):  # noqa: ANN001, ANN201
+    path = tmp_path / "events.jsonl"
+    invalid = (
+        '{"protocol_version":1,"sequence":99,"run_id":"persisted-run",'
+        '"timestamp":"2026-01-01T00:00:00+00:00","type":"output",'
+        '"data":{"kind":"output","stream":"stdout","content":5}}'
+    )
+    path.write_text(
+        "".join(event.model_dump_json() + "\n" for event in _generated_events(seed=47, count=12))
+        + invalid
+        + "\n"
+    )
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="complete final record") as lazy_error:
+        EventStore(path, run_id="active-run")
+    with pytest.raises(ValueError, match="complete final record") as eager_error:
+        _EagerEventStore(path, run_id="reference")
+
+    assert str(lazy_error.value) == str(eager_error.value)
+    assert path.read_bytes() == original
+
+
+def test_lazy_store_matches_eager_store_for_a_concatenated_tail(tmp_path):  # noqa: ANN001, ANN201
+    path = tmp_path / "events.jsonl"
+    serialized = [event.model_dump_json() for event in _generated_events(seed=53, count=12)]
+    path.write_text("\n".join(serialized[:-2]) + "\n" + serialized[-2] + serialized[-1] + "\n")
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="complete final record") as lazy_error:
+        EventStore(path, run_id="active-run")
+    with pytest.raises(ValueError, match="complete final record") as eager_error:
+        _EagerEventStore(path, run_id="reference")
+
+    assert str(lazy_error.value) == str(eager_error.value)
+    assert path.read_bytes() == original
+
+
 def test_a_bounded_read_only_parses_the_records_it_returns(tmp_path):  # noqa: ANN001, ANN201
     path = tmp_path / "events.jsonl"
     count = 6 * _EAGER_TAIL_RECORDS
