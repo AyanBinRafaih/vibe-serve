@@ -2820,6 +2820,14 @@
         "max_rounds": {
           "title": "Max Rounds",
           "type": "integer"
+        },
+        "expected_roles": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Expected Roles",
+          "type": "array"
         }
       },
       "required": [

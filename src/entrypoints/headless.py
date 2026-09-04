@@ -38,6 +38,7 @@ from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.input_manifest import InputBundle, load_input_bundle, load_project_task
 from vibesys.loops.metrics import MetricSpace, Objective
+from vibesys.loops.roles import expected_agent_roles
 from vibesys.profilers import CLI_PROFILER_CHOICES, ProfilerKind, coerce_profiler_kind
 from vibesys.render.headless import HeadlessRenderer
 from vibesys.repository import (
@@ -2593,6 +2594,11 @@ def dispatch(argv: list[str], integration: RunIntegration | None = None) -> None
             unsubscribe = run_integration.events.subscribe(HeadlessRenderer().handle)
         with boot_trace.span("run_started_event"):
             max_rounds = getattr(args, "max_rounds", getattr(args, "max_iterations", 1))
+            expected_roles = expected_agent_roles(loop_kind)
+            if args.profiler is ProfilerKind.NONE:
+                # A disabled profiler never runs (see loop.py's profiler-kind
+                # gate), so don't seed a placeholder for it.
+                expected_roles = tuple(role for role in expected_roles if role != "profiler")
             run_integration.events.emit(
                 CoreEventType.RUN_STARTED,
                 status=EventStatus.ACTIVE,
@@ -2600,6 +2606,7 @@ def dispatch(argv: list[str], integration: RunIntegration | None = None) -> None
                     outer_loop=loop_kind,
                     input=str(args.input_bundle.root),
                     max_rounds=max_rounds,
+                    expected_roles=expected_roles,
                 ),
             )
         runner(args, run_integration)

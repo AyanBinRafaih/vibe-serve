@@ -233,3 +233,27 @@ def test_close_is_idempotent_and_stops_event_projection(tmp_path):  # noqa: ANN0
     )
 
     assert not any(event.type is EventType.AGENT_OUTPUT_CHUNK for event in parts.journal.read())
+
+
+def test_run_started_expected_roles_round_trip_through_the_wire_bridge() -> None:
+    """The core payload bridges to the wire model with and without the field."""
+    from server.events import RunStartedData  # noqa: PLC0415
+    from server.integration import _EVENT_DATA_ADAPTER  # noqa: PLC0415
+    from vibesys.run.events import RunStartedData as CoreRunStartedData  # noqa: PLC0415
+
+    advertised = CoreRunStartedData(
+        outer_loop="plain",
+        input="objective",
+        max_rounds=3,
+        expected_roles=("implementer", "judge", "perf_eval"),
+    )
+    wire = _EVENT_DATA_ADAPTER.validate_python(advertised.model_dump(mode="python"))
+    assert isinstance(wire, RunStartedData)
+    assert wire.expected_roles == ("implementer", "judge", "perf_eval")
+
+    # A recording that predates the field must still validate, as empty.
+    legacy = _EVENT_DATA_ADAPTER.validate_python(
+        {"kind": "run_started", "outer_loop": "plain", "input": "objective", "max_rounds": 3}
+    )
+    assert isinstance(legacy, RunStartedData)
+    assert legacy.expected_roles == ()

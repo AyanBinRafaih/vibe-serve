@@ -170,6 +170,10 @@ class RunStartedData(EventPayload):  # noqa: D101  # tracked: #288
     outer_loop: str
     input: str
     max_rounds: int
+    # The agent roles the loop can run per round (vibesys.loops.roles), so
+    # frontends seed placeholders from the contract instead of a client-side
+    # table. Empty on events recorded before the field existed.
+    expected_roles: tuple[str, ...] = ()
 
 
 class RunInterruptedData(EventPayload):  # noqa: D101  # tracked: #288
