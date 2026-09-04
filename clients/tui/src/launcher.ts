@@ -12,6 +12,7 @@ const READY_TIMEOUT_MS = 30_000;
 const READY_POLL_INTERVAL_MS = 25;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 const BACKEND_EXIT_GRACE_MS = 2_000;
+const FRONTEND_EXIT_GRACE_MS = 2_000;
 
 export async function launch(argv: string[]): Promise<number> {
   const python = resolvePythonCommand();
@@ -211,8 +212,18 @@ async function monitor(
       return frontendCode === 0 ? backendCode : normalizeFrontendExit(frontendCode);
     }
     if (backendCode !== undefined) {
-      const finalFrontendCode = await waitForExit(frontend);
-      return finalFrontendCode ?? backendCode;
+      // The backend never legitimately exits while the frontend is attached
+      // (it stays alive for post-run chat until the frontend ends the
+      // session), so this is always an unexpected backend death. Give the
+      // frontend a moment to exit on its own, then terminate it so the
+      // launcher's cleanup can run.
+      const gracefulFrontendCode = await waitForExit(frontend, FRONTEND_EXIT_GRACE_MS);
+      if (gracefulFrontendCode === undefined) {
+        frontend.kill('SIGTERM');
+        await waitOrKill(frontend);
+        return backendCode;
+      }
+      return gracefulFrontendCode === 0 ? backendCode : normalizeFrontendExit(gracefulFrontendCode);
     }
     await sleep(50);
   }
