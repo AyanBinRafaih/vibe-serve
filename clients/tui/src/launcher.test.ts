@@ -230,6 +230,52 @@ connect(process.env.VIBESYS_CONTROL_SOCKET);
     await expect(launch(['--stub-agent', '--runs-dir', '/tmp/vibesys-test-runs'])).resolves.toBe(3);
   }, 15_000);
 
+  it('pins the backend failure code when the frontend exits 0 within the grace window after backend death', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
+    const backend = await writeExecutable(
+      'dying-backend.mjs',
+      `
+import {createServer} from 'node:net';
+const socketPath = process.argv[process.argv.indexOf('--control-socket') + 1];
+const server = createServer(() => {
+  setTimeout(() => process.exit(7), 100);
+});
+server.listen(socketPath);
+`,
+    );
+    const frontend = await writeExecutable(
+      'clean-exit-frontend.mjs',
+      `
+import {createConnection} from 'node:net';
+setInterval(() => undefined, 1000);
+let connected = false;
+function connect(path) {
+  const socket = createConnection(path);
+  socket.once('connect', () => {
+    connected = true;
+  });
+  socket.once('close', () => {
+    // Exit as if the run had finished cleanly, well within the launcher's
+    // grace window but after it saw the backend exit. The backend's
+    // failure must still win: a frontend that happens to exit 0 here is
+    // not evidence the run succeeded.
+    if (connected) setTimeout(() => process.exit(0), 300);
+  });
+  socket.on('error', () => {
+    if (!connected) setTimeout(() => connect(path), 25);
+  });
+}
+connect(process.env.VIBESYS_CONTROL_SOCKET);
+`,
+    );
+
+    process.env['VIBESYS_PYTHON'] = backend;
+    process.env['VIBESYS_TUI_RUNTIME'] = process.execPath;
+    process.env['VIBESYS_TUI_ENTRYPOINT'] = frontend;
+
+    await expect(launch(['--stub-agent', '--runs-dir', '/tmp/vibesys-test-runs'])).resolves.toBe(7);
+  }, 15_000);
+
   it('starts a headless backend and runs the frontend', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
     const backendTerminated = join(tempDir, 'backend-terminated');

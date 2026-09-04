@@ -217,6 +217,13 @@ async function monitor(
       // session), so this is always an unexpected backend death. Give the
       // frontend a moment to exit on its own, then terminate it so the
       // launcher's cleanup can run.
+      //
+      // This branch's safety depends on the backend never tearing down
+      // while a subscription is active or about to redial. Today
+      // `_client_disconnected` in `unix_jsonl.py` latches on the first
+      // mid-run drop and never unsticks on reconnect, so the backend can
+      // exit under a live client, violating that contract. Fixed by the
+      // reconnect-aware SubscriptionTracker in #588 (PR #602).
       const gracefulFrontendCode = await waitForExit(frontend, FRONTEND_EXIT_GRACE_MS);
       if (gracefulFrontendCode === undefined) {
         frontend.kill('SIGTERM');
