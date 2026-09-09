@@ -1291,6 +1291,41 @@ describe('OpenTUI presentation', () => {
     expect(controller.state.hypothesisScope).not.toBeNull();
   });
 
+  it('closes Help over a visualization before closing the visualization', async () => {
+    const testRenderer = await createTestRenderer({width: 130, height: 22});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      hypothesisScope: {id: 'H-01', label: 'H-01 · r1', title: 'H-01', rounds: [1]},
+      selectedRound: 1,
+      core: {
+        ...initialSessionState().core,
+        rounds: [{number: 1, status: 'active'}],
+        phases: [{kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'}],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openPane('perf');
+    controller.publish({
+      ...controller.state,
+      overlay: {kind: 'help', content: 'Available commands'},
+    });
+    await testRenderer.waitForFrame(value => value.includes('Available commands'));
+
+    // Help is foreground. Escape dismisses it without closing the Performance pane.
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await testRenderer.waitForFrame(value => !value.includes('Available commands'));
+    expect(controller.state.overlay).toBeNull();
+    expect(controller.state.layout.right).not.toBeNull();
+    expect(controller.state.layout.focus).toBe('right');
+
+    // Once Help is gone, the next Escape closes the pane.
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.layout.right).toBeNull();
+    expect(controller.state.layout.focus).toBe('left');
+  });
+
   it('hands the keys back when the pane holding them closes', async () => {
     const testRenderer = await createTestRenderer({width: 130, height: 22});
     const controller = new FakeController({

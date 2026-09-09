@@ -124,8 +124,8 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // Modal state is authoritative: the theme picker, the modal chat, and any
-    // overlay must contain input before the focused docked chat runs. Otherwise
+    // Modal state is authoritative: the theme picker, command overlay, and
+    // modal chat must contain input before the focused docked chat runs. Otherwise
     // a modal opened while the docked chat has focus would leak printable keys
     // into the hidden composer, let Up/Down drive chat suggestions, and route
     // Escape to the left pane instead of closing the modal.
@@ -138,6 +138,20 @@ export function bindKeybindings(
       else if (key.name === 'return' || key.name === 'enter') controller.applySelectedTheme();
       // The picker is modal: keys it does not use are swallowed here so they
       // cannot move panes or type into the still-focused input behind it.
+      key.preventDefault();
+      return;
+    }
+    if (controller.state.overlay !== null) {
+      if (key.name === 'escape') {
+        controller.live();
+        viewport.scrollTo(viewport.scrollHeight);
+      } else if (key.name === 'pageup' || key.name === 'pagedown') {
+        // Content taller than the box scrolls here rather than falling through
+        // to the transcript behind it.
+        actions.scrollOverlay(key.name === 'pageup' ? -1 : 1);
+      }
+      // The overlay is modal: everything it does not handle is swallowed so
+      // keys cannot reach the panes or the hidden command input behind it.
       key.preventDefault();
       return;
     }
@@ -170,20 +184,6 @@ export function bindKeybindings(
       controller.state.layout.right !== null
     ) {
       controller.closePane();
-      key.preventDefault();
-      return;
-    }
-    if (controller.state.overlay !== null) {
-      if (key.name === 'escape') {
-        controller.live();
-        viewport.scrollTo(viewport.scrollHeight);
-      } else if (key.name === 'pageup' || key.name === 'pagedown') {
-        // Content taller than the box scrolls here rather than falling through
-        // to the transcript behind it.
-        actions.scrollOverlay(key.name === 'pageup' ? -1 : 1);
-      }
-      // The overlay is modal: everything it does not handle is swallowed so
-      // keys cannot reach the panes or the hidden command input behind it.
       key.preventDefault();
       return;
     }
