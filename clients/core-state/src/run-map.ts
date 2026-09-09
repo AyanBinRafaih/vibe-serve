@@ -22,6 +22,10 @@ export interface RoundSummary extends RoundTimingState {
   status: RoundStatus;
   startedAt?: string;
   finishedAt?: string;
+  /** Internal provenance for a terminal endpoint inferred at a run boundary. */
+  closedByRunBoundary?: true;
+  /** An explicit round_finished event may supersede a prior inferred endpoint. */
+  closedByRoundFinished?: true;
 }
 
 export interface AgentPhase {
@@ -60,7 +64,11 @@ export interface RunMapState {
   lastEventTimestamp: string | null;
 }
 
-export function applyRunMapEvent(state: RunMapState, event: RunEvent): RunMapState {
+export function applyRunMapEvent(
+  state: RunMapState,
+  event: RunEvent,
+  abandonedAt: string | null = null,
+): RunMapState {
   const seen: RunMapState = {...state, lastEventTimestamp: event.timestamp};
   // Run-scoped terminal events say the run ended, not which agent ended it, so
   // they carry no `agent_kind` and no `round_label`. Every projection below is
@@ -73,7 +81,7 @@ export function applyRunMapEvent(state: RunMapState, event: RunEvent): RunMapSta
   }
   const base =
     event.type === 'run_started'
-      ? closeAbandonedRunState(seen, state.lastEventTimestamp ?? event.timestamp)
+      ? closeAbandonedRunState(seen, abandonedAt ?? state.lastEventTimestamp ?? event.timestamp)
       : seen;
   const started =
     event.type === 'run_started' && event.data?.kind === 'run_started' ? event.data : null;
@@ -145,7 +153,12 @@ function isRoundClosed(status: RoundStatus): boolean {
 function closeRound(round: RoundSummary, timestamp: string): RoundSummary {
   const closed = isRoundClosed(round.status)
     ? round
-    : {...round, status: 'failed' as const, finishedAt: round.finishedAt ?? timestamp};
+    : {
+        ...round,
+        status: 'failed' as const,
+        finishedAt: round.finishedAt ?? timestamp,
+        closedByRunBoundary: true as const,
+      };
   return hasActiveAgentTiming(closed) ? closeActiveAgentTimings(closed, timestamp) : closed;
 }
 
@@ -241,8 +254,22 @@ function mergeRoundPrefix(older: RoundSummary, newer: RoundSummary): RoundSummar
     older.activeAgentStarts === undefined && newer.activeAgentStarts === undefined
       ? undefined
       : {...older.activeAgentStarts, ...newer.activeAgentStarts};
+  const preserveRunBoundary =
+    older.closedByRunBoundary === true && newer.closedByRoundFinished !== true;
   return {
     ...round,
+    // A resume keeps the interrupted round closed even once its next attempt
+    // starts. This matches `applyRoundEvent`, which never reopens a terminal
+    // round during a chronological replay.
+    ...(preserveRunBoundary
+      ? {
+          status: older.status,
+          ...(older.finishedAt === undefined ? {} : {finishedAt: older.finishedAt}),
+          closedByRunBoundary: true as const,
+        }
+      : isRoundClosed(older.status) && !isRoundClosed(newer.status)
+        ? {status: older.status}
+        : {}),
     ...(agentIntervals === undefined ? {} : {agentIntervals}),
     ...(activeAgentStarts === undefined ? {} : {activeAgentStarts}),
   };
@@ -328,7 +355,9 @@ function applyRoundEvent(
   const patch: RoundSummary = {
     number,
     status,
-    ...(terminal ? {finishedAt: event.timestamp} : {startedAt: event.timestamp}),
+    ...(terminal
+      ? {finishedAt: event.timestamp, closedByRoundFinished: true as const}
+      : {startedAt: event.timestamp}),
   };
   const round = existing ? mergeRound(existing, patch) : patch;
   return replaceRound(rounds, updateRoundAgentElapsed(round, phases, event));

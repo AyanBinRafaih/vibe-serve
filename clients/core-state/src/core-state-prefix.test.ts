@@ -101,6 +101,171 @@ describe('prefix backfill equivalence', () => {
 });
 
 describe('prefix merges across the chunk boundary', () => {
+  it('replays a resumed lifetime when backfill follows the server spine', () => {
+    const events = [
+      runStartedEvent(1),
+      executionStartedEvent(2, 'old-attempt'),
+      chunkEvent(3, 'old attempt started'),
+      chunkEvent(4, 'old attempt still running'),
+      chunkEvent(5, 'old attempt still running'),
+      chunkEvent(6, 'old attempt last output'),
+      {...runStartedEvent(7), timestamp: timestamp(7)},
+      executionStartedEvent(8, 'resumed-attempt'),
+      chunkEvent(9, 'tail after resume'),
+    ];
+    const floor = 8;
+    const spine = events.filter(
+      event =>
+        event.sequence !== undefined && event.sequence <= floor && event.type === 'run_started',
+    );
+    const tail = [
+      ...spine,
+      ...events.filter(event => event.sequence !== undefined && event.sequence > floor),
+    ];
+
+    const full = reduceEventBatch(initialCoreState(), events);
+    const bootstrapped = reduceEventBatch(initialCoreState(), tail, undefined, undefined, floor);
+    // This mirrors two event-history requests. The first carries the last
+    // pre-resume output and resumed start, while the old start arrives only in
+    // the later request. Both run boundaries are omitted as spine duplicates.
+    const afterFirstBackfill = reduceEventPrefix(
+      bootstrapped,
+      events.filter(
+        event =>
+          event.sequence === 4 ||
+          event.sequence === 5 ||
+          event.sequence === 6 ||
+          event.sequence === 8,
+      ),
+      3,
+    );
+    const merged = reduceEventPrefix(
+      afterFirstBackfill,
+      events.filter(event => event.sequence === 2 || event.sequence === 3),
+      0,
+    );
+
+    // `activeExecutions` is a checkpoint projection, intentionally owned by
+    // the server rather than event history. Every replay-derived field agrees.
+    expect({...merged, activeExecutions: {}}).toEqual({...full, activeExecutions: {}});
+    expect(merged.phases.filter(phase => phase.kind === 'implementer')).toMatchObject([
+      {executionId: 'old-attempt', status: 'interrupted'},
+      {executionId: 'resumed-attempt', status: 'active'},
+    ]);
+    expect(merged.phases.find(phase => phase.executionId === 'old-attempt')?.finishedAt).toBe(
+      timestamp(6),
+    );
+    expect(reduceEventPrefix(merged, [], 0)).toEqual(merged);
+  });
+
+  it('preserves each inferred endpoint across multi-resume backfill chunkings', () => {
+    const events = [
+      runStartedEvent(1),
+      executionStartedEvent(2, 'first-attempt'),
+      chunkEvent(3, 'first attempt last output'),
+      runStartedEvent(4),
+      executionStartedEvent(5, 'middle-attempt'),
+      chunkEvent(6, 'middle attempt last output'),
+      runStartedEvent(7),
+      executionStartedEvent(8, 'latest-attempt'),
+      chunkEvent(9, 'latest attempt output'),
+    ];
+    const full = reduceEventBatch(initialCoreState(), events);
+
+    for (const chunks of [
+      [
+        {sequences: [5, 6, 8], floor: 4},
+        {sequences: [2, 3], floor: 0},
+      ],
+      [
+        {sequences: [8], floor: 6},
+        {sequences: [5, 6], floor: 4},
+        {sequences: [2, 3], floor: 0},
+      ],
+    ]) {
+      const merged = foldWithSpineBackfill(events, 8, chunks);
+
+      expect({...merged, activeExecutions: {}}).toEqual({...full, activeExecutions: {}});
+      expect(merged.rounds).toMatchObject([
+        {
+          status: 'failed',
+          finishedAt: timestamp(3),
+          agentIntervals: [
+            {startedAt: timestamp(2), finishedAt: timestamp(3)},
+            {startedAt: timestamp(5), finishedAt: timestamp(6)},
+          ],
+          activeAgentStarts: {'implementer:latest-attempt': timestamp(8)},
+        },
+      ]);
+    }
+  });
+
+  it('lets an explicit round finish supersede an inferred resume endpoint', () => {
+    const events = [
+      runStartedEvent(1),
+      executionStartedEvent(2, 'first-attempt'),
+      chunkEvent(3, 'first attempt last output'),
+      runStartedEvent(4),
+      executionStartedEvent(5, 'latest-attempt'),
+      chunkEvent(6, 'latest attempt output'),
+      roundFinishedEvent(7),
+    ];
+    const full = reduceEventBatch(initialCoreState(), events);
+    const merged = foldWithSpineBackfill(events, 4, [
+      {sequences: [2, 3], floor: 0},
+      {sequences: [], floor: 0},
+    ]);
+
+    expect({...merged, activeExecutions: {}}).toEqual({...full, activeExecutions: {}});
+    expect(merged.rounds).toMatchObject([
+      {status: 'completed', finishedAt: timestamp(7), closedByRoundFinished: true},
+    ]);
+  });
+
+  for (const [terminal, expectedStatus] of [
+    ['run_failed', 'failed'],
+    ['run_interrupted', 'interrupted'],
+    ['run_finished', 'interrupted'],
+  ] as const) {
+    it(`retains ${terminal} before the resumed start`, () => {
+      const events: RunEvent[] = [
+        runStartedEvent(1),
+        executionStartedEvent(2, 'old-attempt'),
+        chunkEvent(3, 'old attempt last output'),
+        {sequence: 4, timestamp: timestamp(4), type: terminal},
+        runStartedEvent(5),
+        executionStartedEvent(6, 'resumed-attempt'),
+        chunkEvent(7, 'tail after resume'),
+      ];
+      const floor = 6;
+      const spine = events.filter(
+        event =>
+          event.sequence !== undefined &&
+          event.sequence <= floor &&
+          ['run_started', 'run_finished', 'run_failed', 'run_interrupted'].includes(event.type),
+      );
+      const tail = [
+        ...spine,
+        ...events.filter(event => event.sequence !== undefined && event.sequence > floor),
+      ];
+      const full = reduceEventBatch(initialCoreState(), events);
+      const bootstrapped = reduceEventBatch(initialCoreState(), tail, undefined, undefined, floor);
+      const merged = reduceEventPrefix(
+        bootstrapped,
+        events.filter(
+          event => event.sequence === 2 || event.sequence === 3 || event.sequence === 6,
+        ),
+        0,
+      );
+
+      expect({...merged, activeExecutions: {}}).toEqual({...full, activeExecutions: {}});
+      expect(merged.phases.find(phase => phase.executionId === 'old-attempt')).toMatchObject({
+        status: expectedStatus,
+        finishedAt: timestamp(4),
+      });
+    });
+  }
+
   it('lands a tail tool result on a tool call from the chunk', () => {
     const events = [
       toolCallEvent(1, 'call-a'),
@@ -194,6 +359,7 @@ describe('prefix merges across the chunk boundary', () => {
         status: 'completed',
         startedAt: timestamp(1),
         finishedAt: timestamp(2),
+        closedByRoundFinished: true,
         agentIntervals: [],
         activeAgentStarts: {},
       },
@@ -346,6 +512,39 @@ function backfillAt(events: readonly RunEvent[], boundaries: readonly number[]):
 
 function foldAsPrefix(events: readonly RunEvent[], boundary: number): CoreState {
   return backfillAt(events, [boundary]);
+}
+
+function foldWithSpineBackfill(
+  events: readonly RunEvent[],
+  floor: number,
+  chunks: readonly {sequences: readonly number[]; floor: number}[],
+): CoreState {
+  const spine = events.filter(
+    event =>
+      event.sequence !== undefined &&
+      event.sequence <= floor &&
+      (event.type === 'run_started' ||
+        event.type === 'run_finished' ||
+        event.type === 'run_failed' ||
+        event.type === 'run_interrupted'),
+  );
+  let state = reduceEventBatch(
+    initialCoreState(),
+    [...spine, ...events.filter(event => event.sequence !== undefined && event.sequence > floor)],
+    undefined,
+    undefined,
+    floor,
+  );
+  for (const chunk of chunks) {
+    state = reduceEventPrefix(
+      state,
+      events.filter(
+        event => event.sequence !== undefined && chunk.sequences.includes(event.sequence),
+      ),
+      chunk.floor,
+    );
+  }
+  return state;
 }
 
 function sequenceAt(events: readonly RunEvent[], index: number): number {

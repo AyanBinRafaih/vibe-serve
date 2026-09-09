@@ -128,6 +128,24 @@ export interface CoreDiagnostic {
   sequence: number;
 }
 
+export interface RunLifetimeBoundary {
+  event: RunEvent;
+  /** Last event observed before a resumed run_started boundary, if known. */
+  closeout: {sequence: number; timestamp: string} | null;
+}
+
+function isRunLifetimeBoundary(event: RunEvent): boolean {
+  switch (event.type) {
+    case 'run_started':
+    case 'run_finished':
+    case 'run_failed':
+    case 'run_interrupted':
+      return true;
+    default:
+      return false;
+  }
+}
+
 /**
  * Run status as core state carries it: every status the backend reports, plus
  * the client-only `connecting` that precedes the first snapshot or event.
@@ -156,6 +174,10 @@ export interface CoreState {
    * one. The run map owns the field and its meaning; see `RunMapState`.
    */
   lastEventTimestamp: string | null;
+  /** Sequence of the latest non-chat event folded through the run map. */
+  lastRunMapSequence: number;
+  /** Run lifetime boundaries retained from the replayed event stream. */
+  runLifetimeBoundaries: readonly RunLifetimeBoundary[];
   activeExecutions: Record<string, ActiveAgentExecution>;
   transcript: TranscriptEntry[];
   /** The default thread's transcript; equals `chatTranscripts[DEFAULT_CHAT_THREAD_ID]`. */
@@ -195,6 +217,8 @@ export function initialCoreState(): CoreState {
     rounds: [],
     phases: [],
     lastEventTimestamp: null,
+    lastRunMapSequence: 0,
+    runLifetimeBoundaries: [],
     activeExecutions: {},
     transcript: [],
     chatTranscript: [],
@@ -364,7 +388,39 @@ export function reduceEventPrefix(
   events: readonly RunEvent[],
   historyAfterSequence: number,
 ): CoreState {
-  const older = reduceEventBatch(initialCoreState(), events);
+  const sequences = new Set(
+    events.map(event => event.sequence).filter(sequence => sequence !== undefined),
+  );
+  const boundaries = state.runLifetimeBoundaries.filter(
+    boundary => boundary.event.sequence !== undefined && !sequences.has(boundary.event.sequence),
+  );
+  // Fold ordinary prefix data once. Run-level spine events may carry terminal
+  // transcript and diagnostic facts that the tail already has, so replaying
+  // them through this fold would duplicate those facts during the merge.
+  const olderData = reduceEventBatch(initialCoreState(), events);
+  // Rebuild just the run-map projection with every retained lifetime boundary.
+  // This keeps a narrow older chunk in the same run configuration as a full
+  // replay, and re-applies terminal/resume boundaries without duplicating
+  // their non-map projections.
+  const runMapReplay = reduceEventBatch(
+    {...initialCoreState(), runLifetimeBoundaries: state.runLifetimeBoundaries},
+    [...events, ...boundaries.map(boundary => boundary.event)].sort(
+      (left, right) => (left.sequence ?? 0) - (right.sequence ?? 0),
+    ),
+  );
+  const older: CoreState = {
+    ...olderData,
+    outerLoop: runMapReplay.outerLoop,
+    expectedRoles: runMapReplay.expectedRoles,
+    rounds: runMapReplay.rounds,
+    phases: runMapReplay.phases,
+    lastEventTimestamp: runMapReplay.lastEventTimestamp,
+    lastRunMapSequence: runMapReplay.lastRunMapSequence,
+    runLifetimeBoundaries: mergeRunLifetimeBoundaries(
+      runMapReplay.runLifetimeBoundaries,
+      state.runLifetimeBoundaries,
+    ),
+  };
   const chatTranscripts = mergeChatTranscriptsPrefix(older.chatTranscripts, state.chatTranscripts);
   return {
     sequence: state.sequence,
@@ -379,6 +435,12 @@ export function reduceEventPrefix(
     phases: mergePhaseLists(older.phases, state.phases),
     // The newer batch folded the newer events, so it saw the run more recently.
     lastEventTimestamp: state.lastEventTimestamp ?? older.lastEventTimestamp,
+    lastRunMapSequence:
+      state.lastRunMapSequence > 0 ? state.lastRunMapSequence : older.lastRunMapSequence,
+    runLifetimeBoundaries: mergeRunLifetimeBoundaries(
+      older.runLifetimeBoundaries,
+      state.runLifetimeBoundaries,
+    ),
     // Liveness comes from the backend checkpoint, never from replayed history.
     activeExecutions: state.activeExecutions,
     transcript: mergeTranscriptPrefix(older.transcript, state.transcript),
@@ -552,6 +614,53 @@ function mergeTypedToolFlags(
   return merged;
 }
 
+/** Retain each boundary and its closest known predecessor. */
+function mergeRunLifetimeBoundaries(
+  older: readonly RunLifetimeBoundary[],
+  newer: readonly RunLifetimeBoundary[],
+): readonly RunLifetimeBoundary[] {
+  const merged = new Map<number, RunLifetimeBoundary>();
+  for (const boundary of [...older, ...newer]) {
+    const sequence = boundary.event.sequence;
+    if (sequence === undefined) continue;
+    const existing = merged.get(sequence);
+    if (
+      existing === undefined ||
+      (boundary.closeout?.sequence ?? -1) > (existing.closeout?.sequence ?? -1)
+    ) {
+      merged.set(sequence, boundary);
+    }
+  }
+  return [...merged.values()].sort(
+    (left, right) => (left.event.sequence ?? 0) - (right.event.sequence ?? 0),
+  );
+}
+
+function boundaryFor(
+  boundaries: readonly RunLifetimeBoundary[],
+  event: RunEvent,
+  state: CoreState,
+): RunLifetimeBoundary {
+  const sequence = event.sequence;
+  if (sequence === undefined) return {event, closeout: null};
+  const known = boundaries.find(boundary => boundary.event.sequence === sequence);
+  // Chat events return before the run map fold, so the map's last timestamp
+  // and sequence, rather than the core cursor, identify the closeout point.
+  const observed =
+    state.lastRunMapSequence > 0 &&
+    state.lastRunMapSequence < sequence &&
+    state.lastEventTimestamp !== null
+      ? {sequence: state.lastRunMapSequence, timestamp: state.lastEventTimestamp}
+      : null;
+  return {
+    event,
+    closeout:
+      observed !== null && observed.sequence > (known?.closeout?.sequence ?? -1)
+        ? observed
+        : (known?.closeout ?? null),
+  };
+}
+
 export function reduceEvent(state: CoreState, event: RunEvent): CoreState {
   return foldEvent(state, event, null);
 }
@@ -565,12 +674,32 @@ function foldEvent(state: CoreState, event: RunEvent, folder: TranscriptFolder |
   if (event.agent_kind === 'chat') return applyChatEvent(next, event, folder);
   if (event.agent_kind) next.agentKind = event.agent_kind;
   if (event.round_label) next.roundLabel = event.round_label;
-  const runMap = applyRunMapEvent(next, event);
+  const boundary =
+    event.type === 'run_started' && event.sequence !== undefined
+      ? boundaryFor(state.runLifetimeBoundaries, event, state)
+      : isRunLifetimeBoundary(event)
+        ? {event, closeout: null}
+        : null;
+  const runMap = applyRunMapEvent(
+    {
+      outerLoop: next.outerLoop,
+      expectedRoles: next.expectedRoles,
+      rounds: next.rounds,
+      phases: next.phases,
+      lastEventTimestamp: next.lastEventTimestamp,
+    },
+    event,
+    boundary?.closeout?.timestamp ?? null,
+  );
   next.outerLoop = runMap.outerLoop;
   next.expectedRoles = runMap.expectedRoles;
   next.rounds = runMap.rounds;
   next.phases = runMap.phases;
   next.lastEventTimestamp = runMap.lastEventTimestamp;
+  next.lastRunMapSequence = sequence;
+  if (boundary !== null) {
+    next.runLifetimeBoundaries = mergeRunLifetimeBoundaries(next.runLifetimeBoundaries, [boundary]);
+  }
 
   const data = event.data;
   // The run map owns a round's status and timing; the carried-forward flag is
