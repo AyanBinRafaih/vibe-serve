@@ -168,6 +168,7 @@ _FAILED_HYPOTHESIS_OUTCOMES = (
     }
 ) | {"rejected"}
 _MAX_CONTINUATION_ROUNDS_WITHOUT_DESIGN_REVIEW = 2
+_PARETO_ARCHIVE_PENDING_CLAIM_LIMIT = 8
 
 
 def _persist_agent_run_state(
@@ -385,13 +386,21 @@ def _pareto_archive_summary(records: list[RoundRecord], space: MetricSpace) -> s
         and all(objective.name in record.candidate_metrics for objective in objectives)
     ]
     if pending:
+        pending.sort(key=lambda record: record.round_number)
         lines.append(
             "Measured frontier claims not yet usable as trusted parents (retain the commit, "
             "but do not treat it as a parent). A row lands here because its hard invariants "
             "have not passed independent review, or because its numbers are the "
             "implementer's own report rather than a framework measurement:"
         )
-        for record in pending:
+        omitted = pending[:-_PARETO_ARCHIVE_PENDING_CLAIM_LIMIT]
+        if omitted:
+            lines.append(
+                f"- {len(omitted)} older untrusted claims omitted from this context "
+                f"(rounds {omitted[0].round_number}-{omitted[-1].round_number}); do not "
+                "treat any omitted claim as a trusted parent."
+            )
+        for record in pending[-_PARETO_ARCHIVE_PENDING_CLAIM_LIMIT:]:
             assert record.commit is not None  # noqa: S101  # tracked: #288
             lines.append(
                 f"- round {record.round_number}, commit {record.commit[:12]}: "
