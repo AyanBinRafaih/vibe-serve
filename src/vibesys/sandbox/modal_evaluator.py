@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tarfile
@@ -100,13 +101,12 @@ def _ensure_runtime_dir(path: Path) -> None:
     runtime_dir = path.parent
     try:
         runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        owner_uid = runtime_dir.stat().st_uid
-        is_directory = runtime_dir.is_dir()
+        metadata = runtime_dir.lstat()
     except OSError as exc:
         raise RuntimeError(  # noqa: TRY003
             f"cannot use {runtime_dir} as the evaluator runtime directory: {exc}"
         ) from exc
-    if not is_directory or owner_uid != os.getuid():
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
         raise RuntimeError(  # noqa: TRY003
             f"refusing to use {runtime_dir} as the evaluator runtime directory: "
             f"expected a directory owned by uid {os.getuid()}"
