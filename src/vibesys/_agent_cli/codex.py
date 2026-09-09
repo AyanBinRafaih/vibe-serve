@@ -1,8 +1,10 @@
+import json
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agentshim.codex import CodexGenerationSession
+from agentshim.codex.events import CodexEvent, ToolResultEvent, ToolUseEvent
 from agentshim.events import AgentEventHandler
 
 from .base import MCPServerSpec
@@ -14,51 +16,79 @@ if TYPE_CHECKING:
 _COMMAND_TOOL = "execute"
 
 
-class _PairedCodexToolEvents:
-    """Repair the codex adapter's tool-event stream into call/result pairs.
+def _item_lifecycle(line: str) -> tuple[str, str] | None:
+    """Read lifecycle kind and stable item identity before callbacks discard them."""
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get("type") not in ("item.started", "item.completed"):
+        return None
+    item = data.get("item")
+    if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+        return None
+    return data["type"], item["id"]
 
-    agentshim through 0.5.1 maps a generic codex item's ``item.started`` and
-    ``item.completed`` both to tool-use, so one ``file_change`` (or
-    ``web_search``, ``mcp_tool_call``, ...) reaches ``on_tool_call`` twice
-    with identical arguments and never reaches ``on_tool_result``. This
-    wrapper treats the second identical call for a still-open item as that
-    item's completion: it swallows the duplicate and emits the missing
-    ``on_tool_result`` instead. Command executions (``execute``) already
-    arrive correctly paired and pass through untouched, as does every other
-    callback. Under an adapter that reports completions as results, no
-    duplicate ever arrives and the wrapper forwards everything unchanged.
+
+def _completion_output(parameters: Any) -> str:  # noqa: ANN401  # tracked: #288
+    """Preserve output and error payloads added when a generic item completes."""
+    if isinstance(parameters, dict):
+        for key in ("aggregated_output", "output", "text", "summary", "result", "error", "message"):
+            value = parameters.get(key)
+            if value:
+                return value if isinstance(value, str) else json.dumps(value)
+    return ""
+
+
+class _PairedCodexSession(CodexGenerationSession):
+    """Repair AgentShim's generic tool lifecycle before item IDs are discarded.
+
+    AgentShim 0.5.x maps generic starts and completions to ToolUseEvent.
+    Completion arguments can change, so use the raw lifecycle kind to convert
+    only completions to ToolResultEvent. The base session then pairs by ID,
+    including when a corrected parser supplies ToolResultEvent itself.
     """
 
-    def __init__(self, inner: AgentEventHandler) -> None:
-        self._inner = inner
-        # One open (args, start time) per tool name: codex items in a turn
-        # are sequential, so a second identical call while the first is open
-        # can only be the same item's completion echo.
-        self._open: dict[str, tuple[Any, float]] = {}
+    def __init__(self, **kwargs: Any) -> None:  # noqa: ANN401  # tracked: #288
+        super().__init__(**kwargs)
+        self._lifecycle: tuple[str, str] | None = None
 
-    def __getattr__(self, name: str) -> Any:  # noqa: ANN401  # tracked: #288
-        return getattr(self._inner, name)
+    def _process_stdout(self, line: str) -> None:
+        self._lifecycle = _item_lifecycle(line)
+        try:
+            super()._process_stdout(line)
+        finally:
+            self._lifecycle = None
 
-    def on_tool_call(self, tool: str, args: Any = None) -> None:  # noqa: ANN401  # tracked: #288
-        """Forward a tool call, folding a completion echo into its result."""
-        if tool != _COMMAND_TOOL:
-            opened = self._open.pop(tool, None)
-            if opened is not None and opened[0] == args:
-                self._inner.on_tool_result(
-                    tool=tool,
-                    stdout="",
-                    exit_code=None,
-                    duration=time.monotonic() - opened[1],
+    def _handle_event(self, event: CodexEvent) -> None:
+        if (
+            isinstance(event, ToolUseEvent)
+            and event.tool_name != _COMMAND_TOOL
+            and self._lifecycle is not None
+            and event.tool_id == self._lifecycle[1]
+        ):
+            if self._lifecycle[0] == "item.started":
+                # AgentShim registers only command executions. Register generic
+                # starts too, using the same clock as its duration calculation.
+                self.tool_map[event.tool_id] = event.tool_name
+                self.tool_start_times[event.tool_id] = time.time()
+                self.tool_args[event.tool_id] = event.parameters
+            else:
+                event = ToolResultEvent(
+                    tool_id=event.tool_id,
+                    tool_name=event.tool_name,
+                    parameters=event.parameters,
+                    output=_completion_output(event.parameters),
                 )
-                return
-            self._open[tool] = (args, time.monotonic())
-        self._inner.on_tool_call(tool, args)
-
-    def on_tool_result(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401  # tracked: #288
-        """Forward a real result verbatim and close the matching open call."""
-        tool = kwargs.get("tool", args[0] if args else None)
-        self._open.pop(tool, None)
-        self._inner.on_tool_result(*args, **kwargs)
+        super()._handle_event(event)
+        if (
+            isinstance(event, ToolResultEvent)
+            and event.tool_id
+            and event.tool_name != _COMMAND_TOOL
+        ):
+            self.tool_map.pop(event.tool_id, None)
+            self.tool_start_times.pop(event.tool_id, None)
+            self.tool_args.pop(event.tool_id, None)
 
 
 def _toml_str(value: str) -> str:
@@ -189,12 +219,7 @@ class CodexCodingAgent(CLICodingAgent[CodexGenerationSession]):
         timeout: int | None = None,
         silent: bool = False,  # noqa: FBT001, FBT002  # tracked: #288
     ) -> CodexGenerationSession:
-        # A fresh wrapper per session: open-call state must not leak across
-        # turns.
-        event_handler = (
-            _PairedCodexToolEvents(self.event_handler) if self.event_handler is not None else None
-        )
-        return CodexGenerationSession(
+        return _PairedCodexSession(
             binary_name=self.binary_name,
             env=self.env,
             log_prefix=self._log_prefix,
@@ -203,7 +228,7 @@ class CodexCodingAgent(CLICodingAgent[CodexGenerationSession]):
             cwd=cwd,
             timeout=timeout,
             silent=silent,
-            event_handler=event_handler,
+            event_handler=self.event_handler,
             executor=self.executor,
         )
 
