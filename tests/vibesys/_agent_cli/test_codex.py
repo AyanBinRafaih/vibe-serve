@@ -10,12 +10,18 @@ These tests exercise :mod:`vibesys._agent_cli.codex` without spawning the real
 3. ``CodexGenerationSession`` captures cumulative token usage from
    ``turn.completed`` events and forwards a ``reasoning`` item's text through
    the event handler.
+4. ``_PairedCodexSession`` pairs a generic item's ``item.started`` and
+   ``item.completed`` (both mapped to tool-use upstream) by item id into one
+   ``on_tool_call`` / ``on_tool_result`` pair.
 """
 
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
+
+from agentshim.codex.events import ToolResultEvent
 
 from vibesys._agent_cli.codex import (
     CodexCodingAgent,
@@ -23,6 +29,9 @@ from vibesys._agent_cli.codex import (
     _shell_path_config_args,
 )
 from vibesys._agent_cli.gemini import GeminiCodingAgent
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 def _agent() -> CodexCodingAgent:
@@ -363,6 +372,323 @@ class TestProcessStdout:
         session = _session()
         session._process_stdout("   \n")  # noqa: SLF001  # tracked: #288
         assert session.stdout_lines == []
+
+
+# ---------------------------------------------------------------------------
+# Tool-event pairing
+# ---------------------------------------------------------------------------
+
+
+def _agent_session(handler) -> CodexGenerationSession:  # noqa: ANN001  # tracked: #288
+    """Build a session through the agent, so the pairing subclass is wired in."""
+    agent = _agent()
+    agent.binary_name = "codex"
+    agent.env = {}
+    agent.logger = MagicMock()
+    agent.executor = None
+    agent.event_handler = handler
+    return agent._create_session(["codex", "exec", "--json", "-"], silent=True)  # noqa: SLF001  # tracked: #288
+
+
+def _item_line(event_type: str, item: Mapping[str, object]) -> str:
+    """Serialize one raw codex item lifecycle line."""
+    return json.dumps({"type": event_type, "item": dict(item)})
+
+
+def _tool_events(handler: MagicMock) -> list[str]:
+    """Ordered names of the tool callbacks the handler received."""
+    return [name for name, *_ in handler.method_calls if name.startswith("on_tool")]
+
+
+class TestToolEventPairing:
+    """Pairing of generic codex items into call/result pairs by item id.
+
+    agentshim maps a generic item's ``item.started`` and ``item.completed``
+    both to tool-use events, and the completion payload differs from the
+    start (``result`` / ``error`` get populated), so the session must pair
+    the two by the stable item id, not by argument equality.
+    """
+
+    def test_mcp_lifecycle_emits_one_call_and_one_result(self) -> None:
+        """The reviewed defect: completion parameters differ from the start."""
+        handler = MagicMock()
+        session = _agent_session(handler)
+        session._process_stdout(  # noqa: SLF001  # tracked: #288
+            _item_line(
+                "item.started",
+                {
+                    "id": "item_5",
+                    "type": "mcp_tool_call",
+                    "server": "docs",
+                    "tool": "search",
+                    "arguments": {"query": "x"},
+                    "result": None,
+                    "error": None,
+                    "status": "in_progress",
+                },
+            )
+        )
+        session._process_stdout(  # noqa: SLF001  # tracked: #288
+            _item_line(
+                "item.completed",
+                {
+                    "id": "item_5",
+                    "type": "mcp_tool_call",
+                    "server": "docs",
+                    "tool": "search",
+                    "arguments": {"query": "x"},
+                    "result": {"content": [{"type": "text", "text": "hits"}]},
+                    "error": None,
+                    "status": "completed",
+                },
+            )
+        )
+        handler.on_tool_call.assert_called_once_with(
+            "mcp_tool_call",
+            {
+                "server": "docs",
+                "tool": "search",
+                "arguments": {"query": "x"},
+                "result": None,
+                "error": None,
+            },
+        )
+        handler.on_tool_result.assert_called_once()
+        result = handler.on_tool_result.call_args.kwargs
+        assert result["tool"] == "mcp_tool_call"
+        assert "hits" in result["stdout"]
+        assert result["exit_code"] is None
+        assert result["duration"] is not None
+        assert result["duration"] >= 0
+        assert _tool_events(handler) == ["on_tool_call", "on_tool_result"]
+
+    def test_identical_parameters_with_distinct_ids_stay_two_items(self) -> None:
+        """Byte-identical payloads must pair by id, not by argument equality."""
+        handler = MagicMock()
+        session = _agent_session(handler)
+        for item_id in ("item_a", "item_b"):
+            for event_type, status in (
+                ("item.started", "in_progress"),
+                ("item.completed", "completed"),
+            ):
+                session._process_stdout(  # noqa: SLF001  # tracked: #288
+                    _item_line(
+                        event_type,
+                        {
+                            "id": item_id,
+                            "type": "file_change",
+                            "status": status,
+                            "path": "engine.py",
+                            "kind": "update",
+                        },
+                    )
+                )
+        assert handler.on_tool_call.call_count == 2
+        assert handler.on_tool_result.call_count == 2
+        assert _tool_events(handler) == [
+            "on_tool_call",
+            "on_tool_result",
+            "on_tool_call",
+            "on_tool_result",
+        ]
+        # file_change has no output payload; results carry empty stdout.
+        assert [c.kwargs["stdout"] for c in handler.on_tool_result.call_args_list] == ["", ""]
+
+    def test_interleaved_items_pair_by_id(self) -> None:
+        handler = MagicMock()
+        session = _agent_session(handler)
+        item_a = {"id": "a", "type": "file_change", "path": "a.py"}
+        item_b = {"id": "b", "type": "web_search", "query": "docs"}
+        lines = [
+            ("item.started", {**item_a, "status": "in_progress"}),
+            ("item.started", {**item_b, "status": "in_progress"}),
+            ("item.completed", {**item_b, "status": "completed", "result": "found"}),
+            ("item.completed", {**item_a, "status": "completed"}),
+        ]
+        for event_type, item in lines:
+            session._process_stdout(_item_line(event_type, item))  # noqa: SLF001  # tracked: #288
+        assert [c.args[0] for c in handler.on_tool_call.call_args_list] == [
+            "file_change",
+            "web_search",
+        ]
+        assert [c.kwargs["tool"] for c in handler.on_tool_result.call_args_list] == [
+            "web_search",
+            "file_change",
+        ]
+
+    def test_identical_overlapping_items_keep_both_starts(self) -> None:
+        handler = MagicMock()
+        session = _agent_session(handler)
+        for event_type, item_id in (
+            ("item.started", "a"),
+            ("item.started", "b"),
+            ("item.completed", "b"),
+            ("item.completed", "a"),
+        ):
+            session._process_stdout(  # noqa: SLF001  # tracked: #288
+                _item_line(event_type, {"id": item_id, "type": "file_change", "changes": []})
+            )
+        assert _tool_events(handler) == [
+            "on_tool_call",
+            "on_tool_call",
+            "on_tool_result",
+            "on_tool_result",
+        ]
+
+    def test_identical_completion_only_items_each_get_a_pair(self) -> None:
+        handler = MagicMock()
+        session = _agent_session(handler)
+        for item_id in ("a", "b"):
+            session._process_stdout(  # noqa: SLF001  # tracked: #288
+                _item_line("item.completed", {"id": item_id, "type": "file_change", "changes": []})
+            )
+        assert _tool_events(handler) == [
+            "on_tool_call",
+            "on_tool_result",
+            "on_tool_call",
+            "on_tool_result",
+        ]
+
+    def test_completion_without_observed_start_synthesizes_the_call(self) -> None:
+        handler = MagicMock()
+        session = _agent_session(handler)
+        session._process_stdout(  # noqa: SLF001  # tracked: #288
+            _item_line(
+                "item.completed",
+                {
+                    "id": "w1",
+                    "type": "web_search",
+                    "status": "completed",
+                    "query": "q",
+                    "result": "r",
+                },
+            )
+        )
+        handler.on_tool_call.assert_called_once_with("web_search", {"query": "q", "result": "r"})
+        handler.on_tool_result.assert_called_once()
+        result = handler.on_tool_result.call_args.kwargs
+        assert result["tool"] == "web_search"
+        assert result["stdout"] == "r"
+        assert result["duration"] is None
+        assert _tool_events(handler) == ["on_tool_call", "on_tool_result"]
+
+    def test_command_execution_keeps_base_pairing(self) -> None:
+        """``execute`` items pair upstream; the id pairing must not interfere."""
+        handler = MagicMock()
+        session = _agent_session(handler)
+        session._process_stdout(  # noqa: SLF001  # tracked: #288
+            _item_line(
+                "item.started",
+                {
+                    "id": "c1",
+                    "type": "command_execution",
+                    "status": "in_progress",
+                    "command": "ls -la",
+                },
+            )
+        )
+        session._process_stdout(  # noqa: SLF001  # tracked: #288
+            _item_line(
+                "item.completed",
+                {
+                    "id": "c1",
+                    "type": "command_execution",
+                    "status": "completed",
+                    "command": "ls -la",
+                    "aggregated_output": "file.txt\n",
+                    "exit_code": 0,
+                },
+            )
+        )
+        handler.on_tool_call.assert_called_once_with("execute", {"command": "ls -la"})
+        handler.on_tool_result.assert_called_once()
+        result = handler.on_tool_result.call_args.kwargs
+        assert result["tool"] == "execute"
+        assert result["stdout"] == "file.txt\n"
+        assert result["exit_code"] == 0
+        assert result["duration"] is not None
+
+    def test_real_result_event_closes_started_item_without_duplicate_call(self) -> None:
+        """A fixed adapter emitting a real ToolResultEvent must resolve cleanly."""
+        handler = MagicMock()
+        session = _agent_session(handler)
+        session._process_stdout(  # noqa: SLF001  # tracked: #288
+            _item_line(
+                "item.started",
+                {
+                    "id": "m1",
+                    "type": "mcp_tool_call",
+                    "status": "in_progress",
+                    "server": "docs",
+                    "tool": "search",
+                    "arguments": {"query": "x"},
+                },
+            )
+        )
+        session._handle_event(  # noqa: SLF001  # tracked: #288
+            ToolResultEvent(
+                tool_id="m1",
+                output="done",
+                tool_name="mcp_tool_call",
+                parameters={"server": "docs"},
+            )
+        )
+        handler.on_tool_call.assert_called_once()
+        handler.on_tool_result.assert_called_once()
+        result = handler.on_tool_result.call_args.kwargs
+        assert result["tool"] == "mcp_tool_call"
+        assert result["stdout"] == "done"
+        assert result["duration"] is not None
+
+    def test_failed_completion_surfaces_the_error(self) -> None:
+        handler = MagicMock()
+        session = _agent_session(handler)
+        for event_type, extra in (
+            ("item.started", {"result": None, "error": None, "status": "in_progress"}),
+            ("item.completed", {"result": None, "error": {"message": "boom"}, "status": "failed"}),
+        ):
+            session._process_stdout(  # noqa: SLF001  # tracked: #288
+                _item_line(
+                    event_type,
+                    {
+                        "id": "m2",
+                        "type": "mcp_tool_call",
+                        "server": "docs",
+                        "tool": "search",
+                        "arguments": {},
+                        **extra,
+                    },
+                )
+            )
+        handler.on_tool_call.assert_called_once()
+        handler.on_tool_result.assert_called_once()
+        assert "boom" in handler.on_tool_result.call_args.kwargs["stdout"]
+
+    def test_item_updated_and_non_json_lines_emit_no_tool_events(self) -> None:
+        handler = MagicMock()
+        session = _agent_session(handler)
+        item = {"id": "f1", "type": "file_change", "status": "in_progress", "path": "a.py"}
+        session._process_stdout(_item_line("item.started", item))  # noqa: SLF001  # tracked: #288
+        session._process_stdout(_item_line("item.updated", item))  # noqa: SLF001  # tracked: #288
+        session._process_stdout("starting codex 1.2.3\n")  # noqa: SLF001  # tracked: #288
+        assert handler.on_tool_call.call_count == 1
+        handler.on_tool_result.assert_not_called()
+
+    def test_session_without_handler_processes_a_full_lifecycle(self) -> None:
+        session = _agent_session(None)
+        for event_type, status in (
+            ("item.started", "in_progress"),
+            ("item.completed", "completed"),
+        ):
+            session._process_stdout(  # noqa: SLF001  # tracked: #288
+                _item_line(
+                    event_type,
+                    {"id": "f2", "type": "file_change", "status": status, "path": "a.py"},
+                )
+            )
+        assert session.tool_map == {}
+        assert session.tool_start_times == {}
+        assert session.tool_args == {}
 
 
 class TestProcessStderr:

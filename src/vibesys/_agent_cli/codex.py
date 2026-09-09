@@ -1,7 +1,10 @@
+import json
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from agentshim.codex import CodexGenerationSession
+from agentshim.codex.events import CodexEvent, ToolResultEvent, ToolUseEvent
 from agentshim.events import AgentEventHandler
 
 from .base import MCPServerSpec
@@ -9,6 +12,83 @@ from .cli_agent import CLICodingAgent
 
 if TYPE_CHECKING:
     from agentshim.executor import CommandExecutor
+
+_COMMAND_TOOL = "execute"
+
+
+def _item_lifecycle(line: str) -> tuple[str, str] | None:
+    """Read lifecycle kind and stable item identity before callbacks discard them."""
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get("type") not in ("item.started", "item.completed"):
+        return None
+    item = data.get("item")
+    if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+        return None
+    return data["type"], item["id"]
+
+
+def _completion_output(parameters: Any) -> str:  # noqa: ANN401  # tracked: #288
+    """Preserve output and error payloads added when a generic item completes."""
+    if isinstance(parameters, dict):
+        for key in ("aggregated_output", "output", "text", "summary", "result", "error", "message"):
+            value = parameters.get(key)
+            if value:
+                return value if isinstance(value, str) else json.dumps(value)
+    return ""
+
+
+class _PairedCodexSession(CodexGenerationSession):
+    """Repair AgentShim's generic tool lifecycle before item IDs are discarded.
+
+    AgentShim 0.5.x maps generic starts and completions to ToolUseEvent.
+    Completion arguments can change, so use the raw lifecycle kind to convert
+    only completions to ToolResultEvent. The base session then pairs by ID,
+    including when a corrected parser supplies ToolResultEvent itself.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:  # noqa: ANN401  # tracked: #288
+        super().__init__(**kwargs)
+        self._lifecycle: tuple[str, str] | None = None
+
+    def _process_stdout(self, line: str) -> None:
+        self._lifecycle = _item_lifecycle(line)
+        try:
+            super()._process_stdout(line)
+        finally:
+            self._lifecycle = None
+
+    def _handle_event(self, event: CodexEvent) -> None:
+        if (
+            isinstance(event, ToolUseEvent)
+            and event.tool_name != _COMMAND_TOOL
+            and self._lifecycle is not None
+            and event.tool_id == self._lifecycle[1]
+        ):
+            if self._lifecycle[0] == "item.started":
+                # AgentShim registers only command executions. Register generic
+                # starts too, using the same clock as its duration calculation.
+                self.tool_map[event.tool_id] = event.tool_name
+                self.tool_start_times[event.tool_id] = time.time()
+                self.tool_args[event.tool_id] = event.parameters
+            else:
+                event = ToolResultEvent(
+                    tool_id=event.tool_id,
+                    tool_name=event.tool_name,
+                    parameters=event.parameters,
+                    output=_completion_output(event.parameters),
+                )
+        super()._handle_event(event)
+        if (
+            isinstance(event, ToolResultEvent)
+            and event.tool_id
+            and event.tool_name != _COMMAND_TOOL
+        ):
+            self.tool_map.pop(event.tool_id, None)
+            self.tool_start_times.pop(event.tool_id, None)
+            self.tool_args.pop(event.tool_id, None)
 
 
 def _toml_str(value: str) -> str:
@@ -139,7 +219,7 @@ class CodexCodingAgent(CLICodingAgent[CodexGenerationSession]):
         timeout: int | None = None,
         silent: bool = False,  # noqa: FBT001, FBT002  # tracked: #288
     ) -> CodexGenerationSession:
-        return CodexGenerationSession(
+        return _PairedCodexSession(
             binary_name=self.binary_name,
             env=self.env,
             log_prefix=self._log_prefix,

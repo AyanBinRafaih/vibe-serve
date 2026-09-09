@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol
+from unittest.mock import MagicMock
 
 import pytest
 
+from vibesys.agents.callbacks import AgentLogger
+from vibesys.agents.client import _LoggerObserver
 from vibesys.agents.contracts import (
     AgentEvent,
     AgentExecutionPolicy,
@@ -17,7 +21,8 @@ from vibesys.agents.contracts import (
     MCPServerSpec,
 )
 from vibesys.agents.drivers import agentshim as subject
-from vibesys.run.events import CommandResultPayload
+from vibesys.render.sink import output_sink
+from vibesys.run.events import CommandResultPayload, CoreEvent, ToolCallData, ToolResultData
 from vs_sandbox import ProjectPathPolicy
 
 if TYPE_CHECKING:
@@ -261,30 +266,102 @@ def _self_referential() -> dict[str, Any]:
     return args
 
 
-def test_codex_item_lifecycle_does_not_open_two_turns_for_one_action(
-    fake_agent: list[_FakeAgent], tmp_path: Path
+@pytest.mark.parametrize("item_count", [1, 2])
+@pytest.mark.parametrize(
+    ("item", "completion"),
+    [
+        pytest.param(
+            {"type": "file_change", "changes": [{"path": "src/lib.rs", "kind": "delete"}]},
+            {},
+            id="file-change",
+        ),
+        pytest.param(
+            {
+                "type": "mcp_tool_call",
+                "server": "docs",
+                "tool": "search",
+                "arguments": {"query": "x"},
+                "result": None,
+                "error": None,
+            },
+            {"result": {"content": [{"type": "text", "text": "hits"}]}},
+            id="mcp-result",
+        ),
+        pytest.param(
+            {"type": "mcp_tool_call", "arguments": {}, "result": None, "error": None},
+            {"error": {"message": "unavailable"}},
+            id="mcp-error",
+        ),
+    ],
+)
+def test_codex_item_lifecycles_reach_the_driver_as_separate_pairs(
+    fake_agent: list[_FakeAgent],
+    tmp_path: Path,
+    item_count: int,
+    item: dict[str, Any],
+    completion: dict[str, Any],
 ) -> None:
-    """AgentShim reports one codex ``file_change`` item as start *and* complete.
-
-    Both arrive as identical ``on_tool_call`` callbacks with no item id, and
-    neither is followed by a result, so forwarding both left a second tool turn
-    that never closed.
-    """
+    """Pair raw lifecycle IDs before the driver publishes identical tool arguments."""
     driver = subject.AgentShimDriver(provider="codex")
     session = driver.create_session(_spec(tmp_path))
-    changes = {"changes": [{"path": "src/lib.rs", "kind": "delete"}]}
-    fake_agent[0].tool_call_events = [("file_change", changes), ("file_change", changes)]
-    observer = _Observer()
+    codex = subject.CodexCodingAgent.__new__(subject.CodexCodingAgent)
+    codex.binary_name = "codex"
+    codex.env = {}
+    codex.logger = MagicMock()
+    codex.executor = None
+    codex.event_handler = fake_agent[0].event_handler
+    parser = codex._create_session(["codex", "exec", "--json"], silent=True)  # noqa: SLF001
 
-    session.run_turn(AgentTurnRequest(message="Do it"), observer)
+    def generate(_prompt: str, *, cwd: str | None, timeout: int | None, silent: bool) -> str:
+        assert cwd == str(tmp_path)
+        assert timeout is None
+        assert silent
+        for index in range(item_count):
+            for kind in ("item.started", "item.completed"):
+                parser._process_stdout(  # noqa: SLF001
+                    json.dumps(
+                        {
+                            "type": kind,
+                            "item": {
+                                "id": f"item_{index}",
+                                **item,
+                                **(completion if kind == "item.completed" else {}),
+                            },
+                        }
+                    )
+                )
+        return "done"
 
-    calls = [event for event in observer.events if event.kind is subject.AgentEventKind.TOOL_CALL]
-    assert len(calls) == 1
-    assert calls[0].payload == {"tool": "file_change", "args": changes}
+    fake_agent[0].generate_override = generate
+    seen: list[CoreEvent] = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        session.run_turn(AgentTurnRequest(message="Do it"), _LoggerObserver(AgentLogger()))
+    finally:
+        unsubscribe()
+
+    # Exercise the serialization consumed by the journal and replay clients.
+    wire_events = [CoreEvent.model_validate_json(event.model_dump_json()) for event in seen]
+    calls = [event.data for event in wire_events if isinstance(event.data, ToolCallData)]
+    results = [event.data for event in wire_events if isinstance(event.data, ToolResultData)]
+    assert [type(event.data) for event in wire_events] == [
+        ToolCallData,
+        ToolResultData,
+    ] * item_count
+    assert len({call.call_id for call in calls}) == item_count
+    assert all(call.call_id is not None for call in calls)
+    assert [result.call_id for result in results] == [call.call_id for call in calls]
+    assert [call.args for call in calls] == [
+        {key: value for key, value in item.items() if key != "type"}
+    ] * item_count
+    if completion:
+        assert [json.loads(result.content) for result in results] == [
+            next(iter(completion.values()))
+        ] * item_count
 
 
 def test_a_repeat_call_after_a_result_is_its_own_turn() -> None:
-    handler = subject._AgentShimEventHandler("codex")  # noqa: SLF001
+    handler = subject._AgentShimEventHandler()  # noqa: SLF001
     observer = _Observer()
     handler.observer = observer
 
@@ -301,7 +378,7 @@ def test_a_repeat_call_after_a_result_is_its_own_turn() -> None:
 
 
 def test_a_repeat_call_behind_another_tool_is_its_own_turn() -> None:
-    handler = subject._AgentShimEventHandler("codex")  # noqa: SLF001
+    handler = subject._AgentShimEventHandler()  # noqa: SLF001
     observer = _Observer()
     handler.observer = observer
 
@@ -317,8 +394,8 @@ def test_a_repeat_call_behind_another_tool_is_its_own_turn() -> None:
     assert tools == ["file_change", "todo_list", "file_change"]
 
 
-def test_providers_without_the_codex_item_defect_forward_every_call() -> None:
-    handler = subject._AgentShimEventHandler("claude")  # noqa: SLF001
+def test_repeated_callbacks_without_lifecycle_ids_forward_every_call() -> None:
+    handler = subject._AgentShimEventHandler()  # noqa: SLF001
     observer = _Observer()
     handler.observer = observer
 
@@ -335,10 +412,10 @@ def test_providers_without_the_codex_item_defect_forward_every_call() -> None:
         pytest.param(_self_referential(), id="circular-structure"),
     ],
 )
-def test_call_arguments_json_cannot_render_still_compare(
+def test_call_arguments_json_cannot_render_are_preserved(
     fake_agent: list[_FakeAgent], tmp_path: Path, args: dict[str, Any]
 ) -> None:
-    """An MCP tool's arguments are arbitrary, so the key must never raise."""
+    """The driver preserves arbitrary arguments without serializing or deduplicating."""
     driver = subject.AgentShimDriver(provider="codex")
     session = driver.create_session(_spec(tmp_path))
     fake_agent[0].tool_call_events = [("mcp_tool_call", args), ("mcp_tool_call", args)]
@@ -347,7 +424,8 @@ def test_call_arguments_json_cannot_render_still_compare(
     session.run_turn(AgentTurnRequest(message="Do it"), observer)
 
     calls = [event for event in observer.events if event.kind is subject.AgentEventKind.TOOL_CALL]
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert all(call.payload["args"] is args for call in calls)
 
 
 def test_independent_sessions_overlap_and_chat_cleanup_does_not_interrupt_optimizer(
