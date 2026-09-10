@@ -5,8 +5,11 @@ import io
 import json
 import os
 import shlex
+import stat
 import subprocess
+import sys
 import tarfile
+from importlib.util import module_from_spec, spec_from_file_location
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, call
@@ -88,6 +91,93 @@ def test_deployment_path_rejects_missing_directory_and_escape(tmp_path: Path) ->
         modal_evaluator._deployment_path(str(workspace), "deploy")  # noqa: SLF001
     with pytest.raises(ValueError, match="escapes the project"):
         modal_evaluator._deployment_path(str(workspace), "escape.py")  # noqa: SLF001
+
+
+def test_runtime_dir_is_per_user_without_xdg_runtime_dir(monkeypatch) -> None:  # noqa: ANN001
+    """Falls back to a uid-suffixed temp directory when XDG_RUNTIME_DIR is unset."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(modal_evaluator.os, "getuid", lambda: 1001)
+    first = modal_evaluator._runtime_dir()  # noqa: SLF001
+    monkeypatch.setattr(modal_evaluator.os, "getuid", lambda: 1002)
+    second = modal_evaluator._runtime_dir()  # noqa: SLF001
+
+    assert first != second
+    assert first.name == "vibesys-1001"
+    assert second.name == "vibesys-1002"
+
+
+def test_runtime_dir_prefers_xdg_runtime_dir(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    """Uses XDG_RUNTIME_DIR when set instead of the uid-suffixed temp fallback."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+
+    assert modal_evaluator._runtime_dir() == tmp_path / "vibesys"  # noqa: SLF001
+
+
+def test_import_does_not_validate_or_create_the_runtime_directory(
+    tmp_path: Path,
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """Importing only builds runtime paths, even when XDG points at a symlink."""
+    target = tmp_path / "target"
+    target.mkdir()
+    hostile_runtime_dir = tmp_path / "runtime"
+    hostile_runtime_dir.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(hostile_runtime_dir))
+    calls: list[str] = []
+
+    def record_call(*_args: object, **_kwargs: object) -> None:
+        calls.append("filesystem")
+
+    for method in ("mkdir", "chmod", "lstat"):
+        monkeypatch.setattr(modal_evaluator.Path, method, record_call)
+    module_name = "vibesys.sandbox._modal_evaluator_import_probe"
+    spec = spec_from_file_location(module_name, modal_evaluator.__file__)
+    if spec is None or spec.loader is None:
+        raise AssertionError
+    imported = module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, imported)
+    spec.loader.exec_module(imported)
+
+    assert calls == []
+    assert hostile_runtime_dir / "vibesys" / "modal-evaluator.lock" == imported._LOCK_PATH  # noqa: SLF001
+
+
+def test_exclusive_evaluation_creates_private_runtime_dir_and_lock_file(
+    tmp_path: Path,
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """The lock's runtime directory is created mode 0o700 before flock is taken."""
+    lock_path = tmp_path / "rt" / "modal-evaluator.lock"
+    monkeypatch.setattr(modal_evaluator, "_LOCK_PATH", lock_path)
+
+    with modal_evaluator._exclusive_evaluation():  # noqa: SLF001
+        pass
+
+    runtime_dir = lock_path.parent
+    assert runtime_dir.is_dir()
+    assert stat.S_IMODE(runtime_dir.stat().st_mode) == 0o700
+    assert lock_path.exists()
+
+
+def test_ensure_runtime_dir_rejects_file_shadowing_the_directory(tmp_path: Path) -> None:
+    """A plain file occupying the runtime-dir path raises a clear RuntimeError."""
+    blocked = tmp_path / "rt"
+    blocked.write_text("not a directory")
+    target = blocked / "modal-evaluator.lock"
+
+    with pytest.raises(RuntimeError, match="cannot use"):
+        modal_evaluator._ensure_runtime_dir(target)  # noqa: SLF001
+
+
+def test_ensure_runtime_dir_rejects_symlink_shadowing_the_directory(tmp_path: Path) -> None:
+    """A symlink at the runtime-dir path is rejected instead of followed."""
+    target_directory = tmp_path / "target"
+    target_directory.mkdir()
+    shadow = tmp_path / "rt"
+    shadow.symlink_to(target_directory, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="expected a directory owned by uid"):
+        modal_evaluator._ensure_runtime_dir(shadow / "modal-evaluator.lock")  # noqa: SLF001
 
 
 def test_extract_modal_web_url_handles_rich_line_wrapping() -> None:
