@@ -12,7 +12,6 @@ from pydantic import BaseModel
 from vibesys.agent_runner import (
     log_and_print,
     log_json_and_print,
-    log_markdown_and_print,
     log_prompt_markdown_and_print,
     parse_typed_response_text,
 )
@@ -44,7 +43,6 @@ if TYPE_CHECKING:
 
     from langchain_core.tools import BaseTool
 
-    from vibesys._agent_cli.base import MCPServerSpec as LegacyMCPServerSpec
     from vibesys.agents.callbacks import AgentLogger
     from vibesys.agents.progress import AgentProgress
     from vibesys.constants import ComputeBackend
@@ -75,6 +73,18 @@ class AgentDiagnosticLog:
         log_and_print(message, self.stream)
 
 
+def _publish_final_text(logger: AgentLogger, text: str) -> None:
+    """Render a turn's answer that no driver stream delivered.
+
+    Routed through the turn's logger rather than printed directly so the
+    chunk carries the same ``agent_kind``/``round_label``/``invocation_id``
+    attribution a streamed answer does: a transcript consumer groups by those,
+    and an unattributed chunk becomes a second, orphaned assistant entry.
+    """
+    logger.log_text(text)
+    logger.end_text()
+
+
 class _LoggerObserver:
     """Translate neutral driver events into VibeSys's application logger."""
 
@@ -89,7 +99,10 @@ class _LoggerObserver:
 
         self._logger.end_text()
         if event.kind is AgentEventKind.THINKING:
-            self._logger.on_thinking(event.text or "")
+            if event.payload.get("channel") == "diagnostic":
+                self._logger.on_diagnostic(event.text or "")
+            else:
+                self._logger.on_thinking(event.text or "")
         elif event.kind is AgentEventKind.TOOL_CALL:
             tool = str(event.payload.get("tool", "unknown"))
             args = event.payload.get("args")
@@ -130,19 +143,12 @@ def _usage_dict(usage: AgentUsage) -> dict[str, int | float | None]:
 
 
 def _normalize_mcp_servers(
-    servers: Iterable[LegacyMCPServerSpec] | None,
+    servers: Iterable[MCPServerSpec] | None,
 ) -> tuple[MCPServerSpec, ...]:
+    """Freeze the caller's server list so it can key a session spec."""
     if servers is None:
         return ()
-    return tuple(
-        MCPServerSpec(
-            name=server.name,
-            command=server.command,
-            args=tuple(server.args),
-            env=tuple(sorted(server.env.items())),
-        )
-        for server in servers
-    )
+    return tuple(servers)
 
 
 class AgentClient:
@@ -246,14 +252,14 @@ class AgentClient:
         env: dict[str, str] | None = None,
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
-        mcp_servers: list[LegacyMCPServerSpec] | None = None,
+        mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,
     ) -> T:
         """Run one turn and parse its structured response."""
         del tools  # In-process tools remain a deepagents-only compatibility path.
-        result = self._invoke_turn(
+        result, logger = self._invoke_turn(
             kind=kind,
             workspace=workspace,
             system_prompt=system_prompt,
@@ -275,12 +281,12 @@ class AgentClient:
                 f"No structured response received from {label.lower()}.",
                 self._run_log_file,
             )
-            if result.text:
+            if result.text and not logger.streamed_external_text_this_turn():
                 log_and_print(
                     f"\n=== {label} ROUND OUTPUT (raw output) ===",
                     self._run_log_file,
                 )
-                log_markdown_and_print(result.text, self._run_log_file)
+                _publish_final_text(logger, result.text)
             return fallback_factory()
         log_and_print(f"\n=== {label} ROUND OUTPUT ===", self._run_log_file)
         log_json_and_print(parsed.model_dump_json(indent=2), self._run_log_file)
@@ -297,14 +303,14 @@ class AgentClient:
         env: dict[str, str] | None = None,
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
-        mcp_servers: list[LegacyMCPServerSpec] | None = None,
+        mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,
     ) -> str:
         """Run one conversational turn without a structured-output requirement."""
         del tools
-        result = self._invoke_turn(
+        result, logger = self._invoke_turn(
             kind=kind,
             workspace=workspace,
             system_prompt=system_prompt,
@@ -321,7 +327,11 @@ class AgentClient:
         label = agent_label(kind)
         if result.text:
             log_and_print(f"\n=== {label} ROUND OUTPUT ===", self._run_log_file)
-            log_markdown_and_print(result.text, self._run_log_file)
+            # A driver that streams assistant text has already delivered this
+            # answer, chunk by chunk and attributed to the turn. Printing it
+            # again here would render it twice, the second time unattributed.
+            if not logger.streamed_external_text_this_turn():
+                _publish_final_text(logger, result.text)
         else:
             log_and_print(f"\n=== {label} ROUND OUTPUT (missing response) ===", self._run_log_file)
             log_and_print(f"No response received from {label.lower()}.", self._run_log_file)
@@ -339,10 +349,16 @@ class AgentClient:
         env: dict[str, str] | None,
         invocation_id: str | None,
         progress: AgentProgress | None,
-        mcp_servers: list[LegacyMCPServerSpec] | None,
+        mcp_servers: list[MCPServerSpec] | None,
         reuse_session: bool | None,
         session_key: AgentSessionKey | None,
-    ) -> AgentTurnResult:
+    ) -> tuple[AgentTurnResult, AgentLogger]:
+        """Run one turn, returning its result and the logger that rendered it.
+
+        The logger comes back because it holds the one fact the caller cannot
+        derive from the result: whether the answer already reached the
+        assistant channel as the driver streamed it.
+        """
         label = agent_label(kind)
         model = self._role_models.get(kind, self._model_name)
         reasoning_effort = self._role_reasoning_efforts.get(kind, self._default_reasoning_effort)
@@ -416,7 +432,7 @@ class AgentClient:
                 usage=result.usage if result is not None else AgentUsage(),
             )
         assert result is not None  # noqa: S101  # assigned or the exception propagated
-        return result
+        return result, logger
 
     def _write_usage_record(
         self,
@@ -619,7 +635,15 @@ class AgentClient:
 
     def _evict(self, key: AgentSessionKey) -> None:
         cached = self._sessions.pop(key, None)
-        if cached is not None:
+        if cached is None:
+            return
+        # Stop an in-flight turn before releasing the session's resources:
+        # a client closed from another thread (a kill, a context exit) would
+        # otherwise pull the workspace and driver state out from under a turn
+        # that is still running.
+        try:
+            cached.session.cancel()
+        finally:
             cached.session.close()
 
     def _create_session(self, spec: AgentSessionSpec) -> AgentSession:

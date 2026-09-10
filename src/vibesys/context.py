@@ -908,8 +908,8 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 run_state.local(RunStateNamespace.AGENT).slot("sessions.json", AgentSessionState),
                 log=logger.lprint,
             )
-            # Build the backend-agnostic agent client. Loops invoke this instead
-            # of calling create_deep_agent / vibesys._agent_cli directly. The cli
+            # Build the backend-agnostic agent client. Loops invoke this
+            # instead of calling an agent driver directly. The cli
             # backend is rejected if --docker is set; build_agent_client raises
             # SystemExit with a clear message in that case.
             agent_client = build_agent_client(
@@ -1428,7 +1428,18 @@ class _RunContext:
         self.device.monitor = monitor
 
     def gpu_env(self) -> dict[str, str]:
-        """Env vars for the host-running CLI agent; see :meth:`DeviceLease.gpu_env`."""
+        """Env vars for the CLI agent, empty when that agent runs in a container.
+
+        The pin names a *host* device index (see :meth:`DeviceLease.gpu_env`).
+        An editor container is started with ``--gpus device=N``, so inside it
+        the selected GPU is device 0 and the container env already says so;
+        forwarding the host index there would point the agent at a device the
+        container cannot see. Keeping the pin out of the session spec also
+        keeps a mid-run device reselect from changing the session fingerprint
+        and evicting the live conversation.
+        """
+        if self.agent_client.capabilities.container_execution:
+            return {}
         return self.device.gpu_env()
 
     @contextmanager

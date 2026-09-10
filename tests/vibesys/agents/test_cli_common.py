@@ -1,14 +1,14 @@
 """Tests for the helpers shared by the agentshim and Omnigent CLI runners.
 
-These moved out of ``cli_runner.py`` unchanged when the Omnigent backend needed
-the same behavior. The cases here cover the branches that both backends depend
-on — skill discovery across layouts, replacement on re-materialization, and the
-deliberate never-raise policy on copy failures.
+These moved out of the pre-driver CLI runner unchanged when the Omnigent
+backend needed the same behavior. The cases here cover the branches that both
+backends depend on — skill discovery across layouts, platform pruning,
+replacement on re-materialization, and the deliberate never-raise policy on
+copy failures.
 """
 
 from __future__ import annotations
 
-import json
 from io import StringIO
 from pathlib import Path  # noqa: TC003  # tracked: #288
 
@@ -19,32 +19,10 @@ from vibesys.agents.cli_common import (
     agent_label,
     build_schema_hint,
     discover_skill_dirs,
-    materialize_native_output_schema,
     materialize_skills,
 )
-from vibesys.schemas import (
-    ImplementerResponse,
-    IssuePerfEvalResponse,
-    JudgeResponse,
-    OrchestratorPlan,
-    PerfEvalResponse,
-    PerfMetrics,
-    PreRoundDecision,
-    ProfilerSummary,
-    SingleAgentRoundResponse,
-)
-
-# Response models with at least one ``dict[str, T]`` field, which Pydantic
-# renders as a schema-valued (or ``true``) ``additionalProperties``. Providers
-# on the strict profile cannot express these natively; permissive ones can.
-MAPPING_RESPONSE_MODELS = [
-    ImplementerResponse,
-    SingleAgentRoundResponse,
-    ProfilerSummary,
-    PerfMetrics,
-    PerfEvalResponse,
-    IssuePerfEvalResponse,
-]
+from vibesys.constants import ComputeBackend
+from vibesys.schemas import JudgeResponse
 
 
 def _skill(root: Path, name: str, body: str = "# skill\n") -> Path:
@@ -196,6 +174,66 @@ class TestMaterializeSkills:
         assert not (dest / "alpha").is_symlink()
 
 
+class TestPlatformPruning:
+    """``compute_backend`` selects which ``references/platforms/`` trees survive."""
+
+    @staticmethod
+    def _materialize(tmp_path: Path, compute_backend: ComputeBackend | None) -> Path:
+        """Materialize a skill carrying ``references/platforms/<backend>/`` trees."""
+        skill_src = tmp_path / "serving-systems"
+        skill_src.mkdir()
+        (skill_src / "SKILL.md").write_text("# serving-systems\n")
+        # Portable tier — must survive on every backend.
+        algorithms = skill_src / "references" / "algorithms"
+        algorithms.mkdir(parents=True)
+        (algorithms / "continuous-batching.md").write_text("# contract\n")
+        # One directory per backend under references/platforms/.
+        for backend in ComputeBackend:
+            platform = skill_src / "references" / "platforms" / backend.value
+            platform.mkdir(parents=True)
+            (platform / "floor.md").write_text(f"# {backend.value} floor\n")
+        # A same-named directory *outside* references/platforms/ must not be
+        # pruned — pruning keys on the parent path, not the bare name.
+        decoy = skill_src / "references" / "models" / "cuda"
+        decoy.mkdir(parents=True)
+        (decoy / "note.md").write_text("# decoy\n")
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        materialize_skills(ws, [skill_src], compute_backend=compute_backend)
+        return ws / ".claude/skills" / "serving-systems" / "references"
+
+    @pytest.mark.parametrize(
+        "selected", [ComputeBackend.CUDA, ComputeBackend.TRAINIUM, ComputeBackend.METAL]
+    )
+    def test_prunes_foreign_platform_dirs(self, tmp_path, selected):  # noqa: ANN001, ANN201  # tracked: #288
+        """Only the selected backend's platform guidance reaches the agent.
+
+        Applying one platform's floor to another produces wrong work — the
+        CUDA guidance to eliminate KV padding is inverted on Trainium — so the
+        foreign trees must be absent, not merely deprioritized.
+        """
+        refs = self._materialize(tmp_path, selected)
+
+        platforms = refs / "platforms"
+        assert {p.name for p in platforms.iterdir()} == {selected.value}
+        assert (platforms / selected.value / "floor.md").exists()
+
+    def test_keeps_portable_tiers_and_same_named_dirs(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        """Pruning is scoped to references/platforms/, not to directory names."""
+        refs = self._materialize(tmp_path, ComputeBackend.TRAINIUM)
+
+        assert (refs / "algorithms" / "continuous-batching.md").exists()
+        # `models/cuda/` shares a name with a backend but is not a platform dir.
+        assert (refs / "models" / "cuda" / "note.md").exists()
+
+    def test_without_a_backend_every_platform_is_kept(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        """No selected backend (e.g. non-run tooling) copies the tree intact."""
+        refs = self._materialize(tmp_path, None)
+
+        assert {p.name for p in (refs / "platforms").iterdir()} == {b.value for b in ComputeBackend}
+
+
 class TestBuildSchemaHint:
     def test_names_the_model_and_embeds_its_schema(self):  # noqa: ANN201  # tracked: #288
         hint = build_schema_hint(JudgeResponse)
@@ -207,129 +245,3 @@ class TestBuildSchemaHint:
     def test_forbids_markdown_fences(self):  # noqa: ANN201  # tracked: #288
         """CLI tools wrap JSON in fences unless told not to."""
         assert "Do not wrap it in markdown fences" in build_schema_hint(JudgeResponse)
-
-
-def _assert_declared_objects_are_closed(node) -> None:  # noqa: ANN001  # tracked: #288
-    """Every object that declares properties requires all of them and is closed."""
-    if isinstance(node, list):
-        for value in node:
-            _assert_declared_objects_are_closed(value)
-    elif isinstance(node, dict):
-        if "$ref" in node:
-            assert set(node) == {"$ref"}
-        if "properties" in node:
-            assert set(node["required"]) == set(node["properties"])
-        for value in node.values():
-            _assert_declared_objects_are_closed(value)
-
-
-def _open_maps(node) -> list:  # noqa: ANN001  # tracked: #288
-    """Collect every ``additionalProperties`` value that permits extra keys."""
-    found = []
-    if isinstance(node, list):
-        for value in node:
-            found.extend(_open_maps(value))
-    elif isinstance(node, dict):
-        additional = node.get("additionalProperties")
-        if additional not in (None, False):
-            found.append(additional)
-        for value in node.values():
-            found.extend(_open_maps(value))
-    return found
-
-
-class TestMaterializeNativeOutputSchema:
-    @pytest.mark.parametrize(
-        "response_cls",
-        [PreRoundDecision, OrchestratorPlan, JudgeResponse],
-    )
-    def test_active_agent_schemas_materialize_atomically(self, tmp_path, response_cls):  # noqa: ANN001, ANN201  # tracked: #288
-        relative = materialize_native_output_schema(tmp_path, response_cls)
-        target = tmp_path / relative
-        schema = json.loads(target.read_text())
-
-        def assert_strict_objects(node):  # noqa: ANN001, ANN202  # tracked: #288
-            if isinstance(node, list):
-                for value in node:
-                    assert_strict_objects(value)
-            elif isinstance(node, dict):
-                if "$ref" in node:
-                    assert set(node) == {"$ref"}
-                if "properties" in node:
-                    assert set(node["required"]) == set(node["properties"])
-                    assert node["additionalProperties"] is False
-                for value in node.values():
-                    assert_strict_objects(value)
-
-        assert relative.startswith(".cache/vibesys/response-schemas/")
-        assert_strict_objects(schema)
-        assert "default" not in target.read_text()
-        assert not list(target.parent.glob(f".{target.name}.*"))
-
-    @pytest.mark.parametrize("response_cls", MAPPING_RESPONSE_MODELS)
-    def test_strict_profile_rejects_mappings_before_writing(self, tmp_path, response_cls):  # noqa: ANN001, ANN201  # tracked: #288
-        """Providers on the Codex subset keep the prompt fallback for these."""
-        with pytest.raises(ValueError, match="arbitrary object keys"):
-            materialize_native_output_schema(tmp_path, response_cls)
-
-        assert not (tmp_path / ".cache/vibesys/response-schemas").exists()
-
-    @pytest.mark.parametrize("response_cls", MAPPING_RESPONSE_MODELS)
-    def test_permissive_profile_materializes_mappings(self, tmp_path, response_cls):  # noqa: ANN001, ANN201  # tracked: #288
-        relative = materialize_native_output_schema(
-            tmp_path, response_cls, allow_arbitrary_keys=True
-        )
-        target = tmp_path / relative
-        schema = json.loads(target.read_text())
-
-        assert relative.startswith(".cache/vibesys/response-schemas/")
-        _assert_declared_objects_are_closed(schema)
-        assert "default" not in target.read_text()
-        assert not list(target.parent.glob(f".{target.name}.*"))
-        # The mapping is preserved rather than rewritten to ``false``, so the
-        # CLI still constrains the value type of each arbitrary key.
-        assert _open_maps(schema), "expected the arbitrary-key mapping to survive"
-
-    @pytest.mark.parametrize("response_cls", [PreRoundDecision, OrchestratorPlan, JudgeResponse])
-    def test_permissive_profile_still_closes_declared_objects(self, tmp_path, response_cls):  # noqa: ANN001, ANN201  # tracked: #288
-        """Relaxing the mapping rule must not open up ordinary models."""
-        relative = materialize_native_output_schema(
-            tmp_path, response_cls, allow_arbitrary_keys=True
-        )
-        schema = json.loads((tmp_path / relative).read_text())
-
-        assert _open_maps(schema) == []
-
-    def test_permissive_profile_validates_inside_a_mapping(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        """The preserved mapping subschema is still walked for unsupported constructs."""
-
-        class MappedUnsupportedResponse(JudgeResponse):
-            @classmethod
-            def model_json_schema(cls, *args, **kwargs):  # noqa: ANN002, ANN003, ANN206, ARG003  # tracked: #288
-                return {
-                    "type": "object",
-                    "properties": {"metrics": {"type": "object"}},
-                    "additionalProperties": {"oneOf": [{"type": "string"}]},
-                }
-
-        with pytest.raises(ValueError, match="unsupported keyword 'oneOf'"):
-            materialize_native_output_schema(
-                tmp_path, MappedUnsupportedResponse, allow_arbitrary_keys=True
-            )
-
-        assert not (tmp_path / ".cache/vibesys/response-schemas").exists()
-
-    def test_rejects_unsupported_schema_constructs_before_writing(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        class UnsupportedResponse(JudgeResponse):
-            @classmethod
-            def model_json_schema(cls, *args, **kwargs):  # noqa: ANN002, ANN003, ANN206, ARG003  # tracked: #288
-                return {
-                    "type": "object",
-                    "properties": {"analysis": {"type": "string"}},
-                    "not": {"required": ["analysis"]},
-                }
-
-        with pytest.raises(ValueError, match="unsupported keyword 'not'"):
-            materialize_native_output_schema(tmp_path, UnsupportedResponse)
-
-        assert not (tmp_path / ".cache/vibesys/response-schemas").exists()
