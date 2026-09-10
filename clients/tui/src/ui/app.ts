@@ -324,6 +324,7 @@ export function createOpenTuiApp(
   workspace.add(bottom);
   body.add(workspace);
   root.add(body);
+  root.add(overlay.scrim);
   root.add(overlay.output);
   root.add(themePicker.output);
   root.add(chat.output);
@@ -515,6 +516,7 @@ export function createOpenTuiApp(
     experimentLog.output.visible = showExperimentLog;
     rightPane.render(state, showRightPane, rightWidth);
     overlay.render(state, paneFallback);
+    overlay.renderScrim(state.overlay !== null || state.chatOpen || state.themePicker !== null);
     themePicker.render(state);
     chat.render(state);
     conversationActivityBar.render(state, !showLog);
