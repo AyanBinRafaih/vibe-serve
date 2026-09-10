@@ -112,20 +112,20 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // The focused pane takes the scroll keys. Everything else the chat or the
-    // transcript would normally handle is left alone.
+    // The focused pane takes the scroll keys. Escape belongs to the modal/pane
+    // ladder below, so a right pane's own Escape waits until any modal chat in
+    // front of it has already closed.
     if (
       controller.state.layout.focus === 'right' &&
       controller.state.layout.right !== null &&
-      (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape')
+      (key.name === 'pageup' || key.name === 'pagedown')
     ) {
-      if (key.name === 'escape') controller.closeOverlays();
-      else actions.scrollRightPane(key.name === 'pageup' ? -1 : 1);
+      actions.scrollRightPane(key.name === 'pageup' ? -1 : 1);
       key.preventDefault();
       return;
     }
-    // Modal state is authoritative: the theme picker, the modal chat, and any
-    // overlay must contain input before the focused docked chat runs. Otherwise
+    // Modal state is authoritative: the theme picker, command overlay, and
+    // modal chat must contain input before the focused docked chat runs. Otherwise
     // a modal opened while the docked chat has focus would leak printable keys
     // into the hidden composer, let Up/Down drive chat suggestions, and route
     // Escape to the left pane instead of closing the modal.
@@ -141,10 +141,26 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
+    if (controller.state.overlay !== null) {
+      if (key.name === 'escape') {
+        controller.live();
+        viewport.scrollTo(viewport.scrollHeight);
+      } else if (key.name === 'pageup' || key.name === 'pagedown') {
+        // Content taller than the box scrolls here rather than falling through
+        // to the transcript behind it.
+        actions.scrollOverlay(key.name === 'pageup' ? -1 : 1);
+      }
+      // The overlay is modal: everything it does not handle is swallowed so
+      // keys cannot reach the panes or the hidden command input behind it.
+      key.preventDefault();
+      return;
+    }
     if (controller.state.chatOpen) {
       if (key.name === 'escape') {
-        if (controller.state.layout.right !== null) controller.closeOverlays();
-        else actions.closeChat();
+        // The modal chat is the innermost layer: Escape closes only it,
+        // regardless of whatever pane sits behind it. A pane open behind the
+        // chat unwinds on its own Escape, once the chat is gone.
+        actions.closeChat();
         key.preventDefault();
         return;
       }
@@ -159,17 +175,15 @@ export function bindKeybindings(
       }
       return;
     }
-    if (controller.state.overlay !== null) {
-      if (key.name === 'escape') {
-        controller.live();
-        viewport.scrollTo(viewport.scrollHeight);
-      } else if (key.name === 'pageup' || key.name === 'pagedown') {
-        // Content taller than the box scrolls here rather than falling through
-        // to the transcript behind it.
-        actions.scrollOverlay(key.name === 'pageup' ? -1 : 1);
-      }
-      // The overlay is modal: everything it does not handle is swallowed so
-      // keys cannot reach the panes or the hidden command input behind it.
+    // With the chat closed (or never open), Escape's next layer is the
+    // visualization pane: one press folds it away on its own, leaving
+    // whatever is behind it (a hypothesis trajectory, the round view) intact.
+    if (
+      key.name === 'escape' &&
+      controller.state.layout.focus === 'right' &&
+      controller.state.layout.right !== null
+    ) {
+      controller.closePane();
       key.preventDefault();
       return;
     }
