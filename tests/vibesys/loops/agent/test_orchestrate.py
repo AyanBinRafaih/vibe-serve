@@ -975,6 +975,67 @@ def test_pareto_archive_distinguishes_trusted_and_pending_candidates():  # noqa:
     assert "round 51" in summary
 
 
+def test_pareto_archive_summary_bounds_pending_claims_with_an_omission_notice():  # noqa: ANN201  # tracked: #288
+    """The newest pending claims remain visible and older ones are disclosed."""
+    pending_records = [
+        RoundRecord(
+            round_number,
+            chr(ord("a") + round_number) * 40,
+            None,
+            None,
+            False,  # noqa: FBT003  # tracked: #288
+            reviewed=False,
+            candidate_disposition=CandidateDisposition.PARETO_FRONTIER.value,
+            candidate_metrics={
+                "throughput": 6000.0 + round_number,
+                "latency": 3000.0 + round_number,
+            },
+            candidate_evaluation_artifact=f"h{round_number}.json",
+            candidate_operating_point="concurrency=192",
+            candidate_retention_reason="higher-throughput tradeoff",
+        )
+        for round_number in range(1, 11)
+    ]
+
+    summary = _pareto_archive_summary(pending_records, _THROUGHPUT_LATENCY)
+    assert summary == _pareto_archive_summary(list(reversed(pending_records)), _THROUGHPUT_LATENCY)
+
+    for record in pending_records[-8:]:
+        assert record.commit is not None
+        assert f"round {record.round_number}, commit {record.commit[:12]}" in summary
+    assert "round 1, commit bbbbbbbbbbbb" not in summary
+    assert "round 2, commit cccccccccccc" not in summary
+    assert "2 older untrusted claims omitted from this context (rounds 1-2)" in summary
+    assert "do not treat any omitted claim as a trusted parent" in summary
+
+
+def test_pareto_archive_summary_lists_all_pending_claims_within_the_limit():  # noqa: ANN201  # tracked: #288
+    """A short pending list needs no omission notice."""
+    pending_records = [
+        RoundRecord(
+            round_number,
+            chr(ord("a") + round_number) * 40,
+            None,
+            None,
+            False,  # noqa: FBT003  # tracked: #288
+            reviewed=False,
+            candidate_disposition=CandidateDisposition.PARETO_FRONTIER.value,
+            candidate_metrics={
+                "throughput": 6000.0 + round_number,
+                "latency": 3000.0 + round_number,
+            },
+        )
+        for round_number in range(1, 9)
+    ]
+
+    summary = _pareto_archive_summary(pending_records, _THROUGHPUT_LATENCY)
+
+    for record in pending_records:
+        assert record.commit is not None
+        assert f"round {record.round_number}, commit {record.commit[:12]}" in summary
+    assert "untrusted claims omitted" not in summary
+
+
 def _accuracy_row(
     round_number: int,
     accuracy: float,
