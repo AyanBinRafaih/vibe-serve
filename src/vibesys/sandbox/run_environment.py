@@ -866,16 +866,21 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
         )
 
         # Mount host Modal auth so `modal run` inside the container
-        # authenticates as the host user.
+        # authenticates as the host user. The Modal SDK reads them from the
+        # HOME of the user the container runs as, the agent image's
+        # non-root ``agent`` user, not root. Deferred: the Docker sandbox
+        # module imports the agent stack, which this module must not load.
+        from vs_sandbox import AGENT_HOME  # noqa: PLC0415  # tracked: #288
+
         modal_auth = Path.home() / ".modal.toml"
         if modal_auth.exists():
             resources.append(
-                _resource_for_mount(str(modal_auth), "/root/.modal.toml", read_only=True)
+                _resource_for_mount(str(modal_auth), f"{AGENT_HOME}/.modal.toml", read_only=True)
             )
         modal_config_dir = Path.home() / ".modal"
         if modal_config_dir.is_dir():
             resources.append(
-                _resource_for_mount(str(modal_config_dir), "/root/.modal", read_only=True)
+                _resource_for_mount(str(modal_config_dir), f"{AGENT_HOME}/.modal", read_only=True)
             )
 
         resources = _dedupe_resources(resources)
