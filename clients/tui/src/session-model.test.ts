@@ -951,6 +951,49 @@ describe('session event model', () => {
     });
   });
 
+  it('keeps warning diagnostics off the banner without blocking later errors', () => {
+    const warned = applyEvent(initialSessionState(), {
+      ...event(1, 'framework_warning', {
+        kind: 'framework_warning',
+        summary: 'profiler failed',
+        detail: 'nsys exited 1',
+        source: 'loop',
+      }),
+      agent_kind: null,
+      diagnostic: {
+        id: 'warn-1',
+        code: 'framework_warning',
+        summary: 'profiler failed',
+        detail: 'nsys exited 1',
+        scope: 'run',
+        severity: 'warning',
+        source: 'loop',
+      },
+    });
+
+    expect(warned.core.diagnostics).toMatchObject([
+      {id: 'warn-1', severity: 'warning', source: 'loop'},
+    ]);
+    expect(warned.errorBanner).toBeNull();
+
+    const failed = applyEvent(warned, {
+      ...event(2, 'run_failed'),
+      diagnostic: {
+        id: 'failure-1',
+        code: 'run_failed',
+        summary: 'The current run failed.',
+        scope: 'run',
+        severity: 'fatal',
+        retryability: 'never',
+      },
+    });
+
+    expect(failed.errorBanner).toMatchObject({
+      message: 'The current run failed.',
+      diagnosticId: 'failure-1',
+    });
+  });
+
   it('routes chat agent trajectory events away from the experiment transcript', () => {
     let state = initialSessionState();
     state = applyEvent(

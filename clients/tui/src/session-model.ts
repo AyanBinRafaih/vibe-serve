@@ -1796,6 +1796,9 @@ export function reportError(
 }
 
 function reportProjectedDiagnostic(state: SessionState, diagnostic: CoreDiagnostic): SessionState {
+  // Warnings (e.g. `framework_warning`, #692) stay in the diagnostics list;
+  // the banner is for errors that need attention now.
+  if (diagnostic.severity === 'warning') return state;
   return reportError(state, diagnostic.summary, {
     scope: diagnostic.scope,
     severity: diagnostic.severity === 'fatal' ? 'fatal' : 'recoverable',
