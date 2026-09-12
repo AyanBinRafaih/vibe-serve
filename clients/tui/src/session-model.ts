@@ -1519,7 +1519,9 @@ function applyReducedCore(state: SessionState, core: CoreState): SessionState {
     chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
   });
   if (core.status === 'failed') {
-    const finalDiagnostic = core.diagnostics.at(-1);
+    // Warnings never banner, so a trailing warning must not mask the failure:
+    // surface the last diagnostic that can.
+    const finalDiagnostic = core.diagnostics.filter((d) => d.severity !== 'warning').at(-1);
     if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
   }
   return next;
