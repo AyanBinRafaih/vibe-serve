@@ -1521,7 +1521,7 @@ function applyReducedCore(state: SessionState, core: CoreState): SessionState {
   if (core.status === 'failed') {
     // Warnings never banner, so a trailing warning must not mask the failure:
     // surface the last diagnostic that can.
-    const finalDiagnostic = core.diagnostics.filter((d) => d.severity !== 'warning').at(-1);
+    const finalDiagnostic = core.diagnostics.filter(d => d.severity !== 'warning').at(-1);
     if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
   }
   return next;
