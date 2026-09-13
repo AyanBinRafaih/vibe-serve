@@ -264,6 +264,7 @@ export type Data =
 export type Kind1 = "chat";
 export type Answer1 = string;
 export type ThreadTitle = string | null;
+export type InvocationId1 = string | null;
 export type Kind2 = "chat_thread_created";
 export type ThreadId3 = string;
 export type Title2 = string;
@@ -819,6 +820,7 @@ export interface ChatData {
   kind?: Kind1;
   answer: Answer1;
   thread_title?: ThreadTitle;
+  invocation_id?: InvocationId1;
   [k: string]: unknown;
 }
 /**
