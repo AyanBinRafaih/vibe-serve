@@ -1,0 +1,49 @@
+{
+  "pr": 696,
+  "title": "TUI: restore the vertical round rail, keeping the label-sized agent graph",
+  "url": "https://github.com/uw-syfi/vibesys/pull/696",
+  "scenario": "Replay the bundled bad-cpp full-lifecycle fixture to completion, enter the selected experiment summary, then enter Round 1.",
+  "tool": {
+    "name": "microsoft/tui-test",
+    "version": "0.1.0-beta.3",
+    "backend": "alacritty"
+  },
+  "terminal": {
+    "columns": 160,
+    "rows": 45,
+    "theme": "dark",
+    "term": "xterm-256color"
+  },
+  "fixture": "clients/tui/dev/fixtures/bad-cpp-round1.jsonl",
+  "before": {
+    "sha": "d363042907deed4298dd689fd40771abd542024b",
+    "commit_url": "https://github.com/uw-syfi/vibesys/commit/d363042907deed4298dd689fd40771abd542024b",
+    "worktree": "/tmp/vibesys-pr696-before",
+    "image": "before.png",
+    "text": "before.txt",
+    "observed": "One horizontal round tab appears above a two-column agents/transcript layout."
+  },
+  "after": {
+    "sha": "572f32a144a6cd5569f8bc1c4ead203a472e4414",
+    "commit_url": "https://github.com/uw-syfi/vibesys/commit/572f32a144a6cd5569f8bc1c4ead203a472e4414",
+    "worktree": "/tmp/vibesys-pr696-after",
+    "image": "after.png",
+    "text": "after.txt",
+    "observed": "A 28-column Rounds rail occupies the left column, followed by agents and transcript; orchestrator, implementer, judge, and profiler remain untruncated."
+  },
+  "commands": [
+    "pnpm install --frozen-lockfile --offline",
+    "pnpm --dir clients/tui build",
+    "tui-test run --backend alacritty --cols 160 --rows 45 --env TERM=xterm-256color clients/tui/dev/mock-ui.sh --speed 0 --theme dark",
+    "tui-test wait idle --timeout 15000",
+    "tui-test key press Enter",
+    "tui-test wait idle --timeout 15000",
+    "tui-test key press Enter",
+    "tui-test expect text orchestrator",
+    "tui-test expect text implementer",
+    "tui-test text",
+    "tui-test screenshot",
+    "tui-test record start PNG; tui-test record stop"
+  ],
+  "limitations": "This 160-column pair demonstrates the full rail. It does not separately capture the compact 13-column rail at 85-99 columns or the collapsed state below 85 columns. The fixture is a scrubbed real capture and omits newer execution identity fields, which the harness translates through its normal legacy path."
+}
