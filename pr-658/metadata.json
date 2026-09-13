@@ -1,0 +1,349 @@
+{
+  "pr": 658,
+  "url": "https://github.com/uw-syfi/vibesys/pull/658",
+  "scenario": "Replay the same recorded bad-cpp-round1 journal with the development mock server at speed 0, then submit /open-round 1.",
+  "purpose": "UI smoke and visual equivalence evidence for a performance change.",
+  "capture_tool": {
+    "repository": "https://github.com/microsoft/tui-test",
+    "version": "0.1.0-beta.3",
+    "backend": "alacritty",
+    "png_method": "record start PATH.png --fps 1 --zoom 0.5; record stop. Native one-frame APNG, no conversion or image editing.",
+    "runtime_directory": "/tmp/vibesys-tui-test-tools/state",
+    "runtime_directory_variable": "TUI_TEST_HOME",
+    "release_archive_sha256": "35d0cfff1b3d6cfeba3abb0eeae7537c5722c36414106ca28b142e5e48235a37"
+  },
+  "geometry": {
+    "cols": 150,
+    "rows": 40,
+    "image_width": 1578,
+    "image_height": 940
+  },
+  "theme": "dark",
+  "bun": "1.3.9",
+  "node": "22.22.2",
+  "before_sha": "bf0aa491fb9610157e5119f2f576436aefa1050e",
+  "after_sha": "43076c6a671f10f007eb28d42ee4c24b44a3a08d",
+  "fixture": {
+    "repository_path": "clients/tui/dev/fixtures/bad-cpp-round1.jsonl",
+    "sha256": "3cd39ad26930227e117d60280a2bfd658714b4e43d9b220c8e9e753405aefcd5",
+    "record_count": 403
+  },
+  "observations": [
+    "Before and after PNG, SVG, and terminal text are byte-for-byte identical.",
+    "Round 1 graph, phase statuses, transcript, and recorded benchmark result remain visible."
+  ],
+  "limitations": [
+    "Static captures do not measure performance or prove index complexity. Use the PR regression tests and benchmarks for those claims.",
+    "The recorded fixture contains only one round, so this is smoke coverage rather than the large-history benchmark."
+  ],
+  "captures": {
+    "before": {
+      "revision": "bf0aa491fb9610157e5119f2f576436aefa1050e",
+      "worktree": "/tmp/vibesys-pr658-before",
+      "commands": [
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "run",
+          "--backend",
+          "alacritty",
+          "--cols",
+          "150",
+          "--rows",
+          "40",
+          "--cwd",
+          "/tmp/vibesys-pr658-before",
+          "--env",
+          "TERM=xterm-256color",
+          "--env",
+          "COLORTERM=truecolor",
+          "--env",
+          "LANG=C.UTF-8",
+          "--env",
+          "VIBESYS_THEME=dark",
+          "--env",
+          "PATH=/tmp/vibesys-issues-tools:/home/ayanbrafaih/.cargo/bin:/home/ayanbrafaih/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games",
+          "/bin/bash",
+          "/tmp/vibesys-pr658-before/clients/tui/dev/mock-ui.sh",
+          "--fixture",
+          "/tmp/vibesys-pr658-before/clients/tui/dev/fixtures/bad-cpp-round1.jsonl",
+          "--theme",
+          "dark",
+          "--speed",
+          "0"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "expect",
+          "text",
+          "VibeSys",
+          "--timeout",
+          "15000"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "wait",
+          "idle",
+          "--timeout",
+          "15000"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "submit",
+          "/open-round 1"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "expect",
+          "text",
+          "Transcript",
+          "--timeout",
+          "15000"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "wait",
+          "idle",
+          "--timeout",
+          "15000"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "text"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "state"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "screenshot",
+          "-o",
+          "/tmp/vibesys-pr-screenshots/pr-658/before.svg"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "record",
+          "start",
+          "/tmp/vibesys-pr-screenshots/pr-658/before.png",
+          "--fps",
+          "1",
+          "--zoom",
+          "0.5"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "record",
+          "stop"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-before",
+          "close"
+        ]
+      ],
+      "fixture_path": "/tmp/vibesys-pr658-before/clients/tui/dev/fixtures/bad-cpp-round1.jsonl",
+      "fixture_repository_path": "clients/tui/dev/fixtures/bad-cpp-round1.jsonl",
+      "fixture_sha256": "3cd39ad26930227e117d60280a2bfd658714b4e43d9b220c8e9e753405aefcd5"
+    },
+    "after": {
+      "revision": "43076c6a671f10f007eb28d42ee4c24b44a3a08d",
+      "worktree": "/tmp/vibesys-pr658-after",
+      "commands": [
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "run",
+          "--backend",
+          "alacritty",
+          "--cols",
+          "150",
+          "--rows",
+          "40",
+          "--cwd",
+          "/tmp/vibesys-pr658-after",
+          "--env",
+          "TERM=xterm-256color",
+          "--env",
+          "COLORTERM=truecolor",
+          "--env",
+          "LANG=C.UTF-8",
+          "--env",
+          "VIBESYS_THEME=dark",
+          "--env",
+          "PATH=/tmp/vibesys-issues-tools:/home/ayanbrafaih/.cargo/bin:/home/ayanbrafaih/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games",
+          "/bin/bash",
+          "/tmp/vibesys-pr658-after/clients/tui/dev/mock-ui.sh",
+          "--fixture",
+          "/tmp/vibesys-pr658-before/clients/tui/dev/fixtures/bad-cpp-round1.jsonl",
+          "--theme",
+          "dark",
+          "--speed",
+          "0"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "expect",
+          "text",
+          "VibeSys",
+          "--timeout",
+          "15000"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "wait",
+          "idle",
+          "--timeout",
+          "15000"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "submit",
+          "/open-round 1"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "expect",
+          "text",
+          "Transcript",
+          "--timeout",
+          "15000"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "wait",
+          "idle",
+          "--timeout",
+          "15000"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "text"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "state"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "screenshot",
+          "-o",
+          "/tmp/vibesys-pr-screenshots/pr-658/after.svg"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "record",
+          "start",
+          "/tmp/vibesys-pr-screenshots/pr-658/after.png",
+          "--fps",
+          "1",
+          "--zoom",
+          "0.5"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "record",
+          "stop"
+        ],
+        [
+          "/tmp/vibesys-tui-test-tools/tt",
+          "--session",
+          "pr658-after",
+          "close"
+        ]
+      ],
+      "fixture_path": "/tmp/vibesys-pr658-before/clients/tui/dev/fixtures/bad-cpp-round1.jsonl",
+      "fixture_repository_path": "clients/tui/dev/fixtures/bad-cpp-round1.jsonl",
+      "fixture_sha256": "3cd39ad26930227e117d60280a2bfd658714b4e43d9b220c8e9e753405aefcd5"
+    }
+  },
+  "build_commands": [
+    [
+      "node",
+      "node_modules/typescript/bin/tsc",
+      "-p",
+      "clients/backend-client/tsconfig.json"
+    ],
+    [
+      "node",
+      "node_modules/typescript/bin/tsc",
+      "-p",
+      "clients/core-state/tsconfig.json"
+    ],
+    [
+      "node",
+      "node_modules/typescript/bin/tsc",
+      "-p",
+      "clients/tui/tsconfig.json"
+    ]
+  ],
+  "artifacts": {
+    "before.png": {
+      "sha256": "0c570298aaa521fc785b6409ecf51f8abe1c3b437f77a9e40d761ba7a9f823ba",
+      "bytes": 277584
+    },
+    "before.svg": {
+      "sha256": "f7873774013b4c77daa770696b2135f8e6a5b166fd7ec31c192d21b3a90df37d",
+      "bytes": 42570
+    },
+    "before.txt": {
+      "sha256": "6c6f063e181d4f075a17c2b35e5eb4a30decc417de50d12b6379e383353c7ddc",
+      "bytes": 8377
+    },
+    "after.png": {
+      "sha256": "0c570298aaa521fc785b6409ecf51f8abe1c3b437f77a9e40d761ba7a9f823ba",
+      "bytes": 277584
+    },
+    "after.svg": {
+      "sha256": "f7873774013b4c77daa770696b2135f8e6a5b166fd7ec31c192d21b3a90df37d",
+      "bytes": 42570
+    },
+    "after.txt": {
+      "sha256": "6c6f063e181d4f075a17c2b35e5eb4a30decc417de50d12b6379e383353c7ddc",
+      "bytes": 8377
+    }
+  }
+}

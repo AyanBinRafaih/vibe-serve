@@ -1,0 +1,40 @@
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ VibeSys · running · judging · Round 1 · 2/200k context                                                                                             │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Rounds ─────────────────╮╭─   Agents   ────────────────────────────────────────────────────────────╮╭─ ▸ Transcript   ────────────────────────────╮
+│ ▸r1 ✓ done 25m 35s       ││ Round 1 flow · 25m 35s         4 agents · 0 active · 3 done · 1 waiting ││ input'                                    ▲ │
+│                          ││                                                                         ││ judge · round-1-retry-1-judge               │
+│                          ││                                                                         ││ [framework-validation] running build-and-   │
+│                          ││                                                                         ││ correctness-gate: mkdir -p .cache/tmp &&    │
+│                          ││                                                                         ││ TMPDIR="$PWD/.cache/tmp" make -s all && ./  │
+│                          ││                                                                         ││ bin/tests                                   │
+│                          ││                                                                         ││ judge · round-1-retry-1-judge               │
+│                          ││                                                                         ││ [framework-validation] PASS                 │
+│                          ││                                                                         ││ judge · round-1-retry-1-judge               │
+│                          ││                                                                         ││ [framework-accuracy] running: sh -c 'make   │
+│                          ││                                                                         ││ -s all && ./bin/tests'                      │
+│                          ││                                                                         ││ judge · round-1-retry-1-judge               │
+│                          ││                                                                         ││ [framework-accuracy] PASS                   │
+│                          ││                                                                         ││ judge · round-1-retry-1-judge               │
+│                          ││ ╭────────────╮     ╭────────────╮     ╭────────────╮     ╭────────────╮ ││ [framework-benchmark] running: ./bin/       │
+│                          ││ │✓ orchestra…│────▶│✓ implement…│────▶│✓ judge     │────▶│○ profiler  │ ││ bench --scale 1.0                           │
+│                          ││ │completed   │     │completed   │     │completed   │     │pending     │ ││ judge · round-1-retry-1-judge               │
+│                          ││ │            │     │            │     │            │     │            │ ││ [framework-benchmark] PASS: total_ms=562.   │
+│                          ││ ╰────────────╯     ╰────────────╯     ╰────────────╯     ╰────────────╯ ││ 9504                                        │
+│                          ││                                                                         ││                                             │
+│                          ││                                                                         ││ ╭────────────────────────────────────────╮  │
+│                          ││                                                                         ││ │ Benchmark                              │  │
+│                          ││                                                                         ││ │ total_ms: 562.9504 total_ms            │  │
+│                          ││                                                                         ││ ╰────────────────────────────────────────╯  │
+│                          ││                                                                         ││                                             │
+│                          ││                                                                         ││ ╭────────────────────────────────────────╮  │
+│                          ││                                                                         ││ │ round-1 · PASS                         │  │
+│                          ││                                                                         ││ │ 1 attempt(s)                           │  │
+│                          ││                                                                         ││ ╰────────────────────────────────────────╯  │
+│                          ││                                                                         ││ judge · round-1-retry-1-judge             ▄ │
+│                          ││                                                                         ││ Reached max_rounds=1. Stopping.           ▼ │
+╰──────────────────────────╯╰─────────────────────────────────────────────────────────────────────────╯╰─────────────────────────────────────────────╯
+←→: rounds/agents/transcript · ↑↓: within · [/]: round · F4: zoom · /todos · /prompt · Esc: back
+╭─   Command   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Type /help for commands                                                                                                                            │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
