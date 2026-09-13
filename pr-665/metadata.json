@@ -1,0 +1,511 @@
+{
+  "pr": 665,
+  "url": "https://github.com/uw-syfi/vibesys/pull/665",
+  "before_sha": "ad8a770fa647cfb092875c8098bdd6d7edb472de",
+  "after_sha": "db44c2388be07d5fc687fbaf0cfe8aaec0d99345",
+  "scenario": "Run each unmodified revision's Population.select_parent over the same two candidates, then replay its actual stdout as a protocol-valid subprocess_output in that revision's real TUI. Open round 1 and zoom the transcript with F4.",
+  "input": {
+    "space": {
+      "objectives": [
+        {
+          "name": "latency_ms",
+          "direction": "min"
+        },
+        {
+          "name": "quality",
+          "direction": "max"
+        }
+      ],
+      "relative_noise": 0.0
+    },
+    "seed": 0,
+    "frontier_bias": 0.0,
+    "temperature": 0.01,
+    "candidates": [
+      {
+        "id": 1,
+        "perf_metric": 10.0,
+        "perf_unit": "ms",
+        "metrics": {
+          "latency_ms": 10.0,
+          "quality": 80.0
+        }
+      },
+      {
+        "id": 2,
+        "perf_metric": 100.0,
+        "perf_unit": "ms",
+        "metrics": {
+          "latency_ms": 100.0,
+          "quality": 90.0
+        }
+      }
+    ],
+    "draw_count": 100
+  },
+  "observed_before": {
+    "selected_parent_id": 2,
+    "selected_latency_ms": 100.0,
+    "draw_counts": {
+      "1": 0,
+      "2": 100
+    }
+  },
+  "observed_after": {
+    "selected_parent_id": 1,
+    "selected_latency_ms": 10.0,
+    "draw_counts": {
+      "1": 100,
+      "2": 0
+    }
+  },
+  "capture_tool": {
+    "repository": "https://github.com/microsoft/tui-test",
+    "version": "0.1.0-beta.3",
+    "backend": "alacritty",
+    "runtime_variable": "TUI_TEST_HOME",
+    "runtime_directory": "/tmp/vibesys-tui-test-tools/state",
+    "release_archive_sha256": "35d0cfff1b3d6cfeba3abb0eeae7537c5722c36414106ca28b142e5e48235a37",
+    "png_method": "record start PATH.png --fps 1 --zoom 0.5; record stop. Native one-frame APNG; no postprocessing."
+  },
+  "geometry": {
+    "cols": 150,
+    "rows": 40,
+    "width_px": 1578,
+    "height_px": 940
+  },
+  "theme": "dark",
+  "bun": "1.3.9",
+  "producer_commands": {
+    "before": {
+      "cwd": "/tmp/vibesys-pr665-before",
+      "env": {
+        "PYTHONPATH": "/tmp/vibesys-pr665-before/src:/tmp/vibesys-pr665-before"
+      },
+      "argv": [
+        "/tmp/vibesys-issues-20260910/504/.venv/bin/python",
+        "/tmp/vibesys-tui-test-tools/produce_parent_selection.py",
+        "/tmp/vibesys-pr-screenshots/pr-665",
+        "before"
+      ]
+    },
+    "after": {
+      "cwd": "/tmp/vibesys-pr665-after",
+      "env": {
+        "PYTHONPATH": "/tmp/vibesys-pr665-after/src:/tmp/vibesys-pr665-after"
+      },
+      "argv": [
+        "/tmp/vibesys-issues-20260910/504/.venv/bin/python",
+        "/tmp/vibesys-tui-test-tools/produce_parent_selection.py",
+        "/tmp/vibesys-pr-screenshots/pr-665",
+        "after"
+      ]
+    }
+  },
+  "capture_commands": {
+    "before": [
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "run",
+        "--backend",
+        "alacritty",
+        "--cols",
+        "150",
+        "--rows",
+        "40",
+        "--cwd",
+        "/tmp/vibesys-pr665-before",
+        "--env",
+        "TERM=xterm-256color",
+        "--env",
+        "COLORTERM=truecolor",
+        "--env",
+        "LANG=C.UTF-8",
+        "--env",
+        "PATH=/tmp/vibesys-issues-tools:/usr/bin:/bin",
+        "/bin/bash",
+        "/tmp/vibesys-pr665-before/clients/tui/dev/mock-ui.sh",
+        "--fixture",
+        "/tmp/vibesys-pr-screenshots/pr-665/before-fixture.jsonl",
+        "--theme",
+        "dark",
+        "--speed",
+        "0"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "expect",
+        "text",
+        "VibeSys",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "wait",
+        "idle",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "submit",
+        "/open-round 1"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "expect",
+        "text",
+        "Transcript",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "key",
+        "press",
+        "F4"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "expect",
+        "text",
+        "Selected parent:",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "expect",
+        "text",
+        "100 seeded draws:",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "wait",
+        "idle",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "text"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "state"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "screenshot",
+        "-o",
+        "/tmp/vibesys-pr-screenshots/pr-665/before.svg"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "record",
+        "start",
+        "/tmp/vibesys-pr-screenshots/pr-665/before.png",
+        "--fps",
+        "1",
+        "--zoom",
+        "0.5"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "record",
+        "stop"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-before",
+        "close"
+      ]
+    ],
+    "after": [
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "run",
+        "--backend",
+        "alacritty",
+        "--cols",
+        "150",
+        "--rows",
+        "40",
+        "--cwd",
+        "/tmp/vibesys-pr665-after",
+        "--env",
+        "TERM=xterm-256color",
+        "--env",
+        "COLORTERM=truecolor",
+        "--env",
+        "LANG=C.UTF-8",
+        "--env",
+        "PATH=/tmp/vibesys-issues-tools:/usr/bin:/bin",
+        "/bin/bash",
+        "/tmp/vibesys-pr665-after/clients/tui/dev/mock-ui.sh",
+        "--fixture",
+        "/tmp/vibesys-pr-screenshots/pr-665/after-fixture.jsonl",
+        "--theme",
+        "dark",
+        "--speed",
+        "0"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "expect",
+        "text",
+        "VibeSys",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "wait",
+        "idle",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "submit",
+        "/open-round 1"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "expect",
+        "text",
+        "Transcript",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "key",
+        "press",
+        "F4"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "expect",
+        "text",
+        "Selected parent:",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "expect",
+        "text",
+        "100 seeded draws:",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "wait",
+        "idle",
+        "--timeout",
+        "15000"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "text"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "state"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "screenshot",
+        "-o",
+        "/tmp/vibesys-pr-screenshots/pr-665/after.svg"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "record",
+        "start",
+        "/tmp/vibesys-pr-screenshots/pr-665/after.png",
+        "--fps",
+        "1",
+        "--zoom",
+        "0.5"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "record",
+        "stop"
+      ],
+      [
+        "/tmp/vibesys-tui-test-tools/tt",
+        "--session",
+        "pr665-after",
+        "close"
+      ]
+    ]
+  },
+  "sources": {
+    "producer": "producer.py",
+    "capture": "capture.py",
+    "display_envelope": "before-fixture.jsonl and after-fixture.jsonl; fixed lifecycle envelopes wrap actual producer stdout. No selected outcomes are hard-coded."
+  },
+  "limitations": [
+    "This is a deterministic native-parent scalar-fallback probe, not an optimization campaign. No agent, benchmark, or new candidate code was run.",
+    "End-of-run best selection is outside this PR and outside this capture. Inspiration backfill and OpenEvolve fallback are covered by the PR's tests rather than these screenshots.",
+    "The completed/skipped lifecycle fields are display scaffolding for the replay harness. Only stdout metrics, selected parent, and draw counts are measured producer results."
+  ],
+  "png_validation": {
+    "method": "Decompressed and unfiltered full default PNG IDAT pixels using Python stdlib, then compared RGBA pixels.",
+    "frames_each": 1,
+    "changed_pixels": 1470,
+    "changed_pixel_bounds_inclusive": {
+      "left": 340,
+      "top": 253,
+      "right": 617,
+      "bottom": 289
+    },
+    "result": "Only the selected-parent/latency and draw-count text pixels differ. Header, borders, and all other pixels are identical."
+  },
+  "artifacts": {
+    "after-capture.json": {
+      "bytes": 2825,
+      "sha256": "531fcae32d6a9f1fa0aecaf3635fc68c12ed553a87911477554d366f03433a3f"
+    },
+    "after-fixture.jsonl": {
+      "bytes": 1960,
+      "sha256": "cd93ff15d699c410a48a21924a4d3d2c0ba6ad91843660a6a37358bbb71c6003"
+    },
+    "after-producer.json": {
+      "bytes": 970,
+      "sha256": "5369beb1640c7caae2cc5828e2db8e24fbd40b58cb367619380546b3aba9945d"
+    },
+    "after-producer.txt": {
+      "bytes": 411,
+      "sha256": "ff1dcd03541bcd8fcdac8217e7df65592194e333c928f780147aa3abe7c879cd"
+    },
+    "after-session.json": {
+      "bytes": 171,
+      "sha256": "ef1e972bbdd1487eb72f174eca3a502695f69e42007b7b82e0c09f8fdd10e580"
+    },
+    "after-state.json": {
+      "bytes": 8702,
+      "sha256": "aabc30630ecb797be5bb28a0bb847d3fcb6af07060f666c4093aec7d99eec3ca"
+    },
+    "after.png": {
+      "bytes": 163564,
+      "sha256": "ab58e1b59af4d42533781a2270709dbd1f8b87fc3992391b8260bf7a0e16fd7d"
+    },
+    "after.svg": {
+      "bytes": 20909,
+      "sha256": "71ca41eba60420d695af0e3a6760816472e55abb74bc433a0e254ae77672a57b"
+    },
+    "after.txt": {
+      "bytes": 8464,
+      "sha256": "1213cc79f864e6e9060bbdcfbecc1720a8a32fcc3447a2891b95c164d1b54642"
+    },
+    "before-capture.json": {
+      "bytes": 2845,
+      "sha256": "699ab564e6cdcddd01caf19a24d024bccc96fd77df30f9a68920618efad81ada"
+    },
+    "before-fixture.jsonl": {
+      "bytes": 1961,
+      "sha256": "b557bb55d960e4d42aef5e526687969e85a8fbb0bd019addc860ccc4df75ab1b"
+    },
+    "before-producer.json": {
+      "bytes": 972,
+      "sha256": "bde8a75fec4755bd994d888c27924cd04fb45debd222764e6bdba82153ecd21a"
+    },
+    "before-producer.txt": {
+      "bytes": 412,
+      "sha256": "653338a67969dd978f7c9fd51f4f5eaa8969d041b385ff1afd801ee6dfea362b"
+    },
+    "before-session.json": {
+      "bytes": 173,
+      "sha256": "eb8980c1be6c7beb4ce7c62e6f7c451086775228b229f5863b09b8b36741a937"
+    },
+    "before-state.json": {
+      "bytes": 8702,
+      "sha256": "6117fae4797aabf3af8fb4b4724af85db27db130420cd8c51aa9a054a1f93d70"
+    },
+    "before.png": {
+      "bytes": 163992,
+      "sha256": "4e5a2632f981308143ad66be91a3d311b9d0891a7fd4ab5881d945908c72025b"
+    },
+    "before.svg": {
+      "bytes": 20910,
+      "sha256": "7907f89555578a807c976a5bf7a1c17898f00e6b0c0d72765c3a9843ca7b4138"
+    },
+    "before.txt": {
+      "bytes": 8464,
+      "sha256": "18c5daa08f5fec3eda74a1b344993ca5a9f0b5d05b2aac9533a50b02a2e07c14"
+    },
+    "capture.py": {
+      "bytes": 2050,
+      "sha256": "1cf665949474f71493c72c317f6f2b1c5cab11b611691c2d42bdbb66dd9840d3"
+    },
+    "producer.py": {
+      "bytes": 3898,
+      "sha256": "9215e4e85c3289378c26bfdf1b89d7d7a45019345b0c103e5c2c74b83cd1003f"
+    }
+  }
+}

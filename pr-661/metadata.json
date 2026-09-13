@@ -1,0 +1,57 @@
+{
+  "pr": 661,
+  "title": "TUI: preserve bounded stderr diagnostics from failed sandbox commands",
+  "url": "https://github.com/uw-syfi/vibesys/pull/661",
+  "scenario": "Run each revision's real DockerSandbox.execute implementation against a mocked failed compiler process with 200 stdout characters, `fatal compiler error` on stderr, exit code 1, and an 80-character cap. Serialize the result through the corresponding gate event shape, replay it through the real TUI, open Round 1, and zoom the transcript.",
+  "tool": {
+    "name": "microsoft/tui-test",
+    "version": "0.1.0-beta.3",
+    "backend": "alacritty",
+    "vector_capture": "tui-test screenshot --full",
+    "png_conversion": "CairoSVG 2.9.1 at scale 2"
+  },
+  "terminal": {
+    "columns": 160,
+    "rows": 45,
+    "theme": "dark",
+    "term": "xterm-256color",
+    "view": "transcript zoom"
+  },
+  "fixture_generator": "fixture-generator.py",
+  "capture_script": "capture.sh",
+  "before": {
+    "sha": "bf0aa491fb9610157e5119f2f576436aefa1050e",
+    "commit_url": "https://github.com/uw-syfi/vibesys/commit/bf0aa491fb9610157e5119f2f576436aefa1050e",
+    "worktree": "/tmp/vibesys-pr661-before",
+    "fixture": "before-fixture.jsonl",
+    "image": "before.png",
+    "text": "before.txt",
+    "observed": "The retained stdout prefix is followed by `...[truncated, 141 bytes omitted]`; the fatal stderr diagnostic is absent."
+  },
+  "after": {
+    "sha": "479cd672762db5ec850334d71c5475fbe640f65b",
+    "commit_url": "https://github.com/uw-syfi/vibesys/commit/479cd672762db5ec850334d71c5475fbe640f65b",
+    "worktree": "/tmp/vibesys-pr661-after",
+    "fixture": "after-fixture.jsonl",
+    "image": "after.png",
+    "text": "after.txt",
+    "observed": "The bounded stdout prefix and in-cap marker remain, followed by the retained `fatal compiler error` stderr tail."
+  },
+  "assertions": [
+    "Both revisions render `1 attempt(s)`.",
+    "Before renders `bytes omitted` and does not render `fatal compiler error`.",
+    "After renders `[truncated]` and `fatal compiler error`."
+  ],
+  "commands": [
+    "python fixture-generator.py --worktree WORKTREE --output FIXTURE",
+    "pnpm install --frozen-lockfile --offline",
+    "pnpm --dir clients/tui build",
+    "tui-test run --backend alacritty --cols 160 --rows 45 clients/tui/dev/mock-ui.sh --fixture FIXTURE --speed 0 --theme dark",
+    "tui-test key press Enter; tui-test key press Enter; tui-test key press F4",
+    "tui-test expect text ...",
+    "tui-test text",
+    "tui-test screenshot --full",
+    "python -m cairosvg CAPTURE.svg -o CAPTURE.png -s 2"
+  ],
+  "limitations": "The subprocess call is mocked, so Docker access is unnecessary. The sandbox truncation and returned result are produced by each revision's unmodified DockerSandbox.execute code; the temporary generator only supplies subprocess.CompletedProcess and wraps the returned fields in a minimal valid run replay. The still image demonstrates retained diagnostic content, not Docker or Modal integration. PNGs are static CairoSVG exports of tui-test's settled SVG capture; the original SVGs are included."
+}

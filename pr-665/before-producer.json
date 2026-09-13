@@ -1,0 +1,49 @@
+{
+  "revision": "ad8a770fa647cfb092875c8098bdd6d7edb472de",
+  "implementation_module": "/tmp/vibesys-pr665-before/src/vibesys/loops/evolve/population.py",
+  "function": "Population.select_parent",
+  "space": {
+    "objectives": [
+      {
+        "name": "latency_ms",
+        "direction": "min"
+      },
+      {
+        "name": "quality",
+        "direction": "max"
+      }
+    ],
+    "relative_noise": 0.0
+  },
+  "seed": 0,
+  "frontier_bias": 0.0,
+  "temperature": 0.01,
+  "candidates": [
+    {
+      "id": 1,
+      "perf_metric": 10.0,
+      "perf_unit": "ms",
+      "metrics": {
+        "latency_ms": 10.0,
+        "quality": 80.0
+      }
+    },
+    {
+      "id": 2,
+      "perf_metric": 100.0,
+      "perf_unit": "ms",
+      "metrics": {
+        "latency_ms": 100.0,
+        "quality": 90.0
+      }
+    }
+  ],
+  "selected_parent_id": 2,
+  "selected_latency_ms": 100.0,
+  "selected_quality": 90.0,
+  "draw_count": 100,
+  "draw_counts": {
+    "1": 0,
+    "2": 100
+  }
+}

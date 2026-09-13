@@ -1,0 +1,6 @@
+NATIVE EVOLVE PARENT SELECTION | latency_ms MINIMIZE; quality MAXIMIZE
+Inputs: candidate 1: 10 ms, quality 80; candidate 2: 100 ms, quality 90
+Scalar fallback: frontier_bias=0, temperature=0.01, RNG seed=0
+Selected parent: candidate 2 | Selected latency: 100 ms
+100 seeded draws: candidate 1 = 0, candidate 2 = 100
+Producer: Population.select_parent (unmodified checkout). No agent or benchmark process was run.
