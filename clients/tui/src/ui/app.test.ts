@@ -39,6 +39,7 @@ import {
   moveHypothesisRoundSelection,
   moveThemeSelection,
   normalizeFocus,
+  openChat,
   openChatModelMenu,
   openChatResumeMenu,
   openExperimentLog,
@@ -78,8 +79,8 @@ import {
   ensureContrast,
   listThemes,
   mix,
+  RUN_DIVIDER_MIN_CONTRAST,
   resolveTheme,
-  SUBTLE_TEXT_MIN_CONTRAST,
   scrim,
   THEME_NAMES,
   type ThemeName,
@@ -2828,15 +2829,13 @@ describe('theming', () => {
     expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(light.accent);
     const body = spanColors(testRenderer, 'themed body text');
     expect(body?.fg).toBe(light.conversation.assistant.content);
-    // #565: the card carries its role on the divider rule, not a fill, so its
-    // body sits on the theme's canvas.
+    // #565 took the card's fill and the colour diet took the role tint behind a
+    // bare entry, so every entry's body sits on the theme's canvas.
     expect(body?.bg).toBe(light.canvas);
+    // The divider is a separator, not a role signal: it draws in the neutral
+    // resting border every other frame uses, lifted to the divider floor.
     expect(cardBorder(testRenderer, 'event-themed')).toBe(
-      ensureContrast(
-        light.conversation.assistant.border,
-        light.canvas,
-        SUBTLE_TEXT_MIN_CONTRAST,
-      ).toLowerCase(),
+      ensureContrast(light.border, light.canvas, RUN_DIVIDER_MIN_CONTRAST).toLowerCase(),
     );
     expect(spanColors(testRenderer, 'implementer')?.fg).toBe(light.conversation.assistant.label);
   });
@@ -5607,7 +5606,7 @@ describe('box fills', () => {
     expect(ids).toContain('experiment-log'); // a pane, the same way
     expect(ids).toContain('theme-picker'); // an overlay, built here, never opened
     expect(ids).toContain('event-card'); // a transcript card, now a top-edge rule
-    expect(ids).toContain('event-status'); // borderless, so it keeps its own fill
+    expect(ids).toContain('event-status'); // a bare entry, which now fills nothing
     expect(ids.some(id => id.startsWith('agent-implementer-'))).toBe(true);
 
     expect(offenders(root)).toEqual([]);
@@ -5627,6 +5626,8 @@ describe('box fills', () => {
     // 'event-card-fill' is deliberately absent: #565 removed the transcript
     // card's border and its fill together, so there is no longer a rounded
     // corner to keep a fill out of, and nothing left to move inwards.
+    // 'event-status-fill' is absent for the same reason one step further on: an
+    // entry has no role tint left to paint, so no entry paints a fill at all.
     for (const id of ['header-fill', 'experiment-log-fill']) {
       expect([id, isPainted(root, id)]).toEqual([id, true]);
     }
@@ -6156,6 +6157,139 @@ describe('modal scrim', () => {
   });
 });
 
+describe('single-key gating by the composer that owns the keyboard', () => {
+  /** A round view with two rounds, so `[` has somewhere to go. */
+  function twoRoundController(): FakeController {
+    return new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed' as const},
+          {number: 2, status: 'active' as const},
+        ],
+        transcript: [
+          {
+            id: 'live',
+            kind: 'assistant',
+            label: 'Agent',
+            content: 'live output',
+            roundNumber: 2,
+          },
+        ],
+      },
+    });
+  }
+
+  it('keeps round navigation alive after a chat draft is closed unsent', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = twoRoundController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+
+    // Leave a half-typed question in the modal chat, then close it unsent.
+    controller.publish({...controller.state, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('Experiment chat'));
+    await testRenderer.mockInput.typeText('half a question');
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.chatOpen).toBe(false);
+
+    // The keystroke cannot reach the closed composer, so the parked draft
+    // must not disable the round view's plain keys. The bracket right after
+    // a flushed ESC sits out the parser's escape-sequence timeout, which the
+    // escape helper's beat also covers.
+    testRenderer.mockInput.pressKey('[');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.selectedRound).toBe(1);
+
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+
+    // The draft was parked, not discarded: reopening the chat shows it.
+    controller.publish({...controller.state, chatOpen: true});
+    const reopened = await testRenderer.waitForFrame(value => value.includes('half a question'));
+    expect(reopened).toContain('Experiment chat');
+  });
+
+  it('opens a hypothesis on Enter while an unfocused docked draft is parked', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    // Draft in the docked chat, then move the keys back to the table.
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('draft for later');
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('left');
+
+    // The command input is empty and owns the keyboard, so Enter belongs to
+    // the table even though a draft waits in the unfocused composer beside it.
+    testRenderer.mockInput.pressEnter();
+    await frameAfter(testRenderer);
+    expect(controller.state.hypothesisDetail).not.toBeNull();
+
+    // The draft was parked, not discarded by the drilldown.
+    controller.publish({...controller.state, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('draft for later'));
+  });
+
+  it('keeps navigation keys inside a focused composer holding text', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = twoRoundController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+
+    controller.publish({...controller.state, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('Experiment chat'));
+    await testRenderer.mockInput.typeText('inspect arr');
+    testRenderer.mockInput.pressKey('[');
+    await frameAfter(testRenderer);
+
+    // The bracket is a character of the question, not round navigation.
+    expect(controller.state.selectedRound).toBeNull();
+
+    await testRenderer.mockInput.typeText('0]');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual(['inspect arr[0]']);
+  });
+
+  it('leaves brackets to a typed command while a chat draft is parked', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = twoRoundController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+
+    controller.publish({...controller.state, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('Experiment chat'));
+    await testRenderer.mockInput.typeText('parked draft');
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+
+    // Text in the command input still shadows navigation: the bracket is a
+    // character of the command, whatever the parked draft holds.
+    await testRenderer.mockInput.typeText('/steer fix arr');
+    testRenderer.mockInput.pressKey('[');
+    const typed = await frameAfter(testRenderer);
+    expect(typed).toContain('arr[');
+    expect(controller.state.selectedRound).toBeNull();
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    expect(controller.submissions).toEqual(['/steer fix arr[']);
+  });
+});
+
 /** The renderable behind a screen region, for asserting what a scrim covers. */
 function boxOf(testRenderer: TestRendererSetup, id: string): Renderable {
   const found = testRenderer.renderer.root.findDescendantById(id);
@@ -6535,3 +6669,90 @@ class FakeController implements SessionController {
     for (const listener of this.#listeners) listener(this.state);
   }
 }
+
+describe('chat while a pane is zoomed', () => {
+  /** The landing view with the experiments pane zoomed over the whole row. */
+  async function zoomedLog(): Promise<{
+    testRenderer: TestRendererSetup;
+    controller: FakeController;
+  }> {
+    const testRenderer = await createTestRenderer({width: 200, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('experiments');
+    return {testRenderer, controller};
+  }
+
+  it('opens the modal over the zoomed pane and takes the typing', async () => {
+    // Zoom gives the whole content row to one pane, so the docked chat is off
+    // screen. `chatDocked` used to ignore that and route /chat's focus to the
+    // hidden pane: no chat appeared, and keystrokes went where the operator
+    // could not see them.
+    const {testRenderer, controller} = await zoomedLog();
+    const zoomed = await frameAfter(testRenderer);
+    expect(zoomed).not.toContain('Experiment chat');
+
+    // What the real controller's /chat dispatch runs.
+    controller.publish(openChat(controller.state));
+    const opened = await frameAfter(testRenderer);
+    expect(controller.state.chatOpen).toBe(true);
+    expect(opened).toContain('Experiment chat');
+    expect(boxOf(testRenderer, 'chat-overlay').visible).toBe(true);
+
+    // The cursor landed on the visible composer: the question reaches the
+    // chat, not the command bar behind the modal.
+    await testRenderer.mockInput.typeText('why is r41 slow?');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual(['why is r41 slow?']);
+    expect(controller.submissions).toEqual([]);
+  });
+
+  it('restores the zoomed pane and its keys when the modal closes', async () => {
+    const {testRenderer, controller} = await zoomedLog();
+    controller.publish(openChat(controller.state));
+    await frameAfter(testRenderer);
+    expect(controller.state.chatOpen).toBe(true);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const closed = await frameAfterEscape(testRenderer);
+    expect(controller.state.chatOpen).toBe(false);
+    // Escape closes only the modal: the zoom and the pane keys are exactly
+    // where /chat found them.
+    expect(controller.state.layout.zoomedPane).toBe('experiments');
+    expect(controller.state.layout.focus).toBe('left');
+    expect(closed).toContain('H-07');
+    expect(closed).not.toContain('Experiment chat');
+  });
+
+  it('carries the modal and its draft through a zoom exit into the dock', async () => {
+    const {testRenderer, controller} = await zoomedLog();
+    controller.publish(openChat(controller.state));
+    await frameAfter(testRenderer);
+    expect(controller.state.chatOpen).toBe(true);
+    await testRenderer.mockInput.typeText('draft for the dock');
+
+    // F4 stands down while the modal is open, but zoom can still end under
+    // it. The modal stays the one chat surface until it is dismissed rather
+    // than jumping into the dock mid-question.
+    controller.togglePaneZoom();
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBeNull();
+    expect(controller.state.chatOpen).toBe(true);
+    expect(boxOf(testRenderer, 'chat-overlay').visible).toBe(true);
+    expect(boxOf(testRenderer, 'chat-pane').visible).toBe(false);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const docked = await frameAfterEscape(testRenderer);
+    expect(controller.state.chatOpen).toBe(false);
+    expect(boxOf(testRenderer, 'chat-pane').visible).toBe(true);
+    // One shared draft: the words typed into the modal are waiting in the
+    // docked composer rather than lost with the surface that closed.
+    expect(docked).toContain('draft for the dock');
+  });
+});
