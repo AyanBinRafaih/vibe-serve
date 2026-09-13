@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 
-import pytest
 from deepagents.backends import LocalShellBackend
 
 from entrypoints.headless import _add_common_args
@@ -15,7 +14,7 @@ from vibesys.constants import ComputeBackend
 from vibesys.profilers import ProfilerKind
 from vibesys.prompts import PROMPTS_DIR, RocmComputeBackendFragment
 from vibesys.prompts.renderer import _FRAGMENT_IMPLS, ComputeBackendFragment
-from vs_sandbox import DockerSandbox
+from vs_sandbox import DockerSandbox, HostResource, HostResourceAccess
 
 
 def _make_backend(tmp_path, devices=("/dev/kfd", "/dev/dri/renderD128")) -> RocmBackend:  # noqa: ANN001  # tracked: #288
@@ -62,6 +61,22 @@ class TestRocmSandbox:
         assert sb._devices == ["/dev/kfd", "/dev/dri/renderD128"]  # noqa: SLF001  # tracked: #288
         assert sb._gpus is None  # noqa: SLF001  # tracked: #288
 
+    def test_docker_forwards_resources_to_the_sandbox(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+        impl = _make_backend(tmp_path)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        resource = HostResource(tmp_path / "history", HostResourceAccess.READ_ONLY, "history")
+
+        sb = impl.make_sandbox(
+            SandboxKind.DOCKER,
+            host_workspace=str(workspace),
+            log_path=None,
+            resources=[resource],
+        )
+
+        assert isinstance(sb, DockerSandbox)
+        assert resource in sb._resources  # noqa: SLF001  # tracked: #288
+
     def test_docker_can_skip_accelerator_for_control_plane(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         impl = _make_backend(tmp_path)
         workspace = tmp_path / "ws"
@@ -90,16 +105,6 @@ class TestRocmSandbox:
         )
         assert isinstance(sb, DockerSandbox)
         assert sb._group_add == ["video", "render"]  # noqa: SLF001  # tracked: #288
-
-    def test_modal_raises(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        """Modal has no AMD GPUs — fail loudly rather than silently on CPU."""
-        impl = _make_backend(tmp_path)
-        with pytest.raises(ValueError, match="does not support Modal"):
-            impl.make_sandbox(
-                SandboxKind.MODAL,
-                host_workspace=str(tmp_path),
-                log_path=None,
-            )
 
     def test_torch_wheel_index_targets_rocm(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
         """Without this, `uv add torch` in the agent's fresh venv resolves the

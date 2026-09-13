@@ -7,7 +7,7 @@ A ``ComputeBackendImpl`` knows how to:
 2. Optionally watch the platform for issues (CUDA: nvidia-smi contention).
 3. Optionally migrate compute mid-run (CUDA: re-pick a less-loaded GPU).
 
-Sandbox classes (``DockerSandbox``, ``ModalSandbox``, ``LocalShellBackend``)
+Sandbox classes (``DockerSandbox``, ``LocalShellBackend``)
 stay backend-agnostic: they accept image/env/gpus as plain parameters.  The
 compute backend supplies the right values for its platform inside
 ``make_sandbox``.
@@ -24,9 +24,12 @@ from vibesys.profilers import ProfilerKind  # noqa: TC001  # tracked: #288
 from vs_sandbox.lifecycle import SandboxLifecycle
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence  # tracked: #288
+
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
 
+    from vs_sandbox.host_resources import HostResource
     from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 
@@ -35,7 +38,6 @@ class SandboxKind(StrEnum):
 
     LOCAL = "local"
     DOCKER = "docker"
-    MODAL = "modal"
 
 
 class Device(Protocol):
@@ -68,14 +70,20 @@ class ComputeBackendImpl(Protocol):
         bind_mounts: list[tuple[str, str, bool]],
         passthrough_paths: list[str],
         extra_env: dict[str, str],
-        extra_init_commands: list[str],
+        extra_init_commands: list[str] | None = None,
         lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
-        modal_options: ModalOptions | None = None,
         attach_accelerator: bool = True,
         ephemeral: bool = False,
         container_image: str | None = None,
+        auth_files: list[tuple[str, str]] | None = None,
+        resources: Sequence[HostResource] = (),
     ) -> SandboxBackendProtocol:
         """Construct (do not start) a sandbox configured for this backend.
+
+        ``extra_init_commands`` is ignored by every current backend: a
+        Docker sandbox starts from a prebuilt agent image and installs
+        nothing at start, and a local sandbox has no separate install step.
+        Kept for protocol parity with a future backend that needs it.
 
         ``lifecycle_hooks`` are invoked before the sandbox becomes ready,
         during both initial creation and replacement.
@@ -89,6 +97,18 @@ class ComputeBackendImpl(Protocol):
 
         ``container_image`` pins a Docker sandbox to a resolved image ID. It is
         ignored by non-Docker sandboxes.
+
+        ``auth_files`` names ``(staged source, agent-home destination)`` pairs
+        a Docker sandbox copies in as root at start, then chowns to the agent
+        user. Ignored by non-Docker sandboxes.
+
+        ``resources`` is the caller's :class:`~vs_sandbox.host_resources.HostResource`
+        list for this sandbox, forwarded to ``DockerSandbox(resources=...)``
+        unchanged: a Docker sandbox lowers it to bind mounts and consults it
+        for :meth:`agent_path`. ``bind_mounts`` keeps working for a caller that
+        still builds its own mount tuples directly; the two combine rather
+        than one replacing the other. Ignored by non-Docker sandboxes, whose
+        accelerator device and model-volume mounts stay backend-specific.
         """
         ...
 
@@ -127,31 +147,3 @@ def make_local_shell_sandbox(
     )
     SandboxLifecycle(lifecycle_hooks).before_ready(sandbox)
     return sandbox
-
-
-class ModalOptions:
-    """User-supplied Modal sandbox knobs — orthogonal to platform choice.
-
-    The compute backend supplies image and GPU spec; the user supplies runtime
-    knobs (lifetime, idle timeout, app, model volume).  Plain attribute
-    container so future backends can ignore it without typing gymnastics.
-    """
-
-    def __init__(  # noqa: D107, PLR0913  # tracked: #288
-        self,
-        *,
-        gpu: str | None = "H100",
-        sandbox_timeout: int = 14400,
-        idle_timeout: int | None = 1800,
-        model_volume_name: str | None = None,
-        extra_readonly_volumes: dict[str, str] | None = None,
-        extra_writable_volumes: dict[str, str] | None = None,
-        app_name: str = "vibesys",
-    ) -> None:
-        self.gpu = gpu
-        self.sandbox_timeout = sandbox_timeout
-        self.idle_timeout = idle_timeout
-        self.model_volume_name = model_volume_name
-        self.extra_readonly_volumes = extra_readonly_volumes
-        self.extra_writable_volumes = extra_writable_volumes
-        self.app_name = app_name

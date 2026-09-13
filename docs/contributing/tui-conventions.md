@@ -72,13 +72,21 @@ were shipped wrong once:
 - A box nested inside a pane does not repeat the treatment. The chat's `Message`
   composer sits inside the chat pane, so the pane frame carries the marker and
   the composer keeps the resting frame. Which box holds the cursor is said by
-  the cursor and by the hint line under it.
+  the cursor and by the hint line under it. The `Command` box is the same case:
+  it is drawn inside the pane whose keys it takes, which is the log on the
+  landing view, the transcript inside a round, and whichever single pane a zoom
+  has left on screen.
 - A surface that takes the keys is a pane, whatever its shape. The expanded todo
   list is a strip rather than a column, but `keybindings.ts` routes the arrow
   keys to it, so it is a `PaneId` and the pane it opened over goes back to rest.
   The same holds for a presentation swap: below `MIN_SPLIT_WIDTH` a
   visualization is drawn through the overlay, and that overlay is then the
   performance pane, with its title and its marker.
+
+The round tabs are not a pane. They are one row across the top of the round
+view, `[` and `]` or a click switch the round from anywhere, and they take no
+arrow keys, so `←` and `→` move only between the agents graph and the
+transcript.
 
 Zoom is a separate question from focus. `visiblePaneIds` is the set the content
 row can be given to, and the todo list is deliberately not in it: it is as tall
@@ -100,8 +108,51 @@ than the row saved.
 ### Bindings are visible
 
 The active bindings are shown on the key-help line at the bottom of the screen,
-just above the command input, and that line changes with whichever surface is in
-front. A binding a person has to already know is a binding they do not have.
+under every pane, and that line changes with whichever surface is in front. A
+binding a person has to already know is a binding they do not have.
+
+The line keeps the full width of the screen rather than moving inside a pane
+with the command input. A pane is narrower than the terminal, and a row of
+bindings truncated to fit one is a row whose last bindings nobody has.
+
+### A fill lives on an inner box
+
+`OptimizedBuffer.drawBox` takes one background for the whole rectangle and the
+buffer is write-only, so a `backgroundColor` on a bordered box fills the border
+ring as well. The painted rectangle is then a cell larger than the drawn line on
+all four sides: the line sits in a solid block with fill on both sides of it,
+and under a rounded arc the fill paints the outside of the curve and squares the
+corner back off. That is #642.
+
+So the fill goes on an inner box that occupies the interior, and the outer box
+draws only the border. A cell then reads canvas, then line, then fill, and a
+corner cell holds no fill to bleed past the arc. `box-fill.ts` is the one way to
+do it: a layer inset to zero on all four sides, absolutely positioned so it adds
+no row, no padding and no containing block and the box's children stay where
+they were.
+
+**Exception: an overlay keeps an outer fill.** A box that floats over other
+content needs an opaque edge, or what is behind shows through its border ring.
+That fill reaches the ring by design, so an overlay draws a **square** border
+(`borderStyle: 'single'`): a ring of fill under a rounded arc is #642 again. The
+three modals and the two suggestion popups are the whole list.
+
+Two other answers were tried and rejected, so they are settled rather than open.
+Blending the corner cell between the fill and what was behind it is still one
+flat colour standing in for two regions, and reads as a smudge rather than a
+curve. Forcing every filled box square fixes the corner and leaves the fill
+overhanging the border on all four sides, which is the same disagreement between
+the drawn shape and the painted one, one cell further out.
+
+`app.test.ts` holds both halves over the whole constructed tree rather than over
+a list of call sites, so a box added later fails it without anyone remembering
+to extend a list: no non-overlay box fills its own rectangle, and a site that
+used to fill one still paints a layer inside its border. The exception is an
+explicit list there, because floating over something is not a property a box
+carries: the agent map's cards are absolutely positioned too. One trap the walk
+exists to catch: OpenTUI turns a border back on if `borderStyle` or
+`borderColor` is passed beside `border: false`, so a box that means to draw no
+border has to omit both.
 
 ## Proposed: movement and naming
 

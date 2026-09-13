@@ -34,9 +34,14 @@ describe('session controller', () => {
 
     expect(transport.requests).toEqual([]);
     expect(controller.state.chatConversation).toEqual([]);
-    expect(controller.state.errorBanner?.message).toContain('Commands start with /');
+    // Ordinary text is a routing mistake, not a malformed command: it lands on
+    // the command input's own hint row rather than raising the shared banner
+    // (#564/#635's reasoning, applied to a wrong command instead of an empty
+    // one).
+    expect(controller.state.inputError).toContain('Not a command:');
+    expect(controller.state.errorBanner).toBeNull();
 
-    controller.dismissErrorBanner();
+    controller.clearInputError();
     await controller.submitChat('what is happening?');
 
     expect(transport.requests).toEqual([{type: 'query.chat', text: 'what is happening?'}]);
@@ -668,20 +673,20 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
 
     await controller.submitCommand('/history');
-    expect(controller.state.errorBanner?.scope).toBe('input');
-    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.inputError).toContain('Unknown command /history');
 
     await controller.submitCommand('/history rounds');
-    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history rounds');
+    expect(controller.state.inputError).toContain('Unknown command /history rounds');
 
     await controller.submitCommand('/experiments');
-    expect(controller.state.errorBanner?.message).toContain('Unknown command: /experiments');
+    expect(controller.state.inputError).toContain('Unknown command /experiments');
 
-    controller.dismissErrorBanner();
-    expect(controller.state.errorBanner).toBeNull();
+    controller.clearInputError();
+    expect(controller.state.inputError).toBeNull();
 
     await controller.submitCommand('/history');
-    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
+    expect(controller.state.inputError).toContain('Unknown command /history');
 
     expect(transport.requests).toEqual([]);
   });
@@ -1181,6 +1186,75 @@ describe('session controller', () => {
     expect(controller.state.layout.right).toBeNull();
   });
 
+  it('fetches the view opened while another view’s query is in flight', async () => {
+    const transport = new DeferredDesignTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.deferDesign = true;
+
+    const designOpen = controller.openPane('design');
+    const perfOpen = controller.openPane('perf');
+    // The perf pane is on screen and waiting; its query must not have been
+    // swallowed by the design query still in flight.
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(controller.state.layout.right?.pending).toBe(true);
+    expect(transport.requests.filter(request => request.type === 'query.performance')).toHaveLength(
+      0,
+    );
+
+    transport.releaseDesign();
+    await Promise.all([designOpen, perfOpen]);
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(transport.requests.filter(request => request.type === 'query.performance')).toHaveLength(
+      1,
+    );
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(controller.state.layout.right?.pending).toBe(false);
+    expect(controller.state.layout.right?.content).toContain('Performance · total_ops_per_sec');
+  });
+
+  it('drops the superseded design answer rather than painting it over the perf pane', async () => {
+    const transport = new DeferredDesignTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.deferDesign = true;
+
+    const designOpen = controller.openPane('design');
+    const perfOpen = controller.openPane('perf');
+    transport.releaseDesign();
+    await Promise.all([designOpen, perfOpen]);
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(controller.state.layout.right?.content).toContain('Performance · total_ops_per_sec');
+    expect(controller.state.layout.right?.content).not.toContain('Design changes by round');
+  });
+
+  it('coalesces same-view refreshes during a fetch into one follow-up', async () => {
+    const transport = new DeferredDesignTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.deferDesign = true;
+
+    const designOpen = controller.openPane('design');
+    // Two rounds finish while the query is still running. The in-flight
+    // answer predates both, so one refetch follows, not one per event.
+    transport.emit(event(9, 'round_finished'));
+    transport.emit(event(10, 'round_finished'));
+    const before = designQueries(transport);
+
+    transport.releaseDesign();
+    await designOpen;
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    expect(designQueries(transport) - before).toBe(1);
+
+    transport.releaseDesign();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    expect(controller.state.layout.right?.pending).toBe(false);
+    expect(designQueries(transport) - before).toBe(1);
+  });
+
   it('closes the pane without disturbing the chat', async () => {
     const transport = new FakeTransport([], [], {
       question: 'why?',
@@ -1550,7 +1624,10 @@ describe('session controller', () => {
     const before = transport.requests.length;
     await controller.submitChat('/clear definitely-not');
 
-    expect(controller.state.errorBanner?.message).toBe('Usage: /clear');
+    // A usage error is `scope: 'input'` regardless of which surface typed it,
+    // so it lands on the command input's hint rather than the banner.
+    expect(controller.state.inputError).toBe('Usage: /clear');
+    expect(controller.state.errorBanner).toBeNull();
     // The phrase started no thread and sent no request.
     expect(transport.requests.length).toBe(before);
     expect(controller.state.chatMenu).toBeNull();
@@ -1562,7 +1639,8 @@ describe('session controller', () => {
 
     await controller.submitCommand('/pause typo');
 
-    expect(controller.state.errorBanner).toMatchObject({scope: 'input', message: 'Usage: /pause'});
+    expect(controller.state.inputError).toBe('Usage: /pause');
+    expect(controller.state.errorBanner).toBeNull();
     expect(transport.requests).toEqual([]);
   });
 
@@ -1572,8 +1650,8 @@ describe('session controller', () => {
 
     await controller.submitCommand('/theme monokai');
 
-    expect(controller.state.errorBanner).toMatchObject({scope: 'input'});
-    expect(controller.state.errorBanner?.message).toContain('Unknown theme: monokai');
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.inputError).toContain('Unknown theme: monokai');
     expect(controller.state.themeName).toBe('dark');
     expect(transport.requests).toEqual([]);
   });
@@ -2043,6 +2121,86 @@ class DeferredExperimentsTransport implements ServerTransport {
   }
 }
 
+/**
+ * A backend whose design query the test holds open, so a slow /design can
+ * overlap the next pane command the way the live git-backed query does.
+ * Everything else answers immediately, including the perf query.
+ */
+class DeferredDesignTransport implements ServerTransport {
+  readonly requests: RequestInput[] = [];
+  /** Holds `query.design` answers until the test releases them. */
+  deferDesign = false;
+  readonly #pendingDesign: Array<() => void> = [];
+  #message: ((message: ServerMessage) => void) | null = null;
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    this.requests.push(input);
+    const base = {
+      protocol_version: 1 as const,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true as const,
+    };
+    if (input.type === 'query.snapshot') {
+      return Promise.resolve({...base, snapshot: {run_id: 'run', status: 'running', sequence: 0}});
+    }
+    if (input.type === 'query.experiments') {
+      return Promise.resolve({...base, experiments: [], experiments_ready: true});
+    }
+    if (input.type === 'query.performance') {
+      return Promise.resolve({
+        ...base,
+        performance: [
+          {
+            round: 1,
+            perf_metric: 1200,
+            perf_unit: 'total_ops_per_sec',
+            passed: true,
+            profile_skipped: false,
+          },
+          {
+            round: 2,
+            perf_metric: 2400,
+            perf_unit: 'total_ops_per_sec',
+            passed: true,
+            profile_skipped: false,
+          },
+        ],
+        events: [],
+      });
+    }
+    if (input.type === 'query.design') {
+      const response = {...base, design: [], design_ready: true};
+      if (!this.deferDesign) return Promise.resolve(response);
+      return new Promise(resolve => this.#pendingDesign.push(() => resolve(response)));
+    }
+    return Promise.resolve(base);
+  }
+
+  releaseDesign(): void {
+    const pending = this.#pendingDesign.shift();
+    if (!pending) throw new Error('No pending design request');
+    pending();
+  }
+
+  subscribe(
+    _afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    _onDisconnect: (error: Error) => void,
+  ): Promise<EventSubscription> {
+    this.#message = onMessage;
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  emit(runEvent: RunEvent): void {
+    this.#message?.({type: 'event', event: runEvent});
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
 class DeferredChatTransport implements ServerTransport {
   readonly requests: RequestInput[] = [];
   readonly #pending: Array<(response: ProtocolResponse) => void> = [];
@@ -2283,6 +2441,10 @@ function roundFinished(sequence: number, round: number): RunEvent {
 
 function perfRequests(transport: FakeTransport): number {
   return transport.requests.filter(request => request.type === 'query.performance').length;
+}
+
+function designQueries(transport: DeferredDesignTransport): number {
+  return transport.requests.filter(request => request.type === 'query.design').length;
 }
 
 function entry(
