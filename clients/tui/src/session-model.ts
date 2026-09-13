@@ -89,6 +89,13 @@ export interface SessionState {
   themePicker: ThemePicker | null;
   /** Root-level error state, independent of the active transcript or log view. */
   errorBanner: ErrorBannerState | null;
+  /**
+   * A `scope: 'input'` message, shown on the command input's hint row rather
+   * than the banner. Unlike `errorBanner`, this never carries a backend
+   * `detail`/`hint`: it names a typo in what the operator just typed, so it is
+   * a short client-side string rather than a diagnostic.
+   */
+  inputError: string | null;
 }
 
 export type ErrorSeverity = 'recoverable' | 'fatal';
@@ -119,7 +126,7 @@ export interface ErrorBannerState {
 }
 
 /** The agent graph on the left, or the transcript on the right. */
-export type RoundFocus = 'rounds' | 'agents' | 'transcript';
+export type RoundFocus = 'agents' | 'transcript';
 
 /**
  * The experiment log is open when this is non-null. Selection is held as a
@@ -323,6 +330,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     chatDockFits: true,
     themePicker: null,
     errorBanner: null,
+    inputError: null,
   };
 }
 
@@ -351,11 +359,14 @@ export function experimentLogVisible(state: SessionState): boolean {
  * The chat is docked on the landing view: it is part of that view rather than a
  * dialog over it, so a question never hides the table it is about. Inside a
  * hypothesis, and in a terminal too narrow for two columns, it stays the modal
- * it was.
+ * it was. Zoom hands the content row to one pane, so while any other pane is
+ * zoomed the dock is off screen and the chat is the modal again; otherwise
+ * ``/chat`` would put the keys on a composer the operator cannot see.
  */
 export function chatDocked(state: SessionState): boolean {
   return (
     state.chatDockFits &&
+    (state.layout.zoomedPane === null || state.layout.zoomedPane === 'chat') &&
     state.experimentLog !== null &&
     state.hypothesisDetail === null &&
     state.hypothesisScope === null
@@ -1332,12 +1343,7 @@ export function focusedPane(state: SessionState): PaneId {
   if (state.layout.right !== null) {
     return state.layout.focus === 'right' ? 'performance' : 'transcript';
   }
-  // The rounds rail is a selector on the left of the round view, not one of the
-  // zoomable content panes, so it reports as the agents side for pane-level
-  // focus: no content pane lights its border, and F4 zooms the agents pane
-  // rather than a rail that has nothing to enlarge. The rail draws its own
-  // focus border from `roundFocus` directly.
-  return state.roundFocus === 'rounds' ? 'agents' : state.roundFocus;
+  return state.roundFocus;
 }
 
 /**
@@ -1524,7 +1530,9 @@ function applyReducedCore(state: SessionState, core: CoreState): SessionState {
     chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
   });
   if (core.status === 'failed') {
-    const finalDiagnostic = core.diagnostics.at(-1);
+    // Warnings never banner, so a trailing warning must not mask the failure:
+    // surface the last diagnostic that can.
+    const finalDiagnostic = core.diagnostics.filter(d => d.severity !== 'warning').at(-1);
     if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
   }
   return next;
@@ -1751,15 +1759,34 @@ export function dismissErrorBanner(state: SessionState): SessionState {
 }
 
 /**
+ * Clears a standing input-validation message. Called on the next keystroke
+ * and on Esc (#564/#635's reasoning applied to a wrong command rather than an
+ * empty one): the message names a typo in text the operator is already
+ * retyping, so it is stale the moment they start fixing it.
+ */
+export function clearInputError(state: SessionState): SessionState {
+  if (state.inputError === null) return state;
+  return {...state, inputError: null};
+}
+
+/**
  * Records an error independently of any particular view. A terminal event
  * commonly repeats an invocation failure, so equivalent reports promote the
  * current banner instead of burying its cause beneath a duplicate.
+ *
+ * `scope: 'input'` is routed off the banner entirely: it is client-side
+ * validation of what the operator just typed, never a backend diagnostic with
+ * `detail`/`hint`, so it belongs on the command input's own hint row instead
+ * of the shared error surface (see `command-input.ts`).
  */
 export function reportError(
   state: SessionState,
   message: string,
   report: ErrorReport,
 ): SessionState {
+  if (report.scope === 'input') {
+    return {...state, inputError: message};
+  }
   const diagnostic = report.diagnostic ?? null;
   const scope = diagnostic?.scope ?? report.scope;
   const severity = diagnosticSeverity(diagnostic?.severity) ?? report.severity ?? 'recoverable';
@@ -1801,6 +1828,9 @@ export function reportError(
 }
 
 function reportProjectedDiagnostic(state: SessionState, diagnostic: CoreDiagnostic): SessionState {
+  // Warnings (e.g. `framework_warning`, #692) stay in the diagnostics list;
+  // the banner is for errors that need attention now.
+  if (diagnostic.severity === 'warning') return state;
   return reportError(state, diagnostic.summary, {
     scope: diagnostic.scope,
     severity: diagnostic.severity === 'fatal' ? 'fatal' : 'recoverable',

@@ -9,6 +9,7 @@ import {
   mix,
   relativeLuminance,
   resolveTheme,
+  scrim,
   THEME_NAMES,
   type Theme,
 } from './theme.js';
@@ -57,22 +58,31 @@ describe('theme selection', () => {
     expect(dark.conversation.analysis.label).toBe('#b193f8');
   });
 
-  it('keeps the dark baseline pinned to the pre-theme appearance', () => {
+  it('keeps the dark baseline pinned, background excepted', () => {
     const dark = resolveTheme('dark');
-    expect(dark.canvas).toBe('#0f172a');
+    // #574 moved the canvas, and only the canvas: this was the pre-theme
+    // `#0f172a`, and is now the value the panes already painted, so the whole
+    // screen is one shade instead of two. Everything below is unchanged from
+    // the pre-theme palette, which is the point of pinning it here: the token
+    // that was meant to move is the only one that did.
+    expect(dark.canvas).toBe('#020617');
     expect(dark.accent).toBe('#22d3ee');
     expect(dark.border).toBe('#475569');
     expect(dark.conversation.assistant).toEqual({
-      border: '#0891b2',
-      background: '#0e283d',
+      // The canvas. A role used to tint its own fill (`#03192d`, a 14% step off
+      // the canvas); dropping it is what leaves role carried by the heading
+      // word and its colour and nothing else. Both of those are unchanged,
+      // because they already cleared the floor against the tint and so came
+      // through `ensureContrast` untouched either way.
+      background: '#020617',
       label: '#5cb6cc',
       content: '#e2e8f0',
     });
     expect(dark.conversation.failure.label).toBe('#f28484');
     // A tool call is told apart by its text colour, not by a filled band: a
     // block of background behind text reads as a selection.
-    expect(dark.toolCall.background).toBe(dark.conversation.tool.background);
-    expect(dark.toolResult.background).toBe(dark.conversation.tool.background);
+    expect(dark.toolCall.background).toBe(dark.canvas);
+    expect(dark.toolResult.background).toBe(dark.canvas);
     expect(dark.toolCall.foreground).not.toBe(dark.toolResult.foreground);
     expect(dark.markdown.code).toBe('#a5f3fc');
     expect(dark.markdown.codeBackground).toBe('#1e293b');
@@ -124,10 +134,31 @@ describe('semantic roles', () => {
 
   it.each(
     themes.map(theme => [theme.name, theme] as const),
-  )('%s keeps every conversation card label and body readable on its own fill', (_name, theme: Theme) => {
+  )('%s keeps highlighted code tokens readable on the code surface', (_name, theme: Theme) => {
+    const minimum = theme.name.startsWith('high-contrast') ? 7 : 4.5;
+    // These paint on a fenced block, not the canvas prose sits on, so they are
+    // checked against codeBackground rather than canvas.
+    for (const token of [
+      theme.markdown.keyword,
+      theme.markdown.string,
+      theme.markdown.comment,
+      theme.markdown.number,
+    ]) {
+      expect(contrastRatio(token, theme.markdown.codeBackground)).toBeGreaterThanOrEqual(minimum);
+    }
+  });
+
+  it.each(
+    themes.map(theme => [theme.name, theme] as const),
+  )('%s keeps every conversation role readable on the canvas it now draws on', (_name, theme: Theme) => {
     const minimum = theme.name.startsWith('high-contrast') ? 7 : 4.5;
     for (const role of CONVERSATION_ROLES) {
       const {label, content, background} = theme.conversation[role];
+      // No role paints a fill any more, so this is the canvas, and the floor is
+      // remade against the cell the text actually lands on. A tint coming back
+      // moves the background out from under both checks below at once, which is
+      // why it is asserted here rather than assumed.
+      expect(background).toBe(theme.canvas);
       expect(contrastRatio(label, background)).toBeGreaterThanOrEqual(minimum);
       expect(contrastRatio(content, background)).toBeGreaterThanOrEqual(minimum);
     }
@@ -183,6 +214,39 @@ describe('semantic roles', () => {
     );
   });
 
+  it.each(
+    themes.map(theme => [theme.name, theme] as const),
+  )('%s keeps every semantic foreground readable where a pane draws it', (_name, theme: Theme) => {
+    // Panes reuse these tokens raw, with no re-contrast at the call site:
+    // error-banner draws its message and hint in `warning` and its fatal
+    // message in `conversation.failure.content`; overlay borders and bodies its
+    // help/error/detail kinds in `success`/`error`/`info`; experiment-log
+    // colours rows and the active-hypothesis column in
+    // `warning`/`success`/`error`; theme-picker borders itself in `info`;
+    // chat-overlay borders itself in `conversation.analysis.label`; the header
+    // draws the brand in `accent` and the run state in a verdict colour.
+    //
+    // Every one of those fills `canvas` (#574 collapsed the surface ladder
+    // instead of re-ordering it), so `buildTheme`'s guarantee is now made
+    // against the cell the text actually lands on and this asserts it there.
+    // Stricter than `status colors distinguishable` above, which asks only 3:1
+    // and only of three of them: a token retuned below the reading floor, or a
+    // second background token coming back, breaks all of these at once and
+    // without a symptom until someone reads a pane.
+    const minimum = theme.name.startsWith('high-contrast') ? 7 : 4.5;
+    for (const status of [
+      theme.accent,
+      theme.info,
+      theme.success,
+      theme.warning,
+      theme.error,
+      theme.conversation.failure.content,
+      theme.conversation.analysis.label,
+    ] as const) {
+      expect(contrastRatio(status, theme.canvas)).toBeGreaterThanOrEqual(minimum);
+    }
+  });
+
   it('orients light and dark themes in opposite luminance directions', () => {
     for (const theme of themes) {
       const canvas = relativeLuminance(theme.canvas);
@@ -209,9 +273,49 @@ describe('semantic roles', () => {
       const light = resolveTheme(lightName);
       expect(dark.canvas).not.toBe(light.canvas);
       expect(dark.textPrimary).not.toBe(light.textPrimary);
-      expect(dark.conversation.assistant.background).not.toBe(
-        light.conversation.assistant.background,
-      );
+      // The label, not the background: every role draws on the canvas now, so
+      // comparing backgrounds would only restate the line above.
+      expect(dark.conversation.assistant.label).not.toBe(light.conversation.assistant.label);
+    }
+  });
+});
+
+describe('modal scrim', () => {
+  const themes = listThemes();
+
+  it.each(
+    themes.map(theme => [theme.name, theme] as const),
+  )('%s recedes behind a modal without erasing what is behind it', (name: string, theme: Theme) => {
+    const {color, strength} = scrim(theme);
+    // The theme's own canvas, so the background fades into the surface it
+    // already sits on rather than toward a tone the palette never uses.
+    expect(color).toBe(theme.canvas);
+    expect(strength).toBeGreaterThan(0);
+    expect(strength).toBeLessThan(1);
+
+    const floor = name.startsWith('high-contrast') ? 7 : 4.5;
+    const recessed = contrastRatio(mix(theme.textPrimary, color, strength), color);
+    expect(contrastRatio(theme.textPrimary, theme.canvas)).toBeGreaterThanOrEqual(floor);
+    // Body text lands on WCAG's large-text floor whichever theme it started
+    // from: still recognizable, and well under the comfortable-reading floor
+    // the theme guarantees, which now belongs to the modal alone.
+    expect(recessed).toBeLessThanOrEqual(3);
+    expect(recessed).toBeGreaterThanOrEqual(2.5);
+    expect(recessed).toBeLessThan(floor);
+  });
+
+  it('solves a different strength per theme rather than reusing one blend', () => {
+    const strengths = themes.map(theme => scrim(theme).strength);
+    // Solarized Dark starts at 5.6:1 body text and High Contrast Dark at 21:1,
+    // so one blend cannot recede both. The spread is the point, not a defect.
+    expect(new Set(strengths).size).toBe(themes.length);
+    expect(Math.max(...strengths) - Math.min(...strengths)).toBeGreaterThan(0.2);
+  });
+
+  it('never leaves a modal fully transparent or the background erased', () => {
+    for (const theme of themes) {
+      expect(scrim(theme).strength).toBeGreaterThan(0.3);
+      expect(scrim(theme).strength).toBeLessThan(0.85);
     }
   });
 });

@@ -1,164 +1,293 @@
+from __future__ import annotations
+
 from pathlib import Path
 
+import agentshim
 import pytest
+from tests.support import provider_profiles as fake_profiles
 
 from vibesys.agents import cli_docker
-from vibesys.agents.cli_docker import DockerAuthPath
 
+_SHIPPED = ("claude", "codex", "gemini", "opencode")
 
-def test_auth_import_copies_directories_and_files_to_private_writable_paths(  # noqa: ANN201  # tracked: #288
-    tmp_path: Path,
-    monkeypatch,  # noqa: ANN001  # tracked: #288
-):
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    auth_file = tmp_path / "auth.json"
-    auth_file.write_text('{"synthetic": true}\n')
-    monkeypatch.setitem(
-        cli_docker.DOCKER_AUTH_PATHS,
-        "fixture",
-        [
-            DockerAuthPath(state_dir, "/root/.fixture"),
-            DockerAuthPath(auth_file, "/root/.fixture.json"),
-        ],
-    )
-
-    assert cli_docker.auth_bind_mounts("fixture") == [
-        (str(state_dir), "/opt/vibesys-auth/0", True),
-        (str(auth_file), "/opt/vibesys-auth/1", True),
-    ]
-    assert cli_docker.auth_copy_commands("fixture") == [
-        "mkdir -p /root/.fixture && cp -a /opt/vibesys-auth/0/. /root/.fixture/",
-        "mkdir -p /root && cp -a /opt/vibesys-auth/1 /root/.fixture.json",
-    ]
-
-
-def test_auth_import_uses_provider_native_container_paths():  # noqa: ANN201  # tracked: #288
-    assert {
-        provider: [
-            (spec.host_path.relative_to(Path.home()).as_posix(), spec.container_path)
-            for spec in specs
-        ]
-        for provider, specs in cli_docker.DOCKER_AUTH_PATHS.items()
-    } == {
-        "claude": [
-            (".claude/.credentials.json", "/root/.claude/.credentials.json"),
-            (".claude/settings.json", "/root/.claude/settings.json"),
-            (".claude/settings.local.json", "/root/.claude/settings.local.json"),
-            (".claude.json", "/root/.claude.json"),
-        ],
-        "gemini": [
-            (".gemini/oauth_creds.json", "/root/.gemini/oauth_creds.json"),
-            (".gemini/google_accounts.json", "/root/.gemini/google_accounts.json"),
-            (".gemini/settings.json", "/root/.gemini/settings.json"),
-            (".gemini/.env", "/root/.gemini/.env"),
-        ],
-        "codex": [
-            (".codex/auth.json", "/root/.codex/auth.json"),
-            (".codex/config.toml", "/root/.codex/config.toml"),
-        ],
-        "opencode": [
-            (
-                ".local/share/opencode/auth.json",
-                "/root/.local/share/opencode/auth.json",
-            ),
-            (".config/opencode/opencode.json", "/root/.config/opencode/opencode.json"),
-            (
-                ".config/opencode/opencode.jsonc",
-                "/root/.config/opencode/opencode.jsonc",
-            ),
-            (".config/opencode/config.json", "/root/.config/opencode/config.json"),
-            (
-                ".config/opencode/config.jsonc",
-                "/root/.config/opencode/config.jsonc",
-            ),
-            (".config/opencode/.env", "/root/.config/opencode/.env"),
-        ],
-    }
-
-
-def test_provider_auth_imports_exclude_bulk_runtime_roots():  # noqa: ANN201  # tracked: #288
-    configured_sources = {
-        spec.host_path for specs in cli_docker.DOCKER_AUTH_PATHS.values() for spec in specs
-    }
-
-    assert configured_sources.isdisjoint(
-        {
-            Path.home() / ".claude",
-            Path.home() / ".gemini",
-            Path.home() / ".codex",
-            Path.home() / ".local" / "share" / "opencode",
-            Path.home() / ".config" / "opencode",
-        }
-    )
-
-
-def test_provider_auth_env_registry_covers_credentials_not_model_selection():  # noqa: ANN201  # tracked: #288
-    assert cli_docker.DOCKER_AUTH_ENV_VARS == {
-        "claude": (
+# Stand-in profiles for the tests whose subject is VibeSys's derivation rather
+# than any CLI's declared behaviour. agentshim registers real profiles for all
+# four (and for providers VibeSys does not ship), but a test of the derivation
+# should fail when the derivation changes, not when a library release edits one
+# CLI's install recipe. `TestShippedProfileAssumptions` covers the real
+# profiles.
+_FAKE_PROFILES = {
+    "claude": fake_profiles.profile(
+        "claude",
+        state_dirs=(".claude", ".claude.json", ".config/claude"),
+        auth_env_vars=(
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_CUSTOM_HEADERS",
         ),
-        "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-        "codex": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
-        "opencode": (),
-    }
-    # VibeSys owns per-role model selection; a host export must not override it.
-    forwarded = {name for names in cli_docker.DOCKER_AUTH_ENV_VARS.values() for name in names}
-    assert forwarded.isdisjoint({"ANTHROPIC_MODEL", "OPENAI_MODEL", "GEMINI_MODEL"})
-    assert set(cli_docker.DOCKER_AUTH_ENV_VARS) == set(cli_docker.DOCKER_AUTH_PATHS)
+        auth_files=(
+            ".claude/.credentials.json",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude.json",
+        ),
+    ),
+    "codex": fake_profiles.profile(
+        "codex",
+        state_dirs=(".codex", ".config/codex"),
+        auth_env_vars=("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        auth_files=(".codex/auth.json", ".codex/config.toml"),
+    ),
+    "gemini": fake_profiles.profile(
+        "gemini",
+        state_dirs=(".gemini", ".config/gemini"),
+        auth_env_vars=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        auth_files=(
+            ".gemini/oauth_creds.json",
+            ".gemini/google_accounts.json",
+            ".gemini/settings.json",
+            ".gemini/.env",
+        ),
+    ),
+    "opencode": fake_profiles.profile(
+        "opencode",
+        state_dirs=(".local/share/opencode", ".config/opencode"),
+        auth_env_vars=(),
+        auth_files=(
+            ".local/share/opencode/auth.json",
+            ".config/opencode/opencode.json",
+            ".config/opencode/opencode.jsonc",
+            ".config/opencode/config.json",
+            ".config/opencode/config.jsonc",
+            ".config/opencode/.env",
+        ),
+    ),
+}
 
 
-def test_auth_env_passthrough_forwards_only_variables_the_host_actually_set(  # noqa: ANN201  # tracked: #288
-    monkeypatch,  # noqa: ANN001  # tracked: #288
-):
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-value")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.invalid/v1")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "   ")
-    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
-    monkeypatch.setenv("ANTHROPIC_MODEL", "host-selected-model")
-
-    assert cli_docker.auth_env_passthrough("claude") == {
-        "ANTHROPIC_AUTH_TOKEN": "token-value",
-        "ANTHROPIC_BASE_URL": "https://proxy.invalid/v1",
-    }
+@pytest.fixture
+def fake_profiles_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer every profile lookup from the fakes above, not from agentshim."""
+    fake_profiles.install(monkeypatch, _FAKE_PROFILES)
 
 
-def test_auth_env_passthrough_is_empty_without_host_credentials(monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
-    for name in cli_docker.DOCKER_AUTH_ENV_VARS["claude"]:
-        monkeypatch.delenv(name, raising=False)
+class TestAuthPaths:
+    """Which provider state files are staged into an editor container."""
 
-    assert cli_docker.auth_env_passthrough("claude") == {}
-    assert cli_docker.auth_env_passthrough("unregistered-provider") == {}
+    def test_stages_exactly_the_profiles_declared_auth_files(
+        self,
+        fake_profiles_installed: None,
+    ) -> None:
+        """``auth_paths`` derives entirely from ``ProviderProfile.auth_files``.
+
+        Expectations come from the fake profile itself, not a second
+        hand-typed list, so this fails only when the derivation rule changes.
+        """
+        del fake_profiles_installed
+        home = Path.home()
+
+        for provider in _SHIPPED:
+            expected = [
+                (auth_file, f"/home/agent/{auth_file}")
+                for auth_file in _FAKE_PROFILES[provider].auth_files
+            ]
+            staged = [
+                (spec.host_path.relative_to(home).as_posix(), spec.container_path)
+                for spec in cli_docker.auth_paths(provider)
+            ]
+            assert staged == expected
+
+    def test_never_stages_a_bulk_runtime_root(self, fake_profiles_installed: None) -> None:
+        del fake_profiles_installed
+        configured = {
+            spec.host_path for provider in _SHIPPED for spec in cli_docker.auth_paths(provider)
+        }
+
+        assert configured.isdisjoint(
+            {
+                Path.home() / ".claude",
+                Path.home() / ".gemini",
+                Path.home() / ".codex",
+                Path.home() / ".local" / "share" / "opencode",
+                Path.home() / ".config" / "opencode",
+            }
+        )
+
+    def test_stages_nothing_when_the_profile_declares_no_auth_files(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake_profiles.install(
+            monkeypatch,
+            {"fixture": fake_profiles.profile("fixture", state_dirs=(".fixture-cache",))},
+        )
+
+        assert cli_docker.auth_paths("fixture") == []
+
+    def test_rejects_a_provider_agentshim_does_not_register(self) -> None:
+        with pytest.raises(ValueError, match="unregistered-provider"):
+            cli_docker.auth_paths("unregistered-provider")
 
 
-def test_codex_container_installs_luna_capable_cli_version():  # noqa: ANN201  # tracked: #288
-    commands = cli_docker.docker_init_commands("codex")
+class TestAuthImport:
+    """Staged state is mounted read-only and copied into writable storage."""
 
-    assert (
-        f"npm install -g --include=optional @openai/codex@{cli_docker.CODEX_DOCKER_CLI_VERSION}"
-    ) in commands
-    assert cli_docker.CODEX_DOCKER_CLI_VERSION == "0.144.4"
+    def test_mounts_and_names_each_existing_leaf_for_writable_import(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text('{"synthetic": true}\n')
+        (codex_home / "config.toml").write_text("model = 'synthetic'\n")
+        (tmp_path / ".claude.json").write_text('{"synthetic": true}\n')
+        monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+        fake_profiles.install(
+            monkeypatch,
+            {
+                "fixture": fake_profiles.profile(
+                    "fixture",
+                    state_dirs=(".codex", ".claude.json"),
+                    auth_files=(".codex/auth.json", ".codex/config.toml", ".claude.json"),
+                )
+            },
+        )
+
+        assert cli_docker.auth_bind_mounts("fixture") == [
+            (str(codex_home / "auth.json"), "/opt/vibesys-auth/0", True),
+            (str(codex_home / "config.toml"), "/opt/vibesys-auth/1", True),
+            (str(tmp_path / ".claude.json"), "/opt/vibesys-auth/2", True),
+        ]
+        # `auth_copy_paths` hands these straight to `DockerSandbox(auth_files=...)`,
+        # which copies each pair in as a start-time step; no shell recipe.
+        assert cli_docker.auth_copy_paths("fixture") == [
+            ("/opt/vibesys-auth/0", "/home/agent/.codex/auth.json"),
+            ("/opt/vibesys-auth/1", "/home/agent/.codex/config.toml"),
+            ("/opt/vibesys-auth/2", "/home/agent/.claude.json"),
+        ]
+
+    def test_keeps_staging_indexes_stable_when_a_host_file_is_absent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text("model = 'synthetic'\n")
+        monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+        fake_profiles.install(
+            monkeypatch,
+            {
+                "fixture": fake_profiles.profile(
+                    "fixture",
+                    state_dirs=(".codex",),
+                    auth_files=(".codex/auth.json", ".codex/config.toml"),
+                )
+            },
+        )
+
+        # The mount index is the position in the full list, so a missing
+        # auth.json must not renumber the staging path of config.toml.
+        assert cli_docker.auth_bind_mounts("fixture") == [
+            (str(codex_home / "config.toml"), "/opt/vibesys-auth/1", True),
+        ]
+        assert cli_docker.auth_copy_paths("fixture") == [
+            ("/opt/vibesys-auth/1", "/home/agent/.codex/config.toml"),
+        ]
 
 
-@pytest.mark.parametrize("provider", ["claude", "gemini", "codex", "opencode"])
-def test_editor_container_installs_only_mcp_v1(provider: str) -> None:
-    commands = cli_docker.docker_init_commands(provider)
+class TestAuthEnvVars:
+    """Credential variables come from the profile; model selection never does."""
 
-    assert any("command -v pip3" in command for command in commands)
-    assert "PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --quiet 'mcp>=1.0,<2'" in commands
+    def test_matches_the_shipped_claude_profile(self) -> None:
+        assert cli_docker.auth_env_vars("claude") == (
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+        )
+
+    def test_carries_no_model_selection_variable(self, fake_profiles_installed: None) -> None:
+        del fake_profiles_installed
+        forwarded = {name for provider in _SHIPPED for name in cli_docker.auth_env_vars(provider)}
+
+        # VibeSys owns per-role model selection; a host export must not
+        # override it inside the container.
+        assert forwarded.isdisjoint({"ANTHROPIC_MODEL", "OPENAI_MODEL", "GEMINI_MODEL"})
+
+    def test_forwards_only_variables_the_host_actually_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-value")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.invalid/v1")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "   ")
+        monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+        monkeypatch.setenv("ANTHROPIC_MODEL", "host-selected-model")
+
+        assert cli_docker.auth_env_passthrough("claude") == {
+            "ANTHROPIC_AUTH_TOKEN": "token-value",
+            "ANTHROPIC_BASE_URL": "https://proxy.invalid/v1",
+        }
+
+    def test_is_empty_without_host_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in cli_docker.auth_env_vars("claude"):
+            monkeypatch.delenv(name, raising=False)
+
+        assert cli_docker.auth_env_passthrough("claude") == {}
+
+    def test_rejects_a_provider_agentshim_does_not_register(self) -> None:
+        with pytest.raises(ValueError, match="unregistered-provider"):
+            cli_docker.auth_env_passthrough("unregistered-provider")
 
 
-@pytest.mark.parametrize("provider", ["claude", "gemini", "codex", "opencode"])
-def test_editor_container_installs_pinned_rust_toolchain(provider: str):  # noqa: ANN201  # tracked: #288
-    commands = cli_docker.docker_init_commands(provider)
-    rust_install = next(command for command in commands if "rustup-init.sh" in command)
+class TestShippedProfileAssumptions:
+    """The real agentshim profiles, run through the tables above.
 
-    assert "command -v cargo" in rust_install
-    assert f"--default-toolchain {cli_docker.RUST_DOCKER_TOOLCHAIN_VERSION}" in rust_install
-    assert "--profile minimal" in rust_install
-    assert "--component rustfmt --component clippy" in rust_install
-    assert "ln -sf /root/.cargo/bin/* /usr/local/bin/" in rust_install
-    assert cli_docker.RUST_DOCKER_TOOLCHAIN_VERSION == "1.92.0"
+    Nothing here is monkeypatched: these pin that what the four shipped
+    providers actually declare still satisfies what VibeSys derives from it, so
+    a library release that renames a state directory or adds a
+    model-selection variable fails here rather than at container start.
+    """
+
+    @pytest.mark.parametrize("provider", _SHIPPED)
+    def test_auth_paths_mirrors_the_profiles_own_auth_files(self, provider: str) -> None:
+        profile = agentshim.get_provider(provider).profile
+        home = Path.home()
+
+        assert [
+            (spec.host_path, spec.container_path) for spec in cli_docker.auth_paths(provider)
+        ] == [(home / auth_file, f"/home/agent/{auth_file}") for auth_file in profile.auth_files]
+        # A provider that declares no auth files starts its container CLI
+        # logged out.
+        assert profile.auth_files
+        # Every declared auth file lies inside a declared state directory;
+        # agentshim's own `test_conventions.py` pins that per provider, so
+        # this only checks that VibeSys's read seam still sees it that way.
+        for auth_file in profile.auth_files:
+            assert any(
+                auth_file == state_dir or auth_file.startswith(f"{state_dir}/")
+                for state_dir in profile.state_dirs
+            ), auth_file
+
+    @pytest.mark.parametrize("provider", _SHIPPED)
+    def test_auth_env_vars_carry_credentials_and_no_model_selection(self, provider: str) -> None:
+        forwarded = cli_docker.auth_env_vars(provider)
+
+        assert forwarded == agentshim.get_provider(provider).profile.auth_env_vars
+        # VibeSys owns per-role model selection, so no shipped profile may hand
+        # the container a host override of it (see `auth_env_vars`).
+        assert [name for name in forwarded if name.endswith("_MODEL")] == []
+
+
+def test_docker_provider_env_covers_every_provider_vibesys_ships() -> None:
+    assert set(cli_docker.DOCKER_PROVIDER_ENV) == set(_SHIPPED)
+    # The agent image runs the CLI as the non-root ``agent`` user, so Claude's
+    # root-only IS_SANDBOX=1 escape hatch (a profile.container_env entry) is no
+    # longer folded in.
+    assert "IS_SANDBOX" not in cli_docker.DOCKER_PROVIDER_ENV["claude"]
+    assert all(
+        env["PYTHONPATH"] == "/opt/vibesys" for env in cli_docker.DOCKER_PROVIDER_ENV.values()
+    )
