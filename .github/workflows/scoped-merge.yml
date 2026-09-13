@@ -1,0 +1,38 @@
+name: Scoped TUI and server merge
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: scoped-merge-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/merge-tui'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # issue_comment workflows use the default branch. Pin the checkout to it
+      # explicitly and never fetch or execute the pull request head.
+      - name: Check out trusted merge policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Authorize and merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCOPED_MERGE_USERS: ${{ vars.SCOPED_MERGE_USERS }}
+        run: python3 scripts/scoped_merge.py --event "$GITHUB_EVENT_PATH"

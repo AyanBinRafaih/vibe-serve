@@ -351,11 +351,14 @@ export function experimentLogVisible(state: SessionState): boolean {
  * The chat is docked on the landing view: it is part of that view rather than a
  * dialog over it, so a question never hides the table it is about. Inside a
  * hypothesis, and in a terminal too narrow for two columns, it stays the modal
- * it was.
+ * it was. Zoom hands the content row to one pane, so while any other pane is
+ * zoomed the dock is off screen and the chat is the modal again; otherwise
+ * ``/chat`` would put the keys on a composer the operator cannot see.
  */
 export function chatDocked(state: SessionState): boolean {
   return (
     state.chatDockFits &&
+    (state.layout.zoomedPane === null || state.layout.zoomedPane === 'chat') &&
     state.experimentLog !== null &&
     state.hypothesisDetail === null &&
     state.hypothesisScope === null
@@ -1519,7 +1522,9 @@ function applyReducedCore(state: SessionState, core: CoreState): SessionState {
     chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
   });
   if (core.status === 'failed') {
-    const finalDiagnostic = core.diagnostics.at(-1);
+    // Warnings never banner, so a trailing warning must not mask the failure:
+    // surface the last diagnostic that can.
+    const finalDiagnostic = core.diagnostics.filter(d => d.severity !== 'warning').at(-1);
     if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
   }
   return next;
@@ -1796,6 +1801,9 @@ export function reportError(
 }
 
 function reportProjectedDiagnostic(state: SessionState, diagnostic: CoreDiagnostic): SessionState {
+  // Warnings (e.g. `framework_warning`, #692) stay in the diagnostics list;
+  // the banner is for errors that need attention now.
+  if (diagnostic.severity === 'warning') return state;
   return reportError(state, diagnostic.summary, {
     scope: diagnostic.scope,
     severity: diagnostic.severity === 'fatal' ? 'fatal' : 'recoverable',

@@ -1,15 +1,22 @@
 import {afterEach, describe, expect, it} from 'bun:test';
-import {BoxRenderable, type Renderable, rgbToHex, TextRenderable} from '@opentui/core';
+import {
+  BoxRenderable,
+  type Renderable,
+  rgbToHex,
+  TextAttributes,
+  TextRenderable,
+} from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
 import type {SessionController} from '../session-controller.js';
 import {type ConversationEntry, initialSessionState} from '../session-model.js';
-import {ConversationView, styleSourceTags} from './conversation.js';
+import {ConversationView, styleTranscriptText} from './conversation.js';
 import {createMarkdownStyle} from './styles.js';
 import {
   CONVERSATION_ROLES,
   contrastRatio,
   ensureContrast,
   listThemes,
+  RUN_DIVIDER_MIN_CONTRAST,
   resolveTheme,
   SUBTLE_TEXT_MIN_CONTRAST,
   type Theme,
@@ -77,8 +84,9 @@ function cardOf(view: ConversationView, id: string): BoxRenderable {
  * An entry from a named agent in a named round: the pair a heading splits.
  *
  * 'analysis' because run collapsing is about entries drawn as cards. #620's
- * bare kinds ('status', and unflagged 'diagnostic'/'subprocess') keep their own
- * grammar and are covered separately below.
+ * bare kinds ('status', and unflagged 'diagnostic'/'subprocess') group into
+ * runs the same way and differ only in the frame they do not draw; they are
+ * covered separately below.
  */
 function from(
   who: {agentKind: string; roundLabel: string},
@@ -163,17 +171,13 @@ describe('conversation entry row cost (#565)', () => {
   });
 
   it('costs a divider and a heading per entry, not a margin row plus a four-sided card', async () => {
-    // Divider (1) + heading (1) + one content line (1) for an entry drawn as a
-    // card. A bordered card with its own margin row cost 5 rows for the same
-    // content.
-    //
-    // 'status' is the one kind that does not draw the divider, and that is not
-    // this change's doing: #620 demoted lifecycle chatter to bare lines, so a
-    // status entry draws no frame at all and costs a heading plus its content.
-    // Giving it the rule would undo that demotion, so the row cost is asserted
-    // per kind rather than as one number for all of them.
+    // Divider (1) + heading (1) + one content line (1) for a run opener. A
+    // bordered card with its own margin row cost 5 rows for the same content.
+    // #620's bare kinds pay the same three rows: the divider is the separator
+    // between runs, and the blank row a bare opener used to draw instead was
+    // the same separator spelled less legibly.
     const expected: Record<string, {height: number; border: boolean | 'top'[]}> = {
-      a: {height: 2, border: false},
+      a: {height: 3, border: ['top']},
       b: {height: 3, border: ['top']},
       c: {height: 3, border: ['top']},
     };
@@ -188,8 +192,7 @@ describe('conversation entry row cost (#565)', () => {
       expect([entry.id, card.border]).toEqual([entry.id, want.border]);
     }
     // No stray rows between cards either: the three entries cost exactly 9 rows
-    // end to end (2 + 3 + 3, plus the single margin row the bare status entry
-    // keeps from #620). The pre-#565 card cost 5 rows each, 15 total.
+    // end to end (3 + 3 + 3). The pre-#565 card cost 5 rows each, 15 total.
     expect(view.output.height).toBe(9);
     void testRenderer;
   });
@@ -258,11 +261,11 @@ describe('conversation entry row cost (#565)', () => {
     expect(view.output.height).toBe(3 + 1 + 3 + 3 + 3 + 1 + 3);
   });
 
-  it('collapses a run of #620 bare entries without giving one a divider', async () => {
+  it('collapses a run of #620 bare entries behind one divider', async () => {
     // Bare lifecycle lines are most of what run collapsing buys: a run of them
     // is one agent talking, and it restated the agent above every line. They
-    // lose the repeated heading like any other entry and never gain the
-    // divider, which is the half of the chrome #620's demotion is about.
+    // lose the repeated heading like any other entry, and the divider they do
+    // draw is on the opener alone.
     const entries: ConversationEntry[] = [
       {id: 'b1', kind: 'status', label: 'launcher', content: 'one'},
       {id: 'b2', kind: 'status', label: 'launcher', content: 'two'},
@@ -271,11 +274,11 @@ describe('conversation entry row cost (#565)', () => {
       from(judge, 'j2', 'five'),
     ];
     const {view} = await renderEntries(entries);
-    for (const id of ['b1', 'b2', 'b3']) expect([id, cardOf(view, id).border]).toEqual([id, false]);
-    // The opener keeps heading and content; the rest of the run is content
-    // alone, and #620's margin row goes with the heading rather than splitting
-    // the run with a blank line.
-    expect(cardOf(view, 'b1').height).toBe(2);
+    expect(cardOf(view, 'b1').border).toEqual(['top']);
+    for (const id of ['b2', 'b3']) expect([id, cardOf(view, id).border]).toEqual([id, false]);
+    // The opener keeps divider, heading and content; the rest of the run is
+    // content alone, so no blank row splits one speaker's block.
+    expect(cardOf(view, 'b1').height).toBe(3);
     expect(cardOf(view, 'b2').height).toBe(1);
     expect(cardOf(view, 'b3').height).toBe(1);
     expect(view.output.findDescendantById('event-b2-heading')).toBeUndefined();
@@ -285,8 +288,7 @@ describe('conversation entry row cost (#565)', () => {
     expect(cardOf(view, 'j1').border).toEqual(['top']);
     expect(cardOf(view, 'j1').height).toBe(3);
     expect(cardOf(view, 'j2').height).toBe(1);
-    // One margin row (b1) + 2 + 1 + 1 + 3 + 1.
-    expect(view.output.height).toBe(1 + 2 + 1 + 1 + 3 + 1);
+    expect(view.output.height).toBe(3 + 1 + 1 + 3 + 1);
   });
 
   it('shows the cursor on an entry inside a run without moving its content', async () => {
@@ -310,6 +312,52 @@ describe('conversation entry row cost (#565)', () => {
     const head = cardOf(await renderEntries(run, 'a').then(mounted => mounted.view), 'a');
     expect(head.border).toEqual(['top', 'left']);
     expect(head.getChildren()[0]?.x).toBe(cardOf(resting.view, 'a').getChildren()[0]?.x);
+  });
+});
+
+/**
+ * The rule is the separator between one run and the next, and #620's bare
+ * entries need separating like any other. Both cases below come from the tail
+ * of dev/fixtures/bad-cpp-round1.jsonl, where the judge's "Reached max_rounds"
+ * notice printed directly under the `round-1 · PASS` summary with nothing
+ * between them.
+ */
+describe('every run opener draws the divider', () => {
+  it('draws the rule on a bare entry that opens a run', async () => {
+    const entries: ConversationEntry[] = [
+      {id: 'summary', kind: 'result', label: 'round-1 · PASS', content: '1 attempt(s)'},
+      {
+        id: 'notice',
+        kind: 'diagnostic',
+        label: 'judge',
+        agentKind: 'judge',
+        roundLabel: 'round-1-retry-1-judge',
+        content: 'Reached max_rounds=1. Stopping.',
+      },
+    ];
+    const {testRenderer, view} = await renderEntries(entries);
+    // The notice is a different speaker from the summary above it, so it opens
+    // a run, and a run opener is separated from the run above whether or not
+    // #620 draws it as a bare line.
+    expect(cardOf(view, 'notice').border).toEqual(['top']);
+    // On screen, not just on the box: the rule sits above the notice's own
+    // heading. The summary's rule is drawn either way, so the row asserted is
+    // the second one, which is the row that was missing.
+    const rows = testRenderer.captureCharFrame().split('\n');
+    const notice = rows.findIndex(row => row.includes('Reached max_rounds'));
+    expect(rows[notice - 1]).toContain('judge');
+    expect(rows[notice - 2]?.trimEnd()).toMatch(/^─+$/);
+  });
+
+  it('keeps a bare entry inside a run frameless', async () => {
+    const entries: ConversationEntry[] = [
+      {id: 'b1', kind: 'diagnostic', label: 'launcher', content: 'one'},
+      {id: 'b2', kind: 'diagnostic', label: 'launcher', content: 'two'},
+    ];
+    const {view} = await renderEntries(entries);
+    expect(cardOf(view, 'b1').border).toEqual(['top']);
+    // `false`, not an empty side list (tui-conventions.md).
+    expect(cardOf(view, 'b2').border).toBe(false);
   });
 });
 
@@ -401,24 +449,30 @@ describe('speaker runs survive incremental rendering (#565)', () => {
  * at that layer.
  */
 describe('role and selection stay distinguishable across every theme (#565)', () => {
-  it('holds every role divider to the 3:1 floor textSubtle uses for punctuation and rules', () => {
+  it('holds the run divider above the floor subtle text is held to', () => {
+    // The divider is structural, not decoration, so it does not share
+    // `textSubtle`'s floor. Pinned here because the whole point of the raise is
+    // that the two numbers differ.
+    expect(RUN_DIVIDER_MIN_CONTRAST).toBeGreaterThan(SUBTLE_TEXT_MIN_CONTRAST);
     for (const theme of listThemes()) {
-      const restingColors = CONVERSATION_ROLES.map(role => {
-        // Mirrors the `ensureContrast` call `#renderEntry` makes on
-        // `palette.border` before using it as the resting divider colour.
-        const resting = ensureContrast(
-          theme.conversation[role].border,
-          theme.canvas,
-          SUBTLE_TEXT_MIN_CONTRAST,
-        );
-        expect(contrastRatio(resting, theme.canvas)).toBeGreaterThanOrEqual(
-          SUBTLE_TEXT_MIN_CONTRAST,
-        );
-        return resting;
-      });
-      // Nudging a marginal accent toward black or white must not collapse
-      // two roles onto the same divider colour.
-      expect(new Set(restingColors).size).toBe(restingColors.length);
+      // Mirrors the `ensureContrast` call `#renderEntry` makes on `border`
+      // before using it as the resting divider colour. `border` is not run
+      // through `ensureContrast` in theme.ts the way text tokens are, and a
+      // one-row rule that no longer carries a role accent cannot lean on its
+      // own area to stay noticeable the way a four-sided border could.
+      const resting = ensureContrast(theme.border, theme.canvas, RUN_DIVIDER_MIN_CONTRAST);
+      expect([
+        theme.name,
+        contrastRatio(resting, theme.canvas) >= RUN_DIVIDER_MIN_CONTRAST,
+      ]).toEqual([theme.name, true]);
+      // Still a rule and not the cursor: selection is the one thing that
+      // replaces this colour, so the two may not resolve to the same cell.
+      expect([theme.name, resting]).not.toEqual([theme.name, theme.borderFocus]);
+      // One colour for every role, which is the point: a divider separates one
+      // run from the next and says nothing about who is speaking. Role is the
+      // heading word and the heading colour, and those stay distinct.
+      const labels = CONVERSATION_ROLES.map(role => theme.conversation[role].label);
+      expect(new Set(labels).size).toBe(labels.length);
     }
   });
 
@@ -432,58 +486,98 @@ describe('role and selection stay distinguishable across every theme (#565)', ()
 });
 
 /**
- * #647 review: a reviewer asked that the run id keep the card's colour
- * instead of fading to `textSubtle`, and that a bracketed source tag
- * (`[git-tracking]`, `[framework-validation]`) stand out from the rest of its
- * line. `styleSourceTags` is exported and tested directly for the same reason
- * `unwrapShellCommand` is in previews.ts: the line-splitting and anchoring is
- * the whole of the behaviour, and a full render obscures which case failed.
+ * `styleTranscriptText` is the one place the client styles part of a line, and
+ * it is exported and tested directly for the same reason `unwrapShellCommand`
+ * is in previews.ts: the line-splitting and anchoring is the whole of the
+ * behaviour, and a full render obscures which case failed.
+ *
+ * Both spans it draws are the colour diet, not decoration. A `[source-tag]`
+ * prefix is on nearly every subprocess line and is about 24 of ~78 cells, so it
+ * recedes into `textMuted` rather than carrying the card's label colour. `PASS`
+ * and `FAIL` are what a reader scans for, so they take the emphasis instead:
+ * the verdict role's colour and bold, with the word itself as the channel WCAG
+ * 1.4.1 asks for.
  */
-describe('styleSourceTags (#647)', () => {
-  const palette = resolveTheme(null).conversation.analysis;
+describe('styleTranscriptText', () => {
+  const theme = resolveTheme(null);
+  const palette = theme.conversation.analysis;
 
-  function styledChunks(content: string): {text: string; fg: string | undefined}[] {
-    const styled = styleSourceTags(content, palette);
+  function styledChunks(content: string): {text: string; fg: string | undefined; bold: boolean}[] {
+    const styled = styleTranscriptText(content, palette, theme);
     if (typeof styled === 'string') throw new Error('expected a styled result, got a plain string');
     return styled.chunks.map(chunk => ({
       text: chunk.text,
       fg: chunk.fg === undefined ? undefined : rgbToHex(chunk.fg).toLowerCase(),
+      // The renderer packs a chunk's styles into one bitmask.
+      bold: ((chunk.attributes ?? 0) & TextAttributes.BOLD) !== 0,
     }));
   }
 
-  it('colors a leading tag in the label color and the rest of the line in the content color', () => {
+  const body = (text: string) => ({text, fg: palette.content.toLowerCase(), bold: false});
+  const tag = (text: string) => ({text, fg: theme.textMuted.toLowerCase(), bold: false});
+
+  it('mutes a leading tag and leaves the rest of the line in the content color', () => {
     expect(styledChunks('[git-tracking] trusted input baseline: 4cf7a6767b6f')).toEqual([
-      {text: '[git-tracking]', fg: palette.label.toLowerCase()},
-      {text: ' trusted input baseline: 4cf7a6767b6f', fg: palette.content.toLowerCase()},
+      tag('[git-tracking]'),
+      body(' trusted input baseline: 4cf7a6767b6f'),
     ]);
   });
 
-  it('returns untagged content unchanged, including empty content', () => {
-    expect(styleSourceTags('plain line', palette)).toBe('plain line');
-    expect(styleSourceTags('', palette)).toBe('');
+  it('returns unremarkable content unchanged, including empty content', () => {
+    expect(styleTranscriptText('plain line', palette, theme)).toBe('plain line');
+    expect(styleTranscriptText('', palette, theme)).toBe('');
   });
 
   it('leaves a bracket that is not at the start of the line untouched', () => {
-    expect(styleSourceTags('see [x] here', palette)).toBe('see [x] here');
+    expect(styleTranscriptText('see [x] here', palette, theme)).toBe('see [x] here');
   });
 
-  it('colors a line that is only a tag, with no trailing content chunk', () => {
-    expect(styledChunks('[git-tracking]')).toEqual([
-      {text: '[git-tracking]', fg: palette.label.toLowerCase()},
-    ]);
+  it('mutes a line that is only a tag, with no trailing content chunk', () => {
+    expect(styledChunks('[git-tracking]')).toEqual([tag('[git-tracking]')]);
   });
 
-  it('colors each tagged line independently across multi-line content', () => {
+  it('styles each tagged line independently across multi-line content', () => {
     const content = '[git-tracking] one\nplain\n[framework-validation] two';
     expect(styledChunks(content)).toEqual([
-      {text: '[git-tracking]', fg: palette.label.toLowerCase()},
-      {text: ' one', fg: palette.content.toLowerCase()},
-      {text: '\n', fg: palette.content.toLowerCase()},
-      {text: 'plain', fg: palette.content.toLowerCase()},
-      {text: '\n', fg: palette.content.toLowerCase()},
-      {text: '[framework-validation]', fg: palette.label.toLowerCase()},
-      {text: ' two', fg: palette.content.toLowerCase()},
+      tag('[git-tracking]'),
+      body(' one'),
+      body('\n'),
+      body('plain'),
+      body('\n'),
+      tag('[framework-validation]'),
+      body(' two'),
     ]);
+  });
+
+  it('bolds PASS in the success colour and FAIL in the failure colour', () => {
+    expect(styledChunks('[framework-validation] PASS')).toEqual([
+      tag('[framework-validation]'),
+      body(' '),
+      {text: 'PASS', fg: theme.conversation.success.label.toLowerCase(), bold: true},
+    ]);
+    expect(styledChunks('[framework-validation] FAIL: build: exit 1')).toEqual([
+      tag('[framework-validation]'),
+      body(' '),
+      {text: 'FAIL', fg: theme.conversation.failure.label.toLowerCase(), bold: true},
+      body(': build: exit 1'),
+    ]);
+  });
+
+  it('emphasizes a verdict on an untagged line and mid-line', () => {
+    expect(styledChunks('[framework-validation] reused PASS: warmup')).toEqual([
+      tag('[framework-validation]'),
+      body(' reused '),
+      {text: 'PASS', fg: theme.conversation.success.label.toLowerCase(), bold: true},
+      body(': warmup'),
+    ]);
+  });
+
+  it('leaves a verdict that is only part of a longer word alone', () => {
+    // `\b` on both sides, so the gate's own words are emphasized and prose
+    // about them, or a path that happens to contain them, is not.
+    for (const line of ['3 PASSED, 1 skipped', 'wrote FAILURES.md', 'no failures']) {
+      expect([line, styleTranscriptText(line, palette, theme)]).toEqual([line, line]);
+    }
   });
 });
 
@@ -495,7 +589,7 @@ describe('styleSourceTags (#647)', () => {
  * helper alone, so a future refactor that stops passing the styled result to
  * either `TextRenderable` still fails here.
  */
-describe('transcript source tags and run ids take the card label color (#647)', () => {
+describe('transcript run ids take the card label color, source tags recede (#647)', () => {
   it('colors the run id exactly like the role, selected or not, in every theme', async () => {
     for (const theme of listThemes()) {
       for (const selectedId of [null, 'a'] as const) {
@@ -521,7 +615,7 @@ describe('transcript source tags and run ids take the card label color (#647)', 
     }
   });
 
-  it('colors the bracketed tag on a real diagnostic line (bad-cpp-round1.jsonl) in the label color', async () => {
+  it('mutes the bracketed tag on a real diagnostic line (bad-cpp-round1.jsonl)', async () => {
     // Shape of fixture line 4: a diagnostic entry whose content is exactly
     // one `[git-tracking]`-tagged line, trailing newline included, the way
     // `agent_output_chunk` delivers it.
@@ -537,13 +631,38 @@ describe('transcript source tags and run ids take the card label color (#647)', 
     const card = cardOf(view, 'd1');
     const text = card.getChildren().find(child => child instanceof TextRenderable);
     if (!(text instanceof TextRenderable)) throw new Error('content text missing');
-    const palette = resolveTheme(null).conversation.analysis;
+    const theme = resolveTheme(null);
+    const palette = theme.conversation.analysis;
     const [tag, rest] = text.content.chunks;
     expect(tag?.text).toBe('[git-tracking]');
     expect(rest?.text).toBe(' trusted input baseline: 4cf7a6767b6f');
     if (tag?.fg === undefined || rest?.fg === undefined) throw new Error('chunk missing a colour');
-    expect(rgbToHex(tag.fg).toLowerCase()).toBe(palette.label.toLowerCase());
+    expect(rgbToHex(tag.fg).toLowerCase()).toBe(theme.textMuted.toLowerCase());
+    // Pinned against the label directly, because the muted token is the whole
+    // point: the tag is on nearly every subprocess line and must not compete
+    // with the heading that says who is speaking.
+    expect(rgbToHex(tag.fg).toLowerCase()).not.toBe(palette.label.toLowerCase());
     expect(rgbToHex(rest.fg).toLowerCase()).toBe(palette.content.toLowerCase());
+  });
+
+  it('bolds a gate verdict on the line the gate actually prints', async () => {
+    const entries: ConversationEntry[] = [
+      {
+        id: 'd2',
+        kind: 'subprocess',
+        label: 'launcher',
+        content: '[framework-benchmark] PASS: throughput=1135\n',
+      },
+    ];
+    const {view} = await renderEntries(entries);
+    const card = cardOf(view, 'd2');
+    const text = card.getChildren().find(child => child instanceof TextRenderable);
+    if (!(text instanceof TextRenderable)) throw new Error('content text missing');
+    const theme = resolveTheme(null);
+    const verdict = text.content.chunks.find(chunk => chunk.text === 'PASS');
+    if (verdict?.fg === undefined) throw new Error('verdict chunk missing');
+    expect(rgbToHex(verdict.fg).toLowerCase()).toBe(theme.conversation.success.label.toLowerCase());
+    expect((verdict.attributes ?? 0) & TextAttributes.BOLD).not.toBe(0);
   });
 
   it('leaves an untagged line as a single content-colored chunk', async () => {
