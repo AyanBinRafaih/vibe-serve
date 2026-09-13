@@ -1,0 +1,34 @@
+{
+  "pr": 656,
+  "before_sha": "bf0aa491fb9610157e5119f2f576436aefa1050e",
+  "after_sha": "0f4f1f31a92bb6c21107881c92f2ac91b60fa094",
+  "terminal": {
+    "tool": "microsoft/tui-test 0.1.0-beta.3",
+    "backend": "alacritty",
+    "columns": 150,
+    "rows": 40,
+    "theme": "dark",
+    "term": "xterm-256color"
+  },
+  "scenario": "The real TUI first loads a complete revision-1 experiment projection containing H-KEEP and H-CHANGE. The fixture then publishes experiments_changed at revision 2 and delays the refresh response by 800 ms. Cursor-free requests receive the complete current two-entry list. A request with an exact revision-1 cursor receives only the changed H-CHANGE entry as a revision-2 delta.",
+  "observed": {
+    "visual": "Both revisions preserve H-KEEP, update H-CHANGE, and render 2/2. The native before and after PNGs are byte-identical (SHA-256 4ad7b68f93026e72ba78839dad22bce042a8fe5d5efed44ad722b7fcee82d3a5).",
+    "before_protocol": "The refresh request has no after cursor. The fixture returns the complete two-entry projection in a 728-byte encoded response.",
+    "after_protocol": "The refresh request carries run_id pr656-revision-delta, projection_id controlled-project, revision 1. The fixture returns the single changed entry as a revision 1-to-2 delta in a 600-byte encoded response."
+  },
+  "interaction": [
+    "wait for the initial two-row revision-1 projection",
+    "wait for the automatic experiments_changed refresh",
+    "wait for the delayed revision-2 H-CHANGE row to render",
+    "capture protocol trace, text, SVG, and one-frame APNG"
+  ],
+  "command": "bash capture.sh <session> <worktree> . <before|after>",
+  "artifact_sources": {
+    "fixture": "fixture.py",
+    "runner": "run-fixture.sh",
+    "capture": "capture.sh",
+    "before_protocol_trace": "before-protocol.json",
+    "after_protocol_trace": "after-protocol.json"
+  },
+  "limitations": "Controlled local JSONL protocol fixture, not a real optimization backend. It exercises the production ServerClient, SessionController experiment refresh, OpenTUI renderer, Unix socket, and revisioned merge path. The two-entry fixture makes the transfer reduction smaller than a long real experiment history."
+}

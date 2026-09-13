@@ -1,0 +1,41 @@
+[
+  {
+    "query_number": 1,
+    "request": {
+      "type": "query.experiments",
+      "after": null
+    },
+    "response": {
+      "experiment_count": 2,
+      "experiment_update": {
+        "run_id": "pr656-revision-delta",
+        "projection_id": "controlled-project",
+        "through_revision": 1,
+        "reset": true
+      },
+      "encoded_bytes": 855
+    }
+  },
+  {
+    "query_number": 2,
+    "request": {
+      "type": "query.experiments",
+      "after": {
+        "run_id": "pr656-revision-delta",
+        "projection_id": "controlled-project",
+        "revision": 1
+      }
+    },
+    "response": {
+      "experiment_count": 1,
+      "experiment_update": {
+        "run_id": "pr656-revision-delta",
+        "projection_id": "controlled-project",
+        "from_revision": 1,
+        "through_revision": 2,
+        "reset": false
+      },
+      "encoded_bytes": 600
+    }
+  }
+]
