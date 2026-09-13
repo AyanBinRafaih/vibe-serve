@@ -8,6 +8,7 @@ import {
   applyEventBatch,
   chatDocked,
   chatPaneVisible,
+  clearInputError,
   closePane,
   closeThemePicker,
   cyclePaneFocus,
@@ -52,9 +53,49 @@ import {
 } from './session-model.js';
 import {runStateText, usageText} from './ui/header.js';
 
+describe('input errors', () => {
+  it('routes a scope: input report to the hint row, never the banner', () => {
+    const state = reportError(initialSessionState(), 'Enter a slash command. Use /help.', {
+      scope: 'input',
+    });
+
+    expect(state.inputError).toBe('Enter a slash command. Use /help.');
+    expect(state.errorBanner).toBeNull();
+  });
+
+  it('leaves inputError alone for a real backend scope, and vice versa', () => {
+    const withBanner = reportError(initialSessionState(), 'The request failed.', {
+      scope: 'request',
+    });
+    expect(withBanner.errorBanner).toMatchObject({message: 'The request failed.'});
+    expect(withBanner.inputError).toBeNull();
+
+    const withInput = reportError(withBanner, 'Unknown command: /nope. Use /help.', {
+      scope: 'input',
+    });
+    // Routing input off the banner does not disturb a standing banner from a
+    // real scope, and the reverse: a later banner does not clear the hint.
+    expect(withInput.errorBanner).toEqual(withBanner.errorBanner);
+    expect(withInput.inputError).toBe('Unknown command: /nope. Use /help.');
+  });
+
+  it('clears on request, once, and leaves everything else untouched', () => {
+    const state = reportError({...initialSessionState(), selectedRound: 2}, 'Usage: /pause', {
+      scope: 'input',
+    });
+    const cleared = clearInputError(state);
+
+    expect(cleared.inputError).toBeNull();
+    expect(cleared.selectedRound).toBe(2);
+    expect(clearInputError(cleared)).toBe(cleared);
+  });
+});
+
 describe('event batch projection', () => {
   it('keeps the existing banner while resumed history ends in a running session', () => {
-    const before = reportError(initialSessionState(), 'Local input problem', {scope: 'input'});
+    const before = reportError(initialSessionState(), 'Local protocol problem', {
+      scope: 'protocol',
+    });
 
     const state = applyEventBatch(before, [
       {
@@ -103,6 +144,52 @@ describe('event batch projection', () => {
 
     expect(state.core.status).toBe('failed');
     expect(state.errorBanner).toMatchObject({message: 'The current run failed.', scope: 'run'});
+  });
+
+  it('banners the failure even when a warning diagnostic lands after it', () => {
+    const state = applyEventBatch(initialSessionState(), [
+      event(1, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+      {
+        ...event(2, 'run_failed'),
+        diagnostic: {
+          id: 'failure-1',
+          code: 'run_failed',
+          summary: 'The current run failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+      {
+        ...event(3, 'framework_warning', {
+          kind: 'framework_warning',
+          summary: 'profiler failed',
+          detail: 'nsys exited 1',
+          source: 'loop',
+        }),
+        agent_kind: null,
+        diagnostic: {
+          id: 'warn-1',
+          code: 'framework_warning',
+          summary: 'profiler failed',
+          scope: 'run',
+          severity: 'warning',
+          source: 'loop',
+        },
+      },
+    ]);
+
+    expect(state.core.status).toBe('failed');
+    expect(state.core.diagnostics.at(-1)).toMatchObject({id: 'warn-1', severity: 'warning'});
+    expect(state.errorBanner).toMatchObject({
+      message: 'The current run failed.',
+      diagnosticId: 'failure-1',
+    });
   });
 });
 
@@ -948,6 +1035,49 @@ describe('session event model', () => {
       message: 'Run interrupted',
       detail: 'RuntimeError: launcher_terminated (SIGTERM)',
       severity: 'fatal',
+    });
+  });
+
+  it('keeps warning diagnostics off the banner without blocking later errors', () => {
+    const warned = applyEvent(initialSessionState(), {
+      ...event(1, 'framework_warning', {
+        kind: 'framework_warning',
+        summary: 'profiler failed',
+        detail: 'nsys exited 1',
+        source: 'loop',
+      }),
+      agent_kind: null,
+      diagnostic: {
+        id: 'warn-1',
+        code: 'framework_warning',
+        summary: 'profiler failed',
+        detail: 'nsys exited 1',
+        scope: 'run',
+        severity: 'warning',
+        source: 'loop',
+      },
+    });
+
+    expect(warned.core.diagnostics).toMatchObject([
+      {id: 'warn-1', severity: 'warning', source: 'loop'},
+    ]);
+    expect(warned.errorBanner).toBeNull();
+
+    const failed = applyEvent(warned, {
+      ...event(2, 'run_failed'),
+      diagnostic: {
+        id: 'failure-1',
+        code: 'run_failed',
+        summary: 'The current run failed.',
+        scope: 'run',
+        severity: 'fatal',
+        retryability: 'never',
+      },
+    });
+
+    expect(failed.errorBanner).toMatchObject({
+      message: 'The current run failed.',
+      diagnosticId: 'failure-1',
     });
   });
 
