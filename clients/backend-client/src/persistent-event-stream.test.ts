@@ -145,7 +145,7 @@ describe('PersistentEventStream', () => {
     const stream = new PersistentEventStream(transport, {tail: 1_000, reconnectDelaysMs: [0]});
     await stream.subscribe(callbacks);
 
-    expect(transport.subscribeCalls).toEqual([{afterSequence: 0, tail: 1_000}]);
+    expect(transport.subscribeCalls).toEqual([{afterSequence: 0, tail: 1_000, storeId: undefined}]);
 
     transport.emitBatch([event(1, 'agent_output_chunk', 'one\n')]);
     expect(messages).toHaveLength(1);
@@ -162,8 +162,8 @@ describe('PersistentEventStream', () => {
     await stream.subscribe(callbacks);
 
     expect(transport.subscribeCalls).toEqual([
-      {afterSequence: 0, tail: 1_000},
-      {afterSequence: 0, tail: undefined},
+      {afterSequence: 0, tail: 1_000, storeId: undefined},
+      {afterSequence: 0, tail: undefined, storeId: undefined},
     ]);
     // The fallback succeeded, so no banner: the probe rejection is expected.
     expect(states).toEqual([]);
