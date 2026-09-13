@@ -1,0 +1,27 @@
+{
+  "pr": 737,
+  "before_sha": "ad8a770fa647cfb092875c8098bdd6d7edb472de",
+  "after_sha": "d89406431d09cd0e00ed69f631f26dc849adedbe",
+  "terminal": {
+    "tool": "microsoft/tui-test 0.1.0-beta.3",
+    "backend": "alacritty",
+    "columns": 150,
+    "rows": 40,
+    "theme": "dark",
+    "term": "xterm-256color"
+  },
+  "scenario": "The real TUI folds a scratch-store bootstrap through sequence 4, the fixture drops the event socket and swaps to a durable store, then the client reconnects from its stale cursor. The server sends the durable suffix to a resume without store identity and the full durable log when the resume names store-a.",
+  "interaction": [
+    "wait for the automatic reconnect and durable suffix",
+    "click the visible unowned Round 1 row",
+    "press Enter to open its transcript",
+    "capture text, SVG, and one-frame APNG"
+  ],
+  "command": "bash capture.sh <session> <worktree> . <before|after>",
+  "artifact_sources": {
+    "fixture": "fixture.py",
+    "runner": "run-fixture.sh",
+    "capture": "capture.sh"
+  },
+  "limitations": "Controlled local JSONL protocol fixture, not a real optimization backend. It exercises the production ServerClient, PersistentEventStream, SessionController, OpenTUI renderer, Unix socket reconnect, keyboard, and mouse paths. Fixed timestamps and synthetic transcript labels make the store replacement visible and deterministic."
+}
