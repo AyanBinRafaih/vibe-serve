@@ -1,10 +1,9 @@
-"""Authorize and execute a path-scoped pull request merge."""
+"""Authorize and execute a capability-scoped pull request merge."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -13,14 +12,23 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Never, Protocol, cast
+from typing import Literal, Never, Protocol, cast
 from urllib.parse import quote, urlencode
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-POLICY_PATH = REPO_ROOT / ".github" / "scoped-merge.toml"
+POLICY_PATH = REPO_ROOT / ".github" / "delegated-merge.toml"
 MAX_CHANGED_FILES = 3_000
+MAX_GITHUB_LOGIN_LENGTH = 39
 API_TIMEOUT_SECONDS = 30
+HARD_DENIED_PATHS = frozenset(
+    {
+        ".github/delegated-merge.toml",
+        ".github/workflows/delegated-merge.yml",
+        "scripts/delegated_merge.py",
+    }
+)
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+RepositoryRole = Literal["triage", "write", "maintain", "admin"]
 
 
 class MergeRefusalError(RuntimeError):
@@ -57,16 +65,35 @@ class GitHubClient(Protocol):
 
 
 @dataclass(frozen=True)
+class Check:
+    """One required Actions job and its owning workflow."""
+
+    workflow_file: str
+    job_name: str
+
+
+@dataclass(frozen=True)
+class Capability:
+    """Repository paths and extra checks governed by one named capability."""
+
+    members: frozenset[str]
+    prefixes: tuple[str, ...]
+    paths: frozenset[str]
+    additional_checks: frozenset[str]
+
+
+@dataclass(frozen=True)
 class Policy:
     """Trusted, versioned limits for delegated merges."""
 
+    schema_version: int
     command: str
     repository: str
     base_branch: str
-    workflow_file: str
     merge_method: str
-    allowed_prefixes: tuple[str, ...]
-    allowed_paths: frozenset[str]
+    required_checks: frozenset[str]
+    checks: Mapping[str, Check]
+    capabilities: Mapping[str, Capability]
 
 
 @dataclass(frozen=True)
@@ -129,36 +156,109 @@ def load_policy(path: Path = POLICY_PATH) -> Policy:
     """Load the strict merge policy from TOML."""
     document = tomllib.loads(path.read_text())
     expected = {
+        "schema_version",
         "command",
         "repository",
         "base_branch",
-        "workflow_file",
         "merge_method",
-        "allowed_prefixes",
-        "allowed_paths",
+        "required_checks",
+        "checks",
+        "capabilities",
     }
     if set(document) != expected:
         _refuse(f"policy keys must be exactly {sorted(expected)}")
-    strings = ("command", "repository", "base_branch", "workflow_file", "merge_method")
+    if document["schema_version"] != 1:
+        _refuse("policy schema_version must be 1")
+    strings = ("command", "repository", "base_branch", "merge_method")
     if any(not isinstance(document[key], str) or not document[key] for key in strings):
         _refuse("policy scalar values must be non-empty strings")
-    prefixes = _string_collection(document["allowed_prefixes"], name="allowed_prefixes")
-    paths = _string_collection(document["allowed_paths"], name="allowed_paths")
-    if not prefixes and not paths:
-        _refuse("policy must allow at least one path")
-    if any(not prefix.endswith("/") or not _safe_path(prefix[:-1]) for prefix in prefixes):
-        _refuse("allowed prefixes must be safe repository paths ending in '/' ")
-    if any(not _safe_path(path_value) for path_value in paths):
-        _refuse("allowed paths must be safe repository paths")
+    if not cast("str", document["command"]).startswith("/merge-"):
+        _refuse("policy command must start with '/merge-'")
+    checks = _load_checks(document["checks"])
+    required_checks = frozenset(
+        _string_collection(document["required_checks"], name="required_checks")
+    )
+    if not required_checks:
+        _refuse("policy must define at least one required check")
+    capabilities = _load_capabilities(document["capabilities"])
+    referenced_checks = required_checks | frozenset(
+        check_id
+        for capability in capabilities.values()
+        for check_id in capability.additional_checks
+    )
+    unknown_checks = referenced_checks - checks.keys()
+    if unknown_checks:
+        _refuse(f"policy references undefined checks: {sorted(unknown_checks)}")
     return Policy(
+        schema_version=1,
         command=cast("str", document["command"]),
         repository=cast("str", document["repository"]),
         base_branch=cast("str", document["base_branch"]),
-        workflow_file=cast("str", document["workflow_file"]),
         merge_method=cast("str", document["merge_method"]),
-        allowed_prefixes=prefixes,
-        allowed_paths=frozenset(paths),
+        required_checks=required_checks,
+        checks=checks,
+        capabilities=capabilities,
     )
+
+
+def _load_checks(raw_checks: object) -> Mapping[str, Check]:
+    checks_document = _mapping(raw_checks, "checks")
+    checks: dict[str, Check] = {}
+    for check_id, check_value in checks_document.items():
+        if not _identifier(check_id):
+            _refuse(f"check ID {check_id!r} is invalid")
+        check_document = _mapping(check_value, f"checks.{check_id}")
+        if set(check_document) != {"workflow_file", "job_name"}:
+            _refuse(f"checks.{check_id} must define workflow_file and job_name")
+        checks[check_id] = Check(
+            workflow_file=_string(
+                check_document["workflow_file"], f"checks.{check_id}.workflow_file"
+            ),
+            job_name=_string(check_document["job_name"], f"checks.{check_id}.job_name"),
+        )
+        if not _safe_path(checks[check_id].workflow_file) or "/" in checks[check_id].workflow_file:
+            _refuse(f"checks.{check_id}.workflow_file must be a workflow filename")
+    return checks
+
+
+def _load_capabilities(raw_capabilities: object) -> Mapping[str, Capability]:
+    capabilities_document = _mapping(raw_capabilities, "capabilities")
+    if not capabilities_document:
+        _refuse("policy must define at least one capability")
+    capabilities: dict[str, Capability] = {}
+    for name, capability_value in capabilities_document.items():
+        if not _identifier(name):
+            _refuse(f"capability name {name!r} is invalid")
+        capability_document = _mapping(capability_value, f"capabilities.{name}")
+        expected_fields = {"members", "prefixes", "paths", "additional_checks"}
+        if set(capability_document) != expected_fields:
+            _refuse(f"capabilities.{name} keys must be exactly {sorted(expected_fields)}")
+        members = _member_collection(
+            capability_document["members"], name=f"capabilities.{name}.members"
+        )
+        prefixes = _string_collection(
+            capability_document["prefixes"], name=f"capabilities.{name}.prefixes"
+        )
+        paths = _string_collection(capability_document["paths"], name=f"capabilities.{name}.paths")
+        additional_checks = frozenset(
+            _string_collection(
+                capability_document["additional_checks"],
+                name=f"capabilities.{name}.additional_checks",
+            )
+        )
+        if not prefixes and not paths:
+            _refuse(f"capabilities.{name} must match at least one path")
+        if any(not prefix.endswith("/") or not _safe_path(prefix[:-1]) for prefix in prefixes):
+            _refuse(f"capabilities.{name} prefixes must be safe repository paths ending in '/'")
+        if any(not _safe_path(path_value) for path_value in paths):
+            _refuse(f"capabilities.{name} paths must be safe repository paths")
+        capabilities[name] = Capability(
+            members=members,
+            prefixes=prefixes,
+            paths=frozenset(paths),
+            additional_checks=additional_checks,
+        )
+    return capabilities
 
 
 def parse_event(document: object) -> Event:
@@ -179,28 +279,43 @@ def parse_event(document: object) -> Event:
     )
 
 
-def authorize_event(event: Event, policy: Policy, authorized_users: str) -> None:
-    """Authorize the command issuer and immutable event scope."""
-    users = {login.casefold() for login in re.split(r"[\s,]+", authorized_users) if login}
-    if not users:
-        _refuse("no scoped merge maintainers are configured")
+def authorize_event(event: Event, policy: Policy) -> None:
+    """Authorize the immutable event scope and exact command."""
     if event.action != "created" or not event.is_pull_request:
         _refuse("the command must be a newly created pull request comment")
     if event.repository != policy.repository:
         _refuse(f"the command is not for {policy.repository}")
-    if event.actor_type != "User" or event.actor.casefold() not in users:
-        _refuse(f"@{event.actor} is not an authorized scoped merge maintainer")
-    if event.body.strip() != policy.command:
+    if event.actor_type != "User":
+        _refuse("the command issuer must be a GitHub user")
+    if event.body != policy.command:
         _refuse(f"the exact command is {policy.command}")
 
 
-def authorize_repository_access(permission: object, *, actor: str) -> None:
-    """Require the command issuer to retain live repository access."""
+def authorize_membership(
+    policy: Policy, *, actor: str, role: RepositoryRole, required: frozenset[str]
+) -> None:
+    """Require membership in every selected capability unless the caller is an admin."""
+    if role == "admin":
+        return
+    login = actor.casefold()
+    missing = sorted(
+        capability_name
+        for capability_name in required
+        if login not in policy.capabilities[capability_name].members
+    )
+    if missing:
+        _refuse(f"@{actor} is not a member of required capabilities: {missing}")
+
+
+def authorize_repository_access(permission: object, *, actor: str) -> RepositoryRole:
+    """Return the command issuer's validated live repository role."""
     document = _mapping(permission, "repository permission")
     # GitHub's legacy ``permission`` field collapses Triage into ``read`` and
     # Maintain into ``write``. ``role_name`` preserves the actual role.
-    if document.get("role_name") not in {"triage", "write", "maintain", "admin"}:
+    role = document.get("role_name")
+    if role not in {"triage", "write", "maintain", "admin"}:
         _refuse(f"@{actor} no longer has Triage or higher repository access")
+    return cast("RepositoryRole", role)
 
 
 def authorize_pull_request(
@@ -227,8 +342,10 @@ def authorize_pull_request(
     return _string(head.get("sha"), "pull request head SHA")
 
 
-def authorize_files(files: object, *, changed_files: object, policy: Policy) -> None:
-    """Require a complete, non-empty diff wholly inside the delegated paths."""
+def authorize_files(
+    files: object, *, changed_files: object, policy: Policy
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Resolve the capability and check union for a complete changed-file list."""
     count = _positive_int(changed_files, "pull request changed_files")
     if count > MAX_CHANGED_FILES:
         _refuse(f"the pull request exceeds the {MAX_CHANGED_FILES}-file validation limit")
@@ -236,6 +353,11 @@ def authorize_files(files: object, *, changed_files: object, policy: Policy) -> 
     entries = [entry for page in pages for entry in _list(page, "changed file page")]
     if len(entries) != count:
         _refuse(f"GitHub returned {len(entries)} of {count} changed files")
+    required_capabilities: set[str] = set()
+    required_checks = set(policy.required_checks)
+    hard_denied = HARD_DENIED_PATHS | {
+        f".github/workflows/{check.workflow_file}" for check in policy.checks.values()
+    }
     for entry_value in entries:
         entry = _mapping(entry_value, "changed file")
         names = [_string(entry.get("filename"), "changed file filename")]
@@ -243,12 +365,28 @@ def authorize_files(files: object, *, changed_files: object, policy: Policy) -> 
         if previous is not None:
             names.append(_string(previous, "changed file previous_filename"))
         for name in names:
-            if not _path_allowed(name, policy):
-                _refuse(f"{name} is outside the delegated TUI and server paths")
+            if name in hard_denied:
+                _refuse(f"{name} is controlled by the delegated merge broker")
+            if not _safe_path(name):
+                _refuse(f"{name} is not a safe repository path")
+            matching = {
+                capability_name: capability
+                for capability_name, capability in policy.capabilities.items()
+                if _capability_matches(name, capability)
+            }
+            if not matching:
+                _refuse(f"{name} does not match a delegated merge capability")
+            required_capabilities.update(matching)
+            required_checks.update(
+                check_id
+                for capability in matching.values()
+                for check_id in capability.additional_checks
+            )
+    return frozenset(required_capabilities), frozenset(required_checks)
 
 
-def authorize_workflow(runs: object, *, head_sha: str) -> None:
-    """Require the latest full test workflow run for this head to have succeeded."""
+def select_workflow_run(runs: object, *, head_sha: str, check_id: str) -> int:
+    """Select the latest pull-request workflow run for an exact head SHA."""
     document = _mapping(runs, "workflow runs")
     candidates = [
         _mapping(run, "workflow run")
@@ -258,38 +396,66 @@ def authorize_workflow(runs: object, *, head_sha: str) -> None:
         and run.get("event") == "pull_request"
     ]
     if not candidates:
-        _refuse("the current pull request head has no test workflow run")
+        _refuse(f"check {check_id!r} has no workflow run for the current pull request head")
     latest = max(candidates, key=lambda run: _positive_int(run.get("id"), "workflow run id"))
-    if latest.get("status") != "completed" or latest.get("conclusion") != "success":
-        _refuse("the latest test workflow for the current pull request head has not succeeded")
+    return _positive_int(latest.get("id"), "workflow run id")
 
 
-def run(event_path: Path, *, authorized_users: str, api: GitHubClient) -> str:
+def authorize_check_job(jobs: object, *, check_id: str, job_name: str) -> None:
+    """Require one exact, unambiguous successful job in the selected workflow run."""
+    pages = _list(jobs, "workflow job pages")
+    entries: list[Mapping[str, object]] = []
+    for page in pages:
+        page_document = _mapping(page, "workflow job page")
+        entries.extend(
+            _mapping(job, "workflow job")
+            for job in _list(page_document.get("jobs"), "workflow jobs")
+        )
+    matches = [job for job in entries if job.get("name") == job_name]
+    if len(matches) != 1:
+        _refuse(
+            f"check {check_id!r} expected exactly one job named {job_name!r}, found {len(matches)}"
+        )
+    job = matches[0]
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        _refuse(f"check {check_id!r} job {job_name!r} has not succeeded")
+
+
+def run(event_path: Path, *, api: GitHubClient) -> str:
     """Validate every gate, merge atomically, and return the merge SHA."""
     policy = load_policy()
     event = parse_event(json.loads(event_path.read_text()))
-    authorize_event(event, policy, authorized_users)
+    authorize_event(event, policy)
     repository = quote(policy.repository, safe="/")
     pull_endpoint = f"repos/{repository}/pulls/{event.number}"
     actor = quote(event.actor, safe="")
-    authorize_repository_access(
+    role = authorize_repository_access(
         api.get(f"repos/{repository}/collaborators/{actor}/permission"),
         actor=event.actor,
     )
     pull = api.get(pull_endpoint)
     head_sha = authorize_pull_request(pull, policy=policy, expected_number=event.number)
     changed_files = _mapping(pull, "pull request").get("changed_files")
-    authorize_files(
+    required_capabilities, required_checks = authorize_files(
         api.get(f"{pull_endpoint}/files?per_page=100", paginate=True),
         changed_files=changed_files,
         policy=policy,
     )
+    authorize_membership(policy, actor=event.actor, role=role, required=required_capabilities)
     query = urlencode({"head_sha": head_sha, "event": "pull_request", "per_page": 100})
-    workflow = quote(policy.workflow_file, safe="")
-    authorize_workflow(
-        api.get(f"repos/{repository}/actions/workflows/{workflow}/runs?{query}"),
-        head_sha=head_sha,
-    )
+    for check_id in sorted(required_checks):
+        check = policy.checks[check_id]
+        workflow = quote(check.workflow_file, safe="")
+        run_id = select_workflow_run(
+            api.get(f"repos/{repository}/actions/workflows/{workflow}/runs?{query}"),
+            head_sha=head_sha,
+            check_id=check_id,
+        )
+        authorize_check_job(
+            api.get(f"repos/{repository}/actions/runs/{run_id}/jobs?per_page=100", paginate=True),
+            check_id=check_id,
+            job_name=check.job_name,
+        )
     refreshed = api.get(pull_endpoint)
     refreshed_sha = authorize_pull_request(refreshed, policy=policy, expected_number=event.number)
     if refreshed_sha != head_sha:
@@ -316,11 +482,14 @@ def _comment(api: GitHubClient, event: Event, body: str) -> None:
     )
 
 
-def _path_allowed(path: str, policy: Policy) -> bool:
-    return _safe_path(path) and (
-        path in policy.allowed_paths
-        or any(path.startswith(prefix) for prefix in policy.allowed_prefixes)
+def _capability_matches(path: str, capability: Capability) -> bool:
+    return path in capability.paths or any(
+        path.startswith(prefix) for prefix in capability.prefixes
     )
+
+
+def _identifier(value: str) -> bool:
+    return re.fullmatch(r"[a-z][a-z0-9_-]*", value) is not None
 
 
 def _safe_path(path: str) -> bool:
@@ -367,6 +536,23 @@ def _string_collection(value: object, *, name: str) -> tuple[str, ...]:
     return tuple(strings)
 
 
+def _member_collection(value: object, *, name: str) -> frozenset[str]:
+    members = _string_collection(value, name=name)
+    normalized = tuple(member.casefold() for member in members)
+    if any(not _github_login(member) for member in members):
+        _refuse(f"{name} must contain only valid GitHub logins")
+    if len(normalized) != len(set(normalized)):
+        _refuse(f"{name} contains case-insensitive duplicates")
+    return frozenset(normalized)
+
+
+def _github_login(value: str) -> bool:
+    return (
+        len(value) <= MAX_GITHUB_LOGIN_LENGTH
+        and re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", value) is not None
+    )
+
+
 def _refuse(message: str) -> Never:
     raise MergeRefusalError(message)
 
@@ -384,11 +570,9 @@ def main() -> int:
     event: Event | None = None
     try:
         event = parse_event(json.loads(args.event.read_text()))
-        merge_sha = run(
-            args.event,
-            authorized_users=os.environ.get("SCOPED_MERGE_USERS", ""),
-            api=api,
-        )
+        if event.body.strip() != load_policy().command:
+            return 0
+        merge_sha = run(args.event, api=api)
     except MergeRefusalError as exc:
         message = f"Scoped merge refused: {exc}."
     except (GitHubAPIError, OSError, json.JSONDecodeError, tomllib.TOMLDecodeError):
