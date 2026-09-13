@@ -65,7 +65,7 @@ export function applyExecutionStatus(statuses: StatusMap, event: RunEvent): Stat
       progress: status.progress ?? current?.progress ?? null,
       agentLabel: status.agent_label ?? current?.agentLabel ?? null,
       elapsedSeconds: status.elapsed_seconds ?? current?.elapsedSeconds ?? null,
-      inputTokens: status.input_tokens ?? current?.inputTokens ?? null,
+      inputTokens: reportedInputTokens(status.input_tokens) ?? current?.inputTokens ?? null,
       contextWindow: status.context_window ?? current?.contextWindow ?? null,
     },
   };
@@ -80,11 +80,13 @@ export function applyExecutionStatusUsage(
   event: RunEvent,
 ): ExecutionUsage | null {
   const raw = executionStatusData(event);
-  if (raw?.input_tokens == null) return current;
+  if (raw === null) return current;
+  const rawInputTokens = reportedInputTokens(raw.input_tokens);
+  if (rawInputTokens == null) return current;
   const executionId = executionIdentity(event);
   if (executionId === null) {
     const usage: ExecutionUsage = {
-      inputTokens: raw.input_tokens,
+      inputTokens: rawInputTokens,
       contextWindow: raw.context_window ?? current?.contextWindow ?? null,
       model: current?.model ?? null,
     };
@@ -235,6 +237,17 @@ export function executionStatusData(event: RunEvent): AgentStatusData | null {
 
 function executionIdentity(event: RunEvent): string | null {
   return event.execution_id ?? event.invocation_id ?? null;
+}
+
+/**
+ * A status reports usable context pressure only once its token count is
+ * positive. The backend seeds `input_tokens` at 0 and emits that before an
+ * agent's first completion, treating a zero (or missing) count as "no update"
+ * (see agents/callbacks.py). Mirror that here so a 0 leaves the prior reading
+ * intact instead of overwriting a real count and blanking the meter.
+ */
+function reportedInputTokens(value: number | null | undefined): number | null {
+  return value != null && value > 0 ? value : null;
 }
 
 function latestExecutionStart(

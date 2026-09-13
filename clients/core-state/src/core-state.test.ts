@@ -290,6 +290,24 @@ describe('core state projection', () => {
     expect(state.usage).toEqual({inputTokens: 9_000, contextWindow: 200_000, model: null});
   });
 
+  it('treats a zero input-token status as no update, keeping the live reading', () => {
+    let state = reduceEvent(
+      initialCoreState(),
+      executionEvent(1, 'agent_execution_started', 'first', startedData('First')),
+    );
+    state = reduceEvent(
+      state,
+      statusEvent(2, 'first', 'agent_output_chunk', {input_tokens: 8_000, context_window: 200_000}),
+    );
+    expect(state.usage).toEqual({inputTokens: 8_000, contextWindow: 200_000, model: null});
+
+    // The backend seeds input_tokens at 0 and emits that before the agent's
+    // next completion; a 0 must not overwrite the live count or blank the meter.
+    state = reduceEvent(state, statusEvent(3, 'first', 'agent_output_chunk', {input_tokens: 0}));
+    expect(state.executionStatuses['first']).toMatchObject({sequence: 3, inputTokens: 8_000});
+    expect(state.usage).toEqual({inputTokens: 8_000, contextWindow: 200_000, model: null});
+  });
+
   it('reconciles status through checkpoints and clears only the execution that finishes', () => {
     let state = reduceEvent(initialCoreState(), statusEvent(1, 'first', 'agent_output_chunk'));
     state = reduceEvent(state, statusEvent(2, 'second', 'tool_call'));
