@@ -15,13 +15,12 @@ run inside Docker because it needs no accelerator passthrough. Per-platform
 
 from __future__ import annotations
 
-from collections.abc import Callable  # noqa: TC003  # tracked: #288
+from collections.abc import Callable, Sequence  # noqa: TC003  # tracked: #288
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vibesys.backends.base import (
     ContentionMonitor,
-    ModalOptions,
     SandboxKind,
     make_local_shell_sandbox,
 )
@@ -32,6 +31,7 @@ if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
 
+    from vs_sandbox.host_resources import HostResource
     from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 _DEFAULT_CPU_IMAGE = "python:3.12-bookworm"
@@ -75,20 +75,24 @@ class LocalBackend:
         extra_env: dict[str, str] | None = None,
         extra_init_commands: list[str] | None = None,
         lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
-        modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
         ephemeral: bool = False,
         container_image: str | None = None,
+        auth_files: list[tuple[str, str]] | None = None,
+        resources: Sequence[HostResource] = (),
     ) -> SandboxBackendProtocol:
         # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
         # pulls langchain + anthropic. Registration must stay import-cheap.
         from vs_sandbox import DockerSandbox  # noqa: PLC0415  # tracked: #288
 
-        del attach_accelerator, ephemeral
+        # extra_init_commands is accepted for ComputeBackendImpl protocol
+        # parity (LocalEnvironment.open() passes it unconditionally) but never
+        # used: neither the LOCAL sandbox nor the agent-image-based DOCKER
+        # sandbox runs per-launch install commands.
+        del attach_accelerator, ephemeral, extra_init_commands
         bind_mounts = list(bind_mounts or [])
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
-        extra_init_commands = list(extra_init_commands or [])
         lifecycle_hooks = lifecycle_hooks or []
 
         if kind is SandboxKind.LOCAL:
@@ -102,16 +106,24 @@ class LocalBackend:
                 raise ValueError(f"{self.name.value} backend requires a Docker image")  # noqa: TRY003  # tracked: #288
             return DockerSandbox(
                 host_workspace=host_workspace,
+                # ``DockerEnvironment.open()`` (the plain --docker path)
+                # always resolves and passes an agent image, so this only
+                # falls back to the backend's own base image for a caller
+                # that builds its own Docker sandbox without one — Modal and
+                # SkyPilot's CPU-only local editor container, which still
+                # installs everything per-run until their own image work
+                # (#676, #679) lands.
                 image=container_image or self.image,
                 gpus=None,
                 bind_mounts=bind_mounts,
+                resources=resources,
                 passthrough_paths=passthrough_paths,
                 env=extra_env,
                 log_path=log_path,
-                extra_init_commands=extra_init_commands,
+                auth_files=auth_files,
                 lifecycle_hooks=lifecycle_hooks,
             )
-        if kind in (SandboxKind.DOCKER, SandboxKind.MODAL):
+        if kind is SandboxKind.DOCKER:
             raise ValueError(  # noqa: TRY003  # tracked: #288
                 f"{self.name.value} backend only supports local execution; "
                 f"SandboxKind.{kind.name} is unavailable ({self._unavailable_reason})."

@@ -71,9 +71,12 @@ export class ChatOverlayView {
       paddingLeft: 1,
       paddingRight: 1,
       border: true,
-      borderStyle: 'rounded',
+      // Square with an outer fill, the overlay exception (tui-conventions.md):
+      // the fill is what makes this modal opaque over the run behind it, ring
+      // included, and a fill that reaches the ring needs a square corner.
+      borderStyle: 'single',
       borderColor: theme.conversation.analysis.label,
-      backgroundColor: theme.elevatedSurface,
+      backgroundColor: theme.canvas,
       title: ' Experiment chat ',
       zIndex: 20,
       visible: false,
@@ -179,7 +182,7 @@ export class ChatOverlayView {
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.output.borderColor = theme.conversation.analysis.label;
-    this.output.backgroundColor = theme.elevatedSurface;
+    this.output.backgroundColor = theme.canvas;
     this.#composer.applyTheme(theme);
     this.#conversation.applyTheme(theme, markdownStyle);
   }

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from vibesys import boot_trace
+from vibesys.agents.provider_policy import SHIPPED_PROVIDERS
 from vibesys.config import Config, load_config
 from vibesys.constants import (
     KNOWN_COMPUTE_BACKENDS,
@@ -51,6 +52,7 @@ from vibesys.repository import (
 from vibesys.resource_paths import default_skill_roots
 from vibesys.run.events import CoreEventType, EventStatus, RunStartedData
 from vibesys.run.experiment_repo import ExperimentRepository
+from vibesys.run.git_events import NullGitTrackerEvents
 from vibesys.run.git_tracker import GitTracker
 from vibesys.run.integration import LocalRunIntegration, RunIntegration
 from vibesys.sandbox.run_environment import (
@@ -438,7 +440,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "Which profiler to use between rounds. "
             "'none' to disable standalone profiling, "
             "'nsys' for NVIDIA Nsight Systems (needs /proc/driver/nvidia), "
-            "'torch' for torch.profiler (works in Modal sandboxes), "
+            "'torch' for torch.profiler (works under the Modal run environment), "
             "'neuron' for AWS neuron-explorer (Trainium/NeuronCores), "
             "'otel' for OpenTelemetry service/span/datastore latency on "
             "microservice benchmarks (opt-in; needs an instrumented input bundle), "
@@ -620,7 +622,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cli-provider",
-        choices=["claude", "gemini", "codex", "opencode"],
+        choices=list(SHIPPED_PROVIDERS),
         default=None,
         help=(
             "Which CLI tool to drive when --agent-backend=cli. Overrides "
@@ -1478,7 +1480,7 @@ def _switch_project_resume_branch(project_root: Path, run_id: str) -> None:
         return
     tracker = GitTracker(
         project_root,
-        log=lambda _message: None,
+        events=NullGitTrackerEvents(),
         run_id=run_id,
     )
     try:
