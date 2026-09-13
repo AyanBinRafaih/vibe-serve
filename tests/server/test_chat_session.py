@@ -8,12 +8,14 @@ from unittest.mock import MagicMock
 
 import pytest
 from agentshim.testing import FakeExecutor, FakeRun, scripted_turn
+from tests.server.support import build_server_parts
 
 from server.chat.prompts import (
     experiment_chat_continuation_prompt,
     experiment_chat_system_prompt,
 )
 from server.chat.session import ExperimentChatDependencies, ExperimentChatSession
+from server.events import EventType
 from vibesys.agents.client import AgentClient
 from vibesys.agents.drivers import agentshim as agentshim_driver
 from vibesys.agents.session_key import AgentSessionKey, SessionScope
@@ -57,7 +59,8 @@ def _chat(
     client: Any,  # noqa: ANN401  # Any ChatAgentClient implementation.
     *,
     thread_id: str | None = None,
-    controller: MagicMock | None = None,
+    executions: Any = None,  # noqa: ANN401  # Any ExecutionTracker stand-in.
+    controller: Any = None,  # noqa: ANN401  # Any RunController stand-in.
 ) -> ExperimentChatSession:
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
@@ -67,9 +70,10 @@ def _chat(
     return ExperimentChatSession(
         ExperimentChatDependencies(
             controller=controller,
-            executions=MagicMock(),
+            executions=MagicMock() if executions is None else executions,
             agent_client=client,
             session_key=AgentSessionKey(SessionScope.CHAT, thread_id or "default"),
+            chat_thread_id=thread_id,
             workspace=workspace,
             state_dir=tmp_path / "state",
             agent_shared_state_dir=_SHARED_STATE_DIR,
@@ -288,6 +292,36 @@ def test_stale_claude_session_reasks_instead_of_failing_the_question(
     assert prompts[2].startswith(_CONTINUATION_PROMPT)
     assert prompts[3].startswith(_FULL_PROMPT)
     assert answer.text == "done"
+
+
+@pytest.mark.parametrize("thread_id", [None, "thread-a"])
+def test_streamed_output_is_filed_under_the_thread_that_asked(
+    tmp_path: Path, thread_id: str | None
+) -> None:
+    parts = build_server_parts(tmp_path)
+
+    class _StreamingClient(_FakeClient):
+        """Emit a token mid-turn the way a streaming driver does."""
+
+        def invoke_text(self, **kwargs: Any) -> str:  # noqa: ANN401
+            parts.executions.publish_agent_output("partial ")
+            return super().invoke_text(**kwargs)
+
+    chat = _chat(
+        tmp_path,
+        _StreamingClient(),
+        thread_id=thread_id,
+        executions=parts.executions,
+        controller=parts.controller,
+    )
+
+    chat.ask("what happened?")
+
+    assert [
+        (event.agent_kind, event.chat_thread_id)
+        for event in parts.journal.read()
+        if event.type is EventType.AGENT_OUTPUT_CHUNK
+    ] == [("chat", thread_id)]
 
 
 def test_chat_normalizes_an_agent_failure(tmp_path: Path) -> None:
