@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from vibesys.agents.provider_policy import cli_skill_dirs
 from vibesys.input_manifest import WorkspaceSource
 from vibesys.input_project import materialize_input_project
 from vibesys.skills import foreign_platform_names, is_platforms_parent
@@ -51,14 +52,9 @@ EXCLUDED_WORKSPACE_DIRS: frozenset[str] = frozenset(
     }
 )
 
-# Skill destinations mirrored by _materialize_skills inside cli_runner.
-_CLI_SKILL_DIRS: tuple[str, ...] = (
-    ".agents/skills",
-    ".claude/skills",
-    ".gemini/skills",
-    ".cursor/skills",
-    ".opencode/skills",
-)
+# Skill destinations mirrored by materialize_skills in agents.cli_common; both
+# derive from the same vibesys.agents.provider_policy.cli_skill_dirs union.
+_CLI_SKILL_DIRS: tuple[str, ...] = cli_skill_dirs()
 
 
 @dataclass(frozen=True)
@@ -165,7 +161,7 @@ class Workspace:
         # in the host project, which Modal then uploads verbatim into the
         # fresh sandbox volume at start, and codex-cli fails to load them
         # (e.g. skill description exceeds a newer CLI's length limit).
-        # Mirrors _materialize_skills destinations inside cli_runner.
+        # Mirrors materialize_skills destinations in agents.cli_common.
         for src in skill_sources:
             rel = src.name
             if (self.root / rel).exists():

@@ -23,8 +23,9 @@ carry over. What differs is plumbing:
    :class:`~vibesys.backends.local.LocalBackend`'s ``metal`` and ``cpu``
    bindings; serving-domain prompts may also need target-specific adaptation.
 
-Modal offers no AMD GPUs, so ``make_sandbox`` raises on
-``SandboxKind.MODAL`` (parity with the Trainium backend).
+There is no remote-GPU sandbox path: ``make_sandbox`` supports only
+``SandboxKind.LOCAL`` and ``SandboxKind.DOCKER`` (parity with the Trainium
+backend).
 """
 
 from __future__ import annotations
@@ -32,13 +33,12 @@ from __future__ import annotations
 import glob
 import os
 import subprocess
-from collections.abc import Callable  # noqa: TC003  # tracked: #288
+from collections.abc import Callable, Sequence  # noqa: TC003  # tracked: #288
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vibesys.backends.base import (
     ContentionMonitor,
-    ModalOptions,
     SandboxKind,
     make_local_shell_sandbox,
 )
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     # Annotation only; deepagents pulls langchain + anthropic (~seconds).
     from deepagents.backends.protocol import SandboxBackendProtocol
 
+    from vs_sandbox.host_resources import HostResource
     from vs_sandbox.lifecycle import SandboxLifecycleHooks
 
 # ROCm PyTorch image. Carries the ROCm runtime + a matching torch build.
@@ -159,10 +160,11 @@ class RocmBackend:
         extra_env: dict[str, str] | None = None,
         extra_init_commands: list[str] | None = None,
         lifecycle_hooks: list[SandboxLifecycleHooks] | None = None,
-        modal_options: ModalOptions | None = None,  # noqa: ARG002  # tracked: #288
         attach_accelerator: bool = True,
         ephemeral: bool = False,
         container_image: str | None = None,
+        auth_files: list[tuple[str, str]] | None = None,
+        resources: Sequence[HostResource] = (),
     ) -> SandboxBackendProtocol:
         # Deferred: the sandbox classes subclass deepagents' BaseSandbox, which
         # pulls langchain + anthropic. Registration must stay import-cheap.
@@ -171,16 +173,11 @@ class RocmBackend:
         bind_mounts = list(bind_mounts or [])
         passthrough_paths = list(passthrough_paths or [])
         extra_env = dict(extra_env or {})
-        extra_init_commands = list(extra_init_commands or [])
         lifecycle_hooks = lifecycle_hooks or []
-        del ephemeral
-
-        if kind is SandboxKind.MODAL:
-            raise ValueError(  # noqa: TRY003  # tracked: #288
-                "rocm backend does not support Modal — Modal offers no AMD "
-                "GPUs. Use --docker (Instinct GPUs via /dev/kfd) or local "
-                "execution."
-            )
+        # Accepted for ComputeBackendImpl protocol parity but unused: neither
+        # the LOCAL sandbox nor the agent-image-based DOCKER sandbox runs
+        # per-launch install commands.
+        del ephemeral, extra_init_commands
 
         env = self._build_env(extra_env)
 
@@ -200,10 +197,11 @@ class RocmBackend:
                 group_add=list(_DEVICE_GROUPS),
                 shm_size=_DEFAULT_SHM_SIZE,
                 bind_mounts=bind_mounts,
+                resources=resources,
                 passthrough_paths=passthrough_paths,
                 env=env,
                 log_path=log_path,
-                extra_init_commands=extra_init_commands,
+                auth_files=auth_files,
                 lifecycle_hooks=lifecycle_hooks,
             )
 

@@ -15,8 +15,11 @@ model-weight handling, prompt-visible paths, sandbox startup, and cleanup.  It
 does not execute agent commands directly.
 
 ``ComputeBackendImpl.make_sandbox`` is the compute-platform factory.  It knows
-how to construct a local/Docker/Modal sandbox for CUDA, Metal, or another
-compute backend.
+how to construct a local or Docker sandbox for CUDA, Metal, or another
+compute backend.  The Modal and SkyPilot run environments both request a
+Docker sandbox for the local agent editor container; GPU-bound work
+dispatches separately, through the candidate's own ``modal run`` entrypoint
+or a SkyPilot job.
 
 The concrete sandbox classes are still the command-execution abstraction.  They
 run shell commands, read/write files, translate virtual paths, and manage the
@@ -35,7 +38,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from vibesys.backends import SandboxKind
 from vibesys.backends.base import ComputeBackendImpl  # noqa: TC001  # tracked: #288
@@ -60,7 +63,13 @@ from vibesys.skypilot.bridge import SkyPilotBridge
 from vibesys.skypilot.config import load_cluster_profiles, resolve_profile
 from vibesys.skypilot.runner import SkyPilotJobRunner, stable_cluster_name
 from vs_project import RunEnvironmentRecord, RunResourceRequest
-from vs_sandbox import BeforeReadyContext, ProjectPathPolicy, SandboxLifecycleHooks
+from vs_sandbox import (
+    BeforeReadyContext,
+    HostResource,
+    HostResourceAccess,
+    ProjectPathPolicy,
+    SandboxLifecycleHooks,
+)
 
 _SHELL_COMMAND_ARG_COUNT = 3
 _RunEnvironmentName = Literal["local", "docker", "modal", "skypilot"]
@@ -71,6 +80,15 @@ _RECORDED_ENVIRONMENT_NAMES: tuple[_RunEnvironmentName, ...] = (
     "skypilot",
 )
 _ENVIRONMENTS_TEMPLATE_DIR = PROMPTS_DIR / "environments"
+_RUNTIME_OBJECTIVE_CONTAINER_PATH = "/opt/vibesys-runtime/objective.md"
+"""The runtime resource declaration's ``agent_path`` for the effective objective.
+
+Used in exactly one place: the ``HostResource`` :func:`_container_mount_plan`
+declares for the materialized objective document. Every environment's
+:class:`AgentPaths` instead asks the started sandbox's own
+:meth:`~vs_sandbox.docker_sandbox.DockerSandbox.agent_path` for that document's
+container path, so this constant and the resource declaration are the single
+source of truth an environment consults."""
 _SANDBOX_EVALUATOR_TOOLS_ROOT = Path("/opt/vibesys-evaluator-tools")
 _REMOTE_EVALUATOR_TOOLS_ROOT = Path(".vibesys-evaluator-tools")
 _REMOTE_EVALUATOR_TOOLCHAINS_ROOT = Path(".vibesys-evaluator-toolchains")
@@ -184,6 +202,18 @@ class RunEnvironmentRequest:  # noqa: D101  # tracked: #288
     framework_root: Path = PROJECT_ROOT
     project_path_policy: ProjectPathPolicy = field(default_factory=ProjectPathPolicy)
     state_namespace: StateNamespace | None = None
+
+
+class _AgentPathSandbox(Protocol):
+    """The one lookup ``AgentPaths`` construction needs from a started sandbox.
+
+    Narrower than ``SandboxBackendProtocol``: a host-only sandbox never
+    reaches this contract (``LocalEnvironment`` builds host paths directly),
+    while every ``SandboxKind.DOCKER`` build
+    (:class:`~vs_sandbox.docker_sandbox.DockerSandbox`) satisfies it.
+    """
+
+    def agent_path(self, host_path: Path | str) -> str: ...  # tracked: #288
 
 
 class RunEnvironmentSession(Protocol):  # noqa: D101  # tracked: #288
@@ -365,38 +395,58 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
         return cls(DockerEnvironmentConfig(image=str(image) if image else None))
 
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:  # noqa: D102  # tracked: #288
+        from vibesys.sandbox.images import agent_image  # noqa: PLC0415  # tracked: #288
+
         tools = _evaluator_tools(request)
-        container_image = (
-            _resolve_docker_image_id(_docker_backend_image(request)) if tools else None
+        # The task image, when a task has a Dockerfile, is built by the
+        # headless entrypoint and arrives here as the backend image; only the
+        # agent layer is applied on top of it.
+        container_image = agent_image(
+            _docker_backend_image(request),
+            toolchains=_docker_agent_toolchains(request, tools),
         )
-        bind_mounts, docker_symlinks, passthrough = _container_mount_plan(request)
-        bind_mounts.extend(
-            _docker_evaluator_tool_mounts(request, tools, container_image=container_image)
+        resources, docker_symlinks, passthrough = _container_mount_plan(request)
+        resources = resources + _resources_for_mounts(
+            _docker_evaluator_tool_mounts(request, tools, container_image=container_image),
+            purpose="evaluator tool",
         )
-        extra_init_commands, cli_provider_env = _cli_container_setup(request)
-        extra_init_commands.extend(
-            _evaluator_container_setup(request, include_declared_tools=False)
-        )
+        resolved_cli = _cli_container_env(request)
+        cli_provider_env: dict[str, str] = {}
+        auth_files: list[tuple[str, str]] = []
+        if resolved_cli is not None:
+            provider, cli_provider_env = resolved_cli
+            from vibesys.agents.cli_docker import auth_copy_paths  # noqa: PLC0415  # tracked: #288
+
+            auth_files = auth_copy_paths(provider)
         cli_provider_env.setdefault("UV_CACHE_DIR", "/workspace/.cache/uv")
+        # The agent image's baked toolchain root is read-only (agent.Dockerfile
+        # chmods /opt/cargo a+rX, deliberately: an agent cannot apt/cargo
+        # install mid-round). A Cargo invocation that needs a crate the image
+        # did not prebuild -- an evaluator's own trusted-runner build, most
+        # commonly -- still has to create its registry cache somewhere, so
+        # CARGO_HOME is redirected onto the writable, bind-mounted workspace.
+        # This is unrelated to which crates a candidate build needs: one with
+        # no external dependencies never touches the registry at all.
+        cli_provider_env.setdefault("CARGO_HOME", "/workspace/.cache/cargo")
         if request.git_history_root is not None:
             cli_provider_env.setdefault("VIBESYS_GIT_HISTORY", "/opt/vibesys-history")
-        bind_mounts = _dedupe_mounts(bind_mounts)
+        resources = _dedupe_resources(resources)
         lifecycle_hooks = _symlink_lifecycle_hooks(docker_symlinks)
 
         sandbox = request.backend.make_sandbox(
             SandboxKind.DOCKER,
             host_workspace=str(request.workspace),
             log_path=request.log_dir / "docker.log",
-            bind_mounts=bind_mounts,
+            bind_mounts=[],
+            resources=resources,
             passthrough_paths=passthrough,
             extra_env=cli_provider_env,
-            extra_init_commands=extra_init_commands,
+            auth_files=auth_files,
             lifecycle_hooks=lifecycle_hooks,
             container_image=container_image,
         )
         log: Callable[[str], None] = request.log or (lambda _: None)
-        label = getattr(request.backend, "image", self.config.image or "<backend-default>")
-        log(f"[docker] starting container with image {label}")
+        log(f"[docker] starting container with image {container_image}")
         # DOCKER-kind sandboxes always manage a container lifetime.
         _start_sandbox(sandbox)
 
@@ -405,6 +455,7 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
             view=RunEnvironmentView(
                 paths=_isolated_paths(
                     request,
+                    cast("_AgentPathSandbox", sandbox),
                     evaluator_tools_root=_SANDBOX_EVALUATOR_TOOLS_ROOT,
                 ),
                 prompt_notes=render_template(
@@ -469,6 +520,11 @@ class DockerEnvironment:  # noqa: D101  # tracked: #288
         child_idx: int,  # noqa: ARG002  # tracked: #288
     ) -> CandidateRuntime:
         return CandidateRuntime(view.prompt_notes, view.deployment_namespace)
+
+
+#: The Modal client a candidate's ``modal run`` needs inside the editor
+#: container; baked into that environment's agent image.
+_MODAL_EDITOR_PIP_EXTRAS: tuple[str, ...] = ("modal>=0.66",)
 
 
 @dataclass(frozen=True)
@@ -556,14 +612,26 @@ class SkyPilotEnvironment(DockerEnvironment):
         )
 
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:
-        """Open the bridge and CPU-only local editor container."""
+        """Open the bridge and CPU-only local editor container.
+
+        The editor container starts from the same agent image the plain
+        Docker path builds, pushed to and pulled back from a registry the
+        same way :class:`ModalEnvironment` does (see its ``open`` docstring
+        for why: this backend's Docker daemon cannot be assumed to already
+        have the image locally). It is unrelated to the ``image_id`` the
+        actual accelerator job later runs on: that image is an
+        operator-declared field of the cluster profile
+        (``SkyPilotProfile.remote_runtime_image``), chosen for the
+        accuracy/benchmark command's own runtime needs (CUDA/ROCm, etc.), not
+        for running agent CLIs, and this change leaves it untouched.
+        """
         if self.config.resources is None:
             raise ValueError("SkyPilot requires portable run resources")  # noqa: TRY003
         if request.state_namespace is None:
             raise ValueError("SkyPilot requires a machine-local state namespace")  # noqa: TRY003
         profiles = load_cluster_profiles(self.config.profiles_file)
-        resources = resolve_profile(profiles, self.config.profile, self.config.resources)
-        cluster_name = stable_cluster_name(request.run_id, resources)
+        cluster_resources = resolve_profile(profiles, self.config.profile, self.config.resources)
+        cluster_name = stable_cluster_name(request.run_id, cluster_resources)
         commands: dict[str, tuple[str, ...]] = {}
         for kind, raw_command in (
             ("accuracy", request.accuracy_command),
@@ -577,7 +645,7 @@ class SkyPilotEnvironment(DockerEnvironment):
         bridge = SkyPilotBridge(
             runner=SkyPilotJobRunner(executable=self.config.executable),
             cluster_name=cluster_name,
-            resources=resources,
+            resources=cluster_resources,
             workspace=request.workspace,
             evaluator_package_root=request.evaluator_package_root,
             hidden_paths=request.project_path_policy.hidden_paths,
@@ -590,8 +658,23 @@ class SkyPilotEnvironment(DockerEnvironment):
         )
         try:
             bridge.start()
-            bind_mounts, docker_symlinks, passthrough = _container_mount_plan(request)
-            extra_init_commands, cli_provider_env = _cli_container_setup(request)
+
+            from vibesys.sandbox.images import (  # noqa: PLC0415  # tracked: #288
+                agent_image,
+                ensure_pushed,
+            )
+
+            tools = _evaluator_tools(request)
+            container_image = agent_image(
+                _docker_backend_image(request),
+                toolchains=_docker_agent_toolchains(request, tools),
+            )
+            container_image = _ensure_pushed_for_remote_backend(
+                container_image, ensure_pushed=ensure_pushed, backend_label="SkyPilot"
+            )
+
+            resources, docker_symlinks, passthrough = _container_mount_plan(request)
+            cli_provider_env, auth_files = _cli_provider_env_and_auth_files(request)
             cli_provider_env.setdefault("UV_CACHE_DIR", "/workspace/.cache/uv")
             helper_source = Path(__file__).with_name("skypilot_evaluator.py")
             helper_path = "/opt/vibesys-skypilot-evaluator.py"
@@ -599,7 +682,7 @@ class SkyPilotEnvironment(DockerEnvironment):
             caller_state_path = "/opt/vibesys-skypilot/caller-state"
             caller_state = request.state_namespace.external_directory("caller")
             cli_provider_env["VIBESYS_SKYPILOT_CALLER_STATE"] = caller_state_path
-            bind_mounts.extend(
+            resources = resources + _resources_for_mounts(
                 [
                     (str(helper_source), helper_path, True),
                     (str(bridge.socket_path), socket_path, False),
@@ -611,24 +694,28 @@ class SkyPilotEnvironment(DockerEnvironment):
                 render_template(
                     "skypilot/runtime_notes.j2",
                     template_dir=_ENVIRONMENTS_TEMPLATE_DIR,
-                    nodes=resources.nodes,
-                    accelerators_per_node=resources.accelerators_per_node,
-                    accelerator_type=resources.accelerator_type,
-                    profile_name=resources.profile_name,
+                    nodes=cluster_resources.nodes,
+                    accelerators_per_node=cluster_resources.accelerators_per_node,
+                    accelerator_type=cluster_resources.accelerator_type,
+                    profile_name=cluster_resources.profile_name,
                 )
             )
             runtime_path = "/opt/vibesys-runtime/environment.md"
-            bind_mounts.append((str(runtime_document), runtime_path, True))
+            resources.append(
+                _resource_for_mount(str(runtime_document), runtime_path, read_only=True)
+            )
             passthrough.extend(["/opt/vibesys-runtime", "/opt/vibesys-skypilot"])
             sandbox = request.backend.make_sandbox(
                 SandboxKind.DOCKER,
                 host_workspace=str(request.workspace),
                 log_path=request.log_dir / "docker.log",
-                bind_mounts=_dedupe_mounts(bind_mounts),
+                bind_mounts=[],
+                resources=_dedupe_resources(resources),
                 passthrough_paths=passthrough,
                 extra_env=cli_provider_env,
-                extra_init_commands=extra_init_commands,
+                auth_files=auth_files,
                 lifecycle_hooks=_symlink_lifecycle_hooks(docker_symlinks),
+                container_image=container_image,
                 attach_accelerator=False,
             )
             _start_sandbox(sandbox)
@@ -636,6 +723,8 @@ class SkyPilotEnvironment(DockerEnvironment):
             bridge.close()
             raise
 
+        agent_path_sandbox = cast("_AgentPathSandbox", sandbox)
+        objective_document = _materialize_effective_objective(request)
         prefix = f"python {helper_path} --socket {socket_path}"
         return _SkyPilotRunEnvironmentSession(
             sandbox=sandbox,
@@ -643,8 +732,8 @@ class SkyPilotEnvironment(DockerEnvironment):
             view=RunEnvironmentView(
                 paths=AgentPaths(
                     objective=(
-                        "/opt/vibesys-runtime/objective.md"
-                        if request.objective is not None
+                        agent_path_sandbox.agent_path(objective_document)
+                        if objective_document is not None
                         else "OBJECTIVE.md"
                     ),
                     accuracy_command=(f"{prefix} accuracy" if "accuracy" in commands else None),
@@ -654,7 +743,7 @@ class SkyPilotEnvironment(DockerEnvironment):
                 prompt_notes=render_template(
                     "skypilot/prompt_notes.j2",
                     template_dir=_ENVIRONMENTS_TEMPLATE_DIR,
-                    runtime_container_path=runtime_path,
+                    runtime_container_path=agent_path_sandbox.agent_path(runtime_document),
                 ),
                 isolated=True,
                 cli_sandboxed=True,
@@ -699,16 +788,30 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
         Architecture (refactor April 2026): the agent (codex CLI) runs inside
         a *local* Docker container that does file editing only. GPU-bound
         execution dispatches to Modal via the candidate's declared ``modal run``
-        entrypoint; we install the Modal
-        Python SDK and mount the host's ``~/.modal.toml`` into the container
+        entrypoint; we mount the host's ``~/.modal.toml`` into the container
         so those calls authenticate.
 
         We retain the host-side Modal Volume bootstrap (model + optional
         draft) so the implementer's ``modal.Volume.from_name(...)`` calls
-        resolve.  The previous "long-lived Modal sandbox running codex
-        inside" architecture is gone — it caused HOME-leak auth bugs,
+        resolve. The previous "long-lived Modal sandbox running codex inside"
+        architecture is gone: it caused HOME-leak auth bugs,
         codex-vs-model-weight memory contention, and per-run sandbox
         cold-start overhead that this design eliminates.
+
+        The container starts from the same agent image the plain Docker path
+        builds (:func:`~vibesys.sandbox.images.agent_image`), pushed to and
+        pulled back from a registry (:func:`~vibesys.sandbox.images.ensure_pushed`),
+        since this backend's Docker daemon is not guaranteed to already have
+        it locally the way the local ``--docker`` path's is. Nothing installs
+        anything at container start any more, including the Modal Python SDK
+        an earlier revision ``pip install``ed here: that install already ran
+        through ``extra_init_commands``, which ``DockerSandbox`` (the sandbox
+        class every ``SandboxKind.DOCKER`` construction here actually builds)
+        has ignored ever since the agent-image work landed, so removing it is
+        deleting dead code, not taking away a behavior that ran. A candidate
+        whose declared ``modal run`` entrypoint needs the ``modal`` package
+        still needs something to install it; see the accompanying report for
+        the gap this surfaces.
         """
         # Host-side: ensure Modal Volumes exist for the model + optional
         # draft.  These run before the Docker container starts and are
@@ -716,8 +819,23 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
         self._ensure_model_volume(request)
         self._ensure_draft_volume(request)
 
-        bind_mounts, docker_symlinks, passthrough = _container_mount_plan(request)
-        extra_init_commands, cli_provider_env = _cli_container_setup(request)
+        from vibesys.sandbox.images import (  # noqa: PLC0415  # tracked: #288
+            agent_image,
+            ensure_pushed,
+        )
+
+        tools = _evaluator_tools(request)
+        container_image = agent_image(
+            _docker_backend_image(request),
+            toolchains=_docker_agent_toolchains(request, tools),
+            pip_extras=_MODAL_EDITOR_PIP_EXTRAS,
+        )
+        container_image = _ensure_pushed_for_remote_backend(
+            container_image, ensure_pushed=ensure_pushed, backend_label="Modal"
+        )
+
+        resources, docker_symlinks, passthrough = _container_mount_plan(request)
+        cli_provider_env, auth_files = _cli_provider_env_and_auth_files(request)
         cli_provider_env.setdefault("UV_CACHE_DIR", "/workspace/.cache/uv")
         if request.git_history_root is not None:
             cli_provider_env.setdefault("VIBESYS_GIT_HISTORY", "/opt/vibesys-history")
@@ -737,38 +855,48 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
             )
         )
         runtime_container_path = "/opt/vibesys-runtime/environment.md"
-        bind_mounts.append((str(runtime_document), runtime_container_path, True))
+        resources.append(
+            _resource_for_mount(str(runtime_document), runtime_container_path, read_only=True)
+        )
         passthrough.append("/opt/vibesys-runtime")
         evaluator_helper = request.framework_root / "src/vibesys/sandbox/modal_evaluator.py"
         evaluator_container_path = "/opt/vibesys-modal-evaluator.py"
-        bind_mounts.append((str(evaluator_helper), evaluator_container_path, True))
+        resources.append(
+            _resource_for_mount(str(evaluator_helper), evaluator_container_path, read_only=True)
+        )
 
         # Mount host Modal auth so `modal run` inside the container
-        # authenticates as the host user.
+        # authenticates as the host user. The Modal SDK reads them from the
+        # HOME of the user the container runs as, the agent image's
+        # non-root ``agent`` user, not root. Deferred: the Docker sandbox
+        # module imports the agent stack, which this module must not load.
+        from vs_sandbox import AGENT_HOME  # noqa: PLC0415  # tracked: #288
+
         modal_auth = Path.home() / ".modal.toml"
         if modal_auth.exists():
-            bind_mounts.append((str(modal_auth), "/root/.modal.toml", True))
+            resources.append(
+                _resource_for_mount(str(modal_auth), f"{AGENT_HOME}/.modal.toml", read_only=True)
+            )
         modal_config_dir = Path.home() / ".modal"
         if modal_config_dir.is_dir():
-            bind_mounts.append((str(modal_config_dir), "/root/.modal", True))
+            resources.append(
+                _resource_for_mount(str(modal_config_dir), f"{AGENT_HOME}/.modal", read_only=True)
+            )
 
-        # Install the Modal Python SDK alongside the agent's other packages.
-        # Pinned to a recent release; the wire protocol is forward-compatible
-        # with the host's Modal CLI as long as both are within ~one major.
-        extra_init_commands.insert(0, "pip install --quiet 'modal>=0.66'")
-
-        bind_mounts = _dedupe_mounts(bind_mounts)
+        resources = _dedupe_resources(resources)
         lifecycle_hooks = _symlink_lifecycle_hooks(docker_symlinks)
 
         sandbox = request.backend.make_sandbox(
             SandboxKind.DOCKER,
             host_workspace=str(request.workspace),
             log_path=request.log_dir / "docker.log",
-            bind_mounts=bind_mounts,
+            bind_mounts=[],
+            resources=resources,
             passthrough_paths=passthrough,
             extra_env=cli_provider_env,
-            extra_init_commands=extra_init_commands,
+            auth_files=auth_files,
             lifecycle_hooks=lifecycle_hooks,
+            container_image=container_image,
             attach_accelerator=False,
         )
         log: Callable[[str], None] = request.log or (lambda _: None)
@@ -794,13 +922,15 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
                 ("--evaluator-package-root", "/opt/vibesys-evaluator-package")
             )
         evaluator_prefix = f"{shlex.join(evaluator_arguments)} --"
+        agent_path_sandbox = cast("_AgentPathSandbox", sandbox)
+        objective_document = _materialize_effective_objective(request)
         return _DefaultRunEnvironmentSession(
             sandbox=sandbox,
             view=RunEnvironmentView(
                 paths=AgentPaths(
                     objective=(
-                        "/opt/vibesys-runtime/objective.md"
-                        if request.objective is not None
+                        agent_path_sandbox.agent_path(objective_document)
+                        if objective_document is not None
                         else "OBJECTIVE.md"
                     ),
                     accuracy_command=_prefix_command(
@@ -830,7 +960,7 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
                 prompt_notes=render_template(
                     "modal/prompt_notes.j2",
                     template_dir=_ENVIRONMENTS_TEMPLATE_DIR,
-                    runtime_container_path=runtime_container_path,
+                    runtime_container_path=agent_path_sandbox.agent_path(runtime_document),
                 ),
                 isolated=True,
                 cli_sandboxed=True,
@@ -1125,24 +1255,37 @@ def _materialize_effective_objective(request: RunEnvironmentRequest) -> Path | N
 
 def _isolated_paths(
     request: RunEnvironmentRequest,
+    sandbox: _AgentPathSandbox,
     *,
     evaluator_tools_root: Path | None = None,
 ) -> AgentPaths:
+    """Build agent-facing paths for an already-started container sandbox.
+
+    Every path the agent is told about is asked of *sandbox* rather than
+    hardcoded: :meth:`~vs_sandbox.docker_sandbox.DockerSandbox.agent_path`
+    is the one table mapping a host path to where the container sees it,
+    built from the same resource list :func:`_container_mount_plan` declared.
+    """
+    objective_document = _materialize_effective_objective(request)
     return AgentPaths(
         objective=(
-            "/opt/vibesys-runtime/objective.md" if request.objective is not None else "OBJECTIVE.md"
+            sandbox.agent_path(objective_document)
+            if objective_document is not None
+            else "OBJECTIVE.md"
         ),
         accuracy_command=_environment_command(
             request,
             request.accuracy_command,
             isolated=True,
             evaluator_tools_root=evaluator_tools_root,
+            agent_path=sandbox.agent_path,
         ),
         benchmark_command=_environment_command(
             request,
             request.benchmark_command,
             isolated=True,
             evaluator_tools_root=evaluator_tools_root,
+            agent_path=sandbox.agent_path,
         ),
         profiler_support=(request.profiler_support_name if request.profiler_support_path else None),
     )
@@ -1158,15 +1301,25 @@ def _noop_log(message: str) -> None:
     del message
 
 
-def _environment_command(
+def _environment_command(  # noqa: PLR0913  # tracked: #288
     request: RunEnvironmentRequest,
     command: str | None,
     *,
     isolated: bool = False,
     evaluator_package_root: str | None = None,
     evaluator_tools_root: Path | None = None,
+    agent_path: Callable[[Path | str], str] | None = None,
 ) -> str | None:
-    """Translate semantic paths in argv, then quote the translated command."""
+    """Translate semantic paths in argv, then quote the translated command.
+
+    ``agent_path`` is the started sandbox's own lookup
+    (:meth:`~vs_sandbox.docker_sandbox.DockerSandbox.agent_path`), consulted
+    for the evaluator package root when the caller has one and does not pass
+    an explicit ``evaluator_package_root`` override. A caller with no sandbox
+    yet (or one whose evaluator package lives at a remote-synced path outside
+    the container's own resource list, such as Modal's and SkyPilot's
+    dispatch wrappers) keeps passing an explicit override instead.
+    """
     if command is None:
         return None
     try:
@@ -1176,19 +1329,15 @@ def _environment_command(
     project_root = "/workspace" if isolated else str(request.workspace)
     replacements = [(PROJECT_ROOT_TOKEN, project_root)]
     if request.evaluator_package_root is not None:
-        replacements.append(
-            (
-                str(request.evaluator_package_root),
-                (
-                    evaluator_package_root
-                    or (
-                        "/opt/vibesys-evaluator-package"
-                        if isolated
-                        else str(request.evaluator_package_root)
-                    )
-                ),
-            )
-        )
+        if evaluator_package_root is not None:
+            translated_root = evaluator_package_root
+        elif agent_path is not None:
+            translated_root = agent_path(request.evaluator_package_root)
+        elif isolated:
+            translated_root = "/opt/vibesys-evaluator-package"
+        else:
+            translated_root = str(request.evaluator_package_root)
+        replacements.append((str(request.evaluator_package_root), translated_root))
     tools = _evaluator_tools(request)
     if tools:
         tools_root = evaluator_tools_root or _required_evaluator_tools_root(request)
@@ -1395,12 +1544,64 @@ def _docker_workspace_run(
     )
 
 
+def _resource_for_mount(
+    host_path: str,
+    container_path: str,
+    *,
+    read_only: bool,
+    purpose: str = "container mount",
+) -> HostResource:
+    """Lower one ``(host, container, readonly)`` mount tuple to a ``HostResource``.
+
+    ``agent_path`` is left unset (identity) only when the container path
+    matches the host path verbatim; every mount built here presents at a
+    dedicated container location, so this is effectively always set.
+    """
+    access = HostResourceAccess.READ_ONLY if read_only else HostResourceAccess.READ_WRITE
+    normalized_host = str(Path(host_path))
+    agent_path = container_path if container_path != normalized_host else None
+    return HostResource(Path(host_path), access, purpose, agent_path)
+
+
+def _resources_for_mounts(
+    mounts: Sequence[tuple[str, str, bool]],
+    *,
+    purpose: str = "container mount",
+) -> list[HostResource]:
+    """Lower a batch of ``(host, container, readonly)`` mounts to resources."""
+    return [
+        _resource_for_mount(host, container, read_only=read_only, purpose=purpose)
+        for host, container, read_only in mounts
+    ]
+
+
+def _dedupe_resources(resources: Sequence[HostResource]) -> list[HostResource]:
+    """Keep one resource per container-visible path, preferring the last declared.
+
+    Mirrors the historical ``bind_mounts`` dedup: a path re-declared later
+    (for example an evaluator-tool mount landing on a path an earlier, coarser
+    grant already covered) wins, while the position of the first declaration
+    is preserved.
+    """
+    seen: dict[str, HostResource] = {}
+    for resource in resources:
+        key = resource.agent_path if resource.agent_path is not None else str(resource.path)
+        seen[key] = resource
+    return list(seen.values())
+
+
 def _container_mount_plan(  # noqa: C901  # tracked: #288
     request: RunEnvironmentRequest,
     *,
     include_cli_provider_mounts: bool = True,
-) -> tuple[list[tuple[str, str, bool]], list[tuple[str, str]], list[str]]:
-    """Build the bind mounts + setup symlinks for a sandbox.
+) -> tuple[list[HostResource], list[tuple[str, str]], list[str]]:
+    """Build the host resources + setup symlinks for a sandbox.
+
+    Returns the resource list the sandbox enforces and exposes through
+    :meth:`~vs_sandbox.docker_sandbox.DockerSandbox.agent_path` (workspace
+    read-write mapping aside, which the sandbox itself always provides),
+    the setup symlinks a lifecycle hook must create once the container is
+    up, and the container paths virtual-path translation must leave alone.
 
     ``include_cli_provider_mounts`` controls whether CLI auth state and the
     full project tree are added under ``/opt/vibesys-auth`` and
@@ -1437,7 +1638,7 @@ def _container_mount_plan(  # noqa: C901  # tracked: #288
     passthrough_paths: list[str] = []
     objective_document = _materialize_effective_objective(request)
     if objective_document is not None:
-        bind_mounts.append((str(objective_document), "/opt/vibesys-runtime/objective.md", True))
+        bind_mounts.append((str(objective_document), _RUNTIME_OBJECTIVE_CONTAINER_PATH, True))
         passthrough_paths.append("/opt/vibesys-runtime")
     if request.git_history_root is not None:
         bind_mounts.append((str(request.git_history_root), "/opt/vibesys-history", True))
@@ -1486,7 +1687,7 @@ def _container_mount_plan(  # noqa: C901  # tracked: #288
         bind_mounts.extend(auth_bind_mounts(request.cli_provider))
         bind_mounts.append((str(request.framework_root), "/opt/vibesys", True))
 
-    return bind_mounts, symlinks, passthrough_paths
+    return _resources_for_mounts(bind_mounts), symlinks, passthrough_paths
 
 
 def _reference_container_path(request: RunEnvironmentRequest) -> str:
@@ -1533,30 +1734,44 @@ def _container_project_policy_mounts(
     return mounts
 
 
-def _cli_container_setup(
-    request: RunEnvironmentRequest,
-) -> tuple[list[str], dict[str, str]]:
+def _cli_container_env(request: RunEnvironmentRequest) -> tuple[str, dict[str, str]] | None:
+    """Return ``(provider, container env)`` when a CLI provider needs a container.
+
+    Every containerized environment (Docker, Modal, SkyPilot) now starts from
+    a prebuilt agent image and installs nothing at container start, so this
+    is the whole of what a CLI provider needs from the run request: the
+    auth-presence check and the auth env passthrough. What used to be the
+    shell-command half of this (:func:`vibesys.agents.cli_docker
+    .docker_init_commands`, run through ``extra_init_commands``) is gone; see
+    :func:`_cli_provider_env_and_auth_files` for the staged-file counterpart
+    Modal and SkyPilot pass through ``auth_files`` instead, matching the
+    plain Docker path.
+
+    Returns ``None`` when the run is not a containerized CLI agent (a
+    different agent backend, or no CLI provider selected).
+
+    Raises:
+        ValueError: if *request.cli_provider* has neither a staged auth file
+            nor a usable auth environment variable on this host.
+    """
     effective_agent = request.agent_backend or DEFAULT_AGENT_BACKEND
     if effective_agent != "cli" or not request.cli_provider:
-        return [], {}
+        return None
     from vibesys.agents.cli_docker import (  # noqa: PLC0415  # tracked: #288
-        DOCKER_AUTH_ENV_VARS,
-        DOCKER_AUTH_PATHS,
         DOCKER_PROVIDER_ENV,
-        auth_copy_commands,
         auth_env_passthrough,
-        docker_init_commands,
+        auth_env_vars,
+        auth_paths,
     )
 
     provider = request.cli_provider
-    auth_commands = auth_copy_commands(provider)
     auth_env = auth_env_passthrough(provider)
-    if not auth_commands and not auth_env:
+    staged_auth = [spec for spec in auth_paths(provider) if spec.host_path.exists()]
+    if not staged_auth and not auth_env:
         checked_files = (
-            ", ".join(str(spec.host_path) for spec in DOCKER_AUTH_PATHS.get(provider, []))
-            or "<none registered>"
+            ", ".join(str(spec.host_path) for spec in auth_paths(provider)) or "<none registered>"
         )
-        checked_env = ", ".join(DOCKER_AUTH_ENV_VARS.get(provider, ())) or "<none registered>"
+        checked_env = ", ".join(auth_env_vars(provider)) or "<none registered>"
         raise ValueError(  # noqa: TRY003  # tracked: #288
             f"no {provider!r} CLI authentication is available for the container: "
             f"none of the host files exist ({checked_files}) and none of the "
@@ -1568,8 +1783,53 @@ def _cli_container_setup(
     # Container processes inherit only what ``docker run -e`` sets; the editor
     # container has no other view of the host environment.
     env.update(auth_env)
-    commands = [*auth_commands, *docker_init_commands(provider)]
-    return commands, env
+    return provider, env
+
+
+def _cli_provider_env_and_auth_files(
+    request: RunEnvironmentRequest,
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Return the container env and staged auth copies for a CLI provider, if any.
+
+    The shared counterpart to :meth:`DockerEnvironment.open`'s own inline
+    version of this: every environment that starts a container from the
+    prebuilt agent image copies auth the same way (via
+    :func:`vibesys.agents.cli_docker.auth_copy_paths`, handed to the sandbox
+    as ``auth_files`` so it copies them in at start), rather than running
+    shell commands built from a provider's install recipe.
+    """
+    resolved_cli = _cli_container_env(request)
+    if resolved_cli is None:
+        return {}, []
+    provider, cli_provider_env = resolved_cli
+    from vibesys.agents.cli_docker import auth_copy_paths  # noqa: PLC0415  # tracked: #288
+
+    return cli_provider_env, auth_copy_paths(provider)
+
+
+def _ensure_pushed_for_remote_backend(
+    image_id: str,
+    *,
+    ensure_pushed: Callable[[str], str],
+    backend_label: str,
+) -> str:
+    """Push and verify *image_id*, naming it and *backend_label* on failure.
+
+    ``ensure_pushed`` (:func:`vibesys.sandbox.images.ensure_pushed`) already
+    raises :class:`~vibesys.sandbox.images.ImagePushError` naming the image
+    and what went wrong; this only adds which run environment could not
+    start because of it, so the operator does not have to guess whether a
+    Modal or a SkyPilot launch is the one that failed to reach the registry.
+    """
+    from vibesys.sandbox.images import ImagePushError  # noqa: PLC0415  # tracked: #288
+
+    try:
+        return ensure_pushed(image_id)
+    except ImagePushError as exc:
+        raise ImagePushError(  # noqa: TRY003
+            f"could not push or verify the agent image {image_id} in the "
+            f"registry for a {backend_label} run: {exc}"
+        ) from exc
 
 
 def _evaluator_container_setup(
@@ -1791,9 +2051,15 @@ def _docker_evaluator_tools_root(
 
 
 def _docker_backend_image(request: RunEnvironmentRequest) -> str:
+    """Return the compute backend's base image, the ``agent_image`` build input.
+
+    Used both to build the agent image every Docker run starts from and, when
+    the run also needs cargo-git evaluator tools, to key their host-side
+    build cache.
+    """
     image = getattr(request.backend, "image", None)
     if not isinstance(image, str) or not image:
-        raise EvaluatorToolError("Docker evaluator tools require a configured backend image")  # noqa: TRY003
+        raise EvaluatorToolError("Docker execution requires a configured backend image")  # noqa: TRY003
     return image
 
 
@@ -1874,6 +2140,27 @@ def _evaluator_tools(request: RunEnvironmentRequest) -> dict[str, CargoGitToolSp
     return load_evaluator_package(request.evaluator_package_root).metadata.tools
 
 
+def _docker_agent_toolchains(
+    request: RunEnvironmentRequest,
+    tools: Mapping[str, CargoGitToolSpec],
+) -> frozenset[str]:
+    """Return the toolchains the agent image should bake in for this run.
+
+    Mirrors what :func:`_evaluator_container_setup` installs per-run today:
+    the evaluator package's declared toolchains, plus ``"rust"`` when the run
+    also needs cargo-git evaluator tools. *tools* is the caller's own
+    :func:`_evaluator_tools` result, passed in rather than recomputed.
+    """
+    toolchains: set[str] = set()
+    if request.evaluator_package_root is not None:
+        toolchains |= set(
+            load_evaluator_package(request.evaluator_package_root).metadata.toolchains
+        )
+    if tools:
+        toolchains.add("rust")
+    return frozenset(toolchains)
+
+
 def _required_evaluator_tools_root(request: RunEnvironmentRequest) -> Path:
     if request.evaluator_tools_root is None:
         raise ValueError("evaluator tools require an operator-owned tools root")  # noqa: TRY003
@@ -1883,15 +2170,6 @@ def _required_evaluator_tools_root(request: RunEnvironmentRequest) -> Path:
     except ValueError:
         return root
     raise ValueError("evaluator tools root must be outside the candidate workspace")  # noqa: TRY003
-
-
-def _dedupe_mounts(
-    mounts: list[tuple[str, str, bool]],
-) -> list[tuple[str, str, bool]]:
-    seen: dict[str, tuple[str, str, bool]] = {}
-    for host_path, container_path, readonly in mounts:
-        seen[container_path] = (host_path, container_path, readonly)
-    return list(seen.values())
 
 
 @dataclass(frozen=True)
