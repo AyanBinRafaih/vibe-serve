@@ -2205,6 +2205,54 @@ describe('OpenTUI presentation', () => {
     expect(recollapsed).not.toContain('"field_11": 11');
   });
 
+  it('leaves a selected tool collapsed when Enter is pressed from the todo list', async () => {
+    const response = JSON.stringify(
+      Object.fromEntries(Array.from({length: 12}, (_, index) => [`field_${index}`, index])),
+    );
+    const testRenderer = await createTestRenderer({width: 100, height: 32});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedEntryId: 'tool',
+      todosExpanded: true,
+      core: {
+        ...initialSessionState().core,
+        todos: [
+          {
+            agentKind: null,
+            roundNumber: null,
+            items: [{content: 'benchmark it', status: 'in_progress'}],
+          },
+        ],
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: response,
+            toolName: 'Read',
+            toolArguments: {path: 'run-state.json'},
+            toolResult: {kind: 'tool_result', tool: 'Read', content: response},
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const collapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(collapsed).toContain('benchmark it');
+    expect(collapsed).not.toContain('"field_11": 11');
+
+    // The expanded todo list holds the keys, so Enter belongs to it, not to the
+    // transcript's selected tool card: the card must stay collapsed.
+    testRenderer.mockInput.pressEnter();
+    const afterEnter = await frameAfter(testRenderer);
+    expect(afterEnter).toContain('Show full response');
+    expect(afterEnter).not.toContain('"field_11": 11');
+  });
+
   it('collapses prompts and expands the latest prompt with Ctrl+P', async () => {
     const content = Array.from({length: 20}, (_, index) => `prompt line ${index + 1}`).join('\n');
     const testRenderer = await createTestRenderer({width: 80, height: 20});
@@ -6852,7 +6900,7 @@ describe('round focus on hidden panes', () => {
     expect(controller.state.roundFocus).toBe('transcript');
   });
 
-  it('repairs focus and filter parked on the agents pane when a zoom hides it', async () => {
+  it('keeps the parked agent filter and its cue when a zoom hides the agents pane', async () => {
     const testRenderer = await createTestRenderer({width: 150, height: 26});
     const controller = new FakeController(twoAgentRound());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -6866,19 +6914,20 @@ describe('round focus on hidden panes', () => {
     expect(controller.state.selectedAgentKind).toBe('judge');
 
     // A zoom leaves only the transcript on screen while the agents pane held
-    // the keys. Normalization moves the keys to the visible pane and turns
-    // the filter off with its cue: the transcript shows every agent again and
-    // wears the focus border.
+    // the keys. Normalization moves the keys to the visible pane, but the
+    // filter stays: its `filtered to` header cue is painted above the zoom, so
+    // the transcript stays narrowed to the judge with a signal on screen.
     controller.publish({
       ...controller.state,
       layout: {...controller.state.layout, zoomedPane: 'transcript'},
     });
     const frame = await frameAfter(testRenderer);
     expect(controller.state.roundFocus).toBe('transcript');
-    expect(controller.state.selectedAgentKind).toBeNull();
+    expect(controller.state.selectedAgentKind).toBe('judge');
     expect(frame).toContain('▸ Transcript');
-    expect(frame).toContain('edited the kernel');
+    expect(frame).toContain('filtered to');
     expect(frame).toContain('checking the diff');
+    expect(frame).not.toContain('edited the kernel');
 
     // The keys followed: Up moves the transcript cursor.
     testRenderer.mockInput.pressKey('ARROW_UP');

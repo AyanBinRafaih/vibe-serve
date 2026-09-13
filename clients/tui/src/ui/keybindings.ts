@@ -304,7 +304,7 @@ export function bindKeybindings(
     }
     if (
       (key.name === 'return' || key.name === 'enter') &&
-      focusedPane(controller.state) !== 'agents' &&
+      focusedPane(controller.state) === 'transcript' &&
       actions.inputIsEmpty() &&
       actions.toggleSelectedTool()
     ) {

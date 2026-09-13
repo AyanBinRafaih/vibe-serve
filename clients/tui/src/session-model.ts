@@ -1294,17 +1294,14 @@ export function normalizeFocus(state: SessionState): SessionState {
  * name a pane that is on screen. Beside a visualization a stored 'agents'
  * focus is a parked value that `focusedPane` and the key routing both ignore
  * and closing the pane restores, so it stays. A zoom has no restore point, so
- * focus stranded behind one is repaired: the keys move to the pane the zoom
- * kept, and an agent filter whose only cue the zoom removed turns off rather
- * than silently narrowing the transcript.
+ * focus stranded behind one moves to the pane the zoom kept. The agent filter
+ * stays: its `filtered to <agent>` header cue is painted above the zoom, so
+ * the transcript is never narrowed without a signal.
  */
 function normalizeRoundFocus(state: SessionState): SessionState {
   if (experimentLogVisible(state) || state.layout.right !== null) return state;
-  if (
-    !roundPaneVisible(state, 'agents') &&
-    (state.roundFocus === 'agents' || state.selectedAgentKind !== null)
-  ) {
-    return {...state, roundFocus: 'transcript', selectedAgentKind: null};
+  if (!roundPaneVisible(state, 'agents') && state.roundFocus === 'agents') {
+    return {...state, roundFocus: 'transcript'};
   }
   if (!roundPaneVisible(state, 'transcript') && state.roundFocus === 'transcript') {
     return {...state, roundFocus: 'agents'};
