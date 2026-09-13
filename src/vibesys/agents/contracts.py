@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 
     from langchain_core.tools import BaseTool
 
-    from vibesys._agent_cli.base import MCPServerSpec as LegacyMCPServerSpec
     from vibesys.agents.progress import AgentProgress
     from vibesys.agents.session_key import AgentSessionKey
     from vs_sandbox import HostResource, ProjectPathPolicy
@@ -99,7 +98,15 @@ class AgentUsage:
 
 @dataclass(frozen=True, slots=True)
 class AgentEvent:
-    """One normalized event emitted while an agent turn is running."""
+    """One normalized event emitted while an agent turn is running.
+
+    A ``THINKING`` event carrying ``payload={"channel": "diagnostic"}`` is
+    driver plumbing (a provider heartbeat, a stderr line, a thread or turn
+    marker), not the agent's reasoning. Consumers route it to the diagnostic
+    channel so a transcript never presents plumbing as chain of thought. A
+    driver that has no separate diagnostic stream marks such events itself;
+    every other ``THINKING`` event is agent reasoning.
+    """
 
     kind: AgentEventKind
     text: str | None = None
@@ -191,6 +198,10 @@ class AgentSession(Protocol):
         """
         ...
 
+    def cancel(self) -> None:
+        """Stop an in-flight turn, if any. Idempotent. Safe to call from another thread."""
+        ...
+
     def close(self) -> None:
         """Release session resources. Implementations must be idempotent."""
         ...
@@ -272,7 +283,7 @@ class AgentClientProtocol(Protocol):
         env: dict[str, str] | None = None,
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
-        mcp_servers: list[LegacyMCPServerSpec] | None = None,
+        mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,
@@ -291,7 +302,7 @@ class AgentClientProtocol(Protocol):
         env: dict[str, str] | None = None,
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
-        mcp_servers: list[LegacyMCPServerSpec] | None = None,
+        mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,

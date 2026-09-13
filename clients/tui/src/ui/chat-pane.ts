@@ -11,6 +11,7 @@ import {
   chatThreadHeading,
   type SessionState,
 } from '../session-model.js';
+import {fillLayer} from './box-fill.js';
 import {ChatComposerView, type ChatDraft} from './chat-composer.js';
 import {ConversationView} from './conversation.js';
 import {LOG_CLAIM_PANEL_WIDTH, LOG_COMPACT_PANEL_WIDTH} from './experiment-log.js';
@@ -41,38 +42,6 @@ export function chatDockFits(terminalWidth: number, rightPaneWidth = 0): boolean
 }
 
 /**
- * The row the command column gives up so its box shares a bottom edge with the
- * docked Message box. The pane is bordered and the column is not, so the pane
- * spends the terminal's last row on its own bottom border and the column has to
- * skip the same row to end level with it.
- */
-const DOCK_ALIGNMENT_ROWS = 1;
-
-/**
- * Rows the landing table keeps for itself before presentation may spend one.
- * Nine is the kickoff panel: two borders around the round's title, the phase
- * list, and the lines saying what the round produces.
- */
-const MIN_LANDING_ROWS = 9;
-
-/**
- * Rows the command column insets itself by so the Command and Message boxes
- * line up beneath a docked chat.
- *
- * The row is not free: it comes out of the table above it. A terminal short
- * enough that the table would lose a line keeps the row instead and lets the
- * two boxes sit one row apart. Alignment is presentation and the table is the
- * view, so a short terminal degrades in the direction the operator can see and
- * undo (resize) rather than silently clipping the content.
- *
- * `landingRows` is what the table has before this inset is taken.
- */
-export function commandColumnInset(chatDocked: boolean, landingRows: number): number {
-  if (!chatDocked) return 0;
-  return landingRows - DOCK_ALIGNMENT_ROWS >= MIN_LANDING_ROWS ? DOCK_ALIGNMENT_ROWS : 0;
-}
-
-/**
  * Width in columns for the docked chat. It asks for the columns left over once
  * the table has enough for its claim, so a wide terminal loses no table column
  * to the chat; where there is no such surplus it still takes its readable
@@ -92,11 +61,19 @@ export function chatPaneWidth(terminalWidth: number, rightPaneWidth = 0): number
  */
 export class ChatPaneView {
   readonly output: BoxRenderable;
+  readonly #fill: BoxRenderable;
   readonly #scroll: ScrollBoxRenderable;
   readonly #conversation: ConversationView;
   readonly #composer: ChatComposerView;
   #theme: Theme;
   #renderedConversation: ConversationEntry[] | null = null;
+  /**
+   * The thread on screen while the pane is visible, `null` while it is hidden.
+   * Comparing it against the state says which renders are the pane appearing
+   * or a thread switch, the moments that jump to the tail; every other render
+   * leaves the scroll position to stickyScroll.
+   */
+  #visibleThreadId: string | null = null;
 
   constructor(
     renderer: CliRenderer,
@@ -116,10 +93,6 @@ export class ChatPaneView {
       border: true,
       borderStyle: paneBorderStyle(false),
       borderColor: paneBorderColor(theme, false),
-      // The surface every other pane sits on. Without it this box falls
-      // through to the root's canvas, a lighter shade, so the chat read as a
-      // pale band beside panes that did not match it.
-      backgroundColor: theme.elevatedSurface,
       title: paneTitle(CHAT_PANE_TITLE, false),
       visible: false,
       // Clicking into the chat gives it the keys, the same thing Ctrl+W does.
@@ -127,6 +100,11 @@ export class ChatPaneView {
       // table, so the operator could not tell where their keys were going.
       onMouseUp: () => controller.focusPane('chat'),
     });
+    // The surface every other pane sits on. Without it this box falls through
+    // to the root's canvas, a lighter shade, so the chat read as a pale band
+    // beside panes that did not match it. On its own layer, so the pane keeps
+    // the rounded frame `PANE_BORDER` argues for (tui-conventions.md).
+    this.#fill = fillLayer(this.output, 'chat-pane-fill', theme.canvas);
     this.#scroll = new ScrollBoxRenderable(renderer, {
       id: 'chat-pane-scroll',
       width: '100%',
@@ -154,7 +132,13 @@ export class ChatPaneView {
     this.#composer = new ChatComposerView(
       renderer,
       draft,
-      value => void controller.submitChat(value),
+      value => {
+        // The operator's own message belongs at the tail even when they had
+        // scrolled into history to write it; landing at the bottom also
+        // re-arms sticky-bottom, so the answer streams into view.
+        this.#scrollToTail();
+        void controller.submitChat(value);
+      },
       theme,
       'chat-dock',
       () => controller.focusPane('chat'),
@@ -171,7 +155,7 @@ export class ChatPaneView {
     this.#theme = theme;
     // Resting colour: `render` repaints from the live focus on the next frame.
     this.output.borderColor = paneBorderColor(theme, false);
-    this.output.backgroundColor = theme.elevatedSurface;
+    this.#fill.backgroundColor = theme.canvas;
     this.#conversation.applyTheme(theme, markdownStyle);
     this.#composer.applyTheme(theme);
     this.#renderedConversation = null;
@@ -209,6 +193,8 @@ export class ChatPaneView {
     // hidden still has to stop the composer's spinner.
     this.#composer.syncPending(state.chatPending, visible);
     if (!visible) {
+      // Forgotten while hidden, so the pane reappears on the tail.
+      this.#visibleThreadId = null;
       return;
     }
     this.output.width = width;
@@ -222,9 +208,23 @@ export class ChatPaneView {
     applyPaneFocus(this.output, this.#theme, chatThreadHeading(state), focused);
     this.#composer.activate(Math.max(1, width - 4), focused, state.chatPending);
     this.#composer.renderMenu(state);
-    if (state.chatConversation === this.#renderedConversation) return;
-    this.#renderedConversation = state.chatConversation;
-    this.#conversation.render(state);
+    if (state.chatConversation !== this.#renderedConversation) {
+      this.#renderedConversation = state.chatConversation;
+      this.#conversation.render(state);
+    }
+    // Tailing is stickyScroll's job: it follows appended entries and releases
+    // when the operator scrolls up. The explicit jump is reserved for the
+    // moments the operator asked for the tail, the pane appearing and
+    // switching threads; jumping on every conversation change instead
+    // cancelled a manual scroll-up as soon as an answer streamed in.
+    if (this.#visibleThreadId !== state.activeChatThreadId) {
+      this.#visibleThreadId = state.activeChatThreadId;
+      this.#scrollToTail();
+    }
+  }
+
+  /** Lands the viewport at the bottom, which also re-arms sticky-bottom. */
+  #scrollToTail(): void {
     this.#scroll.scrollTo(this.#scroll.scrollHeight);
   }
 }
