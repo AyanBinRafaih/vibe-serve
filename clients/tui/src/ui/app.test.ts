@@ -2205,6 +2205,54 @@ describe('OpenTUI presentation', () => {
     expect(recollapsed).not.toContain('"field_11": 11');
   });
 
+  it('leaves a selected tool collapsed when Enter is pressed from the todo list', async () => {
+    const response = JSON.stringify(
+      Object.fromEntries(Array.from({length: 12}, (_, index) => [`field_${index}`, index])),
+    );
+    const testRenderer = await createTestRenderer({width: 100, height: 32});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedEntryId: 'tool',
+      todosExpanded: true,
+      core: {
+        ...initialSessionState().core,
+        todos: [
+          {
+            agentKind: null,
+            roundNumber: null,
+            items: [{content: 'benchmark it', status: 'in_progress'}],
+          },
+        ],
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: response,
+            toolName: 'Read',
+            toolArguments: {path: 'run-state.json'},
+            toolResult: {kind: 'tool_result', tool: 'Read', content: response},
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const collapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(collapsed).toContain('benchmark it');
+    expect(collapsed).not.toContain('"field_11": 11');
+
+    // The expanded todo list holds the keys, so Enter belongs to it, not to the
+    // transcript's selected tool card: the card must stay collapsed.
+    testRenderer.mockInput.pressEnter();
+    const afterEnter = await frameAfter(testRenderer);
+    expect(afterEnter).toContain('Show full response');
+    expect(afterEnter).not.toContain('"field_11": 11');
+  });
+
   it('collapses prompts and expands the latest prompt with Ctrl+P', async () => {
     const content = Array.from({length: 20}, (_, index) => `prompt line ${index + 1}`).join('\n');
     const testRenderer = await createTestRenderer({width: 80, height: 20});
@@ -6742,6 +6790,151 @@ class FakeController implements SessionController {
     for (const listener of this.#listeners) listener(this.state);
   }
 }
+
+describe('round focus on hidden panes', () => {
+  // Key routing consulted `roundFocus` while the border consulted
+  // `focusedPane`, so with the agents pane off screen Left could move the keys
+  // and an auto-selected agent filter onto a pane that was not there,
+  // silently narrowing the transcript.
+  function twoAgentRound(): SessionState {
+    const base = initialSessionState();
+    return {
+      ...base,
+      selectedRound: 1,
+      core: {
+        ...base.core,
+        rounds: [{number: 1, status: 'active' as const}],
+        phases: [
+          {
+            kind: 'implementer',
+            status: 'completed' as const,
+            roundNumber: 1,
+            roundLabel: 'round-1-impl',
+          },
+          {kind: 'judge', status: 'active' as const, roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant' as const,
+            label: 'implementer',
+            content: 'edited the kernel',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant' as const,
+            label: 'implementer',
+            content: 'guarded the tail tile',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e3',
+            kind: 'assistant' as const,
+            label: 'judge',
+            content: 'checking the diff',
+            agentKind: 'judge',
+            roundNumber: 1,
+          },
+        ],
+      },
+    };
+  }
+
+  it('keeps Left from filtering the zoomed transcript through the hidden agents pane', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController(twoAgentRound());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('edited the kernel'));
+
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('transcript');
+
+    // Left names the agents pane, but the zoom took it off screen: the keys
+    // hold on the transcript and no invisible agent filter appears.
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    const frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+    expect(controller.state.selectedAgentKind).toBeNull();
+    expect(frame).toContain('edited the kernel');
+    expect(frame).toContain('checking the diff');
+
+    // Up still moves the transcript cursor, not an invisible agent selection.
+    testRenderer.mockInput.pressKey('ARROW_UP');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedEntryId).not.toBeNull();
+    expect(controller.state.selectedAgentKind).toBeNull();
+  });
+
+  it('still reaches the agents pane with Left while it is on screen', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController(twoAgentRound());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('edited the kernel'));
+
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    const frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    // Arriving auto-selects the active agent, with the pane there to show it.
+    expect(controller.state.selectedAgentKind).toBe('judge');
+    expect(frame).toContain('▸ Agents');
+
+    // Zoomed onto the agents pane, Right has no visible transcript to move
+    // to: the keys stay on the one pane that is on screen.
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('agents');
+    testRenderer.mockInput.pressKey('ARROW_RIGHT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+
+    // Unzoomed, the same key moves them again.
+    testRenderer.mockInput.pressKey('F4');
+    testRenderer.mockInput.pressKey('ARROW_RIGHT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+  });
+
+  it('keeps the parked agent filter and its cue when a zoom hides the agents pane', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController(twoAgentRound());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('edited the kernel'));
+
+    // The agents pane holds the keys and an agent filters the transcript.
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(controller.state.selectedAgentKind).toBe('judge');
+
+    // A zoom leaves only the transcript on screen while the agents pane held
+    // the keys. Normalization moves the keys to the visible pane, but the
+    // filter stays: its `filtered to` header cue is painted above the zoom, so
+    // the transcript stays narrowed to the judge with a signal on screen.
+    controller.publish({
+      ...controller.state,
+      layout: {...controller.state.layout, zoomedPane: 'transcript'},
+    });
+    const frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+    expect(controller.state.selectedAgentKind).toBe('judge');
+    expect(frame).toContain('▸ Transcript');
+    expect(frame).toContain('filtered to');
+    expect(frame).toContain('checking the diff');
+    expect(frame).not.toContain('edited the kernel');
+
+    // The keys followed: Up moves the transcript cursor.
+    testRenderer.mockInput.pressKey('ARROW_UP');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedEntryId).not.toBeNull();
+  });
+});
 
 describe('chat while a pane is zoomed', () => {
   /** The landing view with the experiments pane zoomed over the whole row. */
