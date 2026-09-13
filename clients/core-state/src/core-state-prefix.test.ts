@@ -7,7 +7,6 @@ import {
   reduceEventBatch,
   reduceEventPrefix,
 } from './core-state.js';
-import type {RoundSummary} from './run-map.js';
 
 /**
  * Equivalence harness for the tail bootstrap.
@@ -16,14 +15,7 @@ import type {RoundSummary} from './run-map.js';
  * the same `CoreState` as folding its tail and then backfilling the preceding
  * chunks through `reduceEventPrefix`.
  *
- * One exception is scoped out of the comparison, see `mergeRoundLists`: an agent
- * execution whose `agent_execution_started` falls in a backfilled chunk and
- * whose `agent_execution_finished` falls after the boundary loses its timing
- * interval, because the newer fold saw a finish with no start and dropped the
- * timestamp. `withoutRoundTiming` scopes exactly that, and the round-aligned
- * case below asserts full equality including timing.
- *
- * Two further divergences are inherent to folding a bare suffix, and each has a
+ * Two divergences are inherent to folding a bare suffix, and each has a
  * test of its own below rather than a normalization here:
  * - `status` and the expected-phase seeding both need `run_started`, which a
  *   suffix does not carry.
@@ -44,7 +36,7 @@ describe('prefix backfill equivalence', () => {
           const bootstrapped = backfill(events, tail, 97);
 
           expect(bootstrapped.historyAfterSequence).toBe(0);
-          expect(withoutRoundTiming(bootstrapped)).toEqual(withoutRoundTiming(full));
+          expect(bootstrapped).toEqual(full);
         }
       });
     }
@@ -580,6 +572,29 @@ describe('prefix merges across the chunk boundary', () => {
     ]);
   });
 
+  it('keeps an abandoned streamed turn distinct from the tail answer after it', () => {
+    const events = [
+      threadCreatedEvent(1, 'thread-a'),
+      // exec-a streamed and then failed before recording a terminal answer.
+      chatChunkEvent(2, 'thread-a', 'abandoned ', 'exec-a'),
+      chatChunkEvent(3, 'thread-a', 'stream', 'exec-a'),
+      chatChunkEvent(4, 'thread-a', 'complete answer', 'exec-b'),
+      chatEvent(5, 'thread-a', 'complete answer', undefined, 'exec-b'),
+    ];
+
+    // The abandoned turn's chunks fall below the floor while the answered
+    // turn lands in the tail. A full replay keeps two entries, so the
+    // backfilled merge must not fold the tail's answer over the abandoned
+    // turn it never owned.
+    const merged = foldAsPrefix(events, 3);
+
+    expect(merged).toEqual(reduceEventBatch(initialCoreState(), events));
+    expect(merged.chatTranscripts['thread-a']?.map(entry => entry.content)).toEqual([
+      'abandoned stream',
+      'complete answer',
+    ]);
+  });
+
   it('keeps a round started in the chunk and finished in the tail', () => {
     const events = [chunkEvent(1, 'work'), roundFinishedEvent(2)];
 
@@ -649,10 +664,7 @@ describe('prefix merges across the chunk boundary', () => {
     ]);
   });
 
-  // Documents the one field the merge cannot reconstruct. The chunk holds an
-  // open start, the tail holds a finish with nothing to close, and the finish
-  // timestamp is gone by the time the two states meet.
-  it('loses the timing interval of an execution split across the boundary', () => {
+  it('reconciles the timing interval of an execution split across the boundary', () => {
     const events = [
       executionStartedEvent(1, 'exec-a'),
       executionFinishedEvent(2, 'exec-a'),
@@ -662,12 +674,85 @@ describe('prefix merges across the chunk boundary', () => {
 
     const merged = foldAsPrefix(events, 1);
 
-    expect(withoutRoundTiming(merged)).toEqual(withoutRoundTiming(full));
+    expect(merged).toEqual(full);
     expect(full.rounds[0]?.agentIntervals).toEqual([
       {startedAt: timestamp(1), finishedAt: timestamp(2)},
     ]);
-    expect(merged.rounds[0]?.agentIntervals).toEqual([]);
-    expect(merged.rounds[0]?.activeAgentStarts).toEqual({'implementer:exec-a': timestamp(1)});
+    expect(merged.rounds[0]?.agentIntervals).toEqual([
+      {startedAt: timestamp(1), finishedAt: timestamp(2)},
+    ]);
+    expect(merged.rounds[0]?.activeAgentStarts).toEqual({});
+  });
+
+  for (const terminal of ['round_finished', 'run_failed', 'run_interrupted'] as const) {
+    it(`closes a backfilled active timing at a tail ${terminal}`, () => {
+      const terminalEvent: RunEvent =
+        terminal === 'round_finished'
+          ? roundFinishedEvent(2)
+          : {sequence: 2, timestamp: timestamp(2), type: terminal};
+      const events = [executionStartedEvent(1, 'exec-a'), terminalEvent];
+
+      const merged = foldAsPrefix(events, 1);
+      const full = reduceEventBatch(initialCoreState(), events);
+
+      expect({...merged, activeExecutions: {}}).toEqual({...full, activeExecutions: {}});
+      expect(merged.rounds[0]?.agentIntervals).toEqual([
+        {startedAt: timestamp(1), finishedAt: timestamp(2)},
+      ]);
+      expect(merged.rounds[0]?.activeAgentStarts).toEqual({});
+    });
+  }
+
+  it('deduplicates modern and compatibility finishes split across chunks', () => {
+    const events = [
+      executionStartedEvent(1, 'exec-a'),
+      executionFinishedEvent(2, 'exec-a'),
+      phaseFinishedEvent(3, 'exec-a'),
+      roundFinishedEvent(4),
+    ];
+
+    const merged = backfillAt(events, [1, 2, 3]);
+    const full = reduceEventBatch(initialCoreState(), events);
+
+    expect(merged.rounds).toEqual(full.rounds);
+    expect(merged.rounds[0]?.agentIntervals).toEqual([
+      {startedAt: timestamp(1), finishedAt: timestamp(2)},
+    ]);
+  });
+
+  it('reconciles a reused legacy key across more than two prefix chunks', () => {
+    const sharedTimestamp = timestamp(9);
+    const events = [
+      {...legacyExecutionEvent(1, 'agent_execution_started'), timestamp: sharedTimestamp},
+      {...legacyExecutionEvent(2, 'agent_execution_finished'), timestamp: sharedTimestamp},
+      {...legacyExecutionEvent(3, 'agent_execution_started'), timestamp: sharedTimestamp},
+    ];
+
+    const merged = backfillAt(events, [1, 2]);
+    const full = reduceEventBatch(initialCoreState(), events);
+
+    expect(merged.rounds).toEqual(full.rounds);
+    expect(merged.rounds[0]?.agentIntervals).toEqual([
+      {startedAt: sharedTimestamp, finishedAt: sharedTimestamp},
+    ]);
+    expect(merged.rounds[0]?.activeAgentStarts).toEqual({'implementer:': sharedTimestamp});
+  });
+
+  it('retains timing provenance when profileSkipped copies the round', () => {
+    const events = [
+      executionStartedEvent(1, 'exec-a'),
+      roundFinishedEvent(2, {profile_skipped: true}),
+    ];
+
+    const merged = foldAsPrefix(events, 1);
+
+    const full = reduceEventBatch(initialCoreState(), events);
+    expect({...merged, activeExecutions: {}}).toEqual({...full, activeExecutions: {}});
+    expect(merged.rounds[0]).toMatchObject({
+      profileSkipped: true,
+      agentIntervals: [{startedAt: timestamp(1), finishedAt: timestamp(2)}],
+      activeAgentStarts: {},
+    });
   });
 
   // A bare suffix has no `run_started`, so the tail fold has no run status and
@@ -782,18 +867,6 @@ function foldWithSpineBackfill(
 
 function sequenceAt(events: readonly RunEvent[], index: number): number {
   return index < 0 ? 0 : (events[index]?.sequence ?? 0);
-}
-
-/** The state minus the round timing fields a split execution cannot recover. */
-function withoutRoundTiming(state: CoreState): CoreState {
-  return {
-    ...state,
-    rounds: state.rounds.map(
-      ({agentIntervals: _intervals, activeAgentStarts: _starts, ...rest}) => {
-        return rest as RoundSummary;
-      },
-    ),
-  };
 }
 
 // A deterministic 32-bit generator, so a failing seed is reproducible.
@@ -1072,16 +1145,40 @@ function generateRunEvents(seed: number, options: {typedTools: boolean}, rounds 
           },
         });
       }
-      emit({
-        ...chatContext,
-        type: 'chat',
-        status: 'answered',
-        data: {
-          kind: 'chat',
-          answer: words(rng, 5, 30),
-          ...(rng.float() < 0.5 ? {thread_title: words(rng, 2, 4)} : {}),
-        },
-      });
+      // Most turns stream their answer before the terminal record. A streamed
+      // turn is sometimes abandoned (its invocation failed before recording an
+      // answer), and an unstreamed answer is sometimes a legacy id-less record
+      // from before answers carried their invocation.
+      const invocationId = `chat-${events.length}`;
+      const streamed = rng.float() < 0.6;
+      if (streamed) {
+        for (let chunk = rng.int(1, 3); chunk > 0; chunk -= 1) {
+          emit({
+            ...chatContext,
+            type: 'agent_output_chunk',
+            invocation_id: invocationId,
+            data: {
+              kind: 'agent_output_chunk',
+              channel: 'assistant',
+              content: `${words(rng, 2, 6)} `,
+            },
+          });
+        }
+      }
+      const abandoned = streamed && rng.float() < 0.25;
+      if (!abandoned) {
+        emit({
+          ...chatContext,
+          type: 'chat',
+          status: 'answered',
+          data: {
+            kind: 'chat',
+            answer: words(rng, 5, 30),
+            ...(rng.float() < 0.5 ? {thread_title: words(rng, 2, 4)} : {}),
+            ...(streamed || rng.float() < 0.5 ? {invocation_id: invocationId} : {}),
+          },
+        });
+      }
     }
   }
 
@@ -1229,6 +1326,28 @@ function executionFinishedEvent(sequence: number, executionId: string): RunEvent
   };
 }
 
+function phaseFinishedEvent(sequence: number, executionId: string): RunEvent {
+  return {
+    ...baseEvent(sequence, 'phase_finished'),
+    round_label: 'round-1',
+    execution_id: executionId,
+    status: 'completed',
+    data: {kind: 'phase', phase: 'implementer', attempt: null},
+  };
+}
+
+function legacyExecutionEvent(
+  sequence: number,
+  type: 'agent_execution_started' | 'agent_execution_finished',
+): RunEvent {
+  const event =
+    type === 'agent_execution_started'
+      ? executionStartedEvent(sequence, 'discarded')
+      : executionFinishedEvent(sequence, 'discarded');
+  const {execution_id: _discarded, ...legacy} = event;
+  return legacy;
+}
+
 function threadCreatedEvent(sequence: number, threadId: string): RunEvent {
   return {
     ...baseEvent(sequence, 'chat_thread_created'),
@@ -1247,24 +1366,40 @@ function threadCreatedEvent(sequence: number, threadId: string): RunEvent {
   };
 }
 
-function chatEvent(sequence: number, threadId: string, answer: string, title?: string): RunEvent {
+function chatEvent(
+  sequence: number,
+  threadId: string,
+  answer: string,
+  title?: string,
+  invocationId?: string,
+): RunEvent {
   return {
     ...baseEvent(sequence, 'chat'),
     agent_kind: 'chat',
     round_label: 'experiment-chat',
     chat_thread_id: threadId,
     status: 'answered',
-    data: {kind: 'chat', answer, ...(title === undefined ? {} : {thread_title: title})},
+    data: {
+      kind: 'chat',
+      answer,
+      ...(title === undefined ? {} : {thread_title: title}),
+      ...(invocationId === undefined ? {} : {invocation_id: invocationId}),
+    },
   };
 }
 
-function chatChunkEvent(sequence: number, threadId: string, content: string): RunEvent {
+function chatChunkEvent(
+  sequence: number,
+  threadId: string,
+  content: string,
+  invocationId?: string,
+): RunEvent {
   return {
     ...baseEvent(sequence, 'agent_output_chunk'),
     agent_kind: 'chat',
     round_label: 'experiment-chat',
     chat_thread_id: threadId,
-    invocation_id: `${threadId}-turn`,
+    invocation_id: invocationId ?? `${threadId}-turn`,
     data: {kind: 'agent_output_chunk', channel: 'assistant', content},
   };
 }
