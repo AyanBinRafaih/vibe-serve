@@ -1,10 +1,14 @@
 import {afterEach, describe, expect, it} from 'bun:test';
 import {
+  BoxRenderable,
   CliRenderEvents,
+  getBorderSides,
   InputRenderable,
+  type Renderable,
   rgbToHex,
   ScrollBoxRenderable,
   TextareaRenderable,
+  TextRenderable,
 } from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
 import type {ChatOptions, HypothesisEntry} from '@vibesys/backend-client';
@@ -17,6 +21,7 @@ import {
   chatMenuCustomModel,
   clearAgentSelection,
   clearEntrySelection,
+  clearInputError,
   closeChatMenu,
   closeOverlays,
   closePane,
@@ -36,6 +41,7 @@ import {
   moveHypothesisRoundSelection,
   moveThemeSelection,
   normalizeFocus,
+  openChat,
   openChatModelMenu,
   openChatResumeMenu,
   openExperimentLog,
@@ -69,7 +75,18 @@ import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 import {renderDesignSummary} from './design-log.js';
 import {paneTitle} from './focus.js';
 import {headerBackground} from './header.js';
-import {contrastRatio, listThemes, resolveTheme, THEME_NAMES, type ThemeName} from './theme.js';
+import {MIN_SPLIT_WIDTH} from './right-pane.js';
+import {
+  contrastRatio,
+  ensureContrast,
+  listThemes,
+  mix,
+  RUN_DIVIDER_MIN_CONTRAST,
+  resolveTheme,
+  scrim,
+  THEME_NAMES,
+  type ThemeName,
+} from './theme.js';
 
 const cleanup: Array<() => void> = [];
 
@@ -116,10 +133,9 @@ describe('OpenTUI presentation', () => {
     expect(frame).toContain('VibeSys · running · optimizer');
     expect(frame).not.toContain('running · optimizer · round 2');
     // No round is selected, so the agent strip is headed by the run. The run has
-    // no rounds yet, so the rounds rail stays off and leaves the width to the
-    // agents graph and transcript.
+    // no rounds yet, so there is no tab row to draw.
     expect(frame).toContain('Run flow');
-    expect(frame).not.toContain('Rounds');
+    expect(tabsVisible(testRenderer)).toBe(false);
     expect(frame).toContain('● optimizer');
     expect(frame).toContain('Result');
     expect(frame).toContain('Command');
@@ -203,7 +219,7 @@ describe('OpenTUI presentation', () => {
     expect(frame).not.toContain('A later failure.');
   });
 
-  it('renders each round on its own rail row with a status word, glyph, and time', async () => {
+  it('draws the rounds as one tab row between the header and the round view', async () => {
     const testRenderer = await createTestRenderer({width: 100, height: 18});
     const activeStartedAt = new Date(Date.now() - 65_000).toISOString();
     const controller = new FakeController({
@@ -227,13 +243,22 @@ describe('OpenTUI presentation', () => {
     registerCleanup(testRenderer.renderer, app);
 
     const frame = await testRenderer.waitForFrame(value => value.includes('r2'));
+    const root = testRenderer.renderer.root;
+    const header = root.findDescendantById('header-frame');
+    const tabs = root.findDescendantById('round-tabs');
+    const agents = root.findDescendantById('agent-map');
+    const transcript = root.findDescendantById('viewport');
+    if (!header || !tabs || !agents || !transcript) throw new Error('round view was missing');
 
-    // Each round is a rail row carrying its number, a status word and glyph, and
-    // its elapsed time; the active round's time is measured from its agent start.
-    expect(frame).toMatch(/r1\s+✓\s+done/);
-    expect(frame).toMatch(/▸r2\s+⟳\s+run\s+1m\s+\d+s/);
-    expect(frame).toMatch(/r3\s+✗\s+fail/);
-    // Status is a word plus a glyph, never a spinner that reads as motion frozen.
+    // One row straight under the header, and both panes start under it.
+    expect(tabs.visible).toBe(true);
+    expect(tabs.y).toBe(header.y + header.height);
+    expect([agents.y, transcript.y]).toEqual([tabs.y + 1, tabs.y + 1]);
+    expect(root.findDescendantById('round-rail')).toBeUndefined();
+    // Each tab carries its number and outcome glyph; the running round, open
+    // by default, carries its time measured from its agent start.
+    expect(frameRows(frame)[tabs.y]).toMatch(/r1 ✓.*▎ r2 ⟳ 1m \d+s.*r3 ✗ fail/);
+    // A glyph, never a spinner that reads as motion frozen.
     expect(frame).not.toMatch(/[◐◓◑◒]/);
   });
 
@@ -295,6 +320,8 @@ describe('OpenTUI presentation', () => {
       .find(line => line.includes('orchestrator') && line.includes('implementer'));
     expect(stageRow).toBeDefined();
     expect(stageRow).toContain('judge');
+    // A 40% pane at 150 columns names every agent of this round in full.
+    expect(stageRow).not.toContain('…');
     expect(frame).toContain('▶');
     // The stacked strip's connector, not the arrow glyphs in the key help.
     expect(frame).not.toContain('        ↓');
@@ -488,19 +515,30 @@ describe('OpenTUI presentation', () => {
     const lines = active.split('\n');
     const promptLine = lines.findIndex(line => line.includes('Implement the queue'));
     const activityLineIndex = lines.findIndex(line => line.includes('Implementer · Working'));
-    const helpLine = lines.findIndex(line => line.includes('[/]: round'));
+    const helpLine = lines.findIndex(line => line.includes('[/] or click: round'));
+    // The command box is the foot of the transcript pane, so the pane's own
+    // bottom border is below it and the row the activity line is measured
+    // against is where that box starts.
+    const commandTop = lines.findIndex(
+      (line, index) => index > activityLineIndex && /[╭┏][─━] [▸ ] Command /.test(line),
+    );
     const viewportBottomBorder = lines.findIndex(
       (line, index) =>
-        index > activityLineIndex && index < helpLine && FRAME_BOTTOM_RIGHT.test(line.trimEnd()),
+        index > commandTop && index < helpLine && FRAME_BOTTOM_RIGHT.test(line.trimEnd()),
     );
     expect(activityLineIndex).toBeGreaterThan(promptLine);
     expect(FRAME_VERTICAL.test(activityLine?.trimEnd() ?? '')).toBe(true);
-    expect(viewportBottomBorder).toBeGreaterThan(activityLineIndex);
+    expect(commandTop).toBeGreaterThan(activityLineIndex);
+    expect(viewportBottomBorder).toBeGreaterThan(commandTop);
     expect(viewportBottomBorder).toBeLessThan(helpLine);
     const transcriptColumn = Math.max(0, (activityLine?.indexOf('Implementer') ?? 2) - 2);
+    // The command input's reserved hint row sits directly above the box's own
+    // top border, one row of furniture the same way the box itself is, so the
+    // blank-fill check stops above it rather than above the box.
+    const commandChromeTop = commandTop - 1;
     expect(
       lines
-        .slice(activityLineIndex + 1, viewportBottomBorder)
+        .slice(activityLineIndex + 1, commandChromeTop)
         .every(line => line.slice(transcriptColumn).replaceAll(FRAME_VERTICALS, '').trim() === ''),
     ).toBe(true);
 
@@ -641,12 +679,13 @@ describe('OpenTUI presentation', () => {
     registerCleanup(testRenderer.renderer, app);
 
     const frame = await testRenderer.waitForFrame(value => value.includes('r12'));
-    // Rounds the run has not reached are still part of the rail, and the rail
-    // says how many it could not fit below the window.
+    // Rounds the run has not reached are still tabs, and the bar counts the
+    // ones it could not fit on either side.
     expect(frame).toMatch(/r1[34]/);
-    expect(frame).toMatch(/↓ \d+/);
+    expect(frame).toMatch(/‹ \d+/);
+    expect(frame).toMatch(/\d+ ›/);
 
-    // `[` walks back to the first round, and the rail follows the selection
+    // `[` walks back to the first round, and the bar follows the selection
     // rather than leaving it hidden past the edge.
     let early = frame;
     for (let step = 0; step < 11; step += 1) {
@@ -654,7 +693,8 @@ describe('OpenTUI presentation', () => {
       early = await frameAfter(testRenderer);
     }
     expect(controller.state.selectedRound).toBe(1);
-    expect(early).toMatch(/▸r1\s+✓\s+done/);
+    expect(early).toMatch(/▎ ?r1 ✓/);
+    expect(early).not.toContain('‹');
   });
 
   it('leaves brackets and cursor keys to a typed command', async () => {
@@ -825,64 +865,74 @@ describe('OpenTUI presentation', () => {
   });
 
   /**
-   * The rail takes its column off the round view's width, so its breakpoints
-   * are only correct if the transcript still clears its floor beside it. This
-   * measures the laid-out transcript box rather than recomputing the width
-   * arithmetic, which is the only way a layout regression here shows up.
-   *
-   * 100 is the full-rail breakpoint and 80 is inside the range the review
-   * measured at 37 columns: with the rail's old 72-column collapse point the
-   * 13-column compact rail still appeared at 80 and squeezed the transcript
-   * under its minimum.
+   * The rounds are a row above the round view, so its width is the agents pane
+   * and the transcript alone: the graph takes 40% of the terminal, never less
+   * than names every agent in full, and the transcript the rest. Measured on
+   * the laid-out boxes, since a layout regression only shows up there.
    */
-  for (const width of [80, 100]) {
-    it(`keeps the transcript above its floor beside the rail at ${width} columns`, async () => {
+  for (const [width, agentsWidth] of [
+    [160, 64],
+    // 40% of these is under the 63 columns that name every agent in full.
+    [150, 63],
+    [120, 63],
+    // No room for those beside the transcript floor: the stacked list.
+    [100, 30],
+    [80, 30],
+  ] as const) {
+    it(`gives the agents ${agentsWidth} and the transcript the rest at ${width} columns`, async () => {
       const testRenderer = await createTestRenderer({width, height: 30});
-      const controller = new FakeController({
-        ...initialSessionState(),
-        selectedRound: 3,
-        core: {
-          ...initialSessionState().core,
-          rounds: [
-            {number: 1, status: 'completed'},
-            {number: 2, status: 'completed'},
-            {number: 3, status: 'active'},
-          ],
-          phases: [
-            {kind: 'implementer', status: 'completed', roundNumber: 3, roundLabel: 'round-3-impl'},
-            {kind: 'judge', status: 'active', roundNumber: 3, roundLabel: 'round-3-judge'},
-          ],
-          transcript: [
-            {
-              id: 'live',
-              kind: 'assistant',
-              label: 'judge',
-              content: 'live output',
-              agentKind: 'judge',
-              roundNumber: 3,
-            },
-          ],
-        },
-      });
+      const controller = new FakeController(threeStageRound());
       const app = createOpenTuiApp(testRenderer.renderer, controller);
       registerCleanup(testRenderer.renderer, app);
       await testRenderer.waitForFrame(value => value.includes('live output'));
 
-      const transcript = testRenderer.renderer.root.findDescendantById('viewport');
-      if (transcript === undefined) throw new Error('round view was missing its transcript');
+      const root = testRenderer.renderer.root;
+      const agents = root.findDescendantById('agent-map');
+      const transcript = root.findDescendantById('viewport');
+      if (agents === undefined || transcript === undefined) {
+        throw new Error('round view was missing a pane');
+      }
+      expect(root.findDescendantById('round-rail')).toBeUndefined();
+      expect(agents.width).toBe(agentsWidth);
+      expect(transcript.x).toBe(agents.x + agents.width);
+      expect(transcript.width).toBe(width - agentsWidth);
       expect(transcript.width).toBeGreaterThanOrEqual(TRANSCRIPT_MIN);
-      // Whatever the rail decided, the three columns still add up to the terminal.
-      const rail = testRenderer.renderer.root.findDescendantById('round-rail');
-      const agents = testRenderer.renderer.root.findDescendantById('agent-map');
-      const railWidth = rail?.visible === true ? rail.width : 0;
-      expect(railWidth + (agents?.width ?? 0) + transcript.width).toBeLessThanOrEqual(width);
     });
   }
 
-  it("reads the rail's measured delta from the experiment log, not the design log", async () => {
+  for (const width of [150, 120, 100]) {
+    for (const selected of [null, 'orchestrator']) {
+      it(`names every agent in full at ${width} columns, ${selected ?? 'none'} selected`, async () => {
+        const pane = await agentPaneText(width, {
+          ...threeStageRound(),
+          selectedAgentKind: selected,
+        });
+
+        for (const name of ['orchestrator', 'implementer', 'judge']) expect(pane).toContain(name);
+        expect(pane).not.toContain('…');
+      });
+    }
+  }
+
+  it('stacks the agents, names in full, just below the width the graph needs', async () => {
+    // 105 = the 63 columns that name every agent in full + TRANSCRIPT_MIN.
+    const below = await agentPaneText(104, {
+      ...threeStageRound(),
+      selectedAgentKind: 'orchestrator',
+    });
+    expect(below).not.toContain('▶');
+    expect(below).toContain('› ✓ orchestrator');
+    expect(below).toContain('● implementer');
+    expect(below).toContain('○ judge');
+
+    const at = await agentPaneText(105, threeStageRound());
+    expect(at).toContain('▶');
+  });
+
+  it("reads the tabs' measured delta from the experiment log, not the design log", async () => {
     // Per-round stage facts, the measured delta included, cross the protocol on
     // `HypothesisRound`; the design log carries only each round's file list. The
-    // rail joins by round number so it and the experiments table cannot report
+    // tabs join by round number so they and the experiments table cannot report
     // different numbers for the same round.
     const testRenderer = await createTestRenderer({width: 120, height: 24});
     const controller = new FakeController({
@@ -900,7 +950,7 @@ describe('OpenTUI presentation', () => {
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
-    await testRenderer.waitForFrame(value => value.includes('▸r2'));
+    await testRenderer.waitForFrame(value => value.includes('▎ r2'));
     controller.publish({
       ...controller.state,
       experimentLog: {
@@ -923,113 +973,152 @@ describe('OpenTUI presentation', () => {
     expect(frame).toContain('+12%');
   });
 
-  it('leaves a stale rounds focus alone once a narrow width hides the rail', async () => {
-    // A resize can hide the rail while `roundFocus` still reads `rounds`. At this
-    // width the rail is gone, so Up/Down must drive a visible pane (the agents),
-    // not step an invisible round selection.
-    const testRenderer = await createTestRenderer({width: 70, height: 24});
-    const controller = new FakeController({
-      ...initialSessionState(),
-      selectedRound: 1,
-      roundFocus: 'rounds',
-      core: {
-        ...initialSessionState().core,
-        rounds: [
-          {number: 1, status: 'completed'},
-          {number: 2, status: 'completed'},
-          {number: 3, status: 'active'},
-        ],
-        phases: [
-          {kind: 'implementer', status: 'completed', roundNumber: 1, roundLabel: 'round-1-impl'},
-          {kind: 'judge', status: 'active', roundNumber: 1, roundLabel: 'round-1-judge'},
-        ],
-        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
-      },
-    });
+  it('steps Left and Right between the agents and the transcript, clamped at both', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 30});
+    const controller = new FakeController(threeStageRound());
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
-    await testRenderer.waitForFrame(value => value.includes('implementer'));
+    await testRenderer.waitForFrame(value => value.includes('live output'));
 
-    testRenderer.mockInput.pressKey('ARROW_DOWN');
-    const frame = await frameAfter(testRenderer);
-    // The round selection did not move, and an agent carries the keys instead.
-    expect(controller.state.selectedRound).toBe(1);
-    expect(controller.state.selectedAgentKind).not.toBeNull();
-    // The pane taking the keys says so, so the view is never focus-less.
-    expect(frame).toContain('▸ Agents');
-  });
+    const focus: RoundFocus[] = [];
+    for (const key of [
+      'ARROW_LEFT',
+      'ARROW_LEFT',
+      'ARROW_RIGHT',
+      'ARROW_RIGHT',
+      'ARROW_LEFT',
+    ] as const) {
+      testRenderer.mockInput.pressKey(key);
+      await frameAfter(testRenderer);
+      focus.push(controller.state.roundFocus);
+    }
+    // The tabs are not a pane, so nothing sits left of the agents.
+    expect(focus).toEqual(['agents', 'agents', 'transcript', 'transcript', 'agents']);
 
-  it('drives the rail with Up/Down while it is on screen', async () => {
-    const testRenderer = await createTestRenderer({width: 120, height: 24});
-    const controller = new FakeController({
-      ...initialSessionState(),
-      selectedRound: 1,
-      roundFocus: 'rounds',
-      core: {
-        ...initialSessionState().core,
-        rounds: [
-          {number: 1, status: 'completed'},
-          {number: 2, status: 'completed'},
-          {number: 3, status: 'completed'},
-        ],
-        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
-      },
-    });
-    const app = createOpenTuiApp(testRenderer.renderer, controller);
-    registerCleanup(testRenderer.renderer, app);
-    await testRenderer.waitForFrame(value => value.includes('▸r1'));
-
+    // Up and Down there walk the agents; only `[` and `]` change the round.
     testRenderer.mockInput.pressKey('ARROW_DOWN');
     await frameAfter(testRenderer);
-    // The rail is visible, so Down steps the round selection rather than an agent.
-    expect(controller.state.selectedRound).toBe(2);
-    expect(controller.state.selectedAgentKind).toBeNull();
+    expect(controller.state.selectedRound).toBe(3);
+    expect(controller.state.selectedAgentKind).toBe('judge');
   });
 
-  it('resizes the rail from the todo strip’s current height, not the last frame’s', async () => {
-    const testRenderer = await createTestRenderer({width: 120, height: 40});
+  it('shows the tabs only while the whole round view is on screen', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 30});
+    const controller = new FakeController(threeStageRound());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+    expect(tabsVisible(testRenderer)).toBe(true);
+
+    // A zoomed pane has the content row to itself.
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('transcript');
+    expect(tabsVisible(testRenderer)).toBe(false);
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(tabsVisible(testRenderer)).toBe(true);
+
+    // A split gives the right of the row to a visualization.
+    await controller.openPane('perf');
+    await frameAfter(testRenderer);
+    expect(tabsVisible(testRenderer)).toBe(false);
+    // Too narrow to split, the visualization floats over the round instead and
+    // the round keeps its tabs: width alone never hides them.
+    testRenderer.renderer.resize(MIN_SPLIT_WIDTH - 1, 30);
+    await frameAfter(testRenderer);
+    expect(tabsVisible(testRenderer)).toBe(true);
+    testRenderer.renderer.resize(150, 30);
+    await frameAfter(testRenderer);
+    expect(tabsVisible(testRenderer)).toBe(false);
+
+    // The experiment log is the landing view, not a round.
+    controller.closePane();
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+    expect(tabsVisible(testRenderer)).toBe(false);
+  });
+
+  it('keeps the tabs hidden under a zoom while the live round ticks', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 24});
+    const round = threeStageRound();
+    const startedAt = new Date(Date.now() - 5_000).toISOString();
     const controller = new FakeController({
-      ...initialSessionState(),
-      selectedRound: 1,
+      ...round,
       core: {
-        ...initialSessionState().core,
-        rounds: Array.from({length: 60}, (_, index) => ({
-          number: index + 1,
-          status: 'completed' as const,
-        })),
-        todos: [
+        ...round.core,
+        rounds: [
+          ...round.core.rounds.slice(0, 2),
           {
-            agentKind: null,
-            roundNumber: null,
-            items: Array.from({length: 10}, (_, index) => ({
-              content: `task ${index + 1}`,
-              status: 'completed' as const,
-            })),
+            number: 3,
+            status: 'active',
+            startedAt,
+            activeAgentStarts: {'implementer:implementer-1': startedAt},
           },
         ],
-        transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
       },
     });
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
-    const collapsedFrame = await testRenderer.waitForFrame(value => value.includes('▸r1'));
-    const collapsedHidden = hiddenAfterCount(collapsedFrame);
-    expect(collapsedHidden).toBeGreaterThan(0);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(tabsVisible(testRenderer)).toBe(false);
 
-    // Expanding the todos grows the strip in the same paint, so the rail must be
-    // billed the new height and show fewer rounds; sizing it from the previous
-    // (collapsed) height would overrun the shorter rail and clip its rounds.
-    controller.toggleTodos();
-    const expandedFrame = await frameAfter(testRenderer);
-    expect(expandedFrame).toMatch(/▸r1\b/);
-    const expandedHidden = hiddenAfterCount(expandedFrame);
-    expect(expandedHidden).toBeGreaterThan(collapsedHidden);
+    // The live tab re-lays the bar out every second, and that tick must not
+    // bring the bar back over the zoomed pane.
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await frameAfter(testRenderer);
+    expect(tabsVisible(testRenderer)).toBe(false);
+  });
 
-    // Collapsing restores the taller rail in one paint, back to the first budget.
-    controller.toggleTodos();
-    const recollapsedFrame = await frameAfter(testRenderer);
-    expect(recollapsedFrame).toMatch(/▸r1\b/);
-    expect(hiddenAfterCount(recollapsedFrame)).toBe(collapsedHidden);
+  it('bills the tab row to the agent graph so a stacked stage stays in its pane', async () => {
+    // Stacked nodes fit in steps of seven rows, so seven consecutive heights
+    // include one where the tab row decides whether another node fits.
+    for (let height = 30; height < 37; height += 1) {
+      const testRenderer = await createTestRenderer({width: 150, height});
+      const base = initialSessionState();
+      const controller = new FakeController({
+        ...base,
+        selectedRound: 1,
+        core: {
+          ...base.core,
+          rounds: [{number: 1, status: 'active'}],
+          phases: [
+            {kind: 'orchestrator', status: 'completed', roundNumber: 1, roundLabel: 'round-1-pre'},
+            ...Array.from({length: 8}, (_, index) => ({
+              kind: 'implementer',
+              status: index === 7 ? ('active' as const) : ('interrupted' as const),
+              roundNumber: 1,
+              roundLabel: `round-1-retry-${index + 1}-implementer`,
+              executionId: `e${index}`,
+            })),
+            {kind: 'judge', status: 'pending', roundNumber: 1, roundLabel: null},
+          ],
+          transcript: [{id: 'live', kind: 'assistant', label: 'Agent', content: 'live output'}],
+        },
+      });
+      const app = createOpenTuiApp(testRenderer.renderer, controller);
+      registerCleanup(testRenderer.renderer, app);
+      await testRenderer.waitForFrame(value => value.includes('↑'));
+
+      const root = testRenderer.renderer.root;
+      const content = root.findDescendantById('agent-map-content');
+      const heading = root.findDescendantById('agent-map-heading');
+      const canvas = root.findDescendantById('agent-graph-canvas');
+      if (!content || !heading || !canvas) throw new Error('agent graph was missing');
+      const nodes = canvas.getChildren().filter(child => child instanceof BoxRenderable);
+      expect(nodes.length).toBeGreaterThan(0);
+      // Every node sits under the heading and inside the pane's content, so it
+      // shares no row with the overflow count or the pane's border.
+      for (const node of nodes) {
+        expect({height, top: node.y > heading.y}).toEqual({height, top: true});
+        expect({height, bottom: node.y + node.height <= content.y + content.height}).toEqual({
+          height,
+          bottom: true,
+        });
+      }
+    }
   });
 
   it('focuses round panes from blank and interactive click targets', async () => {
@@ -1200,8 +1289,8 @@ describe('OpenTUI presentation', () => {
 
     const frame = await testRenderer.waitForFrame(value => value.includes('has not run yet'));
     expect(frame).toContain('Round 9 has not run yet.');
-    // The rail still shows it as a round of this run, marked as the one open.
-    expect(frame).toMatch(/▸r9\s+·\s+plan/);
+    // The tabs still show it as a round of this run, marked as the one open.
+    expect(frame).toMatch(/▎ r9 ·/);
   });
 
   it('unwinds the modal chat over a visualization one Escape at a time', async () => {
@@ -1410,17 +1499,15 @@ describe('OpenTUI presentation', () => {
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
 
-    // The rounds rail takes its column and the transcript keeps its floor, so at
-    // this width the graph sits at its minimum node size and the first stage's
-    // name truncates; wait on the last column instead to know the graph drew.
+    // The last column is drawn once the whole graph is.
     const frame = await testRenderer.waitForFrame(value => value.includes('profiler'));
 
     expect(frame).toContain('7 agents');
     expect(frame).toContain('2 active');
-    // Every stage is drawn, and the fan-out rows do not collapse onto each
-    // other. The label truncates to "implement…" once the rail narrows the
-    // graph, so match the stem the truncation keeps.
-    const nodeRows = frame.split('\n').filter(line => line.includes('implement'));
+    // Every stage is drawn, named in full, and the fan-out rows do not
+    // collapse onto each other.
+    expect(frame).toContain('orchestrator');
+    const nodeRows = frame.split('\n').filter(line => line.includes('implementer'));
     expect(nodeRows.length).toBeGreaterThanOrEqual(3);
     expect(frame).toContain('▶');
   });
@@ -1594,6 +1681,33 @@ describe('OpenTUI presentation', () => {
     expect(controller.submissions).toEqual(['/help']);
   });
 
+  it('does nothing when Enter is pressed on an empty command box', async () => {
+    // Reproduces #564: a round with no selected expandable tool result, so no
+    // pane action consumes Enter, and the box has never been typed into.
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    testRenderer.mockInput.pressEnter();
+    await frameAfter(testRenderer);
+    expect(controller.submissions).toEqual([]);
+    expect(controller.state.errorBanner).toBeNull();
+  });
+
+  it('does nothing when Enter is pressed with only whitespace typed', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    await testRenderer.mockInput.typeText('   ');
+    testRenderer.mockInput.pressEnter();
+    await frameAfter(testRenderer);
+    expect(controller.submissions).toEqual([]);
+    expect(controller.state.errorBanner).toBeNull();
+  });
+
   it('rejects ordinary text from the command input without sending chat', async () => {
     const testRenderer = await createTestRenderer({width: 80, height: 16});
     const controller = new FakeController(initialSessionState());
@@ -1602,10 +1716,46 @@ describe('OpenTUI presentation', () => {
 
     await testRenderer.mockInput.typeText('what is running?');
     testRenderer.mockInput.pressEnter();
-    const frame = await testRenderer.waitForFrame(value => value.includes('Commands start with /'));
-    expect(frame).toContain('Use Experiment chat for questions.');
+    // Wait on the real state, not frame text: the hint row is half the
+    // screen's width, so this message is truncated on screen and never
+    // appears there verbatim.
+    await testRenderer.waitForFrame(() => controller.state.inputError !== null);
+    // The message lands on the command input's own hint row, not the
+    // full-width banner: #564/#635's reasoning ("reporting a no-op as an error
+    // trains the operator to ignore the banner") applies just as well to a
+    // wrong command as to an empty box.
+    expect(commandHintText(testRenderer)).toBe(
+      '✗ Not a command: try /help, or ask in Experiment chat.',
+    );
+    expect(testRenderer.renderer.root.findDescendantById('error-banner')?.visible).toBe(false);
     expect(controller.submissions).toEqual([]);
     expect(controller.chatSubmissions).toEqual([]);
+  });
+
+  it('clears the input error on the next keystroke, and reverts the box border', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 16});
+    const controller = new FakeController(initialSessionState());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    const box = (): BoxRenderable => {
+      const node = testRenderer.renderer.root.findDescendantById('command-input-box');
+      if (!(node instanceof BoxRenderable)) throw new Error('command box was missing');
+      return node;
+    };
+    const restingColor = rgbToHex(box().borderColor).toLowerCase();
+
+    await testRenderer.mockInput.typeText('what is running?');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.state.inputError !== null);
+    expect(controller.state.inputError).not.toBeNull();
+    expect(rgbToHex(box().borderColor).toLowerCase()).not.toBe(restingColor);
+
+    // The message named a typo in what was just typed, so it is stale the
+    // moment the operator starts fixing it: the next keystroke clears it.
+    await testRenderer.mockInput.typeText('/');
+    await frameAfter(testRenderer);
+    expect(controller.state.inputError).toBeNull();
+    expect(rgbToHex(box().borderColor).toLowerCase()).toBe(restingColor);
   });
 
   it('suggests and completes slash commands with Tab', async () => {
@@ -1741,7 +1891,7 @@ describe('OpenTUI presentation', () => {
 
     const overlay = await testRenderer.waitForFrame(value => value.includes('Esc: close dialog'));
     expect(overlay).toContain('Available commands');
-    // No round has landed yet, so the rail stays hidden and the round view is
+    // No round has landed yet, so there is no tab row and the round view is
     // just the agents graph and the transcript behind the overlay.
     expect(overlay).toContain('Agents');
     testRenderer.mockInput.pressKey('ESCAPE');
@@ -1795,10 +1945,14 @@ describe('OpenTUI presentation', () => {
     const frame = await testRenderer.waitForFrame(value => value.includes('2 passed'));
     expect(frame).toContain('→ Bash pytest');
     expect(frame).toContain('← 2 passed');
-    // Header housing, agents pane, transcript frame, and the card's call and
-    // result regions: the rail is absent because this fixture has no rounds.
-    // A focused pane draws a heavy corner, so the count is over both styles.
-    expect(frame.match(/[╭┏]/g)).toHaveLength(5);
+    // Header housing, agents pane, transcript frame, and the command box. A
+    // round tab draws no border, and this fixture has no rounds. A focused pane draws a
+    // heavy corner, so the count is over both styles. The transcript card used
+    // to contribute a fifth: #565 replaced its four-sided border with a
+    // top-edge rule, which draws no corner glyph at all. The call and result
+    // regions #620 added are bands inside the card, not bordered boxes, so they
+    // never contributed one.
+    expect(frame.match(/[╭┏]/g)).toHaveLength(4);
   });
 
   it('renders a typed command payload with labeled stderr and exit code', async () => {
@@ -1972,10 +2126,12 @@ describe('OpenTUI presentation', () => {
     const frame = await testRenderer.waitForFrame(value => value.includes('[codex error]'));
     expect(frame).toContain('[codex turn started]');
     expect(frame).toContain('driver: agentshim');
-    // Header housing, agents pane, transcript frame, command bar, and the one
-    // card the error diagnostic still earns. The two quiet diagnostics draw no
-    // border at all, so they add nothing to the count.
-    expect(frame.match(/[╭┏]/g)).toHaveLength(5);
+    // Header housing, agents pane, transcript frame, and the command bar. The
+    // two quiet diagnostics draw no border at all, so they add nothing to the
+    // count, and the one card the error diagnostic still earns no longer adds
+    // one either: #565 turned that four-sided border into a top-edge rule,
+    // which has no corner glyph.
+    expect(frame.match(/[╭┏]/g)).toHaveLength(4);
   });
 
   it('renders an unanswered tool call once, with no response band', async () => {
@@ -1994,8 +2150,9 @@ describe('OpenTUI presentation', () => {
     // The response band is the only thing that draws a left arrow followed by
     // text; the footer's key hint is the glyph pair, not this.
     expect(frame).not.toContain('← ');
-    // One card: the header, the two panes, the command bar, and this turn.
-    expect(frame.match(/[╭┏]/g)).toHaveLength(5);
+    // The header, the two panes, and the command bar. This turn's card no
+    // longer adds a corner: #565 made it a top-edge rule instead of a border.
+    expect(frame.match(/[╭┏]/g)).toHaveLength(4);
   });
 
   it('collapses, prettifies, and expands long JSON tool responses', async () => {
@@ -2673,6 +2830,21 @@ describe('overlay scrolling', () => {
 });
 
 describe('theming', () => {
+  /**
+   * The role colour a transcript card carries.
+   *
+   * The top-edge rule, because that is where the role lives: a card has no
+   * fill (tui-conventions.md) and #565 replaced its four sides with that one
+   * rule, so the body text reports the canvas and the role would otherwise go
+   * unasserted here. `conversation.test.ts` pins the same colour as a
+   * computation over theme.ts across all eight themes; this asserts the
+   * rendered frame actually carries what that computation produces.
+   */
+  function cardBorder(testRenderer: TestRendererSetup, id: string): string | undefined {
+    const card = testRenderer.renderer.root.findDescendantById(id);
+    return card instanceof BoxRenderable ? rgbToHex(card.borderColor).toLowerCase() : undefined;
+  }
+
   const assistantEntry = {
     id: 'themed',
     kind: 'assistant' as const,
@@ -2699,11 +2871,18 @@ describe('theming', () => {
     expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(light.accent);
     const body = spanColors(testRenderer, 'themed body text');
     expect(body?.fg).toBe(light.conversation.assistant.content);
-    expect(body?.bg).toBe(light.conversation.assistant.background);
+    // #565 took the card's fill and the colour diet took the role tint behind a
+    // bare entry, so every entry's body sits on the theme's canvas.
+    expect(body?.bg).toBe(light.canvas);
+    // The divider is a separator, not a role signal: it draws in the neutral
+    // resting border every other frame uses, lifted to the divider floor.
+    expect(cardBorder(testRenderer, 'event-themed')).toBe(
+      ensureContrast(light.border, light.canvas, RUN_DIVIDER_MIN_CONTRAST).toLowerCase(),
+    );
     expect(spanColors(testRenderer, 'implementer')?.fg).toBe(light.conversation.assistant.label);
   });
 
-  it('keeps the dark baseline identical to the pre-theme palette', async () => {
+  it('keeps the dark baseline identical to the pre-theme palette, background aside', async () => {
     const testRenderer = await createTestRenderer({width: 90, height: 20});
     const controller = new FakeController({
       ...initialSessionState(),
@@ -2720,9 +2899,43 @@ describe('theming', () => {
     expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe('#22d3ee');
     const body = spanColors(testRenderer, 'themed body text');
     expect(body?.fg).toBe('#e2e8f0');
-    // Assistant cards derive their fill from the canvas and the role accent.
-    expect(body?.bg).toBe('#0e283d');
+    // Both changes land on this one cell. #565 removed the card's fill, so the
+    // body reports whatever is behind it, and #574 collapsed the palette, so
+    // what is behind it is the one universal background rather than the old
+    // lighter `canvas`. Neither value either change asserted on its own
+    // survives: not `#0f172a` (the canvas before the collapse) and not
+    // `#03192d` (a role tint the card no longer paints).
+    expect(body?.bg).toBe('#020617');
     expect(spanColors(testRenderer, 'implementer')?.fg).toBe('#5cb6cc');
+  });
+
+  it('gives the key-help line the same background as the chrome above it', async () => {
+    // #574's second symptom, and the one visible without comparing two panes:
+    // the key-help line sets no background of its own, so it fell through to
+    // the root frame. The root was painted `canvas` while every pane and the
+    // header were painted the darker `elevatedSurface`, which left a pale rule
+    // across the bottom of the screen under a dark theme. With one background
+    // there is nothing left to fall through to that disagrees.
+    //
+    // Asserted against the header's own cells rather than a literal, because
+    // the symptom is that two rows disagree; that stays the property being
+    // checked if the palette moves again.
+    const testRenderer = await createTestRenderer({width: 150, height: 40});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        transcript: [assistantEntry],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('F4: zoom'));
+
+    const help = spanColors(testRenderer, 'F4: zoom');
+    expect(help?.bg).toBe(spanColors(testRenderer, 'VibeSys')?.bg);
+    expect(help?.bg).toBe(resolveTheme('dark').canvas);
   });
 
   it('repaints live when the selected theme changes', async () => {
@@ -2747,7 +2960,7 @@ describe('theming', () => {
     expect(spanColors(testRenderer, 'VibeSys')?.fg).toBe(solarized.accent);
     const body = spanColors(testRenderer, 'themed body text');
     expect(body?.fg).toBe(solarized.conversation.assistant.content);
-    expect(body?.bg).toBe(solarized.conversation.assistant.background);
+    expect(body?.bg).toBe(solarized.canvas);
   });
 
   it('navigates the theme list with the keyboard and applies on Enter', async () => {
@@ -3337,14 +3550,17 @@ describe('theming', () => {
     expect(landing).toContain('Implementation Details');
     expect(landing).toContain('Batch the prefill step');
 
-    // Each column has its own input, under the surface it writes to, and the
-    // command box starts where the chat column ends rather than running under
-    // it.
+    // Each column has its own input, inside the pane that input writes to.
     // The cursor starts in the command box, and the chat says how to reach it.
     expect(landing).toContain('Ctrl+W to type here');
     expect(paneFrameColumn(landing, 'Experiment chat')).not.toBeNull();
     expect(paneFrameColumn(landing, 'Message')).not.toBeNull();
-    expect(paneFrameColumn(landing, 'Command')).toBe(paneFrameColumn(landing, 'Experiments'));
+    // Inset by the table's own border and padding rather than level with its
+    // frame: the command box is a child of the pane whose keys it takes, so it
+    // starts inside that pane and cannot run back under the chat beside it.
+    const table = paneFrameColumn(landing, 'Experiments');
+    expect(table).not.toBeNull();
+    expect(paneFrameColumn(landing, 'Command')).toBe((table ?? 0) + 2);
   });
 
   it('keeps the message and command boxes on the same rows while the chat is docked', async () => {
@@ -3395,13 +3611,124 @@ describe('theming', () => {
     expect(rows.message).toBe(rows.command);
   });
 
-  it('gives the short terminal its landing rows back instead of the box alignment', async () => {
-    // The row that puts the Command box on the Message box's row comes out of
-    // the table above it. On a terminal with no row to spare the table keeps
-    // it and the two boxes sit one row apart: the operator can see that and
-    // undo it by resizing, whereas a clipped last line of the kickoff copy
-    // just looks like the copy ends there.
-    const testRenderer = await createTestRenderer({width: 100, height: 16});
+  it('keeps the command box inside the pane whose keys it takes, in every view', async () => {
+    // The box used to sit in a row of its own beneath every pane, which is why
+    // it could take keys while another pane wore the marker. It is a child of
+    // the pane it writes to now, and which pane that is differs by view, so
+    // what has to hold is that it lands in the right one through a view change,
+    // a split, each zoom that takes the left pane off screen, and the width
+    // that replaces the split with a floating pane.
+    const testRenderer = await createTestRenderer({width: 140, height: 24});
+    const controller = splitController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    /** The command box is the foot of `paneId`, inside that pane's frame. */
+    const expectCommandInside = (paneId: string): void => {
+      const pane = testRenderer.renderer.root.findDescendantById(paneId);
+      const command = testRenderer.renderer.root.findDescendantById('command-input-box');
+      if (pane === undefined || command === undefined)
+        throw new Error(`${paneId} geometry was missing`);
+      expect({pane: paneId, onScreen: pane.visible && command.visible}).toEqual({
+        pane: paneId,
+        onScreen: true,
+      });
+      expect({pane: paneId, insideLeft: command.x > pane.x}).toEqual({
+        pane: paneId,
+        insideLeft: true,
+      });
+      expect({
+        pane: paneId,
+        insideRight: command.x + command.width < pane.x + pane.width,
+      }).toEqual({pane: paneId, insideRight: true});
+      // The pane's own bottom border is the row under the box, so the box ends
+      // one row short of the pane. That is also why the two columns of the
+      // landing view line up without a row being spent on it.
+      expect({pane: paneId, foot: command.y + command.height}).toEqual({
+        pane: paneId,
+        foot: pane.y + pane.height - 1,
+      });
+    };
+
+    // A round: the transcript.
+    await frameAfter(testRenderer);
+    expectCommandInside('viewport');
+
+    // A split: still the left pane, not the one the split opened on the right.
+    await controller.openPane('perf');
+    await frameAfter(testRenderer);
+    const rightPane = testRenderer.renderer.root.findDescendantById('right-pane');
+    const command = testRenderer.renderer.root.findDescendantById('command-input-box');
+    if (rightPane === undefined || command === undefined)
+      throw new Error('split geometry was missing');
+    expect(rightPane.visible).toBe(true);
+    expect(command.x).toBeLessThan(rightPane.x);
+    expectCommandInside('viewport');
+
+    // Zoomed onto the visualization, which is now the only pane on screen.
+    controller.focusPane('right');
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('performance');
+    expectCommandInside('right-pane');
+
+    // Zoomed onto the agents pane, whose contents are rebuilt on every repaint:
+    // the box has to survive the repaint, not only the first frame after it.
+    testRenderer.mockInput.pressKey('F4');
+    controller.closePane();
+    controller.focusRound('agents');
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('agents');
+    expectCommandInside('agent-map');
+    controller.publish({
+      ...controller.state,
+      core: {...controller.state.core, status: 'completed'},
+    });
+    await frameAfter(testRenderer);
+    expectCommandInside('agent-map');
+
+    // Too narrow to split: the visualization becomes a floating pane over the
+    // round, the transcript keeps the box, and the floating pane keeps clear of
+    // it rather than covering the surface still taking the keystrokes.
+    testRenderer.mockInput.pressKey('F4');
+    await controller.openPane('perf');
+    testRenderer.renderer.resize(MIN_SPLIT_WIDTH - 1, 20);
+    const narrow = await frameAfter(testRenderer);
+    expect(narrow).toContain('best r7 1135 tok_s');
+    expectCommandInside('viewport');
+    const floating = testRenderer.renderer.root.findDescendantById('overlay');
+    const narrowCommand = testRenderer.renderer.root.findDescendantById('command-input-box');
+    if (floating === undefined || narrowCommand === undefined)
+      throw new Error('fallback geometry was missing');
+    expect(floating.visible).toBe(true);
+    expect(floating.y + floating.height).toBeLessThanOrEqual(narrowCommand.y);
+
+    // The landing view: the table, at a width that carries the chat beside it.
+    testRenderer.renderer.resize(140, 24);
+    controller.closePane();
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+    expectCommandInside('experiment-log');
+
+    // Through all of it, the box never claimed a focus of its own: it takes no
+    // marker, and exactly one pane wears one.
+    expect(markedPanes(paneBorders(testRenderer))).toHaveLength(1);
+    expect(markedPanes(paneBorders(testRenderer))).not.toContain('▸ Command');
+  });
+
+  it('keeps the short terminal both its landing rows and the box alignment', async () => {
+    // Alignment used to cost the table a row, so a terminal with none to spare
+    // gave the row back and let the two boxes sit one row apart. Each box now
+    // sits inside its own pane and the two panes are the same rectangle, so
+    // the boxes share a row because they are siblings rather than because a
+    // row was budgeted for it. That budget is what #556 measured, and it is
+    // gone: nothing is bought, so a short terminal has nothing to give up.
+    //
+    // The command input's own reserved hint row (#input-error-inline) costs
+    // every view one more row than #556 measured, so the heights that used to
+    // mark this boundary are each one row taller now.
+    const testRenderer = await createTestRenderer({width: 100, height: 17});
     const controller = kickoffController();
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -3423,11 +3750,11 @@ describe('theming', () => {
     expect(short).toContain('This activity becomes');
     expect(short).toMatch(/[╭┏][─━]\s*▸?\s*Command/);
     expect(short).toContain('Type /help for commands');
-    // The cost, stated: the boxes are one row apart rather than level.
-    expect(bottomRows().command).toBe(bottomRows().message + 1);
+    // Level at the height that used to have to choose.
+    expect(bottomRows().command).toBe(bottomRows().message);
 
-    // One more row and the alignment is affordable again, copy still whole.
-    testRenderer.renderer.resize(100, 17);
+    // And at the height that could afford it before, copy still whole.
+    testRenderer.renderer.resize(100, 18);
     const taller = await frameAfter(testRenderer);
     expect(taller).toContain('This activity becomes');
     expect(bottomRows().command).toBe(bottomRows().message);
@@ -3463,7 +3790,14 @@ describe('theming', () => {
     controller.focusPane('left');
     await frameAfter(testRenderer);
     await testRenderer.mockInput.typeText('/');
-    await testRenderer.waitForFrame(value => value.includes('/pause'));
+    // Not `waitForFrame(text.includes('/pause'))`: the chat's own list is still
+    // open beside this one and offers the same commands, so the text can match
+    // on a frame the command list has not been laid out in yet. Wait for the
+    // list itself to have taken a row per match.
+    await testRenderer.waitForFrame(() => {
+      const list = testRenderer.renderer.root.findDescendantById('command-input-suggestions');
+      return list?.visible === true && list.height > 2;
+    });
     const command = boxTopUnder('command-input-suggestions', 'command-input-box');
     expect(command.menu).toBe(command.box);
   });
@@ -3478,11 +3812,19 @@ describe('theming', () => {
 
     await testRenderer.mockInput.typeText('this belongs in chat');
     testRenderer.mockInput.pressEnter();
-    await testRenderer.waitForFrame(value => value.includes('Commands start with /'));
+    // Wait on the real state, not frame text: the hint row is half the
+    // screen's width, so this message is truncated on screen and never
+    // appears there verbatim.
+    await testRenderer.waitForFrame(() => controller.state.inputError !== null);
+    expect(commandHintText(testRenderer)).toBe(
+      '✗ Not a command: try /help, or ask in Experiment chat.',
+    );
     expect(controller.submissions).toEqual([]);
     expect(controller.chatSubmissions).toEqual([]);
     testRenderer.mockInput.pressKey('ESCAPE');
     await frameAfterEscape(testRenderer);
+    // Esc clears the input error the same way it dismisses the banner.
+    expect(controller.state.inputError).toBeNull();
 
     testRenderer.mockInput.pressKey('w', {ctrl: true});
     await frameAfter(testRenderer);
@@ -3662,7 +4004,7 @@ describe('theming', () => {
     expect(controller.chatSubmissions).toEqual(['draft survives the layout change']);
   });
 
-  it('lets the docked chat span the table and command surface', async () => {
+  it('gives the docked chat and the table the same rectangle, each holding its own input', async () => {
     const testRenderer = await createTestRenderer({width: 140, height: 20});
     const controller = logController();
     const app = createOpenTuiApp(testRenderer.renderer, controller);
@@ -3671,14 +4013,25 @@ describe('theming', () => {
     await frameAfter(testRenderer);
 
     const chatPane = testRenderer.renderer.root.findDescendantById('chat-pane');
-    const workspace = testRenderer.renderer.root.findDescendantById('workspace');
+    const table = testRenderer.renderer.root.findDescendantById('experiment-log');
     const composer = testRenderer.renderer.root.findDescendantById('chat-dock-composer-box');
-    if (chatPane === undefined || workspace === undefined || composer === undefined)
+    const command = testRenderer.renderer.root.findDescendantById('command-input-box');
+    if (
+      chatPane === undefined ||
+      table === undefined ||
+      composer === undefined ||
+      command === undefined
+    )
       throw new Error('landing layout was missing');
-    expect(chatPane.y).toBe(workspace.y);
-    expect(chatPane.y + chatPane.height).toBe(workspace.y + workspace.height);
+    // Two columns of one row, so they start and end on the same lines. This is
+    // what makes the boxes below line up without a row being budgeted for it.
+    expect(chatPane.y).toBe(table.y);
+    expect(chatPane.y + chatPane.height).toBe(table.y + table.height);
+    // Each input sits within the frame of the pane it writes to.
     expect(composer.x).toBeGreaterThan(chatPane.x);
     expect(composer.x + composer.width).toBeLessThan(chatPane.x + chatPane.width);
+    expect(command.x).toBeGreaterThan(table.x);
+    expect(command.x + command.width).toBeLessThan(table.x + table.width);
   });
 
   it('raises the command list out of the command input, clear of the chat', async () => {
@@ -4291,7 +4644,6 @@ describe('theming', () => {
       // The transcript holds the round view's keys by default. Every other
       // titled surface, the shared command box included, stays neutral.
       expect(paneBorders(testRenderer)).toEqual({
-        Rounds: theme.borderStrong,
         Agents: theme.border,
         '▸ Transcript': theme.borderFocus,
         Command: theme.border,
@@ -4302,7 +4654,6 @@ describe('theming', () => {
       // The treatment moves whole: the pane that gains it and the pane that
       // loses it are repainted in the same frame.
       expect(paneBorders(testRenderer)).toEqual({
-        Rounds: theme.borderStrong,
         '▸ Agents': theme.borderFocus,
         Transcript: theme.border,
         Command: theme.border,
@@ -4389,7 +4740,6 @@ describe('theming', () => {
 
     expect(controller.state.roundFocus).toBe('transcript');
     expect(paneBorders(testRenderer)).toEqual({
-      Rounds: theme.borderStrong,
       Agents: theme.border,
       '▸ Transcript': theme.borderFocus,
       Command: theme.border,
@@ -4922,7 +5272,11 @@ describe('theming', () => {
   });
 
   it('uses the empty hypotheses screen as a truthful planning kickoff', async () => {
-    const testRenderer = await createTestRenderer({width: 100, height: 16});
+    // The command input's own reserved hint row (#input-error-inline) costs
+    // every view one more row than this screen used to need, so the kickoff
+    // copy needs one extra row of height to stay on screen (see the sibling
+    // boundary test above, which hit the same shift).
+    const testRenderer = await createTestRenderer({width: 100, height: 17});
     const controller = kickoffController();
     const app = createOpenTuiApp(testRenderer.renderer, controller);
     registerCleanup(testRenderer.renderer, app);
@@ -5182,6 +5536,208 @@ describe('header hierarchy', () => {
     expect(frame).not.toContain('V...');
   });
 });
+/**
+ * A fill lives on an inner box, so a border ring shows what is behind the box.
+ *
+ * `docs/contributing/tui-conventions.md` states the rule and the reason.
+ * `BoxRenderable` hands `OptimizedBuffer.drawBox` one `backgroundColor` for the
+ * whole rectangle and the buffer is write-only, so a fill set on a bordered box
+ * paints the ring as well: the painted rectangle ends up one cell larger than
+ * the drawn line on all four sides, the line sits in a solid block, and under a
+ * rounded arc the fill paints the outside of the curve and squares the corner
+ * back off. That is #642.
+ *
+ * Asserted by walking the constructed tree rather than by reading a frame, so
+ * it covers every box the app builds, including the modals that stay
+ * `visible: false` until they are opened, and so a call site added later fails
+ * this without anyone remembering to extend a list.
+ */
+describe('box fills', () => {
+  /**
+   * The boxes that keep an outer fill, which is the one exception.
+   *
+   * Each of them floats over other content, so the fill has to reach the border
+   * ring or what is behind shows through it. A list rather than a structural
+   * test because floating is not a property a box carries: the agent map's
+   * cards are absolutely positioned too, and they are laid out on a canvas
+   * rather than over anything, so `position` would exempt them as well. Every
+   * entry here is an exception someone reviewed, which is the point of holding
+   * them in one place.
+   */
+  const OVERLAY_IDS = new Set([
+    'overlay',
+    'theme-picker',
+    'chat-overlay',
+    'command-input-suggestions',
+  ]);
+
+  /** One per composer, and a composer is built per surface, so match the suffix. */
+  function isOverlay(id: string): boolean {
+    return OVERLAY_IDS.has(id) || id.endsWith('-composer-menu');
+  }
+
+  /** Every box under `renderable`, itself included. */
+  function* boxesIn(renderable: Renderable): Generator<BoxRenderable> {
+    if (renderable instanceof BoxRenderable) yield renderable;
+    for (const child of renderable.getChildren()) yield* boxesIn(child);
+  }
+
+  /** The id of every box that breaks the rule, so a failure names the site. */
+  function offenders(renderable: Renderable): string[] {
+    const found: string[] = [];
+    for (const box of boxesIn(renderable)) {
+      const sides = getBorderSides(box.border);
+      if (!sides.top && !sides.right && !sides.bottom && !sides.left) continue;
+      // `transparent` is the default and is what "no fill of its own" means
+      // here: `drawBox` leaves the rectangle alone, so the ring keeps whatever
+      // was already under it.
+      if (box.backgroundColor.a === 0) continue;
+      // An overlay may keep the outer fill, but only square. The fill reaches
+      // the ring either way, and a ring of fill under a rounded arc is #642.
+      if (isOverlay(box.id) && box.borderStyle !== 'rounded') continue;
+      found.push(box.id);
+    }
+    return found;
+  }
+
+  function boxIds(renderable: Renderable): string[] {
+    return [...boxesIn(renderable)].map(box => box.id);
+  }
+
+  /** A box that is there and is actually painting something. */
+  function isPainted(root: Renderable, id: string): boolean {
+    const box = root.findDescendantById(id);
+    return box instanceof BoxRenderable && box.backgroundColor.a > 0;
+  }
+
+  /** Enough state to build the boxes that are made per entry, not at startup. */
+  function shapeController(): FakeController {
+    return new FakeController({
+      ...initialSessionState(),
+      selectedAgentKind: 'implementer',
+      selectedEntryId: 'card',
+      core: {
+        ...initialSessionState().core,
+        status: 'running',
+        agentKind: 'implementer',
+        rounds: [{number: 1, status: 'active'}],
+        phases: [
+          {kind: 'optimizer', status: 'completed', roundNumber: 1, roundLabel: 'round 1'},
+          {kind: 'implementer', status: 'active', roundNumber: 1, roundLabel: 'round 1'},
+        ],
+        // Stamped with the agent and the round, because `visibleConversation`
+        // filters on both and an unstamped entry would be dropped before a
+        // card was ever built for it.
+        transcript: [
+          {
+            id: 'card',
+            kind: 'assistant',
+            agentKind: 'implementer',
+            roundNumber: 1,
+            label: 'implementer · round 1',
+            content: 'a bordered card',
+          },
+          {
+            id: 'status',
+            kind: 'status',
+            agentKind: 'implementer',
+            roundNumber: 1,
+            content: 'a status line',
+          },
+        ],
+      },
+    });
+  }
+
+  it('keeps a fill off every bordered box that is not an overlay', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 30});
+    const app = createOpenTuiApp(testRenderer.renderer, shapeController());
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('a bordered card'));
+    const root = testRenderer.renderer.root;
+
+    // Coverage first, because a walk that reached nothing passes vacuously.
+    // One box from each side of the rule, plus the two that are built per
+    // entry rather than once at startup.
+    const ids = boxIds(root);
+    expect(ids).toContain('header-frame'); // bordered, fill moved inwards
+    expect(ids).toContain('experiment-log'); // a pane, the same way
+    expect(ids).toContain('theme-picker'); // an overlay, built here, never opened
+    expect(ids).toContain('event-card'); // a transcript card, now a top-edge rule
+    expect(ids).toContain('event-status'); // a bare entry, which now fills nothing
+    expect(ids.some(id => id.startsWith('agent-implementer-'))).toBe(true);
+
+    expect(offenders(root)).toEqual([]);
+  });
+
+  it('moves a fill inwards rather than dropping it', async () => {
+    // The other half of the rule, and the one a walk for offenders cannot see:
+    // deleting a fill satisfies that walk too, and it was how this branch first
+    // tried to answer #642. Every site that used to fill its own rectangle has
+    // to still be painting one, on a layer inside the border.
+    const testRenderer = await createTestRenderer({width: 120, height: 30});
+    const app = createOpenTuiApp(testRenderer.renderer, shapeController());
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('a bordered card'));
+    const root = testRenderer.renderer.root;
+
+    // 'event-card-fill' is deliberately absent: #565 removed the transcript
+    // card's border and its fill together, so there is no longer a rounded
+    // corner to keep a fill out of, and nothing left to move inwards.
+    // 'event-status-fill' is absent for the same reason one step further on: an
+    // entry has no role tint left to paint, so no entry paints a fill at all.
+    for (const id of ['header-fill', 'experiment-log-fill']) {
+      expect([id, isPainted(root, id)]).toEqual([id, true]);
+    }
+  });
+
+  it('keeps the rule in the stacked agent layout', async () => {
+    // Two things only a narrow terminal builds. The agent pane falls back to
+    // stacked rows when there is no width to lay the graph out, and a
+    // visualization below `MIN_SPLIT_WIDTH` is drawn through the overlay,
+    // which then wears the pane treatment. That second one is the case a
+    // construction-time rule cannot cover on its own: `applyPaneFocus` sets
+    // the frame at render time, so the rounded overlay it could reintroduce
+    // only exists after a frame.
+    const testRenderer = await createTestRenderer({width: 60, height: 30});
+    const controller = shapeController();
+    controller.paneContent = 'Performance · tok_s\nbest r1 1135 tok_s';
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('implementer'));
+    await controller.openPane('perf');
+    await testRenderer.waitForFrame(value => value.includes('1135 tok_s'));
+    const root = testRenderer.renderer.root;
+
+    expect(boxIds(root)).toContain('agent-implementer');
+    expect(offenders(root)).toEqual([]);
+  });
+
+  it('flags a bordered box that fills its own rectangle', async () => {
+    // The walks above are only evidence while they can fail. These are the
+    // controls: a box built the way #642 reported, and the overlay exception
+    // used to take a rounded frame back, which is the same bug again.
+    const {renderer} = await createTestRenderer({width: 20, height: 6});
+    cleanup.push(() => renderer.destroy());
+    for (const [id, borderStyle] of [
+      ['bordered-and-filled', 'rounded'],
+      ['overlay', 'rounded'],
+    ] as const) {
+      const box = new BoxRenderable(renderer, {
+        id,
+        width: 6,
+        height: 3,
+        border: true,
+        borderStyle,
+        backgroundColor: '#ffffff',
+      });
+      renderer.root.add(box);
+      cleanup.push(() => box.destroyRecursively());
+    }
+
+    expect(offenders(renderer.root)).toEqual(['bordered-and-filled', 'overlay']);
+  });
+});
 
 /**
  * The experiment log settles synchronously, so there is no later frame to wait
@@ -5197,10 +5753,54 @@ function frameRows(frame: string): string[] {
   return frame.split('\n');
 }
 
-/** The count the rail's `↓ n` overflow indicator reports, or 0 when it is absent. */
-function hiddenAfterCount(frame: string): number {
-  const value = frame.match(/↓\s+(\d+)/)?.[1];
-  return value === undefined ? 0 : Number(value);
+/** Whether the round tab row is on screen. */
+function tabsVisible(testRenderer: TestRendererSetup): boolean {
+  return testRenderer.renderer.root.findDescendantById('round-tabs')?.visible === true;
+}
+
+/** The agents pane's columns of every screen row, drawn for `state` at `width`. */
+async function agentPaneText(width: number, state: SessionState): Promise<string> {
+  const testRenderer = await createTestRenderer({width, height: 30});
+  const app = createOpenTuiApp(testRenderer.renderer, new FakeController(state));
+  registerCleanup(testRenderer.renderer, app);
+  const frame = await testRenderer.waitForFrame(value => value.includes('judge'));
+  const pane = testRenderer.renderer.root.findDescendantById('agent-map');
+  if (pane === undefined) throw new Error('agent pane was missing');
+  return frameRows(frame)
+    .map(row => row.slice(pane.x, pane.x + pane.width))
+    .join('\n');
+}
+
+/** The third of three rounds, with three stages and its transcript on screen. */
+function threeStageRound(): SessionState {
+  const base = initialSessionState();
+  return {
+    ...base,
+    selectedRound: 3,
+    core: {
+      ...base.core,
+      rounds: [
+        {number: 1, status: 'completed'},
+        {number: 2, status: 'completed'},
+        {number: 3, status: 'active'},
+      ],
+      phases: [
+        {kind: 'orchestrator', status: 'completed', roundNumber: 3, roundLabel: 'round-3-pre'},
+        {kind: 'implementer', status: 'active', roundNumber: 3, roundLabel: 'round-3'},
+        {kind: 'judge', status: 'pending', roundNumber: 3, roundLabel: null},
+      ],
+      transcript: [
+        {
+          id: 'live',
+          kind: 'assistant',
+          label: 'implementer',
+          content: 'live output',
+          agentKind: 'implementer',
+          roundNumber: 3,
+        },
+      ],
+    },
+  };
 }
 
 /** The landing view, which is where the chat is a docked pane. */
@@ -5355,8 +5955,12 @@ function paneBorders(testRenderer: TestRendererSetup): Record<string, string> {
   const borders: Record<string, string> = {};
   for (const line of testRenderer.captureSpans().lines) {
     for (const span of line.spans) {
-      // Either frame style, since a focused pane draws the heavy one.
-      for (const match of span.text.matchAll(/[╭┏][─━]([^─━╮┓]+)[─━]/g)) {
+      // All three corner glyphs a titled box can open with: rounded, the
+      // heavy one a focused pane would draw, and square. Square is in the set
+      // because an overlay keeps an outer fill and so draws a square frame
+      // (tui-conventions.md), and the narrow-terminal visualization is drawn
+      // through the overlay while it is also the performance pane.
+      for (const match of span.text.matchAll(/[╭┏┌][─━]([^─━╮┓┐]+)[─━]/g)) {
         borders[(match[1] ?? '').trim()] = rgbToHex(span.fg).toLowerCase();
       }
     }
@@ -5473,6 +6077,348 @@ function clipboardReturning(
   };
 }
 
+describe('modal scrim', () => {
+  const helpOverlay = {kind: 'help' as const, content: 'Available commands'};
+
+  function behindTheModal(themeName: ThemeName): SessionState {
+    const initial = initialSessionState(themeName);
+    return {
+      ...initial,
+      core: {
+        ...initial.core,
+        status: 'running',
+        transcript: [
+          {id: 'behind', kind: 'assistant', label: 'implementer', content: 'transcript behind it'},
+        ],
+      },
+    };
+  }
+
+  it.each(
+    THEME_NAMES.map(name => [name] as const),
+  )('%s dims every cell around the modal and leaves the modal at full contrast', async (themeName: ThemeName) => {
+    const theme = resolveTheme(themeName);
+    const {color, strength} = scrim(theme);
+    const testRenderer = await createTestRenderer({width: 100, height: 24});
+    const controller = new FakeController(behindTheModal(themeName));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('transcript behind it'));
+    await testRenderer.waitForVisualIdle();
+    const closed = frameCells(testRenderer);
+    const headerBefore = requireSpanColors(testRenderer, 'VibeSys');
+
+    controller.publish({...controller.state, overlay: helpOverlay});
+    await testRenderer.waitForFrame(value => value.includes('Available commands'));
+    await testRenderer.waitForVisualIdle();
+    const open = frameCells(testRenderer);
+
+    const box = boxOf(testRenderer, 'overlay');
+    // Every band around the modal, so a scrim confined to the box region
+    // fails here rather than passing on the rows it happens to cover.
+    const dimmed = {above: 0, below: 0, left: 0, right: 0};
+    const moved: number[] = [];
+    for (const [row, column, before, after] of cellsOutside(closed, open, box)) {
+      if (before.char !== after.char) {
+        moved.push(row);
+        continue;
+      }
+      // A blank cell has no visible foreground, and the scrim claims it.
+      if (before.char !== ' ') {
+        expect(channelDistance(after.fg, mix(before.fg, color, strength))).toBeLessThanOrEqual(1);
+      }
+      expect(channelDistance(after.bg, mix(before.bg, color, strength))).toBeLessThanOrEqual(1);
+      if (after.fg === before.fg && after.bg === before.bg) continue;
+      if (row < box.y) dimmed.above += 1;
+      else if (row >= box.y + box.height) dimmed.below += 1;
+      else if (column < box.x) dimmed.left += 1;
+      else dimmed.right += 1;
+    }
+    expect(dimmed.above).toBeGreaterThan(0);
+    expect(dimmed.below).toBeGreaterThan(0);
+    expect(dimmed.left).toBeGreaterThan(0);
+    expect(dimmed.right).toBeGreaterThan(0);
+    // The header gains its Escape hint, so its own rows are allowed to change
+    // characters. Nothing else outside the box moves: the scrim repaints cells,
+    // it does not lay anything out. The header sits in its own housing since
+    // #571, so its rows are read off the frame rather than assumed to be row 0.
+    const headerFrame = boxOf(testRenderer, 'header-frame');
+    const headerRows = new Set(
+      Array.from({length: headerFrame.height}, (_, offset) => headerFrame.y + offset),
+    );
+    expect(moved.filter(row => !headerRows.has(row))).toEqual([]);
+
+    const floor = themeName.startsWith('high-contrast') ? 7 : 4.5;
+    const modalBody = requireSpanColors(testRenderer, 'Available commands');
+    // The modal keeps a fill and squares its border (#642), and that fill is
+    // now the one background the theme has (#574), so this reads `canvas`
+    // where it used to read the separate elevated surface. The property is
+    // unchanged: the modal is the one surface the scrim does not paint over.
+    expect(modalBody).toEqual({fg: theme.textPrimary, bg: theme.canvas});
+    expect(contrastRatio(modalBody.fg, modalBody.bg)).toBeGreaterThanOrEqual(floor);
+    // Background text recedes below the floor the theme guarantees, and stays
+    // above the point where the run behind the modal would be erased.
+    const headerAfter = requireSpanColors(testRenderer, 'VibeSys');
+    expect(contrastRatio(headerBefore.fg, headerBefore.bg)).toBeGreaterThanOrEqual(floor);
+    const recessed = contrastRatio(headerAfter.fg, headerAfter.bg);
+    expect(recessed).toBeLessThan(floor);
+    expect(recessed).toBeGreaterThanOrEqual(1.9);
+  });
+
+  it('restores the frame exactly when the modal closes', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 24});
+    const controller = new FakeController(behindTheModal('dark'));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('transcript behind it'));
+    await testRenderer.waitForVisualIdle();
+    const before = frameCells(testRenderer);
+
+    controller.publish({...controller.state, overlay: helpOverlay});
+    await testRenderer.waitForFrame(value => value.includes('Available commands'));
+    await testRenderer.waitForVisualIdle();
+    controller.publish({...controller.state, overlay: null});
+    await testRenderer.waitForFrame(value => !value.includes('Available commands'));
+    await testRenderer.waitForVisualIdle();
+
+    expect(frameCells(testRenderer)).toEqual(before);
+  });
+
+  it('raises one scrim under whichever modals are open, and never over them', async () => {
+    const testRenderer = await createTestRenderer({width: 100, height: 24});
+    const controller = new FakeController(behindTheModal('dark'));
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('transcript behind it'));
+    const scrimBox = boxOf(testRenderer, 'overlay-scrim');
+    // One scrim under every modal: two of them stacked must not dim each other,
+    // and a command ack over the chat still needs the background held down.
+    expect(scrimBox.zIndex).toBeLessThan(boxOf(testRenderer, 'chat-overlay').zIndex);
+    expect(scrimBox.zIndex).toBeLessThan(boxOf(testRenderer, 'overlay').zIndex);
+    expect(scrimBox.zIndex).toBeLessThan(boxOf(testRenderer, 'theme-picker').zIndex);
+    expect(scrimBox.visible).toBe(false);
+
+    for (const modal of [
+      {chatOpen: true},
+      {overlay: helpOverlay},
+      {themePicker: {selected: 'dark' as const}},
+    ]) {
+      controller.publish({...behindTheModal('dark'), ...modal});
+      await testRenderer.flush();
+      expect(scrimBox.visible).toBe(true);
+      // The whole terminal, so the dim never stops at the pane the modal is in.
+      expect([scrimBox.x, scrimBox.y, scrimBox.width, scrimBox.height]).toEqual([0, 0, 100, 24]);
+      controller.publish(behindTheModal('dark'));
+      await testRenderer.flush();
+      expect(scrimBox.visible).toBe(false);
+    }
+  });
+});
+
+describe('single-key gating by the composer that owns the keyboard', () => {
+  /** A round view with two rounds, so `[` has somewhere to go. */
+  function twoRoundController(): FakeController {
+    return new FakeController({
+      ...initialSessionState(),
+      core: {
+        ...initialSessionState().core,
+        rounds: [
+          {number: 1, status: 'completed' as const},
+          {number: 2, status: 'active' as const},
+        ],
+        transcript: [
+          {
+            id: 'live',
+            kind: 'assistant',
+            label: 'Agent',
+            content: 'live output',
+            roundNumber: 2,
+          },
+        ],
+      },
+    });
+  }
+
+  it('keeps round navigation alive after a chat draft is closed unsent', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = twoRoundController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+
+    // Leave a half-typed question in the modal chat, then close it unsent.
+    controller.publish({...controller.state, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('Experiment chat'));
+    await testRenderer.mockInput.typeText('half a question');
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.chatOpen).toBe(false);
+
+    // The keystroke cannot reach the closed composer, so the parked draft
+    // must not disable the round view's plain keys. The bracket right after
+    // a flushed ESC sits out the parser's escape-sequence timeout, which the
+    // escape helper's beat also covers.
+    testRenderer.mockInput.pressKey('[');
+    await frameAfterEscape(testRenderer);
+    expect(controller.state.selectedRound).toBe(1);
+
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+
+    // The draft was parked, not discarded: reopening the chat shows it.
+    controller.publish({...controller.state, chatOpen: true});
+    const reopened = await testRenderer.waitForFrame(value => value.includes('half a question'));
+    expect(reopened).toContain('Experiment chat');
+  });
+
+  it('opens a hypothesis on Enter while an unfocused docked draft is parked', async () => {
+    const testRenderer = await createTestRenderer({width: 140, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+
+    // Draft in the docked chat, then move the keys back to the table.
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    await testRenderer.mockInput.typeText('draft for later');
+    testRenderer.mockInput.pressKey('w', {ctrl: true});
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.focus).toBe('left');
+
+    // The command input is empty and owns the keyboard, so Enter belongs to
+    // the table even though a draft waits in the unfocused composer beside it.
+    testRenderer.mockInput.pressEnter();
+    await frameAfter(testRenderer);
+    expect(controller.state.hypothesisDetail).not.toBeNull();
+
+    // The draft was parked, not discarded by the drilldown.
+    controller.publish({...controller.state, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('draft for later'));
+  });
+
+  it('keeps navigation keys inside a focused composer holding text', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = twoRoundController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+
+    controller.publish({...controller.state, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('Experiment chat'));
+    await testRenderer.mockInput.typeText('inspect arr');
+    testRenderer.mockInput.pressKey('[');
+    await frameAfter(testRenderer);
+
+    // The bracket is a character of the question, not round navigation.
+    expect(controller.state.selectedRound).toBeNull();
+
+    await testRenderer.mockInput.typeText('0]');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual(['inspect arr[0]']);
+  });
+
+  it('leaves brackets to a typed command while a chat draft is parked', async () => {
+    const testRenderer = await createTestRenderer({width: 120, height: 20});
+    const controller = twoRoundController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('live output'));
+
+    controller.publish({...controller.state, chatOpen: true});
+    await testRenderer.waitForFrame(value => value.includes('Experiment chat'));
+    await testRenderer.mockInput.typeText('parked draft');
+    testRenderer.mockInput.pressKey('ESCAPE');
+    await frameAfterEscape(testRenderer);
+
+    // Text in the command input still shadows navigation: the bracket is a
+    // character of the command, whatever the parked draft holds.
+    await testRenderer.mockInput.typeText('/steer fix arr');
+    testRenderer.mockInput.pressKey('[');
+    const typed = await frameAfter(testRenderer);
+    expect(typed).toContain('arr[');
+    expect(controller.state.selectedRound).toBeNull();
+
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.submissions.length === 1);
+    expect(controller.submissions).toEqual(['/steer fix arr[']);
+  });
+});
+
+/** The renderable behind a screen region, for asserting what a scrim covers. */
+function boxOf(testRenderer: TestRendererSetup, id: string): Renderable {
+  const found = testRenderer.renderer.root.findDescendantById(id);
+  if (found === undefined) throw new Error(`no renderable with id ${id}`);
+  return found;
+}
+
+/**
+ * The command input hint row's rendered text, flattened from its `StyledText`
+ * content (`.content` is not a plain string, so it cannot be compared with
+ * `toBe`/`toMatchObject` directly). Throws if the row is missing, so a typo'd
+ * id fails loudly instead of the assertion passing vacuously.
+ */
+function commandHintText(testRenderer: TestRendererSetup): string {
+  const hint = testRenderer.renderer.root.findDescendantById('command-input-hint');
+  if (!(hint instanceof TextRenderable)) throw new Error('command-input-hint was missing');
+  return hint.content.chunks.map(chunk => chunk.text).join('');
+}
+
+/** The colors of the span carrying `needle`, which the caller expects on screen. */
+function requireSpanColors(
+  testRenderer: TestRendererSetup,
+  needle: string,
+): {fg: string; bg: string} {
+  const colors = spanColors(testRenderer, needle);
+  if (colors === undefined) throw new Error(`no rendered span contains ${needle}`);
+  return colors;
+}
+
+/** The captured frame as a grid of cells, for asserting what a scrim repaints. */
+function frameCells(
+  testRenderer: TestRendererSetup,
+): Array<Array<{char: string; fg: string; bg: string}>> {
+  return testRenderer.captureSpans().lines.map(line => {
+    const row: Array<{char: string; fg: string; bg: string}> = [];
+    for (const span of line.spans) {
+      const fg = rgbToHex(span.fg).toLowerCase();
+      const bg = rgbToHex(span.bg).toLowerCase();
+      for (const char of span.text) row.push({char, fg, bg});
+    }
+    return row;
+  });
+}
+
+type Cell = {char: string; fg: string; bg: string};
+
+/** Every screen cell the modal does not cover, paired across the two frames. */
+function* cellsOutside(
+  closed: Cell[][],
+  open: Cell[][],
+  box: Renderable,
+): Generator<[number, number, Cell, Cell]> {
+  for (const [row, cells] of closed.entries()) {
+    for (const [column, before] of cells.entries()) {
+      const covered =
+        row >= box.y && row < box.y + box.height && column >= box.x && column < box.x + box.width;
+      const after = open[row]?.[column];
+      if (covered || after === undefined) continue;
+      yield [row, column, before, after];
+    }
+  }
+}
+
+/** The largest per-channel gap between two hex colors. */
+function channelDistance(left: string, right: string): number {
+  const channels = (hex: string): number[] =>
+    [1, 3, 5].map(at => Number.parseInt(hex.slice(at, at + 2), 16));
+  const [first, second] = [channels(left), channels(right)];
+  return Math.max(...first.map((value, index) => Math.abs(value - (second[index] ?? 0))));
+}
+
 class FakeController implements SessionController {
   readonly #listeners = new Set<(state: SessionState) => void>();
   readonly submissions: string[] = [];
@@ -5524,7 +6470,7 @@ class FakeController implements SessionController {
   submitCommand(value: string): Promise<void> {
     if (!value.trim().startsWith('/')) {
       this.publish(
-        reportError(this.state, 'Commands start with /. Use Experiment chat for questions.', {
+        reportError(this.state, 'Not a command: try /help, or ask in Experiment chat.', {
           scope: 'input',
         }),
       );
@@ -5752,6 +6698,9 @@ class FakeController implements SessionController {
   dismissErrorBanner(): void {
     this.publish(dismissErrorBanner(this.state));
   }
+  clearInputError(): void {
+    this.publish(clearInputError(this.state));
+  }
   cyclePaneFocus(): void {
     this.publish(cyclePaneFocus(this.state));
   }
@@ -5793,3 +6742,90 @@ class FakeController implements SessionController {
     for (const listener of this.#listeners) listener(this.state);
   }
 }
+
+describe('chat while a pane is zoomed', () => {
+  /** The landing view with the experiments pane zoomed over the whole row. */
+  async function zoomedLog(): Promise<{
+    testRenderer: TestRendererSetup;
+    controller: FakeController;
+  }> {
+    const testRenderer = await createTestRenderer({width: 200, height: 20});
+    const controller = logController();
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await frameAfter(testRenderer);
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('experiments');
+    return {testRenderer, controller};
+  }
+
+  it('opens the modal over the zoomed pane and takes the typing', async () => {
+    // Zoom gives the whole content row to one pane, so the docked chat is off
+    // screen. `chatDocked` used to ignore that and route /chat's focus to the
+    // hidden pane: no chat appeared, and keystrokes went where the operator
+    // could not see them.
+    const {testRenderer, controller} = await zoomedLog();
+    const zoomed = await frameAfter(testRenderer);
+    expect(zoomed).not.toContain('Experiment chat');
+
+    // What the real controller's /chat dispatch runs.
+    controller.publish(openChat(controller.state));
+    const opened = await frameAfter(testRenderer);
+    expect(controller.state.chatOpen).toBe(true);
+    expect(opened).toContain('Experiment chat');
+    expect(boxOf(testRenderer, 'chat-overlay').visible).toBe(true);
+
+    // The cursor landed on the visible composer: the question reaches the
+    // chat, not the command bar behind the modal.
+    await testRenderer.mockInput.typeText('why is r41 slow?');
+    testRenderer.mockInput.pressEnter();
+    await testRenderer.waitForFrame(() => controller.chatSubmissions.length === 1);
+    expect(controller.chatSubmissions).toEqual(['why is r41 slow?']);
+    expect(controller.submissions).toEqual([]);
+  });
+
+  it('restores the zoomed pane and its keys when the modal closes', async () => {
+    const {testRenderer, controller} = await zoomedLog();
+    controller.publish(openChat(controller.state));
+    await frameAfter(testRenderer);
+    expect(controller.state.chatOpen).toBe(true);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const closed = await frameAfterEscape(testRenderer);
+    expect(controller.state.chatOpen).toBe(false);
+    // Escape closes only the modal: the zoom and the pane keys are exactly
+    // where /chat found them.
+    expect(controller.state.layout.zoomedPane).toBe('experiments');
+    expect(controller.state.layout.focus).toBe('left');
+    expect(closed).toContain('H-07');
+    expect(closed).not.toContain('Experiment chat');
+  });
+
+  it('carries the modal and its draft through a zoom exit into the dock', async () => {
+    const {testRenderer, controller} = await zoomedLog();
+    controller.publish(openChat(controller.state));
+    await frameAfter(testRenderer);
+    expect(controller.state.chatOpen).toBe(true);
+    await testRenderer.mockInput.typeText('draft for the dock');
+
+    // F4 stands down while the modal is open, but zoom can still end under
+    // it. The modal stays the one chat surface until it is dismissed rather
+    // than jumping into the dock mid-question.
+    controller.togglePaneZoom();
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBeNull();
+    expect(controller.state.chatOpen).toBe(true);
+    expect(boxOf(testRenderer, 'chat-overlay').visible).toBe(true);
+    expect(boxOf(testRenderer, 'chat-pane').visible).toBe(false);
+
+    testRenderer.mockInput.pressKey('ESCAPE');
+    const docked = await frameAfterEscape(testRenderer);
+    expect(controller.state.chatOpen).toBe(false);
+    expect(boxOf(testRenderer, 'chat-pane').visible).toBe(true);
+    // One shared draft: the words typed into the modal are waiting in the
+    // docked composer rather than lost with the surface that closed.
+    expect(docked).toContain('draft for the dock');
+  });
+});
