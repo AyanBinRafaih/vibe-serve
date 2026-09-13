@@ -36,8 +36,20 @@ export const CONVERSATION_ROLES: readonly ConversationRole[] = [
   'failure',
 ];
 
+/**
+ * What a conversation role is drawn in.
+ *
+ * Two channels for one fact, which is the whole of it: the heading word says
+ * who is speaking and `label` colours it. `background` is the canvas for every
+ * role, so it is the cell a role's text lands on rather than a surface of its
+ * own; it is here because the bands below still need a background to name.
+ *
+ * A role tint and a role-coloured run divider used to sit beside those two, so
+ * one fact carried four signals at once. The tint was the loudest of them: a
+ * screen of entries read as a field of blocks. The divider is a separator, and
+ * separators are neutral.
+ */
 export interface ConversationRoleColors {
-  border: string;
   background: string;
   label: string;
   content: string;
@@ -57,6 +69,24 @@ export interface MarkdownColors {
   codeBackground: string;
   link: string;
   blockquote: string;
+  /** Tree-sitter `keyword` captures inside a fence with a shipped grammar. */
+  keyword: string;
+  /** Tree-sitter `string` captures inside a fence with a shipped grammar. */
+  string: string;
+  /** Tree-sitter `comment` captures inside a fence with a shipped grammar. */
+  comment: string;
+  /** Tree-sitter `number` captures inside a fence with a shipped grammar. */
+  number: string;
+  /** Tree-sitter `function` captures inside a fence with a shipped grammar. */
+  function: string;
+  /** Tree-sitter `type` captures inside a fence with a shipped grammar. */
+  type: string;
+  /** Tree-sitter `operator` captures inside a fence with a shipped grammar. */
+  operator: string;
+  /** Tree-sitter `variable` captures inside a fence with a shipped grammar. */
+  variable: string;
+  /** Tree-sitter `punctuation.*` captures inside a fence with a shipped grammar. */
+  punctuation: string;
 }
 
 export interface Theme {
@@ -75,9 +105,30 @@ export interface Theme {
    */
   minContrast: number;
 
+  /**
+   * The one background the UI paints. Every pane, modal, the header, the error
+   * banner, the composer and the frame behind them all fill with this, so a box
+   * is told from the page by its border and not by a shade of its own.
+   *
+   * There is deliberately no second, raised shade (#574). On a cell grid a
+   * "raised" surface is a flat fill one step off the canvas: at a step small
+   * enough to keep text readable it is not seen as depth, and at a step large
+   * enough to be seen it bleeds a rectangle around content it is not marking.
+   *
+   * Where the two used to disagree this took the pane's value rather than the
+   * frame's, because the panes cover nearly all of the screen. That made the
+   * frame the minority colour, and the strips of it left showing between and
+   * below the panes read as stray bands of light rather than as a background.
+   * The key-help line was the plainest case: it paints no background of its own
+   * and so falls through to the frame, which drew a pale rule across the bottom
+   * of every dark theme.
+   *
+   * The two remaining fills name a state rather than a depth: `selectedSurface`
+   * is what the cursor is on, and `surface` backs a code block, which has no
+   * border to delimit it.
+   */
   canvas: string;
   surface: string;
-  elevatedSurface: string;
   selectedSurface: string;
 
   textPrimary: string;
@@ -177,13 +228,60 @@ export function ensureContrast(foreground: string, background: string, minRatio:
   return candidate;
 }
 
+/**
+ * The dim a modal paints over everything behind it, as a colour and how far
+ * each background cell is pulled toward it. Applied by the renderer as an
+ * alpha blend over the finished frame, so it changes colour without moving a
+ * single cell.
+ */
+export interface Scrim {
+  /** Colour every background cell is pulled toward. */
+  color: string;
+  /** How far it is pulled: 0 leaves the frame alone, 1 replaces it. */
+  strength: number;
+}
+
+/**
+ * Contrast the scrim leaves between background text and what it sits on. WCAG's
+ * large-text floor: the run behind the modal stays recognizable, and the
+ * comfortable-reading floor each theme guarantees (4.5, or 7 on the
+ * high-contrast pair) is left to the modal, the one surface the scrim does not
+ * paint over.
+ */
+const SCRIM_RESIDUAL_CONTRAST = 3;
+
+/** A scrim that erases the background is a screen, not a dim. */
+const MAX_SCRIM_STRENGTH = 0.85;
+
+const SCRIM_STEPS = 100;
+
+/**
+ * Pulls the background toward the theme's own canvas, so it fades into the
+ * surface it already sits on instead of toward a blend the palette never uses.
+ * That darkens a dark theme and washes out a light one without an appearance
+ * branch, and it never invents a mid-tone a high-contrast palette excludes.
+ *
+ * The strength is solved per theme rather than fixed, because the themes do not
+ * start from the same contrast: one blend deep enough to recede Solarized
+ * Dark's 5.6:1 body text leaves High Contrast Dark's 21:1 fully readable.
+ * Solving for a residual lands every theme at the same recessed legibility.
+ */
+export function scrim(theme: Theme): Scrim {
+  const color = theme.canvas;
+  for (let step = 1; step <= SCRIM_STEPS; step += 1) {
+    const strength = (step / SCRIM_STEPS) * MAX_SCRIM_STRENGTH;
+    const faded = mix(theme.textPrimary, color, strength);
+    if (contrastRatio(faded, color) <= SCRIM_RESIDUAL_CONTRAST) return {color, strength};
+  }
+  return {color, strength: MAX_SCRIM_STRENGTH};
+}
+
 interface ThemeSpec {
   name: ThemeName;
   label: string;
   appearance: Appearance;
   canvas: string;
   surface: string;
-  elevatedSurface: string;
   selectedSurface: string;
   textPrimary: string;
   textMuted: string;
@@ -199,7 +297,6 @@ interface ThemeSpec {
   error: string;
   roleAccents: Record<ConversationRole, string>;
   minContrast: number;
-  cardTint: number;
   overrides?: {
     conversation?: Partial<Record<ConversationRole, Partial<ConversationRoleColors>>>;
     toolCall?: Partial<BandColors>;
@@ -212,6 +309,20 @@ interface ThemeSpec {
 export const SUBTLE_TEXT_MIN_CONTRAST = 3;
 
 /**
+ * The floor the transcript's run divider is held to, above the subtle-text one.
+ * Subtle text is decoration a reader can skip; this rule is one cell tall and
+ * is the only thing left saying where one run ends and the next begins, so it
+ * has to survive at a glance.
+ *
+ * It used to draw in the speaking role's accent and borrowed that saturated
+ * colour's own contrast, 3.84 to 4.76 across the eight themes. Neutral at 3
+ * measured 3.03 to 3.31 and the grouping read visibly weaker. 4.5 puts the rule
+ * back in the band the per-role dividers occupied without giving it a colour
+ * channel back.
+ */
+export const RUN_DIVIDER_MIN_CONTRAST = 4.5;
+
+/**
  * How far a card's label is pulled toward the theme's strongest text before the
  * contrast floor is applied. The raw role accent reads as a border but is too
  * close to the card fill to head it: lifting it keeps the role's hue while
@@ -221,11 +332,12 @@ const LABEL_LIFT = 0.35;
 
 function buildConversationRole(spec: ThemeSpec, role: ConversationRole): ConversationRoleColors {
   const accent = spec.roleAccents[role];
-  // A low tint off the canvas: enough to group a card's lines together, not so
-  // much that a screen of cards becomes a field of blocks.
-  const background = mix(spec.canvas, accent, spec.cardTint);
+  // The canvas, not a tint off it. A tint low enough to keep text readable was
+  // not seen as grouping and a tint high enough to be seen bled a rectangle
+  // around every entry, which is the same argument `canvas` above makes against
+  // a second surface.
+  const background = spec.canvas;
   const derived: ConversationRoleColors = {
-    border: accent,
     background,
     label: ensureContrast(mix(accent, spec.textStrong, LABEL_LIFT), background, spec.minContrast),
     content: ensureContrast(spec.textPrimary, background, spec.minContrast),
@@ -238,14 +350,18 @@ function buildToolBands(
   conversation: Record<ConversationRole, ConversationRoleColors>,
 ): {toolCall: BandColors; toolResult: BandColors} {
   const tool = conversation.tool;
+  // The canvas, by way of the role the bands belong to: a band is told apart by
+  // its text colour, not by a fill behind it, and both foregrounds are held to
+  // the floor against the cell they actually land on.
+  const background = tool.background;
   return {
     toolCall: {
-      background: tool.background,
-      foreground: ensureContrast(spec.roleAccents.user, tool.background, spec.minContrast),
+      background,
+      foreground: ensureContrast(spec.roleAccents.user, background, spec.minContrast),
       ...spec.overrides?.toolCall,
     },
     toolResult: {
-      background: tool.background,
+      background,
       foreground: tool.content,
       ...spec.overrides?.toolResult,
     },
@@ -263,6 +379,19 @@ function buildMarkdown(spec: ThemeSpec): MarkdownColors {
     codeBackground,
     link: ensureContrast(spec.info, spec.canvas, spec.minContrast),
     blockquote: ensureContrast(spec.textMuted, spec.canvas, spec.minContrast),
+    // Checked against codeBackground, not canvas: these paint on a fenced
+    // block's surface, not the canvas prose sits on.
+    keyword: ensureContrast(spec.info, codeBackground, spec.minContrast),
+    string: ensureContrast(spec.success, codeBackground, spec.minContrast),
+    number: ensureContrast(spec.warning, codeBackground, spec.minContrast),
+    comment: ensureContrast(spec.textMuted, codeBackground, spec.minContrast),
+    function: ensureContrast(spec.borderStrong, codeBackground, spec.minContrast),
+    type: ensureContrast(spec.borderFocus, codeBackground, spec.minContrast),
+    operator: ensureContrast(spec.border, codeBackground, spec.minContrast),
+    variable: ensureContrast(spec.textPrimary, codeBackground, spec.minContrast),
+    // The lower floor, like `textSubtle` itself: punctuation and rules, not
+    // words.
+    punctuation: ensureContrast(spec.textSubtle, codeBackground, SUBTLE_TEXT_MIN_CONTRAST),
   };
   return {...derived, ...spec.overrides?.markdown};
 }
@@ -280,7 +409,6 @@ function buildTheme(spec: ThemeSpec): Theme {
     minContrast: spec.minContrast,
     canvas: spec.canvas,
     surface: spec.surface,
-    elevatedSurface: spec.elevatedSurface,
     selectedSurface: spec.selectedSurface,
     textPrimary: ensureContrast(spec.textPrimary, spec.canvas, spec.minContrast),
     textMuted: ensureContrast(spec.textMuted, spec.canvas, spec.minContrast),
@@ -305,9 +433,8 @@ const DARK: ThemeSpec = {
   name: 'dark',
   label: 'Dark',
   appearance: 'dark',
-  canvas: '#0f172a',
+  canvas: '#020617',
   surface: '#1e293b',
-  elevatedSurface: '#020617',
   // Distinct from the canvas: a selection painted in the canvas colour is not a
   // selection. Every other theme already differs here.
   selectedSurface: '#1e293b',
@@ -324,7 +451,6 @@ const DARK: ThemeSpec = {
   warning: '#facc15',
   error: '#f87171',
   minContrast: 4.5,
-  cardTint: 0.14,
   roleAccents: {
     assistant: '#0891b2',
     user: '#2563eb',
@@ -353,9 +479,8 @@ const LIGHT: ThemeSpec = {
   name: 'light',
   label: 'Light',
   appearance: 'light',
-  canvas: '#f8fafc',
+  canvas: '#ffffff',
   surface: '#f1f5f9',
-  elevatedSurface: '#ffffff',
   selectedSurface: '#e2e8f0',
   textPrimary: '#0f172a',
   textMuted: '#475569',
@@ -370,7 +495,6 @@ const LIGHT: ThemeSpec = {
   warning: '#b45309',
   error: '#b91c1c',
   minContrast: 4.5,
-  cardTint: 0.1,
   roleAccents: {
     assistant: '#0e7490',
     user: '#1d4ed8',
@@ -387,9 +511,8 @@ const SOLARIZED_DARK: ThemeSpec = {
   name: 'solarized-dark',
   label: 'Solarized Dark',
   appearance: 'dark',
-  canvas: '#002b36',
+  canvas: '#001f27',
   surface: '#073642',
-  elevatedSurface: '#001f27',
   selectedSurface: '#073642',
   textPrimary: '#93a1a1',
   textMuted: '#839496',
@@ -404,7 +527,6 @@ const SOLARIZED_DARK: ThemeSpec = {
   warning: '#b58900',
   error: '#dc322f',
   minContrast: 4.5,
-  cardTint: 0.16,
   roleAccents: {
     assistant: '#2aa198',
     user: '#268bd2',
@@ -421,9 +543,8 @@ const SOLARIZED_LIGHT: ThemeSpec = {
   name: 'solarized-light',
   label: 'Solarized Light',
   appearance: 'light',
-  canvas: '#fdf6e3',
+  canvas: '#fffbf0',
   surface: '#eee8d5',
-  elevatedSurface: '#fffbf0',
   selectedSurface: '#eee8d5',
   textPrimary: '#073642',
   textMuted: '#586e75',
@@ -438,7 +559,6 @@ const SOLARIZED_LIGHT: ThemeSpec = {
   warning: '#b58900',
   error: '#dc322f',
   minContrast: 4.5,
-  cardTint: 0.12,
   roleAccents: {
     assistant: '#2aa198',
     user: '#268bd2',
@@ -455,9 +575,8 @@ const CATPPUCCIN_MOCHA: ThemeSpec = {
   name: 'catppuccin-mocha',
   label: 'Catppuccin Mocha',
   appearance: 'dark',
-  canvas: '#1e1e2e',
+  canvas: '#11111b',
   surface: '#181825',
-  elevatedSurface: '#11111b',
   selectedSurface: '#313244',
   textPrimary: '#cdd6f4',
   textMuted: '#a6adc8',
@@ -472,7 +591,6 @@ const CATPPUCCIN_MOCHA: ThemeSpec = {
   warning: '#f9e2af',
   error: '#f38ba8',
   minContrast: 4.5,
-  cardTint: 0.16,
   roleAccents: {
     assistant: '#94e2d5',
     user: '#89b4fa',
@@ -489,9 +607,8 @@ const CATPPUCCIN_LATTE: ThemeSpec = {
   name: 'catppuccin-latte',
   label: 'Catppuccin Latte',
   appearance: 'light',
-  canvas: '#eff1f5',
+  canvas: '#ffffff',
   surface: '#e6e9ef',
-  elevatedSurface: '#ffffff',
   selectedSurface: '#ccd0da',
   textPrimary: '#4c4f69',
   textMuted: '#6c6f85',
@@ -506,7 +623,6 @@ const CATPPUCCIN_LATTE: ThemeSpec = {
   warning: '#df8e1d',
   error: '#d20f39',
   minContrast: 4.5,
-  cardTint: 0.12,
   roleAccents: {
     assistant: '#179299',
     user: '#1e66f5',
@@ -525,7 +641,6 @@ const HIGH_CONTRAST_DARK: ThemeSpec = {
   appearance: 'dark',
   canvas: '#000000',
   surface: '#0a0a0a',
-  elevatedSurface: '#000000',
   selectedSurface: '#262626',
   textPrimary: '#ffffff',
   textMuted: '#e6e6e6',
@@ -540,7 +655,6 @@ const HIGH_CONTRAST_DARK: ThemeSpec = {
   warning: '#ffd700',
   error: '#ff8080',
   minContrast: 7,
-  cardTint: 0.1,
   roleAccents: {
     assistant: '#00ffff',
     user: '#7cc7ff',
@@ -559,7 +673,6 @@ const HIGH_CONTRAST_LIGHT: ThemeSpec = {
   appearance: 'light',
   canvas: '#ffffff',
   surface: '#f2f2f2',
-  elevatedSurface: '#ffffff',
   selectedSurface: '#d9d9d9',
   textPrimary: '#000000',
   textMuted: '#1a1a1a',
@@ -578,7 +691,6 @@ const HIGH_CONTRAST_LIGHT: ThemeSpec = {
   warning: '#7a4b00',
   error: '#b00000',
   minContrast: 7,
-  cardTint: 0.08,
   roleAccents: {
     assistant: '#006466',
     user: '#0033cc',

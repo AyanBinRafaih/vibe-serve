@@ -4,6 +4,7 @@ import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {focusedPane, visibleTodos} from '../session-model.js';
 import {paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
+import {displayWidth, truncateToWidth} from './text-width.js';
 import type {Theme} from './theme.js';
 
 const STATUS_MARKER: Record<string, string> = {
@@ -35,7 +36,7 @@ export function todoStripWidth(agentPaneWidth: number, terminalWidth: number): n
  * The rows the strip is about to occupy for a state, derived from the state
  * rather than read back from the laid-out box. `output.height` reflects the last
  * committed layout, so it lags one paint behind a render that just changed it;
- * a sibling sized in the same paint (the rounds rail) needs the height the strip
+ * a sibling sized in the same paint (the agents pane) needs the height the strip
  * is taking now, not the one it took last frame. `render` sets the box from this
  * function, so the two cannot disagree: no visible todos means no strip, a
  * collapsed strip is one summary row, and an expanded strip is its capped items
@@ -79,9 +80,15 @@ export function todoItemLine(todo: TodoItem, maxWidth: number): string {
   return truncate(`${todoMarker(todo.status)} ${todo.content}`, maxWidth);
 }
 
+/**
+ * At most `width` cells, ellipsized. Measured in cells, not code units: a CJK
+ * todo that fits by `String.length` can still be twice as wide on screen, and
+ * slicing by code units can land inside a wide character.
+ */
 function truncate(line: string, maxWidth: number): string {
   const width = Math.max(8, maxWidth);
-  return line.length <= width ? line : `${line.slice(0, width - 1)}…`;
+  if (displayWidth(line) <= width) return line;
+  return `${truncateToWidth(line, width - 1)}…`;
 }
 
 /**

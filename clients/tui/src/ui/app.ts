@@ -8,6 +8,7 @@ import {
 import {COMMAND_NAMES} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
+  chatPaneFocused,
   experimentLogVisible,
   focusedPane,
   type SessionState,
@@ -16,9 +17,10 @@ import {
 } from '../session-model.js';
 import {ActivityBarView} from './activity-bar.js';
 import {AgentMapView} from './agent-map.js';
+import {fillLayer} from './box-fill.js';
 import {createChatDraft} from './chat-composer.js';
 import {ChatOverlayView} from './chat-overlay.js';
-import {ChatPaneView, chatDockFits, chatPaneWidth, commandColumnInset} from './chat-pane.js';
+import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
 import {RendererSelectionClipboard, type SelectionClipboard} from './clipboard.js';
 import {createCommandInputPanel} from './command-input.js';
 import {ConversationView} from './conversation.js';
@@ -35,7 +37,7 @@ import {
 import {bindKeybindings} from './keybindings.js';
 import {OverlayView} from './overlay.js';
 import {RightPaneView, rightPaneWidth, splitFits} from './right-pane.js';
-import {RoundRailView, roundRailVisible, roundRailWidth} from './round-rail.js';
+import {RoundTabsView} from './round-tabs.js';
 import {createMarkdownStyle} from './styles.js';
 import {resolveTheme, type ThemeName} from './theme.js';
 import {ThemePickerView} from './theme-picker.js';
@@ -48,8 +50,8 @@ export interface OpenTuiApp {
 /** Which of the client's editors currently holds the cursor. */
 type FocusTarget = 'command' | 'chat' | 'modal';
 
-const KEY_HELP = `←→: rounds/agents/transcript · ↑↓: within · [/]: round · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Ctrl+L: live`;
-const SCOPED_KEY_HELP = `←→: rounds/agents/transcript · ↑↓: within · [/]: round · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Esc: back`;
+const KEY_HELP = `←→: agents/transcript · ↑↓: within · [/] or click: round · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Ctrl+L: live`;
+const SCOPED_KEY_HELP = `←→: agents/transcript · ↑↓: within · [/] or click: round · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Esc: back`;
 const LOG_KEY_HELP = `↑↓ or scroll: select · Enter/click: open hypothesis · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
 const LOG_CHAT_KEY_HELP = `↑↓: select · Enter/click: hypothesis · Ctrl+W: chat · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
 const HYPOTHESIS_KEY_HELP =
@@ -108,16 +110,19 @@ export function createOpenTuiApp(
     paddingLeft: 1,
     paddingRight: 1,
     border: true,
+    // Rounded, like the panes below it. The fill is on an inner layer, so
+    // there is nothing in the corner cell to bleed past the arc
+    // (tui-conventions.md).
     borderStyle: 'rounded',
     borderColor: theme.border,
-    // The same surface every other pane sits on. Without this the frame falls
-    // through to the root's `canvas`, which is a different shade, so the header
-    // read as a band laid over the UI rather than a pane within it. That is
-    // the exact quality the housing exists to remove. Through
-    // `headerBackground` because `headerSpanStyle` derives the text tones
-    // against the same call: the fill and the contrast basis are one fact.
-    backgroundColor: headerBackground(theme),
   });
+  // The same surface every other pane sits on. Without this the frame falls
+  // through to the root's `canvas`, which is a different shade, so the header
+  // read as a band laid over the UI rather than a pane within it. That is the
+  // exact quality the housing exists to remove. Through `headerBackground`
+  // because `headerSpanStyle` derives every header tone's contrast against the
+  // same call: the fill and the contrast basis are one fact.
+  const headerFill = fillLayer(headerFrame, 'header-fill', headerBackground(theme));
   // One renderable per span, because a terminal cell carries one foreground
   // colour and the header's roles do not share one. The row is allocated once
   // at its maximum and repainted in place: the spans change on every frame, and
@@ -194,17 +199,12 @@ export function createOpenTuiApp(
     verticalScrollbarOptions: {showArrows: true},
     onMouseUp: focusTranscript,
   });
+  // Every content pane is a column of this row, the chat included. Each of them
+  // owns whatever input writes to it, so two panes side by side are the same
+  // rectangle and their boxes share a bottom edge because they are siblings
+  // rather than because a row was budgeted to line them up.
   const main = new BoxRenderable(renderer, {
     id: 'main',
-    width: '100%',
-    flexGrow: 1,
-    flexDirection: 'row',
-  });
-  // The chat is a sibling of the entire workspace column, not just its
-  // transcript row. Its composer therefore remains inside the chat border and
-  // the pane spans the same height as the table plus command surface.
-  const body = new BoxRenderable(renderer, {
-    id: 'body',
     width: '100%',
     flexGrow: 1,
     flexDirection: 'row',
@@ -223,7 +223,7 @@ export function createOpenTuiApp(
   let renderedKeyHelp = KEY_HELP;
   let transientStatus: string | null = null;
   let markdownStyle = createMarkdownStyle(theme);
-  const roundRail = new RoundRailView(renderer, controller, theme);
+  const roundTabs = new RoundTabsView(renderer, controller, theme);
   const todoStrip = new TodoStripView(renderer, controller, theme);
   const errorBanner = new ErrorBannerView(renderer, theme, () => controller.dismissErrorBanner());
   const agentMap = new AgentMapView(renderer, controller, theme);
@@ -277,20 +277,20 @@ export function createOpenTuiApp(
     value => void controller.submitCommand(value),
     theme,
     () => controller.focusPane('left'),
+    () => controller.clearInputError(),
   );
-  const bottom = new BoxRenderable(renderer, {
-    id: 'bottom',
-    width: '100%',
-    flexShrink: 0,
-    flexDirection: 'column',
-    alignItems: 'stretch',
-  });
-  const commandColumn = new BoxRenderable(renderer, {
-    id: 'command-column',
-    flexGrow: 1,
-    flexShrink: 0,
-    flexDirection: 'column',
-  });
+  /**
+   * Moves the command box, and the list that completes it, into one pane.
+   *
+   * Both go straight into the pane rather than into a column of their own, the
+   * way the chat pane holds its own composer and menu: the list is positioned
+   * against the bottom of whatever contains it, and a wrapper sized to its
+   * contents leaves the list no room to open upwards into.
+   */
+  const hostCommandSurface = (pane: BoxRenderable): void => {
+    pane.add(commandInput.suggestions);
+    pane.add(commandInput.output);
+  };
 
   // A slash command and a key toggle the same prompt: the controller routes the
   // request, the transcript decides which prompt it applies to.
@@ -301,29 +301,34 @@ export function createOpenTuiApp(
   // fixed activity row. Activity stays outside scrolling content, so a new
   // turn can change scroll height without moving the line.
   transcriptFrame.add(conversationActivityBar.output);
-  // The rounds rail is the left edge of the round view; the agents graph and
-  // transcript follow to its right, so drilling deeper reads left to right.
-  main.add(roundRail.output);
+  // The chat is the leftmost column of the same row as the table it discusses,
+  // so both panes end on the same line and each keeps its own input inside its
+  // own frame.
+  main.add(chatPane.output);
+  // Drilling deeper into a round reads left to right: agents, then transcript.
   main.add(agentMap.output);
   main.add(transcriptFrame);
   // The log lives in the main pane rather than floating over it: it is the
   // landing view, not a dialog.
   main.add(experimentLog.output);
   main.add(rightPane.output);
-  commandColumn.add(help);
-  // Absolute inside the command column rather than the root, so the list rises
-  // out of the input it belongs to instead of across the chat beside it.
-  commandColumn.add(commandInput.suggestions);
-  commandColumn.add(commandInput.box);
-  bottom.add(commandColumn);
+  // The pane the command box is currently inside. The first frame is drawn
+  // before any experiment log arrives, so the round view's transcript owns it
+  // until `render` says otherwise.
+  let commandHost: BoxRenderable = transcriptFrame;
+  hostCommandSurface(commandHost);
   root.add(headerFrame);
   root.add(errorBanner.output);
-  body.add(chatPane.output);
+  // The round tabs head both panes of the round view, outside every border:
+  // the selected tab's fill inside a rounded frame would be #642.
+  workspace.add(roundTabs.output);
   workspace.add(main);
   workspace.add(todoStrip.output);
-  workspace.add(bottom);
-  body.add(workspace);
-  root.add(body);
+  // The key-help line stays the width of the screen and under every pane. Inside
+  // one of them it would be cut to that pane's columns, and a binding that has
+  // been truncated away is a binding nobody has.
+  workspace.add(help);
+  root.add(workspace);
   root.add(overlay.scrim);
   root.add(overlay.output);
   root.add(themePicker.output);
@@ -338,10 +343,10 @@ export function createOpenTuiApp(
     markdownStyle = createMarkdownStyle(theme);
     root.backgroundColor = theme.canvas;
     headerFrame.borderColor = theme.border;
-    headerFrame.backgroundColor = headerBackground(theme);
+    headerFill.backgroundColor = headerBackground(theme);
     transcriptFrame.borderColor = theme.border;
     help.fg = theme.textSubtle;
-    roundRail.applyTheme(theme);
+    roundTabs.applyTheme(theme);
     todoStrip.applyTheme(theme);
     errorBanner.applyTheme(theme);
     agentMap.applyTheme(theme);
@@ -419,43 +424,44 @@ export function createOpenTuiApp(
           ? KEY_HELP
           : SCOPED_KEY_HELP;
     help.content = transientStatus ?? renderedKeyHelp;
-    // The rounds rail and agent map are per-round detail. They belong to a
+    // The round tabs and agent map are per-round detail. They belong to a
     // hypothesis trajectory, not to the list of claims.
     const showAgents = !showLog && (zoomedPane === null ? !showSplit : zoomedPane === 'agents');
     const showTranscript = !showLog && (zoomedPane === null || zoomedPane === 'transcript');
-    // The rail takes a fixed column off the left of the round view. The agent
-    // map is sized against what is left so the transcript keeps its floor beside
-    // the rail rather than being squeezed by it.
+    // The tabs head the whole round view, so they give way wherever it is not
+    // on screen whole: a zoomed pane, or a split that takes the row's right side.
+    const showTabs = !showLog && zoomedPane === null && !showSplit;
     const errorHeight = state.errorBanner === null ? 0 : errorBanner.output.height;
-    const railWidth = roundRailVisible(state, renderer.terminalWidth)
-      ? roundRailWidth(renderer.terminalWidth)
-      : 0;
     agentMap.output.visible = showAgents;
     transcriptFrame.visible = showTranscript;
-    roundRail.output.visible = railWidth > 0;
     todoStrip.output.visible = !showLog && zoomedPane === null;
+    // Hidden through the view rather than the box, so its live timer stops too
+    // instead of redrawing the bar back onto the screen a second later.
+    if (!showTabs) roundTabs.hide();
     if (!showLog) {
-      // The row budget the main area draws from, shared by the rail and the
-      // agents pane because they are columns of the same row. It comes from the
-      // strip height the state implies, not from `todoStrip.output.height`: the
+      const tabRows = showTabs ? roundTabs.render(state, renderer.terminalWidth) : 0;
+      // The row budget the agents pane draws from, between the tab row above
+      // the main row and the todo strip below it. The strip's share comes from
+      // the height the state implies, not from `todoStrip.output.height`: the
       // box height reflects the last committed layout, so reading it back in the
-      // same paint that expanded or collapsed the strip bills the panes the
-      // previous frame's height and leaves them a row long or short (clipping
-      // the selected late round, the overflow indicator, or a graph node) until
-      // the next paint.
+      // same paint that expanded or collapsed the strip bills the pane the
+      // previous frame's height and leaves it a row long or short (clipping a
+      // graph node or its overflow count) until the next paint.
+      //
+      // The command box is a column inside one of those panes now rather than a
+      // band under them, so it takes no rows off this budget.
       const mainRows = Math.max(
         0,
         renderer.terminalHeight -
           headerFrame.height -
           errorHeight -
+          tabRows -
           todoStripHeight(state) -
-          help.height -
-          commandInput.box.height,
+          help.height,
       );
       agentMap.render(
         state,
         zoomedPane === 'agents' ? renderer.terminalWidth : undefined,
-        railWidth,
         mainRows,
       );
       // The todo box sits under the agent pane and stops where it stops: the
@@ -467,7 +473,6 @@ export function createOpenTuiApp(
         state,
         typeof agentWidth === 'number' ? todoStripWidth(agentWidth, renderer.terminalWidth) : null,
       );
-      if (railWidth > 0) roundRail.render(state, railWidth, mainRows);
       conversation.render(state);
     }
     // The agent map is the first thing to give up room: it is a summary the
@@ -482,16 +487,10 @@ export function createOpenTuiApp(
     // hidden renderable still reports a row of its own, so each is asked
     // whether it is on screen before its rows are counted.
     const rowsOn = (pane: BoxRenderable): number => (pane.visible ? pane.height : 0);
-    // The rounds rail is a column inside the main row, not a strip above it, so
-    // only the header and the banner take rows off the top.
+    // The round tabs give way to a split, so only the header and the banner
+    // take rows off the top.
     const above = headerFrame.height + rowsOn(errorBanner.output);
-    const belowRows = rowsOn(todoStrip.output) + help.height + commandInput.box.height;
-    // Taken from the same budget the main area draws from, so the decision and
-    // the consequence cannot disagree.
-    const commandInset = commandColumnInset(
-      showChatPane,
-      renderer.terminalHeight - above - belowRows,
-    );
+    const belowRows = rowsOn(todoStrip.output) + help.height;
     // Match the chat to the left pane's rectangle so it sits beside the
     // visualization instead of over it.
     if (showSplit) {
@@ -499,18 +498,45 @@ export function createOpenTuiApp(
         left: 1,
         width: leftWidth - 2,
         top: above,
-        height: renderer.terminalHeight - above - belowRows - commandInset,
+        height: renderer.terminalHeight - above - belowRows,
       });
     } else {
       chat.setPaneBounds(null);
     }
     chatPane.render(state, showChatPane, chatWidth);
     const chatInputFocused = showChatPane && state.layout.focus === 'chat';
-    commandColumn.visible = zoomedPane !== 'chat';
-    bottom.paddingBottom = commandInset;
+    // A zoomed chat already has a composer inside it, so the command box stands
+    // down rather than following the zoom into a pane that does not want it.
+    // The key-help line goes with it, the way it did when the two shared a row.
+    const showCommand = zoomedPane !== 'chat';
+    commandInput.output.visible = showCommand;
+    if (!showCommand) commandInput.suggestions.visible = false;
+    help.visible = showCommand;
+    // Which pane the command box writes to, and therefore which one it is drawn
+    // inside. Clicking it asks for `left` focus, so it belongs to the pane that
+    // focus names: the log on the landing view and the transcript inside a
+    // round. Zoom is the only thing that can take that pane off screen, and then
+    // the box follows the one pane that is left. The narrow-width fallback needs
+    // no case of its own: it draws the visualization through the overlay and
+    // leaves the pane underneath on screen, still holding the box.
+    const nextHost =
+      zoomedPane === 'performance'
+        ? rightPane.output
+        : zoomedPane === 'agents'
+          ? agentMap.output
+          : showLog
+            ? experimentLog.output
+            : transcriptFrame;
+    if (nextHost !== commandHost) {
+      commandHost.remove(commandInput.suggestions);
+      commandHost.remove(commandInput.output);
+      hostCommandSurface(nextHost);
+      commandHost = nextHost;
+    }
     // The command list completes the box it belongs to, and on this view that
     // box cannot open a chat that is already beside it.
     commandInput.setCommandContext({chatDocked: showChatPane});
+    commandInput.render(state);
     experimentLog.setAvailableWidth(showSplit || showChatPane ? leftWidth - chatWidth : null);
     experimentLog.render(state);
     experimentLog.output.visible = showExperimentLog;
@@ -542,11 +568,20 @@ export function createOpenTuiApp(
         : chatPane.navigateSuggestions(direction),
     completeChatInput: () =>
       controller.state.chatOpen ? chat.completeSuggestion() : chatPane.completeSuggestion(),
-    // Enter belongs to a pane only when nothing is typed anywhere. Asking which
-    // box has the cursor is not enough: a question waiting in the other box is
-    // still a question, and Enter must never discard it to open a hypothesis.
+    // Enter and the single-key bindings yield to typing, and typing happens
+    // in exactly one composer: the modal chat while it is open, the focused
+    // docked chat, otherwise the command box. Only that composer's text
+    // matters. A draft parked in a closed or unfocused chat surface cannot
+    // take the keystroke, and it survives whatever the binding does, so it
+    // must not disable navigation. The ladder mirrors the key router's own
+    // early returns, so any state it routes to a chat composer is exactly a
+    // state this gate consults that composer in.
     inputIsEmpty: () =>
-      commandInput.isEmpty() && chatPane.isComposerEmpty() && chat.isComposerEmpty(),
+      controller.state.chatOpen
+        ? chat.isComposerEmpty()
+        : chatPaneFocused(controller.state)
+          ? chatPane.isComposerEmpty()
+          : commandInput.isEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
     toggleSelectedTool: () => conversation.toggleSelectedTool(),
@@ -591,7 +626,7 @@ export function createOpenTuiApp(
       unbindKeys();
       commandInput.destroy();
       conversationActivityBar.destroy();
-      roundRail.destroy();
+      roundTabs.destroy();
       agentMap.destroy();
       experimentLog.destroy();
       chat.destroy();
