@@ -1059,7 +1059,8 @@ export class SocketSessionController implements SessionController {
     if (message.type === 'event_batch') {
       if (resumed) {
         const store = message.store_id ?? '';
-        if (this.#storeId !== null && store !== this.#storeId) {
+        const knownStoreChanged = Boolean(this.#storeId && store && store !== this.#storeId);
+        if (knownStoreChanged) {
           // The run swapped its durable log while the stream was severed. The
           // resume named the store we last folded, so the server dropped our
           // cursor and replayed the live store from its floor: this batch
@@ -1079,6 +1080,7 @@ export class SocketSessionController implements SessionController {
           );
           this.#recordSpine(message.events, declared);
         } else {
+          if (store) this.#storeId = store;
           // A resumed subscription replays exactly the events after the
           // client's own cursor and declares no history floor of its own
           // (`history_after_sequence` 0 on every batch). Taking that literally

@@ -2058,6 +2058,59 @@ describe('stream reconnect', () => {
     expect(controller.state.core.outerLoop).toBe('agent');
     expect(controller.state.core.historyAfterSequence).toBe(0);
   });
+
+  it('keeps the fold when an old-server fallback omits store identity', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0]);
+    await controller.start();
+    transport.emitBatch(
+      [
+        {
+          ...event(1, 'run_started'),
+          data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+        },
+      ],
+      0,
+      'run-store',
+    );
+
+    // A server predating store-aware resumes rejects the first dial, then the
+    // stream falls back to a plain cursor resume whose suffix names no store.
+    transport.refuseSubscribes = 1;
+    transport.sever();
+    await settle();
+    expect(transport.subscribeCalls.at(-1)?.storeId).toBeUndefined();
+    transport.emitBatch([event(2, 'agent_output_chunk', 'two\n')]);
+
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.sequence).toBe(2);
+    expect(controller.state.core.transcript.map(item => item.content).join('')).toContain('two\n');
+  });
+
+  it('keeps the fold and learns an identity first seen on a resumed suffix', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0, 0]);
+    await controller.start();
+    transport.emitBatch([
+      {
+        ...event(1, 'run_started'),
+        data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+      },
+    ]);
+
+    transport.sever();
+    await settle();
+    transport.emitBatch([event(2, 'agent_output_chunk', 'two\n')], 0, 'run-store');
+
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.sequence).toBe(2);
+    expect(controller.state.core.transcript.map(item => item.content).join('')).toContain('two\n');
+
+    // Once learned, the identity protects the next cursor resume.
+    transport.sever();
+    await settle();
+    expect(transport.subscribeCalls.at(-1)?.storeId).toBe('run-store');
+  });
 });
 
 class FakeTransport implements ServerTransport {
