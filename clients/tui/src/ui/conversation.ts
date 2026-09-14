@@ -2,6 +2,7 @@ import {
   BoxRenderable,
   bold,
   type CliRenderer,
+  CodeRenderable,
   fg,
   MarkdownRenderable,
   StyledText,
@@ -15,9 +16,16 @@ import {hasRunEnded} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
 import type {ConversationEntry, SessionState} from '../session-model.js';
 import {visibleConversation} from '../session-model.js';
-import {promptPreview, toolCallPreview, toolResultPreview} from './previews.js';
 import {
+  type CollapsiblePreview,
+  promptPreview,
+  toolCallPreview,
+  toolResultPreview,
+} from './previews.js';
+import {
+  codeSurface,
   createMarkdownBlockOptions,
+  drawOnCodeSurface,
   type EntryPalette,
   entryPalette,
   type MarkdownBlockOptions,
@@ -78,6 +86,7 @@ export class ConversationView {
   readonly #onFocusRequest: (() => void) | undefined;
   #renderedConversation: ConversationEntry[] = [];
   #renderedCards: BoxRenderable[] = [];
+  /** The selection the cards in `#renderedCards` currently depict. */
   #renderedSelection: string | null = null;
   #selectedId: string | null = null;
   /** First visible entry the window renders; 0 once it covers everything. */
@@ -146,14 +155,7 @@ export class ConversationView {
   }
 
   render(state: SessionState): void {
-    const selection = this.#selectionFor(state);
-    if (selection !== this.#renderedSelection) {
-      // The cursor is drawn into the cards, so a change has to redraw them even
-      // when the entries are identical.
-      this.#renderedConversation = [];
-      this.#renderedSelection = selection;
-    }
-    this.#selectedId = selection;
+    this.#selectedId = this.#selectionFor(state);
     this.#renderConversation(this.#selectConversation(state));
   }
 
@@ -252,8 +254,31 @@ export class ConversationView {
     return entries.slice(this.#windowStart);
   }
 
+  /**
+   * Redraws the cards a selection move touches. The cursor is drawn into the
+   * cards, but only into the two it moves between: every other card renders
+   * identically under either selection, so the move costs two card
+   * replacements instead of the full-window rebuild it used to force. This
+   * runs before the structural comparison so the rendered cards agree with
+   * `#selectedId` again, which is the invariant every incremental path below
+   * assumes; an endpoint that is not rendered yet (it sits in history the
+   * window is about to reveal, or in entries about to be appended) is built by
+   * whichever path materializes it, since they all draw with `#selectedId`.
+   */
+  #syncSelectionCards(): void {
+    if (this.#selectedId === this.#renderedSelection) return;
+    for (const id of [this.#renderedSelection, this.#selectedId]) {
+      if (id === null) continue;
+      const index = this.#renderedConversation.findIndex(entry => entry.id === id);
+      if (index !== -1) this.#replaceCard(index, this.#renderedConversation);
+    }
+    this.#renderedSelection = this.#selectedId;
+  }
+
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
   #renderConversation(conversation: ConversationEntry[]): void {
     const entries = this.#windowed(conversation);
+    this.#syncSelectionCards();
     if (
       sameEntries(entries, this.#renderedConversation) &&
       (entries.length > 0 || this.output.getChildren().length > 0)
@@ -371,6 +396,8 @@ export class ConversationView {
    * `undefined` for the first one in the view, which is what decides whether
    * this entry opens a speaker run and so draws the divider and heading.
    */
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+  // biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
   #renderEntry(entry: ConversationEntry, previous: ConversationEntry | undefined): BoxRenderable {
     const palette = entryPalette(entry, this.#theme);
     const selected = this.#selectedId === entry.id;
@@ -521,6 +548,26 @@ export class ConversationView {
           wrapMode: 'word',
         }),
       );
+      if (entry.command !== undefined) {
+        // A gate's command (from the typed `gate_started` event, or, for
+        // recorded/legacy prose, core-state's `splitFrameworkValidationCommand`)
+        // gets code treatment instead of word-wrapping it like a sentence.
+        // `char` wrap is the point: a command's spaces are argument
+        // separators, not soft-wrap points, so it must break anywhere rather
+        // than at one.
+        const commandBlock = new CodeRenderable(this.renderer, {
+          content: entry.command,
+          // No bash grammar ships today (GRAMMAR_FILETYPES in styles.ts), so
+          // this still takes the flat drawUnstyledText path below; tagging it
+          // now means it lights up automatically once a bash grammar lands.
+          filetype: 'bash',
+          syntaxStyle: this.#markdownBlockOptions.syntaxStyle,
+          width: '100%',
+          wrapMode: 'char',
+        });
+        drawOnCodeSurface(commandBlock, codeSurface(this.#theme));
+        card.add(commandBlock);
+      }
       if (output?.collapsible) {
         const hidden =
           output.hiddenLines > 0
@@ -576,10 +623,7 @@ export class ConversationView {
   }
 
   #renderToolTurn(card: BoxRenderable, entry: ConversationEntry): void {
-    const toolCall =
-      entry.toolName !== undefined && entry.toolArguments !== undefined
-        ? toolCallPreview(entry.toolName, entry.toolArguments)
-        : (entry.toolCall ?? '');
+    const toolCall = toolCallText(entry);
     const toolResponse = entry.toolResult?.content ?? entry.toolResponse;
     card.add(
       new TextRenderable(this.renderer, {
@@ -608,15 +652,11 @@ export class ConversationView {
         }),
       );
       if (response.collapsible) {
-        const hidden =
-          response.hiddenLines > 0
-            ? `${response.hiddenLines} more line${response.hiddenLines === 1 ? '' : 's'}`
-            : `${response.hiddenCharacters} more characters`;
         card.add(
           new TextRenderable(this.renderer, {
             content: expanded
               ? '▴ click or Enter to collapse response'
-              : `▾ Show full response · ${hidden} · click or Enter`,
+              : `▾ Show full response · ${hiddenToolResponseSize(response)} · click or Enter`,
             fg: this.#theme.info,
             width: '100%',
           }),
@@ -624,6 +664,19 @@ export class ConversationView {
       }
     }
   }
+}
+
+function toolCallText(entry: ConversationEntry): string {
+  if (entry.toolName !== undefined && entry.toolArguments !== undefined) {
+    return toolCallPreview(entry.toolName, entry.toolArguments);
+  }
+  return entry.toolCall ?? '';
+}
+
+function hiddenToolResponseSize(response: CollapsiblePreview): string {
+  if (response.hiddenLines === 0) return `${response.hiddenCharacters} more characters`;
+  const unit = response.hiddenLines === 1 ? 'line' : 'lines';
+  return `${response.hiddenLines} more ${unit}`;
 }
 
 /**

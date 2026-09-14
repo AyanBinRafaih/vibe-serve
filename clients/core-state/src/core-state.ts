@@ -1,5 +1,14 @@
 import type {Diagnostic, RunEvent, RunSnapshot, RunStatus} from '@vibesys/backend-client';
 import {
+  applyExecutionStatus,
+  applyExecutionStatusUsage,
+  type ExecutionStatus,
+  mergeExecutionStatusesPrefix,
+  mergeExecutionStatusUsagePrefix,
+  reconcileExecutionStatuses,
+  removeExecutionStatus,
+} from './execution-status.js';
+import {
   type AgentPhase,
   applyRunMapEvent,
   mergePhaseLists,
@@ -105,6 +114,12 @@ export interface TranscriptEntry {
   invocationId?: string;
   startsTurn?: boolean;
   toolCall?: string;
+  /**
+   * A shell command to give code treatment instead of word-wrapped prose.
+   * Populated straight from a typed `gate_started` event's `command` field,
+   * or, for recorded/legacy prose, split out by `splitFrameworkValidationCommand`.
+   */
+  command?: string;
   toolResponse?: string;
   toolName?: string;
   toolCallId?: string;
@@ -181,6 +196,8 @@ export interface CoreState {
   /** Run lifetime boundaries retained from the replayed event stream. */
   runLifetimeBoundaries: readonly RunLifetimeBoundary[];
   activeExecutions: Record<string, ActiveAgentExecution>;
+  /** Freshest structured status for each active or not-yet-checkpointed execution. */
+  executionStatuses: Record<string, ExecutionStatus>;
   transcript: TranscriptEntry[];
   /** The default thread's transcript; equals `chatTranscripts[DEFAULT_CHAT_THREAD_ID]`. */
   chatTranscript: TranscriptEntry[];
@@ -222,6 +239,7 @@ export function initialCoreState(): CoreState {
     lastRunMapSequence: 0,
     runLifetimeBoundaries: [],
     activeExecutions: {},
+    executionStatuses: {},
     transcript: [],
     chatTranscript: [],
     chatTranscripts: {[DEFAULT_CHAT_THREAD_ID]: []},
@@ -300,13 +318,13 @@ export function reduceSnapshot(state: CoreState, snapshot: RunSnapshot): CoreSta
   // has seen the run end, a snapshot no newer than the fold cannot un-end it;
   // a genuinely newer one (a resumed run) still applies.
   if (hasRunEnded(registered) && snapshot.sequence <= registered.sequence) return registered;
-  return {
-    ...registered,
+  const next = cloneCoreStateWith(registered, {
     status: snapshot.status,
     agentKind: snapshot.agent_kind ?? null,
     roundLabel: snapshot.round_label ?? null,
     activeExecutions: activeExecutionsFromCheckpoint(snapshot.active_executions ?? []),
-  };
+  });
+  return next;
 }
 
 export type ActiveExecutionCheckpoint = NonNullable<RunSnapshot['active_executions']>;
@@ -318,7 +336,10 @@ export function reconcileActiveExecutions(
   throughSequence?: number,
 ): CoreState {
   if (throughSequence !== undefined && throughSequence < state.sequence) return state;
-  return {...state, activeExecutions: activeExecutionsFromCheckpoint(executions)};
+  const next = cloneCoreStateWith(state, {
+    activeExecutions: activeExecutionsFromCheckpoint(executions),
+  });
+  return next;
 }
 
 /**
@@ -445,12 +466,27 @@ export function reduceEventPrefix(
     ),
     // Liveness comes from the backend checkpoint, never from replayed history.
     activeExecutions: state.activeExecutions,
+    executionStatuses: mergeExecutionStatusesPrefix(
+      older.executionStatuses,
+      state.executionStatuses,
+      state.activeExecutions,
+    ),
     transcript: mergeTranscriptPrefix(older.transcript, state.transcript),
     chatTranscripts,
     chatTranscript: chatTranscripts[DEFAULT_CHAT_THREAD_ID] ?? [],
     chatThreads: mergeChatThreadsPrefix(older.chatThreads, state.chatThreads),
     todos: mergeTodosPrefix(older.todos, state.todos),
-    usage: state.usage ?? older.usage,
+    usage: mergeExecutionStatusUsagePrefix(
+      state.usage ?? older.usage,
+      mergeExecutionStatusesPrefix(
+        older.executionStatuses,
+        state.executionStatuses,
+        state.activeExecutions,
+      ),
+      older.executionStatuses,
+      events,
+      older.usage,
+    ),
     // Sorted rather than concatenated for the same reason the transcript is
     // merged: a tail batch can carry events from below its own floor.
     benchmarks: [...older.benchmarks, ...state.benchmarks].sort(
@@ -493,40 +529,80 @@ export function reduceEventPrefix(
  * - Two typed `tool_result` events carrying the same `call_id`, which only a
  *   malformed producer emits, diverge.
  */
+
 function mergeTranscriptPrefix(
   older: readonly TranscriptEntry[],
   newer: readonly TranscriptEntry[],
 ): TranscriptEntry[] {
-  const entries: TranscriptEntry[] = [];
-  const index = new OpenToolCallIndex();
-  let left = 0;
-  let right = 0;
-  while (left < older.length || right < newer.length) {
-    const source =
-      left >= older.length
-        ? newer
-        : right >= newer.length
-          ? older
-          : entryOrder(newer[right]) < entryOrder(older[left])
-            ? newer
-            : older;
-    const entry = source === older ? older[left++] : newer[right++];
-    if (entry === undefined) continue;
-    // A terminal chat answer carries no turn id and, in replay, folds over its
-    // own still-open streamed turn through `foldChatAnswer`. When the turn's
-    // chunks sit below the history floor and the answer above it, the two
-    // arrive from opposite lists, so reconcile them here as replay would; a
-    // second entry would otherwise survive. Anything else takes the normal step.
-    if (
-      entry.kind === 'assistant' &&
-      entry.turnId === undefined &&
-      foldChatAnswer(entries, entry)
-    ) {
-      continue;
-    }
-    foldTranscriptEntry(entries, entry, index);
+  const replay = new TranscriptPrefixReplay();
+  const ordered = new ReplayOrderedTranscriptEntries(older, newer);
+  for (let entry = ordered.next(); entry !== undefined; entry = ordered.next()) {
+    replay.append(entry);
   }
-  return entries;
+  return replay.entries;
+}
+
+/**
+ * Aligns two already ordered transcript projections into replay order.
+ *
+ * Entries with the same sequence retain the older projection first. That is
+ * the original event order at the prefix boundary and lets the newer entry
+ * update or extend it through the normal transcript fold.
+ */
+class ReplayOrderedTranscriptEntries {
+  readonly #older: readonly TranscriptEntry[];
+  readonly #newer: readonly TranscriptEntry[];
+  #olderAt = 0;
+  #newerAt = 0;
+
+  constructor(older: readonly TranscriptEntry[], newer: readonly TranscriptEntry[]) {
+    this.#older = older;
+    this.#newer = newer;
+  }
+
+  next(): TranscriptEntry | undefined {
+    if (this.#olderAt >= this.#older.length) return this.#takeNewer();
+    if (this.#newerAt >= this.#newer.length) return this.#takeOlder();
+    if (entryOrder(this.#newer[this.#newerAt]) < entryOrder(this.#older[this.#olderAt])) {
+      return this.#takeNewer();
+    }
+    return this.#takeOlder();
+  }
+
+  #takeOlder(): TranscriptEntry | undefined {
+    const entry = this.#older[this.#olderAt];
+    this.#olderAt += 1;
+    return entry;
+  }
+
+  #takeNewer(): TranscriptEntry | undefined {
+    const entry = this.#newer[this.#newerAt];
+    this.#newerAt += 1;
+    return entry;
+  }
+}
+
+/** Applies ordinary transcript folding to entries selected for prefix replay. */
+class TranscriptPrefixReplay {
+  readonly entries: TranscriptEntry[] = [];
+  readonly #openTools = new OpenToolCallIndex();
+
+  append(entry: TranscriptEntry): void {
+    // A terminal chat answer carries no turn id and, in replay, folds over its
+    // own still-open streamed turn through `foldChatAnswer` (which matches the
+    // answer's invocation id, so an abandoned turn's stream is never claimed).
+    // When the turn's chunks sit below the history floor and the answer above
+    // it, the two arrive from opposite lists, so reconcile them here as replay
+    // would; a second entry would otherwise survive. Anything else takes the
+    // normal step.
+    if (isTerminalChatAnswer(entry) && foldChatAnswer(this.entries, entry)) return;
+    foldTranscriptEntry(this.entries, entry, this.#openTools);
+  }
+}
+
+/** Whether `entry` is eligible to close a streamed chat turn during replay. */
+function isTerminalChatAnswer(entry: TranscriptEntry): boolean {
+  return entry.kind === 'assistant' && entry.turnId === undefined;
 }
 
 /**
@@ -667,12 +743,15 @@ export function reduceEvent(state: CoreState, event: RunEvent): CoreState {
   return foldEvent(state, event, null);
 }
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+// biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
 function foldEvent(state: CoreState, event: RunEvent, folder: TranscriptFolder | null): CoreState {
   const sequence = event.sequence ?? 0;
   if (sequence > 0 && sequence <= state.sequence) return state;
   let next: CoreState = {...state, sequence: Math.max(state.sequence, sequence)};
   next = applyDiagnosticEvent(next, event);
   next = applyAgentExecutionEvent(next, event);
+  next = applyAgentStatusEvent(next, event);
   if (event.agent_kind === 'chat') return applyChatEvent(next, event, folder);
   if (event.agent_kind) next.agentKind = event.agent_kind;
   if (event.round_label) next.roundLabel = event.round_label;
@@ -782,6 +861,19 @@ function foldEvent(state: CoreState, event: RunEvent, folder: TranscriptFolder |
   return next;
 }
 
+function cloneCoreState(state: CoreState): CoreState {
+  return Object.create(
+    Object.getPrototypeOf(state),
+    Object.getOwnPropertyDescriptors(state),
+  ) as CoreState;
+}
+
+function cloneCoreStateWith(state: CoreState, patch: Partial<CoreState>): CoreState {
+  const next = cloneCoreState(state);
+  Object.assign(next, patch);
+  return next;
+}
+
 /** Returns the one diagnostic added or updated by a reducer transition. */
 export function latestDiagnosticChange(
   previous: CoreState,
@@ -881,6 +973,37 @@ function applyAgentExecutionEvent(state: CoreState, event: RunEvent): CoreState 
     return {...state, activeExecutions: remaining};
   }
   return state;
+}
+
+function applyAgentStatusEvent(state: CoreState, event: RunEvent): CoreState {
+  const data = event.data;
+  const executionId = event.execution_id;
+  let executionStatuses =
+    Object.keys(state.activeExecutions).length === 0
+      ? state.executionStatuses
+      : reconcileExecutionStatuses(state.executionStatuses, state.activeExecutions);
+  if (data?.kind === 'agent_execution_started') {
+    executionStatuses = reconcileExecutionStatuses(executionStatuses, state.activeExecutions);
+  } else if (data?.kind === 'agent_execution_finished' && executionId != null) {
+    executionStatuses = removeExecutionStatus(executionStatuses, executionId);
+  } else if (
+    event.type === 'run_finished' ||
+    event.type === 'run_failed' ||
+    event.type === 'run_interrupted'
+  ) {
+    executionStatuses = {};
+  } else {
+    executionStatuses = applyExecutionStatus(executionStatuses, event);
+  }
+  const usage = applyExecutionStatusUsage(
+    state.usage,
+    state.executionStatuses,
+    executionStatuses,
+    state.activeExecutions,
+    event,
+  );
+  if (executionStatuses === state.executionStatuses && usage === state.usage) return state;
+  return cloneCoreStateWith(state, {executionStatuses, usage});
 }
 
 function updateTodos(previous: ExecutionTodos[], event: RunEvent): ExecutionTodos[] {
@@ -1014,10 +1137,19 @@ function appendChatTranscript(
  * dropped because the turn is over: neither a later chunk nor a later answer
  * may fold into it. Returns false when there is no open streamed turn, in
  * which case the answer appends as its own entry.
+ *
+ * An answer stamped with an invocation id owns exactly the turn that streamed
+ * under that id: a mismatch means the open turn was abandoned (its invocation
+ * failed before a terminal answer was recorded), so the answer appends and
+ * the abandoned turn stays as it streamed. Answers from journals written
+ * before the id existed carry none and keep the last-open-turn fold.
  */
 function foldChatAnswer(entries: TranscriptEntry[], incoming: TranscriptEntry): boolean {
   const last = entries.at(-1);
   if (last === undefined || last.kind !== 'assistant' || last.turnId === undefined) return false;
+  if (incoming.invocationId !== undefined && incoming.invocationId !== last.invocationId) {
+    return false;
+  }
   const {turnId: _closed, ...merged} = {...last, ...incoming, id: last.id};
   entries[entries.length - 1] = merged;
   return true;
@@ -1072,6 +1204,7 @@ function diagnosticSeverityRank(severity: CoreDiagnostic['severity']): number {
   return 0;
 }
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
 function diagnosticFromEvent(event: RunEvent): CoreDiagnostic | null {
   const diagnostic = event.diagnostic;
   if (diagnostic !== null && diagnostic !== undefined) {
@@ -1164,6 +1297,8 @@ function failureKind(
   return eventType === 'run_interrupted' ? 'run_interruption' : scope;
 }
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+// biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
 function eventToTranscriptEntry(event: RunEvent): TranscriptEntry | null {
   const data = event.data;
   const id = String(event.sequence ?? `${event.timestamp}-${event.type}`);
@@ -1183,6 +1318,11 @@ function eventToTranscriptEntry(event: RunEvent): TranscriptEntry | null {
     };
   }
   if (data?.kind === 'chat') {
+    // The invocation id names the turn this answer closes: the same id the
+    // turn's streamed chunks carried. `foldChatAnswer` matches on it so the
+    // answer can never fold over a different turn's abandoned stream. Records
+    // written before the field existed carry none.
+    const invocationId = data.invocation_id ?? undefined;
     return {
       id,
       kind: 'assistant',
@@ -1190,15 +1330,17 @@ function eventToTranscriptEntry(event: RunEvent): TranscriptEntry | null {
       label: 'Answer',
       ...agentFields,
       ...roundFields,
+      ...(invocationId === undefined ? {} : {invocationId}),
     };
   }
   if (data?.kind === 'agent_output_chunk') {
     const kind = outputKind(data.channel);
     const invocationId = event.invocation_id ?? undefined;
+    const gate = kind === 'diagnostic' ? splitFrameworkValidationCommand(data.content) : null;
     return {
       id,
       kind,
-      content: data.content,
+      content: gate?.content ?? data.content,
       label: labelFor(event, data.channel),
       ...agentFields,
       ...roundFields,
@@ -1207,6 +1349,7 @@ function eventToTranscriptEntry(event: RunEvent): TranscriptEntry | null {
       ...(kind === 'tool' && data.content.trimStart().startsWith('→ ')
         ? {startsTurn: true, toolCall: data.content}
         : {}),
+      ...(gate?.command === undefined ? {} : {command: gate.command}),
     };
   }
   if (data?.kind === 'tool_call') {
@@ -1290,13 +1433,13 @@ function eventToTranscriptEntry(event: RunEvent): TranscriptEntry | null {
   // so the transcript attributes them to their subsystem, not to an agent.
   if (data?.kind === 'gate_started') {
     const recipe = data.recipe == null ? '' : ` ${data.recipe}`;
-    const command = data.command == null ? '' : `: ${data.command}`;
     return {
       id,
       kind: 'status',
-      content: `running${recipe}${command}`,
+      content: `running${recipe}`,
       label: frameworkLabel(`framework-${data.gate}`, event),
       ...roundFields,
+      ...(data.command == null ? {} : {command: data.command}),
     };
   }
   if (data?.kind === 'gate_finished') return gateFinishedEntry(event, data, id, roundFields);
@@ -1367,6 +1510,34 @@ function configurationFailureContent(data: {
   if (data.usage) sections.push(data.usage);
   sections.push(`Code: ${data.code} · Stage: ${data.stage}`);
   return sections.join('\n\n');
+}
+
+/**
+ * Legacy/recorded-prose adapter: a live backend on `main` now emits a typed
+ * `gate_started` event whose `command` field `eventToTranscriptEntry` reads
+ * directly (see above), but a run recorded before #697 (e.g. the dev harness
+ * fixture `clients/tui/dev/fixtures/bad-cpp-round1.jsonl`, replayed byte for
+ * byte as `agent_output_chunk`/diagnostic) still carries the gate command as
+ * free text: loop.py's old `ctx.lprint(f"[framework-validation] running
+ * {recipe.name}: {recipe.command}")`. This is the one place that text is
+ * folded into an entry, so it is split here rather than let the TUI
+ * word-wrap a shell command as prose.
+ *
+ * Deliberately narrow: only the exact "[framework-validation] running
+ * <recipe>: " prefix qualifies, so ordinary diagnostic prose (a colon, the
+ * word "running", a bracket tag with a different shape, such as the sibling
+ * `[framework-validation] PASS` / `reused PASS: ...` lines) is never mistaken
+ * for a command.
+ */
+const FRAMEWORK_VALIDATION_RUN = /^\[framework-validation\] running [^:\n]+: ([\s\S]*)$/;
+
+function splitFrameworkValidationCommand(content: string): {content: string; command?: string} {
+  const match = FRAMEWORK_VALIDATION_RUN.exec(content);
+  if (match === null) return {content};
+  const raw = match[1] ?? '';
+  const command = raw.endsWith('\n') ? raw.slice(0, -1) : raw;
+  if (command === '') return {content};
+  return {content: content.slice(0, content.length - raw.length), command};
 }
 
 function outputKind(channel: string): TranscriptEntry['kind'] {
