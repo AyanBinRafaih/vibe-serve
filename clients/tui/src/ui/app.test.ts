@@ -12,7 +12,7 @@ import {
 } from '@opentui/core';
 import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing';
 import type {ChatOptions, HypothesisEntry} from '@vibesys/backend-client';
-import type {CoreRunStatus} from '@vibesys/core-state';
+import {type CoreRunStatus, DEFAULT_CHAT_THREAD_ID} from '@vibesys/core-state';
 import {chatHelpText, parseCommand} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
@@ -2203,6 +2203,54 @@ describe('OpenTUI presentation', () => {
       value.includes('Show full response'),
     );
     expect(recollapsed).not.toContain('"field_11": 11');
+  });
+
+  it('leaves a selected tool collapsed when Enter is pressed from the todo list', async () => {
+    const response = JSON.stringify(
+      Object.fromEntries(Array.from({length: 12}, (_, index) => [`field_${index}`, index])),
+    );
+    const testRenderer = await createTestRenderer({width: 100, height: 32});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      selectedEntryId: 'tool',
+      todosExpanded: true,
+      core: {
+        ...initialSessionState().core,
+        todos: [
+          {
+            agentKind: null,
+            roundNumber: null,
+            items: [{content: 'benchmark it', status: 'in_progress'}],
+          },
+        ],
+        transcript: [
+          {
+            id: 'tool',
+            kind: 'tool',
+            label: 'implementer · round 1',
+            content: response,
+            toolName: 'Read',
+            toolArguments: {path: 'run-state.json'},
+            toolResult: {kind: 'tool_result', tool: 'Read', content: response},
+          },
+        ],
+      },
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+
+    const collapsed = await testRenderer.waitForFrame(value =>
+      value.includes('Show full response'),
+    );
+    expect(collapsed).toContain('benchmark it');
+    expect(collapsed).not.toContain('"field_11": 11');
+
+    // The expanded todo list holds the keys, so Enter belongs to it, not to the
+    // transcript's selected tool card: the card must stay collapsed.
+    testRenderer.mockInput.pressEnter();
+    const afterEnter = await frameAfter(testRenderer);
+    expect(afterEnter).toContain('Show full response');
+    expect(afterEnter).not.toContain('"field_11": 11');
   });
 
   it('collapses prompts and expands the latest prompt with Ctrl+P', async () => {
@@ -5317,7 +5365,13 @@ describe('theming', () => {
     const kickoff = await frameAfter(testRenderer);
     expect(kickoff).toContain('Planning Hypothesis 1');
     expect(kickoff).toContain('Round 2');
-    expect(kickoff).toContain('Round 1 · recorded agent turns · no hypothesis');
+    // The round row now lands on the same column grid a hypothesis row uses
+    // (see experiment-log.test.ts), so its cells are checked rather than the
+    // single string the row used to be. "(no hypothes…" is the ID column,
+    // which never drops at a narrow width, unlike the claim column.
+    const unassociatedLine = kickoff.split('\n').find(line => line.includes('(no hypothes'));
+    expect(unassociatedLine).toBeDefined();
+    expect(unassociatedLine).toMatch(/\b1\b/);
 
     testRenderer.mockInput.pressEnter();
     const round = await frameAfter(testRenderer);
@@ -5342,9 +5396,10 @@ describe('theming', () => {
     registerCleanup(testRenderer.renderer, app);
     await controller.openExperimentLog();
 
-    expect(await frameAfter(testRenderer)).toContain(
-      'Round 7 · recorded agent turns · no hypothesis',
-    );
+    const indexed = await frameAfter(testRenderer);
+    const indexedLine = indexed.split('\n').find(line => line.includes('(no hypothes'));
+    expect(indexedLine).toBeDefined();
+    expect(indexedLine).toMatch(/\b7\b/);
 
     testRenderer.mockInput.pressEnter();
     const detail = await frameAfter(testRenderer);
@@ -5353,9 +5408,10 @@ describe('theming', () => {
     expect(detail).not.toContain('other round');
 
     testRenderer.mockInput.pressKey('ESCAPE');
-    expect(await frameAfterEscape(testRenderer)).toContain(
-      'Round 7 · recorded agent turns · no hypothesis',
-    );
+    const reopened = await frameAfterEscape(testRenderer);
+    const reopenedLine = reopened.split('\n').find(line => line.includes('(no hypothes'));
+    expect(reopenedLine).toBeDefined();
+    expect(reopenedLine).toMatch(/\b7\b/);
   });
 
   it('keeps later hypothesis planning below the existing history', async () => {
@@ -5409,12 +5465,22 @@ describe('theming', () => {
     await controller.openExperimentLog();
 
     const frame = await frameAfter(testRenderer);
+    const lines = frame.split('\n');
+    // Round rows no longer carry "Round N" as literal text (see
+    // experiment-log.test.ts), so the two unowned-round rows are told apart
+    // by their line order instead: ascending by round number, round 2 first.
+    // "(no hypothes…" is the ID column, which never drops at a narrow width,
+    // unlike the claim column "recorded agent turns" sits in.
+    const unownedRoundLineIndices = lines
+      .map((line, index) => (line.includes('(no hypothes') ? index : -1))
+      .filter(index => index >= 0);
+    expect(unownedRoundLineIndices).toHaveLength(2);
     const positions = [
-      frame.indexOf('H-01'),
-      frame.indexOf('Round 2 · recorded'),
-      frame.indexOf('H-03'),
-      frame.indexOf('Round 4 · recorded'),
-      frame.indexOf('Planning Hypothesis 3'),
+      lines.findIndex(line => line.includes('H-01')),
+      unownedRoundLineIndices[0] ?? -1,
+      lines.findIndex(line => line.includes('H-03')),
+      unownedRoundLineIndices[1] ?? -1,
+      lines.findIndex(line => line.includes('Planning Hypothesis 3')),
     ];
     expect(positions.every(position => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((left, right) => left - right));
@@ -6077,6 +6143,201 @@ function clipboardReturning(
   };
 }
 
+describe('chat scroll anchoring', () => {
+  /** A conversation long enough to overflow either chat surface's viewport. */
+  function longChat(prefix: string, count = 20): SessionState['chatConversation'] {
+    const entries: SessionState['chatConversation'] = [];
+    for (let index = 0; index < count; index += 1) {
+      entries.push({
+        id: `${prefix}-q${index}`,
+        kind: 'user',
+        label: 'You',
+        content: `${prefix} question ${index}`,
+      });
+      entries.push({
+        id: `${prefix}-a${index}`,
+        kind: 'assistant',
+        label: 'Answer',
+        content: `${prefix} answer ${index}`,
+      });
+    }
+    return entries;
+  }
+
+  function chatScroll(testRenderer: TestRendererSetup, id: string): ScrollBoxRenderable {
+    const scroll = testRenderer.renderer.root.findDescendantById(id);
+    if (!(scroll instanceof ScrollBoxRenderable)) throw new Error(`${id} was not scrollable`);
+    return scroll;
+  }
+
+  it('keeps a manual scroll-up across an unrelated state notification', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      chatOpen: true,
+      chatConversation: longChat('m'),
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('m answer 19'));
+    const transcript = chatScroll(testRenderer, 'chat-transcript');
+    expect(transcript.scrollTop).toBeGreaterThan(0);
+
+    // The operator scrolls up to reread an earlier answer; the wheel lands on
+    // the same setter.
+    transcript.scrollTop = 0;
+    const scrolled = await frameAfter(testRenderer);
+    expect(scrolled).toContain('m question 0');
+    expect(transcript.scrollTop).toBe(0);
+
+    // Run events notify continuously during a live run and each notification
+    // re-renders every view. This one leaves the chat itself untouched (the
+    // conversation keeps its identity), so the viewport must not move.
+    controller.publish({...controller.state, eventStreamAvailable: false});
+    await testRenderer.waitForVisualIdle();
+    expect(transcript.scrollTop).toBe(0);
+    expect(await frameAfter(testRenderer)).toContain('m question 0');
+  });
+
+  it('keeps a manual scroll-up in the docked pane while an answer arrives', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 22});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      chatDockFits: true,
+      chatConversation: longChat('d'),
+    });
+    controller.experiments = [logEntry('H-01', 1, 1, {claim: 'fuse the epilogue'})];
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await controller.openExperimentLog();
+    await testRenderer.waitForFrame(value => value.includes('d answer 19'));
+    const scroll = chatScroll(testRenderer, 'chat-pane-scroll');
+    expect(scroll.scrollTop).toBeGreaterThan(0);
+
+    scroll.scrollTop = 0;
+    await frameAfter(testRenderer);
+    expect(scroll.scrollTop).toBe(0);
+
+    // A streamed answer replaces the conversation array, so the identity gate
+    // above the pane's conversation render does not filter this one out.
+    controller.publish({
+      ...controller.state,
+      chatConversation: [
+        ...controller.state.chatConversation,
+        {id: 'd-late', kind: 'assistant', label: 'Answer', content: 'd late token'},
+      ],
+    });
+    await testRenderer.waitForVisualIdle();
+    expect(scroll.scrollTop).toBe(0);
+    expect(await frameAfter(testRenderer)).toContain('d question 0');
+  });
+
+  it('keeps tailing appended entries while the viewport is at the bottom', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      chatOpen: true,
+      chatConversation: longChat('m'),
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('m answer 19'));
+    const transcript = chatScroll(testRenderer, 'chat-transcript');
+    const tailed = transcript.scrollTop;
+    expect(tailed).toBeGreaterThan(0);
+
+    controller.publish({
+      ...controller.state,
+      chatConversation: [
+        ...controller.state.chatConversation,
+        {id: 'm-late', kind: 'assistant', label: 'Answer', content: 'm a later answer'},
+      ],
+    });
+    const frame = await testRenderer.waitForFrame(value => value.includes('m a later answer'));
+    expect(frame).toContain('m a later answer');
+    expect(transcript.scrollTop).toBeGreaterThan(tailed);
+  });
+
+  it('opens the chat on the tail, including after a scrolled-up close', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      chatConversation: longChat('m'),
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await frameAfter(testRenderer);
+
+    controller.publish({...controller.state, chatOpen: true});
+    const opened = await testRenderer.waitForFrame(value => value.includes('m answer 19'));
+    expect(opened).not.toContain('m question 0');
+    const transcript = chatScroll(testRenderer, 'chat-transcript');
+    expect(transcript.scrollTop).toBeGreaterThan(0);
+
+    // Scrolled into history, closed, reopened: the reading position does not
+    // outlive the modal.
+    transcript.scrollTop = 0;
+    await frameAfter(testRenderer);
+    controller.publish({...controller.state, chatOpen: false});
+    await testRenderer.waitForVisualIdle();
+    controller.publish({...controller.state, chatOpen: true});
+    const reopened = await testRenderer.waitForFrame(value => value.includes('m answer 19'));
+    expect(reopened).not.toContain('m question 0');
+    expect(transcript.scrollTop).toBeGreaterThan(0);
+  });
+
+  it('jumps to the tail when the active thread switches', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 24});
+    const one = longChat('one');
+    const two = longChat('two');
+    const controller = new FakeController({
+      ...initialSessionState(),
+      chatOpen: true,
+      chatConversation: one,
+      chatConversations: {[DEFAULT_CHAT_THREAD_ID]: one, 'thread-2': two},
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('one answer 19'));
+    const transcript = chatScroll(testRenderer, 'chat-transcript');
+    transcript.scrollTop = 0;
+    await frameAfter(testRenderer);
+    expect(transcript.scrollTop).toBe(0);
+
+    controller.publish(switchChatThread(controller.state, 'thread-2'));
+    const switched = await testRenderer.waitForFrame(value => value.includes('two answer 19'));
+    expect(switched).not.toContain('two question 0');
+    expect(transcript.scrollTop).toBeGreaterThan(0);
+  });
+
+  it('jumps to the tail when the operator submits a message', async () => {
+    const testRenderer = await createTestRenderer({width: 80, height: 24});
+    const controller = new FakeController({
+      ...initialSessionState(),
+      chatOpen: true,
+      chatConversation: longChat('m'),
+    });
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('m answer 19'));
+    const transcript = chatScroll(testRenderer, 'chat-transcript');
+    transcript.scrollTop = 0;
+    await frameAfter(testRenderer);
+    expect(transcript.scrollTop).toBe(0);
+
+    // Writing from history: sending must land the operator on their own
+    // message and the incoming answer, not leave them where they were reading.
+    await testRenderer.mockInput.typeText('what changed?');
+    testRenderer.mockInput.pressEnter();
+    const answered = await testRenderer.waitForFrame(value =>
+      value.includes('Recorded diagnostic'),
+    );
+    expect(controller.chatSubmissions).toEqual(['what changed?']);
+    expect(answered).not.toContain('m question 0');
+    expect(transcript.scrollTop).toBeGreaterThan(0);
+  });
+});
+
 describe('modal scrim', () => {
   const helpOverlay = {kind: 'help' as const, content: 'Available commands'};
 
@@ -6096,6 +6357,7 @@ describe('modal scrim', () => {
 
   it.each(
     THEME_NAMES.map(name => [name] as const),
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
   )('%s dims every cell around the modal and leaves the modal at full contrast', async (themeName: ThemeName) => {
     const theme = resolveTheme(themeName);
     const {color, strength} = scrim(theme);
@@ -6742,6 +7004,151 @@ class FakeController implements SessionController {
     for (const listener of this.#listeners) listener(this.state);
   }
 }
+
+describe('round focus on hidden panes', () => {
+  // Key routing consulted `roundFocus` while the border consulted
+  // `focusedPane`, so with the agents pane off screen Left could move the keys
+  // and an auto-selected agent filter onto a pane that was not there,
+  // silently narrowing the transcript.
+  function twoAgentRound(): SessionState {
+    const base = initialSessionState();
+    return {
+      ...base,
+      selectedRound: 1,
+      core: {
+        ...base.core,
+        rounds: [{number: 1, status: 'active' as const}],
+        phases: [
+          {
+            kind: 'implementer',
+            status: 'completed' as const,
+            roundNumber: 1,
+            roundLabel: 'round-1-impl',
+          },
+          {kind: 'judge', status: 'active' as const, roundNumber: 1, roundLabel: 'round-1-judge'},
+        ],
+        transcript: [
+          {
+            id: 'e1',
+            kind: 'assistant' as const,
+            label: 'implementer',
+            content: 'edited the kernel',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e2',
+            kind: 'assistant' as const,
+            label: 'implementer',
+            content: 'guarded the tail tile',
+            agentKind: 'implementer',
+            roundNumber: 1,
+          },
+          {
+            id: 'e3',
+            kind: 'assistant' as const,
+            label: 'judge',
+            content: 'checking the diff',
+            agentKind: 'judge',
+            roundNumber: 1,
+          },
+        ],
+      },
+    };
+  }
+
+  it('keeps Left from filtering the zoomed transcript through the hidden agents pane', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController(twoAgentRound());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('edited the kernel'));
+
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('transcript');
+
+    // Left names the agents pane, but the zoom took it off screen: the keys
+    // hold on the transcript and no invisible agent filter appears.
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    const frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+    expect(controller.state.selectedAgentKind).toBeNull();
+    expect(frame).toContain('edited the kernel');
+    expect(frame).toContain('checking the diff');
+
+    // Up still moves the transcript cursor, not an invisible agent selection.
+    testRenderer.mockInput.pressKey('ARROW_UP');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedEntryId).not.toBeNull();
+    expect(controller.state.selectedAgentKind).toBeNull();
+  });
+
+  it('still reaches the agents pane with Left while it is on screen', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController(twoAgentRound());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('edited the kernel'));
+
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    const frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    // Arriving auto-selects the active agent, with the pane there to show it.
+    expect(controller.state.selectedAgentKind).toBe('judge');
+    expect(frame).toContain('▸ Agents');
+
+    // Zoomed onto the agents pane, Right has no visible transcript to move
+    // to: the keys stay on the one pane that is on screen.
+    testRenderer.mockInput.pressKey('F4');
+    await frameAfter(testRenderer);
+    expect(controller.state.layout.zoomedPane).toBe('agents');
+    testRenderer.mockInput.pressKey('ARROW_RIGHT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+
+    // Unzoomed, the same key moves them again.
+    testRenderer.mockInput.pressKey('F4');
+    testRenderer.mockInput.pressKey('ARROW_RIGHT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+  });
+
+  it('keeps the parked agent filter and its cue when a zoom hides the agents pane', async () => {
+    const testRenderer = await createTestRenderer({width: 150, height: 26});
+    const controller = new FakeController(twoAgentRound());
+    const app = createOpenTuiApp(testRenderer.renderer, controller);
+    registerCleanup(testRenderer.renderer, app);
+    await testRenderer.waitForFrame(value => value.includes('edited the kernel'));
+
+    // The agents pane holds the keys and an agent filters the transcript.
+    testRenderer.mockInput.pressKey('ARROW_LEFT');
+    await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('agents');
+    expect(controller.state.selectedAgentKind).toBe('judge');
+
+    // A zoom leaves only the transcript on screen while the agents pane held
+    // the keys. Normalization moves the keys to the visible pane, but the
+    // filter stays: its `filtered to` header cue is painted above the zoom, so
+    // the transcript stays narrowed to the judge with a signal on screen.
+    controller.publish({
+      ...controller.state,
+      layout: {...controller.state.layout, zoomedPane: 'transcript'},
+    });
+    const frame = await frameAfter(testRenderer);
+    expect(controller.state.roundFocus).toBe('transcript');
+    expect(controller.state.selectedAgentKind).toBe('judge');
+    expect(frame).toContain('▸ Transcript');
+    expect(frame).toContain('filtered to');
+    expect(frame).toContain('checking the diff');
+    expect(frame).not.toContain('edited the kernel');
+
+    // The keys followed: Up moves the transcript cursor.
+    testRenderer.mockInput.pressKey('ARROW_UP');
+    await frameAfter(testRenderer);
+    expect(controller.state.selectedEntryId).not.toBeNull();
+  });
+});
 
 describe('chat while a pane is zoomed', () => {
   /** The landing view with the experiments pane zoomed over the whole row. */

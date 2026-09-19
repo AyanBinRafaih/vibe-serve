@@ -1,6 +1,7 @@
 import {afterEach, describe, expect, it} from 'bun:test';
 import {
   BoxRenderable,
+  CodeRenderable,
   type Renderable,
   rgbToHex,
   TextAttributes,
@@ -10,7 +11,7 @@ import {createTestRenderer, type TestRendererSetup} from '@opentui/core/testing'
 import type {SessionController} from '../session-controller.js';
 import {type ConversationEntry, initialSessionState} from '../session-model.js';
 import {ConversationView, styleTranscriptText} from './conversation.js';
-import {createMarkdownStyle} from './styles.js';
+import {codeSurface, createMarkdownStyle} from './styles.js';
 import {
   CONVERSATION_ROLES,
   contrastRatio,
@@ -36,8 +37,14 @@ interface Mounted {
   draw(entries: ConversationEntry[], selectedId?: string | null): Promise<void>;
 }
 
-async function mount(theme: Theme = resolveTheme(null)): Promise<Mounted> {
-  const testRenderer = await createTestRenderer({width: 80, height: 40});
+async function mount(
+  theme: Theme = resolveTheme(null),
+  // Tall enough for every test's cards to keep their natural height: rows the
+  // root has to flex-shrink land several cards on one row, and which card
+  // paints a contended cell is not part of any behaviour under test.
+  size: {width: number; height: number} = {width: 80, height: 40},
+): Promise<Mounted> {
+  const testRenderer = await createTestRenderer(size);
   // The list is swapped per draw rather than fixed at construction, because
   // the incremental paths below need one view to see several lists.
   let entries: ConversationEntry[] = [];
@@ -439,6 +446,105 @@ describe('speaker runs survive incremental rendering (#565)', () => {
 });
 
 /**
+ * A selection move used to invalidate the whole rendered window: the cursor is
+ * drawn into the cards, and `render` cleared its incremental state whenever
+ * `selectedEntryId` changed, so every arrow key paid a full card rebuild (a
+ * few hundred milliseconds near `CONVERSATION_WINDOW_THRESHOLD`). Only the
+ * two cards the cursor moves between change appearance, so the move now
+ * replaces exactly those, and the result must stay identical to a fresh
+ * render of the same state, alone and composed with the append and reveal
+ * paths.
+ */
+describe('a selection move re-renders only the cards it touches', () => {
+  it('replaces the two cards the cursor moves between and no others', async () => {
+    const run = [
+      from(judge, 'a', 'one'),
+      from(judge, 'b', 'two'),
+      from(judge, 'c', 'three'),
+      from(implementer, 'i', 'four'),
+    ];
+    const mounted = await mount();
+    await mounted.draw(run, 'b');
+    const before = [...mounted.view.output.getChildren()];
+    await mounted.draw(run, 'c');
+    const after = mounted.view.output.getChildren();
+    const replaced = after.flatMap((card, index) => (card === before[index] ? [] : [index]));
+    expect(replaced).toEqual([1, 2]);
+  });
+
+  it('draws the same frame as a fresh render after a selection-only update', async () => {
+    const run = [from(judge, 'a', 'one'), from(judge, 'b', 'two'), from(implementer, 'i', 'three')];
+    const mounted = await mount();
+    await mounted.draw(run);
+    const untouched = mounted.view.output.getChildren()[2];
+    for (const selectedId of ['b', 'a', null]) {
+      await mounted.draw(run, selectedId);
+      const fresh = await renderEntries(run, selectedId);
+      expect(shapeOf(mounted.view)).toBe(shapeOf(fresh.view));
+      expect(mounted.testRenderer.captureCharFrame()).toBe(fresh.testRenderer.captureCharFrame());
+    }
+    // Incremental, not a rebuild: a card the cursor never visited survives the
+    // whole tour.
+    expect(mounted.view.output.getChildren()[2]).toBe(untouched);
+  });
+
+  it('applies a selection move and an append arriving in the same render', async () => {
+    const shown = [from(judge, 'a', 'one'), from(judge, 'b', 'two'), from(judge, 'c', 'three')];
+    const grown = [...shown, from(implementer, 'i', 'four')];
+    const mounted = await mount();
+    await mounted.draw(shown, 'a');
+    const kept = mounted.view.output.getChildren()[2];
+    // One render sees both: the cursor moved a→b and 'i' arrived.
+    await mounted.draw(grown, 'b');
+    expect(mounted.view.output.getChildren()[2]).toBe(kept);
+    expect(cardOf(mounted.view, 'b').border).toEqual(['left']);
+    const fresh = await renderEntries(grown, 'b');
+    expect(shapeOf(mounted.view)).toBe(shapeOf(fresh.view));
+    expect(mounted.testRenderer.captureCharFrame()).toBe(fresh.testRenderer.captureCharFrame());
+  });
+
+  it('materializes the cursor on an entry appended in the same render', async () => {
+    const shown = [from(judge, 'a', 'one'), from(judge, 'b', 'two')];
+    const grown = [...shown, from(judge, 'c', 'three')];
+    const mounted = await mount();
+    await mounted.draw(shown, 'a');
+    const kept = mounted.view.output.getChildren()[1];
+    await mounted.draw(grown, 'c');
+    expect(mounted.view.output.getChildren()[1]).toBe(kept);
+    expect(cardOf(mounted.view, 'c').border).toEqual(['left']);
+    const fresh = await renderEntries(grown, 'c');
+    expect(shapeOf(mounted.view)).toBe(shapeOf(fresh.view));
+    expect(mounted.testRenderer.captureCharFrame()).toBe(fresh.testRenderer.captureCharFrame());
+  });
+
+  it('composes with the window: selecting into history reveals it without rebuilding the tail', async () => {
+    // One entry past the threshold, so the first paint windows to the tail and
+    // the history above it is unmaterialized. The viewport holds all 206
+    // one-row cards plus the opener's chrome, so the frame comparison covers
+    // the whole seam between the revealed head and the kept tail.
+    const size = {width: 80, height: 220};
+    const all = Array.from({length: 2_001}, (_, index) =>
+      from(judge, `e${index}`, `line ${index}`),
+    );
+    const mounted = await mount(undefined, size);
+    await mounted.draw(all);
+    expect(mounted.view.output.getChildren()).toHaveLength(200);
+    const lastCard = mounted.view.output.getChildren().at(-1);
+    // The cursor lands six entries above the window: the reveal path
+    // materializes those with the cursor already on the right card, and the
+    // 200 cards on screen are not rebuilt for it.
+    await mounted.draw(all, 'e1795');
+    expect(mounted.view.output.getChildren()).toHaveLength(206);
+    expect(mounted.view.output.getChildren().at(-1)).toBe(lastCard);
+    expect(cardOf(mounted.view, 'e1795').border).toEqual(['top', 'left']);
+    const fresh = await mount(undefined, size);
+    await fresh.draw(all, 'e1795');
+    expect(shapeOf(mounted.view)).toBe(shapeOf(fresh.view));
+    expect(mounted.testRenderer.captureCharFrame()).toBe(fresh.testRenderer.captureCharFrame());
+  });
+});
+
+/**
  * Role and selection have to stay distinguishable in all eight themes
  * (#565's fourth acceptance criterion). theme.ts's colours come out of
  * `mix()` and `ensureContrast()` and exist nowhere as literals, so this
@@ -674,5 +780,109 @@ describe('transcript run ids take the card label color, source tags recede (#647
     expect(text.content.chunks).toHaveLength(1);
     expect(text.content.chunks[0]?.text).toBe('plain content');
     expect(rgbToHex(text.fg).toLowerCase()).toBe(palette.content.toLowerCase());
+  });
+});
+
+describe('a gate command entry', () => {
+  // Shape of clients/tui/dev/fixtures/bad-cpp-round1.jsonl:388, already split
+  // by core-state's `splitFrameworkValidationCommand` into prose plus
+  // `command`.
+  const GATE_COMMAND = 'mkdir -p .cache/tmp && TMPDIR="$PWD/.cache/tmp" make -s all && ./bin/tests';
+
+  it('draws the command in a CodeRenderable with char wrap, not word wrap', async () => {
+    const entries: ConversationEntry[] = [
+      {
+        id: 'g1',
+        kind: 'diagnostic',
+        label: 'judge · round-1-retry-1-judge',
+        content: '[framework-validation] running build-and-correctness-gate: ',
+        command: GATE_COMMAND,
+      },
+    ];
+    const {view} = await renderEntries(entries);
+    const card = cardOf(view, 'g1');
+    const code = card.getChildren().find(child => child instanceof CodeRenderable);
+    if (!(code instanceof CodeRenderable)) throw new Error('command code block missing');
+    expect(code.content).toBe(GATE_COMMAND);
+    // The core of the fix: a shell command's spaces are argument separators,
+    // not soft-wrap points, so it must break anywhere rather than at spaces.
+    expect(code.wrapMode).toBe('char');
+    // The prose still draws as it does today, ahead of the command: the
+    // bracket tag muted and the rest content-colored, same as any other
+    // diagnostic line (the "mutes the bracketed tag" case above).
+    const text = card.getChildren().find(child => child instanceof TextRenderable);
+    if (!(text instanceof TextRenderable)) throw new Error('prose text missing');
+    const prose =
+      typeof text.content === 'string'
+        ? text.content
+        : text.content.chunks.map(chunk => chunk.text).join('');
+    expect(prose).toBe('[framework-validation] running build-and-correctness-gate: ');
+  });
+
+  it('tags the command as bash and still renders flat (no bundled grammar yet)', async () => {
+    const entries: ConversationEntry[] = [
+      {
+        id: 'g3',
+        kind: 'diagnostic',
+        label: 'judge · round-1-retry-1-judge',
+        content: '[framework-validation] running build-and-correctness-gate: ',
+        command: GATE_COMMAND,
+      },
+    ];
+    const {view} = await renderEntries(entries);
+    const card = cardOf(view, 'g3');
+    const code = card.getChildren().find(child => child instanceof CodeRenderable);
+    if (!(code instanceof CodeRenderable)) throw new Error('command code block missing');
+    expect(code.filetype).toBe('bash');
+    // 'bash' has no bundled grammar (GRAMMAR_FILETYPES in styles.ts), so
+    // drawOnCodeSurface still takes the flat drawUnstyledText path: same
+    // colors as an untagged block, no visual change today.
+    const theme = resolveTheme(null);
+    expect({fg: rgbToHex(code.fg), bg: rgbToHex(code.bg)}).toEqual(codeSurface(theme));
+    expect(code.drawUnstyledText).toBe(true);
+    expect(code.baseHighlight).toBeUndefined();
+  });
+
+  it('renders an entry without a command exactly as before: no code block', async () => {
+    const entries: ConversationEntry[] = [
+      {id: 'g2', kind: 'diagnostic', label: 'launcher', content: 'plain diagnostic line'},
+    ];
+    const {view} = await renderEntries(entries);
+    const card = cardOf(view, 'g2');
+    expect(card.getChildren().find(child => child instanceof CodeRenderable)).toBeUndefined();
+    const text = card.getChildren().find(child => child instanceof TextRenderable);
+    if (!(text instanceof TextRenderable)) throw new Error('content text missing');
+    expect(text.wrapMode).toBe('word');
+  });
+
+  it('draws a typed gate_started entry the same way: prose plus a bash code block, not duplicated', async () => {
+    // Shape core-state's eventToTranscriptEntry now produces directly from a
+    // typed gate_started event's `command` field: prose carries no command.
+    const entries: ConversationEntry[] = [
+      {
+        id: 'g4',
+        kind: 'status',
+        label: 'framework-validation · round-1',
+        content: 'running focused-tests',
+        command: GATE_COMMAND,
+      },
+    ];
+    const {view} = await renderEntries(entries);
+    const card = cardOf(view, 'g4');
+    const code = card.getChildren().find(child => child instanceof CodeRenderable);
+    if (!(code instanceof CodeRenderable)) throw new Error('command code block missing');
+    expect(code.content).toBe(GATE_COMMAND);
+    expect(code.filetype).toBe('bash');
+    expect(code.wrapMode).toBe('char');
+    const text = card.getChildren().find(child => child instanceof TextRenderable);
+    if (!(text instanceof TextRenderable)) throw new Error('prose text missing');
+    const prose =
+      typeof text.content === 'string'
+        ? text.content
+        : text.content.chunks.map(chunk => chunk.text).join('');
+    expect(prose).toBe('running focused-tests');
+    expect(prose).not.toContain(GATE_COMMAND);
+    // Exactly one command block: the command never renders twice.
+    expect(card.getChildren().filter(child => child instanceof CodeRenderable)).toHaveLength(1);
   });
 });
