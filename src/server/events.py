@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from typing import BinaryIO
 
+    from server.event_index import SourceStat
+
 
 class EventType(StrEnum):  # noqa: D101  # tracked: #288
     SERVER_STARTED = "server_started"
@@ -789,9 +791,11 @@ class EventStore:
     def _scan_unlocked(self) -> tuple[list[_StoredRecord], int | None]:
         """Index the log by byte range and header without a full-file allocation.
 
-        An exact sidecar match restores the record index without parsing the
-        JSONL prefix. Otherwise this streams the source once and atomically
-        publishes a replacement cache. A record the cheap header scan cannot
+        A sidecar whose indexed prefix is unchanged restores the record index
+        without parsing that prefix; a source that has only grown (the journal
+        is append-only) has just its suffix scanned, and the extended index is
+        republished. Otherwise this streams the whole source once and
+        atomically publishes a replacement cache. A record the cheap header scan cannot
         classify is fully validated in place, so strict corruption detection
         does not require retaining the other event payloads.
         """
@@ -808,10 +812,13 @@ class EventStore:
             except ValueError:
                 records = []
             else:
-                records, malformed_tail_offset, _safe_count, _safe_boundary = (
+                initial_source = source_stat(self.path)
+                records, malformed_tail_offset, safe_count, safe_boundary = (
                     self._scan_stream_unlocked(records, start=cached.boundary)
                 )
                 self._parse_eager_tail(records, malformed_tail_offset)
+                if initial_source is not None and safe_boundary != cached.boundary:
+                    self._publish_index(records, safe_count, safe_boundary, initial_source)
                 return records, malformed_tail_offset
 
         initial_source = source_stat(self.path)
@@ -820,14 +827,23 @@ class EventStore:
         )
         self._parse_eager_tail(records, malformed_tail_offset)
         if initial_source is not None:
-            write_event_index(
-                self.path,
-                (_index_record_from_stored(records[index]) for index in range(safe_count)),
-                safe_count,
-                safe_boundary,
-                initial_source,
-            )
+            self._publish_index(records, safe_count, safe_boundary, initial_source)
         return records, malformed_tail_offset
+
+    def _publish_index(
+        self,
+        records: list[_StoredRecord],
+        safe_count: int,
+        safe_boundary: int,
+        initial_source: SourceStat,
+    ) -> None:
+        write_event_index(
+            self.path,
+            (_index_record_from_stored(records[index]) for index in range(safe_count)),
+            safe_count,
+            safe_boundary,
+            initial_source,
+        )
 
     def _scan_stream_unlocked(
         self, records: list[_StoredRecord], *, start: int

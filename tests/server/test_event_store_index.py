@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ import server.event_index as event_index_module
 import server.events as events_module
 from server.event_index import event_index_path, load_event_index
 from server.events import EventStore, EventType, RunEvent, make_event
+from server.journal import EventJournal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -115,28 +117,174 @@ def test_warm_attach_uses_the_validated_sidecar_without_scanning_jsonl(
     assert index_path.read_bytes() == original_index
 
 
-def test_appended_source_rebuilds_instead_of_trusting_a_stale_prefix(
+def _count_header_scans(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count JSONL lines classified by the header scan (the suffix/full scan work)."""
+    scanned = [0]
+    scan_header = events_module._scan_header_fields  # noqa: SLF001
+
+    def counting(line: bytes) -> _ScannedHeader | None:
+        scanned[0] += 1
+        return scan_header(line)
+
+    monkeypatch.setattr(events_module, "_scan_header_fields", counting)
+    return scanned
+
+
+def _append(path: Path, sequence: int, text: str) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(_event(sequence, text).model_dump_json() + "\n")
+
+
+def test_grown_source_scans_only_the_suffix_and_extends_the_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "events.jsonl"
-    _write(path, [1, 2, 3])
+    _write(path, list(range(1, 51)))
     EventStore(path, run_id="first")
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(_event(4, "appended").model_dump_json() + "\n")
-    scanned = 0
-    scan_header = events_module._scan_header_fields  # noqa: SLF001
-
-    def count_header_scans(line: bytes) -> _ScannedHeader | None:
-        nonlocal scanned
-        scanned += 1
-        return scan_header(line)
-
-    monkeypatch.setattr(events_module, "_scan_header_fields", count_header_scans)
+    indexed_boundary = path.stat().st_size
+    _append(path, 51, "appended-a")
+    _append(path, 52, "appended-b")
+    scanned = _count_header_scans(monkeypatch)
 
     store = EventStore(path, run_id="second")
 
-    assert scanned == 4
-    assert [event.text for event in store.read()] == ["event-0", "event-1", "event-2", "appended"]
+    assert scanned[0] == 2
+    assert store.last_sequence == 52
+    assert [event.text for event in store.read()][-2:] == ["appended-a", "appended-b"]
+    extended = load_event_index(path)
+    assert extended is not None
+    assert len(extended.records) == 52
+    assert extended.boundary == path.stat().st_size > indexed_boundary
+    assert extended.records[50].offset == indexed_boundary
+
+    # The rewritten sidecar is reusable as is: nothing is scanned a third time.
+    scanned[0] = 0
+    third = EventStore(path, run_id="third")
+    assert scanned[0] == 0
+    assert third.last_sequence == 52
+
+
+def test_prefix_edit_with_growth_is_rejected_and_rebuilt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "events.jsonl"
+    _write(path, [1, 2, 3, 4])
+    EventStore(path, run_id="first")
+    content = path.read_bytes()
+    edited = content.replace(b"event-0", b"edited0")  # head of the indexed region
+    assert len(edited) == len(content)
+    path.write_bytes(edited)
+    _append(path, 5, "appended")
+
+    assert load_event_index(path) is None
+    scanned = _count_header_scans(monkeypatch)
+    store = EventStore(path, run_id="second")
+
+    assert scanned[0] == 5
+    assert next(iter(store.read())).text == "edited0"
+
+
+def test_edit_near_the_boundary_with_growth_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    _write(path, [1, 2, 3])
+    EventStore(path, run_id="first")
+    content = path.read_bytes()
+    path.write_bytes(content.replace(b"event-2", b"edited2"))
+    _append(path, 4, "appended")
+
+    assert load_event_index(path) is None
+
+
+def test_interior_edit_with_growth_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    _write(path, list(range(1, 3_000)))
+    EventStore(path, run_id="first")
+    assert path.stat().st_size > 8 * 64 * 1024
+    boundary = path.stat().st_size
+    with path.open("r+b") as stream:
+        stream.seek(boundary * 4 // 8 + 10)  # inside a sampled window
+        stream.write(b"#")
+    _append(path, 3_000, "appended")
+
+    assert load_event_index(path) is None
+
+
+def test_different_file_at_the_same_path_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    _write(path, [1, 2, 3])
+    EventStore(path, run_id="first")
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_bytes(path.read_bytes())
+    _append(replacement, 4, "appended")
+    replacement.replace(path)
+
+    assert load_event_index(path) is None
+
+
+def test_source_shrunk_by_a_partial_tail_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    _write(path, [1, 2, 3])
+    EventStore(path, run_id="first")
+    with path.open("r+b") as stream:
+        stream.truncate(path.stat().st_size - 1)
+
+    assert load_event_index(path) is None
+
+
+def test_partial_sidecar_is_rejected_even_when_the_source_grew(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    _write(path, [1, 2, 3])
+    EventStore(path, run_id="first")
+    index_path = event_index_path(path)
+    index_path.write_bytes(index_path.read_bytes()[:-20])
+    _append(path, 4, "appended")
+
+    assert load_event_index(path) is None
+    assert [event.sequence for event in EventStore(path, run_id="second").read()] == [1, 2, 3, 4]
+
+
+def test_sidecar_of_another_version_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    _write(path, [1, 2, 3])
+    EventStore(path, run_id="first")
+
+    def bump(header: dict[str, object], _records: list[list[object]]) -> None:
+        header["version"] = 1
+
+    _rewrite_sidecar(event_index_path(path), bump)
+
+    assert load_event_index(path) is None
+
+
+def test_journal_attach_reuses_the_index_despite_server_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_dir = tmp_path / "run" / "logs"
+    events_path = log_dir / "run-events.jsonl"
+
+    def attach() -> EventJournal:
+        journal = EventJournal(threading.Condition(threading.RLock()))
+        journal.attach(log_dir)
+        return journal
+
+    attach()  # creates the log; there is nothing to index yet
+    for index in range(50):
+        attach().record(EventType.OUTPUT, f"seed-{index}")
+    first = attach()  # its cold scan is the first to publish the sidecar
+    for index in range(3):
+        first.record(EventType.OUTPUT, f"line-{index}")
+    assert event_index_path(events_path).exists()
+    indexed_lines = len(load_event_index(events_path).records)  # type: ignore[union-attr]
+    assert len(events_path.read_text().splitlines()) > indexed_lines + 3
+    scanned = _count_header_scans(monkeypatch)
+
+    second = attach()
+
+    # Only the lines appended since the sidecar was written are scanned.
+    assert scanned[0] == len(events_path.read_text().splitlines()) - indexed_lines - 1
+    assert scanned[0] == 4 < indexed_lines
+    started = [event for event in second.read() if event.type is EventType.SERVER_STARTED]
+    assert len(started) == 53
 
 
 def test_source_change_during_scan_does_not_publish_an_index(
