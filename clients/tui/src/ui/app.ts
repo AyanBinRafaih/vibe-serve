@@ -8,6 +8,7 @@ import {
 import {COMMAND_NAMES} from '../commands.js';
 import type {SessionController} from '../session-controller.js';
 import {
+  chatPaneFocused,
   experimentLogVisible,
   focusedPane,
   type SessionState,
@@ -15,11 +16,11 @@ import {
   visibleRoundNumber,
 } from '../session-model.js';
 import {ActivityBarView} from './activity-bar.js';
-import {AgentMapView} from './agent-map.js';
+import {AgentMapView, agentsPaneVisible} from './agent-map.js';
 import {fillLayer} from './box-fill.js';
 import {createChatDraft} from './chat-composer.js';
 import {ChatOverlayView} from './chat-overlay.js';
-import {ChatPaneView, chatDockFits, chatPaneWidth} from './chat-pane.js';
+import {ChatPaneView, chatDockFits, chatPaneWidthWithOverride} from './chat-pane.js';
 import {RendererSelectionClipboard, type SelectionClipboard} from './clipboard.js';
 import {createCommandInputPanel} from './command-input.js';
 import {ConversationView} from './conversation.js';
@@ -36,7 +37,7 @@ import {
 import {bindKeybindings} from './keybindings.js';
 import {OverlayView} from './overlay.js';
 import {RightPaneView, rightPaneWidth, splitFits} from './right-pane.js';
-import {RoundRailView, roundRailVisible, roundRailWidth} from './round-rail.js';
+import {RoundRailView, roundRailColumns} from './round-rail.js';
 import {createMarkdownStyle} from './styles.js';
 import {resolveTheme, type ThemeName} from './theme.js';
 import {ThemePickerView} from './theme-picker.js';
@@ -49,12 +50,27 @@ export interface OpenTuiApp {
 /** Which of the client's editors currently holds the cursor. */
 type FocusTarget = 'command' | 'chat' | 'modal';
 
-const KEY_HELP = `←→: rounds/agents/transcript · ↑↓: within · [/]: round · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Ctrl+L: live`;
-const SCOPED_KEY_HELP = `←→: rounds/agents/transcript · ↑↓: within · [/]: round · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Esc: back`;
-const LOG_KEY_HELP = `↑↓ or scroll: select · Enter/click: open hypothesis · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
-const LOG_CHAT_KEY_HELP = `↑↓: select · Enter/click: hypothesis · Ctrl+W: chat · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
+// `help` is one row and clips rather than wraps, so a hint added here costs the
+// hints behind it on a narrow terminal, which is exactly where the resize keys
+// matter most. All three ride one token, and `or click` after `[/]: round` is
+// dropped to pay for it: a rail row looks clickable on its own, while `<>=` is
+// advertised nowhere else.
+const KEY_HELP = `←→: rounds/agents/transcript · ↑↓: within · [/]: round · <>=: width · Tab: complete · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Ctrl+L: live`;
+const SCOPED_KEY_HELP = `←→: rounds/agents/transcript · ↑↓: within · [/]: round · <>=: width · Tab: complete · F4: zoom · ${COMMAND_NAMES.todos} · ${COMMAND_NAMES.prompt} · Esc: back`;
+const LOG_KEY_HELP = `↑↓ or scroll: select · Enter/click: open hypothesis · Tab: complete · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
+// The resize keys are guarded by `chatPaneVisible(state)` (`keybindings.ts`),
+// which is false in every state `LOG_KEY_HELP` covers, so `<>=: width` goes
+// only on this line, the one state where the keys can actually fire.
+// Advertising a binding that cannot fire is worse than not advertising it at
+// all: tui/conventions.md's "Bindings are visible" is about a person not
+// having to already know a binding, and a dead one on the help line breaks
+// that trust the same way a false error would break the banner's (#635).
+//
+// This line is one row and clips rather than wraps (see `KEY_HELP` above), so
+// the new token costs the tokens behind it on a narrow terminal.
+const LOG_CHAT_KEY_HELP = `↑↓: select · Enter/click: hypothesis · <>=: width · Tab: complete · Ctrl+W: chat · F4: zoom · ${COMMAND_NAMES['open-round']} --N`;
 const HYPOTHESIS_KEY_HELP =
-  '↑↓: select round · Enter/click: trajectory · PgUp/PgDn: scroll · Esc: hypotheses';
+  '↑↓: select round · Enter/click: trajectory · d: diff · Tab: complete · PgUp/PgDn: scroll · Esc: hypotheses';
 /** Bezel, one content row, bezel. See the header frame below. */
 const HEADER_FRAME_HEIGHT = 3;
 
@@ -78,6 +94,7 @@ function emptyTranscriptMessage(state: SessionState): string {
   return 'Waiting for run events…';
 }
 
+// biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
 export function createOpenTuiApp(
   renderer: CliRenderer,
   controller: SessionController,
@@ -111,7 +128,7 @@ export function createOpenTuiApp(
     border: true,
     // Rounded, like the panes below it. The fill is on an inner layer, so
     // there is nothing in the corner cell to bleed past the arc
-    // (tui-conventions.md).
+    // (tui/conventions.md).
     borderStyle: 'rounded',
     borderColor: theme.border,
   });
@@ -276,6 +293,7 @@ export function createOpenTuiApp(
     value => void controller.submitCommand(value),
     theme,
     () => controller.focusPane('left'),
+    () => controller.clearInputError(),
   );
   /**
    * Moves the command box, and the list that completes it, into one pane.
@@ -287,7 +305,7 @@ export function createOpenTuiApp(
    */
   const hostCommandSurface = (pane: BoxRenderable): void => {
     pane.add(commandInput.suggestions);
-    pane.add(commandInput.box);
+    pane.add(commandInput.output);
   };
 
   // A slash command and a key toggle the same prompt: the controller routes the
@@ -361,6 +379,8 @@ export function createOpenTuiApp(
 
   let focusTarget: FocusTarget = 'command';
   let lastState: SessionState = controller.state;
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+  // biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
   const render = (state: SessionState): void => {
     lastState = state;
     const previewName = state.themePicker?.selected ?? state.themeName;
@@ -402,7 +422,7 @@ export function createOpenTuiApp(
     const chatWidth = showChatPane
       ? zoomedPane === 'chat'
         ? renderer.terminalWidth
-        : chatPaneWidth(renderer.terminalWidth, rightWidth)
+        : chatPaneWidthWithOverride(renderer.terminalWidth, rightWidth, state.chatWidthOverride)
       : 0;
     const showExperimentLog = showLog && (zoomedPane === null || zoomedPane === 'experiments');
     paintHeader(renderHeader(state, showLog, renderer.terminalWidth - HEADER_CHROME));
@@ -422,16 +442,16 @@ export function createOpenTuiApp(
           : SCOPED_KEY_HELP;
     help.content = transientStatus ?? renderedKeyHelp;
     // The rounds rail and agent map are per-round detail. They belong to a
-    // hypothesis trajectory, not to the list of claims.
-    const showAgents = !showLog && (zoomedPane === null ? !showSplit : zoomedPane === 'agents');
+    // hypothesis trajectory, not to the list of claims. `agentsPaneVisible` is
+    // this same decision, shared with the `<`/`>` resize keys so a layout
+    // change cannot leave the render and the keybinding guard disagreeing.
+    const showAgents = agentsPaneVisible(state, renderer.terminalWidth);
     const showTranscript = !showLog && (zoomedPane === null || zoomedPane === 'transcript');
     // The rail takes a fixed column off the left of the round view. The agent
     // map is sized against what is left so the transcript keeps its floor beside
     // the rail rather than being squeezed by it.
     const errorHeight = state.errorBanner === null ? 0 : errorBanner.output.height;
-    const railWidth = roundRailVisible(state, renderer.terminalWidth)
-      ? roundRailWidth(renderer.terminalWidth)
-      : 0;
+    const railWidth = roundRailColumns(state, renderer.terminalWidth);
     agentMap.output.visible = showAgents;
     transcriptFrame.visible = showTranscript;
     roundRail.output.visible = railWidth > 0;
@@ -508,7 +528,7 @@ export function createOpenTuiApp(
     // down rather than following the zoom into a pane that does not want it.
     // The key-help line goes with it, the way it did when the two shared a row.
     const showCommand = zoomedPane !== 'chat';
-    commandInput.box.visible = showCommand;
+    commandInput.output.visible = showCommand;
     if (!showCommand) commandInput.suggestions.visible = false;
     help.visible = showCommand;
     // Which pane the command box writes to, and therefore which one it is drawn
@@ -528,19 +548,25 @@ export function createOpenTuiApp(
             : transcriptFrame;
     if (nextHost !== commandHost) {
       commandHost.remove(commandInput.suggestions);
-      commandHost.remove(commandInput.box);
+      commandHost.remove(commandInput.output);
       hostCommandSurface(nextHost);
       commandHost = nextHost;
     }
     // The command list completes the box it belongs to, and on this view that
     // box cannot open a chat that is already beside it.
     commandInput.setCommandContext({chatDocked: showChatPane});
+    commandInput.render(state);
     experimentLog.setAvailableWidth(showSplit || showChatPane ? leftWidth - chatWidth : null);
     experimentLog.render(state);
     experimentLog.output.visible = showExperimentLog;
     rightPane.render(state, showRightPane, rightWidth);
     overlay.render(state, paneFallback);
-    overlay.renderScrim(state.overlay !== null || state.chatOpen || state.themePicker !== null);
+    overlay.renderScrim(
+      state.overlay !== null ||
+        state.diffViewer !== null ||
+        state.chatOpen ||
+        state.themePicker !== null,
+    );
     themePicker.render(state);
     chat.render(state);
     conversationActivityBar.render(state, !showLog);
@@ -566,11 +592,20 @@ export function createOpenTuiApp(
         : chatPane.navigateSuggestions(direction),
     completeChatInput: () =>
       controller.state.chatOpen ? chat.completeSuggestion() : chatPane.completeSuggestion(),
-    // Enter belongs to a pane only when nothing is typed anywhere. Asking which
-    // box has the cursor is not enough: a question waiting in the other box is
-    // still a question, and Enter must never discard it to open a hypothesis.
+    // Enter and the single-key bindings yield to typing, and typing happens
+    // in exactly one composer: the modal chat while it is open, the focused
+    // docked chat, otherwise the command box. Only that composer's text
+    // matters. A draft parked in a closed or unfocused chat surface cannot
+    // take the keystroke, and it survives whatever the binding does, so it
+    // must not disable navigation. The ladder mirrors the key router's own
+    // early returns, so any state it routes to a chat composer is exactly a
+    // state this gate consults that composer in.
     inputIsEmpty: () =>
-      commandInput.isEmpty() && chatPane.isComposerEmpty() && chat.isComposerEmpty(),
+      controller.state.chatOpen
+        ? chat.isComposerEmpty()
+        : chatPaneFocused(controller.state)
+          ? chatPane.isComposerEmpty()
+          : commandInput.isEmpty(),
     closeChat: () => controller.closeChat(),
     toggleLatestPrompt: () => conversation.toggleLatestPrompt(),
     toggleSelectedTool: () => conversation.toggleSelectedTool(),
@@ -584,6 +619,8 @@ export function createOpenTuiApp(
     selectNextRound: () => controller.selectNextRound(),
     selectPreviousRound: () => controller.selectPreviousRound(),
     toggleTodos: () => controller.toggleTodos(),
+    setGraphWidthOverride: width => controller.setGraphWidthOverride(width),
+    setChatWidthOverride: width => controller.setChatWidthOverride(width),
     scrollRightPane: delta => rightPane.scrollBy(delta),
     scrollChatPane: delta => chatPane.scrollBy(delta),
     scrollExperimentDetail: delta => experimentLog.scrollBy(delta),

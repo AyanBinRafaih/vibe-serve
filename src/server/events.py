@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,11 +15,19 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError, model_validator
 
 from server.diagnostics import Diagnostic
+from server.event_index import (
+    EventIndexRecord,
+    load_event_index,
+    source_stat,
+    write_event_index,
+)
 from server.run_lifecycle import RunStatus
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from typing import BinaryIO
+
+    from server.event_index import SourceStat
 
 
 class EventType(StrEnum):  # noqa: D101  # tracked: #288
@@ -52,6 +61,11 @@ class EventType(StrEnum):  # noqa: D101  # tracked: #288
     TOOL_RESULT = "tool_result"
     TODO_UPDATE = "todo_update"
     USAGE_UPDATE = "usage_update"
+    GATE_STARTED = "gate_started"
+    GATE_FINISHED = "gate_finished"
+    WORKSPACE_SNAPSHOT = "workspace_snapshot"
+    RUN_CONFIGURED = "run_configured"
+    FRAMEWORK_WARNING = "framework_warning"
 
 
 class EventStatus(StrEnum):  # noqa: D101  # tracked: #288
@@ -72,6 +86,25 @@ AgentOutputChannel = Literal["assistant", "analysis", "tool", "diagnostic", "pro
 """Presentation channel for streamed agent output."""
 
 
+class GateKind(StrEnum):
+    """Closed set of framework-owned gates a candidate passes through."""
+
+    VALIDATION = "validation"
+    ACCURACY = "accuracy"
+    BENCHMARK = "benchmark"
+
+
+class FrameworkSource(StrEnum):
+    """Closed set of framework subsystems that emit framework events."""
+
+    GATES = "gates"
+    GIT_TRACKING = "git_tracking"
+    LOOP = "loop"
+    GPU = "gpu"
+    SKYPILOT = "skypilot"
+    OTHER = "other"
+
+
 class EventPayload(BaseModel):
     """Immutable base for every structured event payload.
 
@@ -89,6 +122,11 @@ class ChatData(EventPayload):  # noqa: D101  # tracked: #288
     # The authoritative thread title, set by the server on the turn that
     # titles a previously untitled thread so clients learn it from replay.
     thread_title: str | None = None
+    # Identity of the turn this answer closes: the same id the turn's streamed
+    # chunks carried, so clients fold the terminal answer over exactly that
+    # turn and never over an abandoned one. None on records written before the
+    # field existed, for which clients keep the last-open-turn heuristic.
+    invocation_id: str | None = None
 
 
 class ChatThreadCreatedData(EventPayload):
@@ -200,6 +238,7 @@ class RunStatusChangedData(EventPayload):
 class ExperimentsChangedData(EventPayload):  # noqa: D101  # tracked: #288
     kind: Literal["experiments_changed"] = "experiments_changed"
     reason: Literal["project_attached", "active_hypothesis_changed", "round_persisted"]
+    revision: int | None = Field(default=None, ge=0)
 
 
 class ConfigurationFailedData(EventPayload):  # noqa: D101  # tracked: #288
@@ -337,6 +376,88 @@ class RoundFinishedData(EventPayload):  # noqa: D101  # tracked: #288
     profile_skipped: bool = False
 
 
+class GateStartedData(EventPayload):
+    """One framework gate began evaluating the current candidate."""
+
+    kind: Literal["gate_started"] = "gate_started"
+    gate: GateKind
+    # The validation recipe being executed; None for accuracy and benchmark.
+    recipe: str | None = None
+    # The trusted command the gate runs, when one is configured.
+    command: str | None = None
+    source: FrameworkSource = FrameworkSource.GATES
+    source_label: str | None = None
+
+
+class GateFinishedData(EventPayload):
+    """Outcome of one framework gate; envelope status carries pass or fail.
+
+    ``metric``/``value``/``unit`` are set only on a passing benchmark gate.
+    ``unit`` keeps the historical fallback of the metric name when the
+    contract declares no unit. ``output_tail`` carries the trailing command
+    output on failure.
+    """
+
+    kind: Literal["gate_finished"] = "gate_finished"
+    gate: GateKind
+    recipe: str | None = None
+    # True when a prior PASS for the exact same input was reused instead of
+    # re-running the command.
+    reused: bool = False
+    metric: str | None = None
+    value: FiniteFloat | None = None
+    unit: str | None = None
+    output_tail: str | None = None
+    source: FrameworkSource = FrameworkSource.GATES
+    source_label: str | None = None
+
+
+class WorkspaceSnapshotData(EventPayload):
+    """A Git tracker outcome: a snapshot, baseline, or exclusion change.
+
+    Exactly one aspect is populated per event: a snapshot attempt carries
+    ``label`` (``commit`` is None when there was nothing to commit), a
+    trusted-input baseline carries ``baseline``, and a snapshot-exclusion
+    change carries ``excluded_paths``.
+    """
+
+    kind: Literal["workspace_snapshot"] = "workspace_snapshot"
+    label: str = ""
+    commit: str | None = None
+    baseline: str | None = None
+    excluded_paths: tuple[str, ...] = ()
+    source: FrameworkSource = FrameworkSource.GIT_TRACKING
+
+
+class RunConfiguredData(EventPayload):
+    """One per run: the resolved configuration a loop starts with."""
+
+    kind: Literal["run_configured"] = "run_configured"
+    run_log_path: str
+    project_root: str
+    model: str | None = None
+    # First line of the objective only; the full text lives in run state.
+    objective: str | None = None
+    search_policy: str | None = None
+    benchmark_contract: bool = False
+    pareto_objectives: str | None = None
+    source: FrameworkSource = FrameworkSource.LOOP
+
+
+class FrameworkWarningData(EventPayload):
+    """A non-fatal framework fault an operator should see.
+
+    The server projection also lifts this payload into the wire event's
+    ``diagnostic`` field so diagnostic-oriented clients need no new handling.
+    """
+
+    kind: Literal["framework_warning"] = "framework_warning"
+    summary: str
+    detail: str | None = None
+    source: FrameworkSource = FrameworkSource.OTHER
+    source_label: str | None = None
+
+
 EventData = Annotated[
     ChatData
     | ChatThreadCreatedData
@@ -361,7 +482,12 @@ EventData = Annotated[
     | ToolCallData
     | ToolResultData
     | TodoUpdateData
-    | UsageUpdateData,
+    | UsageUpdateData
+    | GateStartedData
+    | GateFinishedData
+    | WorkspaceSnapshotData
+    | RunConfiguredData
+    | FrameworkWarningData,
     Field(discriminator="kind"),
 ]
 
@@ -476,15 +602,17 @@ class EventStore:
     def __init__(self, path: Path, run_id: str):  # noqa: ANN204, D107  # tracked: #288
         self.path = path
         self.run_id = run_id
+        # Names this store's sequence space. Sequences are only comparable
+        # within one store, and a run replaces its store mid-flight when the
+        # durable log is attached, so a consumer holding folded state needs an
+        # identity to tell "the next events" from "a different log's events".
+        # Neither ``path`` nor ``run_id`` can serve: a retired store can be
+        # reopened at the same path, and ``run_id`` is reassigned in place.
+        self.store_id = uuid.uuid4().hex
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._parsed_records = 0
-        scanned = self._scan_unlocked()
-        if scanned is None:
-            events, self._malformed_tail_offset = self._read_unlocked()
-            self._records = _records_from_events(_repair_legacy_sequences(events))
-        else:
-            self._records, self._malformed_tail_offset = scanned
+        self._records, self._malformed_tail_offset = self._scan_unlocked()
         # A valid final record whose line was never terminated must gain its
         # newline before ``append`` writes anything after it.
         self._missing_tail_newline = self._malformed_tail_offset is None and _ends_without_newline(
@@ -661,36 +789,108 @@ class EventStore:
             event = event.model_copy(update={"sequence": record.header.sequence})
         record.event = event
 
-    def _scan_unlocked(self) -> tuple[list[_StoredRecord], int | None] | None:
-        """Index the log by byte range and header, or return None on any doubt.
+    def _scan_unlocked(self) -> tuple[list[_StoredRecord], int | None]:
+        """Index the log by byte range and header without a full-file allocation.
 
-        ``json.loads`` is a real parser, so the offsets and header fields it
-        yields are exact. Returning None sends construction to the fully eager
-        path, which is the only place a corrupt history is diagnosed.
+        A sidecar whose indexed prefix is unchanged restores the record index
+        without parsing that prefix; a source that has only grown (the journal
+        is append-only) has just its suffix scanned, and the extended index is
+        republished. Otherwise this streams the whole source once and
+        atomically publishes a replacement cache. A record the cheap header scan cannot
+        classify is fully validated in place, so strict corruption detection
+        does not require retaining the other event payloads.
         """
         if not self.path.exists():
             return [], None
-        raw = self.path.read_bytes()
-        lines = raw.splitlines(keepends=True)
-        records: list[_StoredRecord] = []
+
+        cached = load_event_index(self.path)
+        if cached is not None:
+            try:
+                records: list[_StoredRecord] = []
+                while cached.records:
+                    records.append(_stored_record_from_index(cached.records.pop()))
+                records.reverse()
+            except ValueError:
+                records = []
+            else:
+                initial_source = source_stat(self.path)
+                records, malformed_tail_offset, safe_count, safe_boundary = (
+                    self._scan_stream_unlocked(records, start=cached.boundary)
+                )
+                self._parse_eager_tail(records, malformed_tail_offset)
+                if initial_source is not None and safe_boundary != cached.boundary:
+                    self._publish_index(records, safe_count, safe_boundary, initial_source)
+                return records, malformed_tail_offset
+
+        initial_source = source_stat(self.path)
+        records, malformed_tail_offset, safe_count, safe_boundary = self._scan_stream_unlocked(
+            [], start=0
+        )
+        self._parse_eager_tail(records, malformed_tail_offset)
+        if initial_source is not None:
+            self._publish_index(records, safe_count, safe_boundary, initial_source)
+        return records, malformed_tail_offset
+
+    def _publish_index(
+        self,
+        records: list[_StoredRecord],
+        safe_count: int,
+        safe_boundary: int,
+        initial_source: SourceStat,
+    ) -> None:
+        write_event_index(
+            self.path,
+            (_index_record_from_stored(records[index]) for index in range(safe_count)),
+            safe_count,
+            safe_boundary,
+            initial_source,
+        )
+
+    def _scan_stream_unlocked(
+        self, records: list[_StoredRecord], *, start: int
+    ) -> tuple[list[_StoredRecord], int | None, int, int]:
+        """Extend ``records`` by streaming source lines beginning at ``start``."""
         malformed_tail_offset: int | None = None
-        offset = 0
-        last_sequence = 0
-        for index, line in enumerate(lines):
-            record_offset = offset
-            offset += len(line)
+        last_sequence = records[-1].header.sequence if records else 0
+        safe_count = len(records)
+        safe_boundary = start
+        for record_offset, line, is_final in _stream_lines(self.path, start=start):
             header_fields = _scan_header_fields(line)
             if header_fields is None:
                 # A final line holding complete JSON the header scan cannot
                 # classify must be judged by full validation, so it falls to
                 # the eager path; only a tail with no complete JSON prefix (a
                 # torn append) is set aside for repair.
-                if index != len(lines) - 1 or _starts_with_complete_json(line):
-                    return None
-                # Preserve access to earlier audit history if a process was
-                # interrupted during its final append.
-                malformed_tail_offset = record_offset
-                break
+                if is_final and not _starts_with_complete_json(line):
+                    # Preserve access to earlier audit history if a process was
+                    # interrupted during its final append.
+                    malformed_tail_offset = record_offset
+                    break
+                try:
+                    self._parsed_records += 1
+                    event = RunEvent.model_validate_json(line)
+                except ValidationError as error:
+                    if not is_final:
+                        raise
+                    raise _complete_invalid_tail_error(self.path, record_offset) from error
+                raw_sequence = event.sequence
+                sequence = raw_sequence if raw_sequence > last_sequence else last_sequence + 1
+                if sequence != raw_sequence:
+                    event = event.model_copy(update={"sequence": sequence})
+                last_sequence = sequence
+                records.append(
+                    _StoredRecord(
+                        header=_header_from_event(event, sequence),
+                        offset=record_offset,
+                        length=len(line),
+                        raw_sequence=raw_sequence,
+                        event=event,
+                    )
+                )
+                if line.endswith(b"\n"):
+                    safe_count = len(records)
+                    safe_boundary = record_offset + len(line)
+                continue
             raw_sequence, event_type, execution_id, chat_thread_id = header_fields
             sequence = raw_sequence if raw_sequence > last_sequence else last_sequence + 1
             last_sequence = sequence
@@ -707,11 +907,13 @@ class EventStore:
                     raw_sequence=raw_sequence,
                 )
             )
-        self._parse_eager_tail(raw, records, malformed_tail_offset)
-        return records, malformed_tail_offset
+            if line.endswith(b"\n"):
+                safe_count = len(records)
+                safe_boundary = record_offset + len(line)
+        return records, malformed_tail_offset, safe_count, safe_boundary
 
     def _parse_eager_tail(
-        self, raw: bytes, records: list[_StoredRecord], malformed_tail_offset: int | None
+        self, records: list[_StoredRecord], malformed_tail_offset: int | None
     ) -> None:
         """Validate the trailing window, raising on any record that fails.
 
@@ -719,11 +921,20 @@ class EventStore:
         never leave behind, so a validation failure on the final record is
         corruption to surface, not an interrupted write to set aside.
         """
-        for position in range(max(0, len(records) - _EAGER_TAIL_RECORDS), len(records)):
-            record = records[position]
+        start = max(0, len(records) - _EAGER_TAIL_RECORDS)
+        tail = records[start:]
+        if not tail:
+            return
+        with self.path.open("rb") as stream:
+            base = tail[0].offset
+            stream.seek(base)
+            raw = stream.read(tail[-1].offset + tail[-1].length - base)
+        for relative_position, record in enumerate(tail):
+            begin = record.offset - base
             try:
-                self._parse_record(record, raw[record.offset : record.offset + record.length])
+                self._parse_record(record, raw[begin : begin + record.length])
             except ValidationError as error:
+                position = start + relative_position
                 if position != len(records) - 1 or malformed_tail_offset is not None:
                     raise
                 raise _complete_invalid_tail_error(self.path, record.offset) from error
@@ -731,18 +942,14 @@ class EventStore:
     def _read_unlocked(self) -> tuple[list[RunEvent], int | None]:
         if not self.path.exists():
             return [], None
-        lines = self.path.read_bytes().splitlines(keepends=True)
         events: list[RunEvent] = []
-        offset = 0
-        for index, line in enumerate(lines):
-            record_offset = offset
-            offset += len(line)
+        for record_offset, line, is_final in _stream_lines(self.path, start=0):
             try:
                 self._parsed_records += 1
                 event = RunEvent.model_validate_json(line)
                 events.append(event)
             except ValidationError as error:
-                if index != len(lines) - 1:
+                if not is_final:
                     raise
                 if _starts_with_complete_json(line):
                     raise _complete_invalid_tail_error(self.path, record_offset) from error
@@ -750,6 +957,47 @@ class EventStore:
                 # interrupted during its final append.
                 return events, record_offset
         return events, None
+
+
+def _stream_lines(path: Path, *, start: int) -> Iterable[tuple[int, bytes, bool]]:
+    """Yield source lines with offsets and final-line identity using bounded memory."""
+    with path.open("rb") as stream:
+        stream.seek(start)
+        offset = start
+        line = stream.readline()
+        while line:
+            following = stream.readline()
+            yield offset, line, not following
+            offset += len(line)
+            line = following
+
+
+def _stored_record_from_index(record: EventIndexRecord) -> _StoredRecord:
+    """Restore a typed in-memory record from primitive validated cache fields."""
+    return _StoredRecord(
+        header=EventHeader(
+            sequence=record.sequence,
+            type=EventType(record.event_type),
+            execution_id=record.execution_id,
+            chat_thread_id=record.chat_thread_id,
+        ),
+        offset=record.offset,
+        length=record.length,
+        raw_sequence=record.raw_sequence,
+    )
+
+
+def _index_record_from_stored(record: _StoredRecord) -> EventIndexRecord:
+    """Project one scanned record into the sidecar's primitive representation."""
+    return EventIndexRecord(
+        offset=record.offset,
+        length=record.length,
+        raw_sequence=record.raw_sequence,
+        sequence=record.header.sequence,
+        event_type=record.header.type.value,
+        execution_id=record.header.execution_id,
+        chat_thread_id=record.header.chat_thread_id,
+    )
 
 
 def _scan_header_fields(line: bytes) -> tuple[int, EventType, str | None, str | None] | None:

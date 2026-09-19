@@ -28,36 +28,48 @@ const RAIL_MIN = RAIL_COMPACT_WIDTH + STACKED_WIDTH + TRANSCRIPT_MIN;
 /** Border top and bottom; the title rides the top border. */
 const RAIL_VCHROME = 2;
 
-const STATUS_GLYPH: Record<RoundState['status'], string> = {
-  active: '⟳',
-  completed: '✓',
-  failed: '✗',
+/**
+ * What a round came to, which is what its glyph and status word show.
+ *
+ * A completed round's own status says it ran to the end, not what the judge
+ * decided about it, so a round the judge failed would otherwise wear the same
+ * solid check as one it passed. How the round was judged outranks how it
+ * measured (profile skipped), which outranks that it finished. `pass` matches
+ * what the check already implies, and `deferred` or an unjudged round has no
+ * claim to contradict it, so only `fail` takes the cross. The word follows the
+ * glyph (`✗ fail`, never `✗ done`); the measured delta still trails it, since
+ * it is what the judge saw. The cross is also the only part of the label
+ * compact width keeps, so a narrow rail still carries the verdict.
+ */
+type RoundOutcome = 'done' | 'fail' | 'skipped' | 'live' | 'planned';
+
+const OUTCOME_GLYPH: Record<RoundOutcome, string> = {
+  done: '✓',
+  fail: '✗',
+  skipped: '○',
+  live: '⟳',
   planned: '·',
 };
-const STATUS_WORD: Record<RoundState['status'], string> = {
-  active: 'run',
-  completed: 'done',
-  failed: 'fail',
+const OUTCOME_WORD: Record<RoundOutcome, string> = {
+  done: 'done',
+  fail: 'fail',
+  skipped: 'done',
+  live: 'run',
   planned: 'plan',
 };
 
-/**
- * A completed round's own status says it ran to the end, not what the judge
- * decided about it, so a round the judge failed would otherwise wear the same
- * solid check as one it passed. It trades the check for a cross instead, on
- * the same reasoning the profile-skipped ring already follows: how the round
- * was judged outranks how it measured, which outranks that it finished. The
- * cross is also the only part of the label compact width keeps, so a narrow
- * rail still carries the verdict. `pass` matches what the check already
- * implies, and `deferred` or an unjudged round has no claim to contradict it,
- * so only `fail` takes the cross.
- */
-function statusGlyph(round: RoundState, state: SessionState): string {
-  if (round.status === 'completed') {
-    if (hypothesisRoundFor(state, round.number)?.judge_verdict === 'fail') return '✗';
-    if (round.profileSkipped === true) return '○';
+function roundOutcome(round: RoundState, state: SessionState): RoundOutcome {
+  switch (round.status) {
+    case 'active':
+      return 'live';
+    case 'planned':
+      return 'planned';
+    case 'failed':
+      return 'fail';
+    case 'completed':
+      if (hypothesisRoundFor(state, round.number)?.judge_verdict === 'fail') return 'fail';
+      return round.profileSkipped === true ? 'skipped' : 'done';
   }
-  return STATUS_GLYPH[round.status];
 }
 
 /**
@@ -87,6 +99,17 @@ export function roundRailVisible(state: SessionState, terminalWidth: number): bo
   // transcript keep the whole width rather than losing a column to an empty box.
   if (stripRounds(state).length === 0) return false;
   return roundRailWidth(terminalWidth) > 0;
+}
+
+/**
+ * Columns the rail takes off the round view: its fixed width while it is on
+ * screen, else 0. The one number the agents pane, the `<`/`>`/`=` width keys,
+ * and `app.ts` subtract from the terminal, so they cannot disagree about the
+ * room the panes share. The rail never resizes with those keys; only the panes
+ * beside it do.
+ */
+export function roundRailColumns(state: SessionState, terminalWidth: number): number {
+  return roundRailVisible(state, terminalWidth) ? roundRailWidth(terminalWidth) : 0;
 }
 
 export interface RailWindow {
@@ -319,10 +342,11 @@ export class RoundRailView {
     compact: boolean,
   ): string {
     const marker = isSelected ? '▸' : ' ';
-    const glyph = statusGlyph(round, state);
+    const outcome = roundOutcome(round, state);
+    const glyph = OUTCOME_GLYPH[outcome];
     if (compact) return `${marker}r${round.number}${glyph}`;
     const metric = roundMetric(round, state, new Date());
-    const parts = [`${marker}r${round.number}`, glyph, STATUS_WORD[round.status]];
+    const parts = [`${marker}r${round.number}`, glyph, OUTCOME_WORD[outcome]];
     if (metric.length > 0) parts.push(metric);
     return parts.join(' ');
   }

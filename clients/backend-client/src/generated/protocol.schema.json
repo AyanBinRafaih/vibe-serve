@@ -405,6 +405,18 @@
           ],
           "default": null,
           "title": "Thread Title"
+        },
+        "invocation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Invocation Id"
         }
       },
       "required": [
@@ -916,6 +928,106 @@
       "title": "DesignFileChange",
       "type": "object"
     },
+    "DesignPatch": {
+      "additionalProperties": false,
+      "description": "One file's unified patch text from a round's commit range.\n\n``patch`` is the raw ``git diff`` output for the one file (rename\ndetection on, so a renamed file arrives as a single patch spanning both\npaths). None means the workspace repository could not produce the text\n(repository missing or unreadable), which is distinct from an empty\nstring, a file the range lists but whose content did not change.\n\n``truncated`` marks a patch cut at the server's size bound. The echoed\nrange and paths let a client show the exact ``git diff`` command that\nreproduces the full output externally.",
+      "properties": {
+        "base": {
+          "title": "Base",
+          "type": "string"
+        },
+        "head": {
+          "title": "Head",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "renamed_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Renamed From"
+        },
+        "patch": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Patch"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "base",
+        "head",
+        "path"
+      ],
+      "title": "DesignPatch",
+      "type": "object"
+    },
+    "DesignPatchQuery": {
+      "additionalProperties": false,
+      "description": "Request one file's unified patch from a round's commit range.\n\n``base`` and ``head`` are a round's own range exactly as ``query.design``\npublished it (``DesignRound.base`` and ``DesignRound.commit``), and\n``path`` must be one of that round's listed file changes. The server\nvalidates all three, so a client cannot diff arbitrary revisions or read\npaths the design log filtered out.",
+      "properties": {
+        "protocol_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Protocol Version",
+          "type": "integer"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "type": {
+          "const": "query.design_patch",
+          "default": "query.design_patch",
+          "title": "Type",
+          "type": "string"
+        },
+        "base": {
+          "title": "Base",
+          "type": "string"
+        },
+        "head": {
+          "title": "Head",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "base",
+        "head",
+        "path"
+      ],
+      "title": "DesignPatchQuery",
+      "type": "object"
+    },
     "DesignQuery": {
       "additionalProperties": false,
       "description": "Request the per-round design log for the attached run.\n\nThe design log is the operator's view of what each round changed in the\nsystem under optimization: the files the round touched and how each stage\nof the round concluded.",
@@ -964,6 +1076,18 @@
           ],
           "default": null,
           "title": "Commit"
+        },
+        "base": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base"
         },
         "files": {
           "anyOf": [
@@ -1061,6 +1185,18 @@
           ],
           "default": null,
           "title": "Debug Ref"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source"
         }
       },
       "required": [
@@ -1134,6 +1270,11 @@
           },
           "title": "Active Executions",
           "type": "array"
+        },
+        "store_id": {
+          "default": "",
+          "title": "Store Id",
+          "type": "string"
         },
         "history_after_sequence": {
           "default": 0,
@@ -1212,7 +1353,12 @@
         "tool_call",
         "tool_result",
         "todo_update",
-        "usage_update"
+        "usage_update",
+        "gate_started",
+        "gate_finished",
+        "workspace_snapshot",
+        "run_configured",
+        "framework_warning"
       ],
       "title": "EventType",
       "type": "string"
@@ -1271,6 +1417,32 @@
       "title": "EventsQuery",
       "type": "object"
     },
+    "ExperimentCursor": {
+      "additionalProperties": false,
+      "description": "Client's last completely applied experiment projection.",
+      "properties": {
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "projection_id": {
+          "title": "Projection Id",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_id",
+        "projection_id",
+        "revision"
+      ],
+      "title": "ExperimentCursor",
+      "type": "object"
+    },
     "ExperimentQuery": {
       "additionalProperties": false,
       "description": "Request the hypothesis-level experiment log for the attached run.",
@@ -1295,9 +1467,71 @@
           "default": "query.experiments",
           "title": "Type",
           "type": "string"
+        },
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExperimentCursor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "title": "ExperimentQuery",
+      "type": "object"
+    },
+    "ExperimentUpdate": {
+      "additionalProperties": false,
+      "description": "How to apply ``Response.experiments`` to a client's prior snapshot.\n\nA reset replaces the entire list. A delta replaces entries by stable\nhypothesis ID and then removes the named IDs. ``from_revision`` is None for\na reset because no prior client state is trusted.",
+      "properties": {
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "projection_id": {
+          "title": "Projection Id",
+          "type": "string"
+        },
+        "from_revision": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "From Revision"
+        },
+        "through_revision": {
+          "minimum": 0,
+          "title": "Through Revision",
+          "type": "integer"
+        },
+        "reset": {
+          "title": "Reset",
+          "type": "boolean"
+        },
+        "removed_hypothesis_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Removed Hypothesis Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "run_id",
+        "projection_id",
+        "through_revision",
+        "reset"
+      ],
+      "title": "ExperimentUpdate",
       "type": "object"
     },
     "ExperimentsChangedData": {
@@ -1316,12 +1550,255 @@
           ],
           "title": "Reason",
           "type": "string"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revision"
         }
       },
       "required": [
         "reason"
       ],
       "title": "ExperimentsChangedData",
+      "type": "object"
+    },
+    "FrameworkSource": {
+      "description": "Closed set of framework subsystems that emit framework events.",
+      "enum": [
+        "gates",
+        "git_tracking",
+        "loop",
+        "gpu",
+        "skypilot",
+        "other"
+      ],
+      "title": "FrameworkSource",
+      "type": "string"
+    },
+    "FrameworkWarningData": {
+      "description": "A non-fatal framework fault an operator should see.\n\nThe server projection also lifts this payload into the wire event's\n``diagnostic`` field so diagnostic-oriented clients need no new handling.",
+      "properties": {
+        "kind": {
+          "const": "framework_warning",
+          "default": "framework_warning",
+          "title": "Kind",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "source": {
+          "$ref": "#/$defs/FrameworkSource",
+          "default": "other"
+        },
+        "source_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Label"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "title": "FrameworkWarningData",
+      "type": "object"
+    },
+    "GateFinishedData": {
+      "description": "Outcome of one framework gate; envelope status carries pass or fail.\n\n``metric``/``value``/``unit`` are set only on a passing benchmark gate.\n``unit`` keeps the historical fallback of the metric name when the\ncontract declares no unit. ``output_tail`` carries the trailing command\noutput on failure.",
+      "properties": {
+        "kind": {
+          "const": "gate_finished",
+          "default": "gate_finished",
+          "title": "Kind",
+          "type": "string"
+        },
+        "gate": {
+          "$ref": "#/$defs/GateKind"
+        },
+        "recipe": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recipe"
+        },
+        "reused": {
+          "default": false,
+          "title": "Reused",
+          "type": "boolean"
+        },
+        "metric": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metric"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "output_tail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Tail"
+        },
+        "source": {
+          "$ref": "#/$defs/FrameworkSource",
+          "default": "gates"
+        },
+        "source_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Label"
+        }
+      },
+      "required": [
+        "gate"
+      ],
+      "title": "GateFinishedData",
+      "type": "object"
+    },
+    "GateKind": {
+      "description": "Closed set of framework-owned gates a candidate passes through.",
+      "enum": [
+        "validation",
+        "accuracy",
+        "benchmark"
+      ],
+      "title": "GateKind",
+      "type": "string"
+    },
+    "GateStartedData": {
+      "description": "One framework gate began evaluating the current candidate.",
+      "properties": {
+        "kind": {
+          "const": "gate_started",
+          "default": "gate_started",
+          "title": "Kind",
+          "type": "string"
+        },
+        "gate": {
+          "$ref": "#/$defs/GateKind"
+        },
+        "recipe": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recipe"
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "source": {
+          "$ref": "#/$defs/FrameworkSource",
+          "default": "gates"
+        },
+        "source_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Label"
+        }
+      },
+      "required": [
+        "gate"
+      ],
+      "title": "GateStartedData",
       "type": "object"
     },
     "HistoryQuery": {
@@ -2391,6 +2868,17 @@
           "title": "Experiments",
           "type": "array"
         },
+        "experiment_update": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExperimentUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "experiments_ready": {
           "anyOf": [
             {
@@ -2421,6 +2909,17 @@
           ],
           "default": null,
           "title": "Design Ready"
+        },
+        "design_patch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DesignPatch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -2513,6 +3012,88 @@
         "judge_verdict"
       ],
       "title": "RoundFinishedData",
+      "type": "object"
+    },
+    "RunConfiguredData": {
+      "description": "One per run: the resolved configuration a loop starts with.",
+      "properties": {
+        "kind": {
+          "const": "run_configured",
+          "default": "run_configured",
+          "title": "Kind",
+          "type": "string"
+        },
+        "run_log_path": {
+          "title": "Run Log Path",
+          "type": "string"
+        },
+        "project_root": {
+          "title": "Project Root",
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "objective": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective"
+        },
+        "search_policy": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Search Policy"
+        },
+        "benchmark_contract": {
+          "default": false,
+          "title": "Benchmark Contract",
+          "type": "boolean"
+        },
+        "pareto_objectives": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pareto Objectives"
+        },
+        "source": {
+          "$ref": "#/$defs/FrameworkSource",
+          "default": "loop"
+        }
+      },
+      "required": [
+        "run_log_path",
+        "project_root"
+      ],
+      "title": "RunConfiguredData",
       "type": "object"
     },
     "RunEvent": {
@@ -2645,12 +3226,16 @@
                   "chat_thread_created": "#/$defs/ChatThreadCreatedData",
                   "configuration_failed": "#/$defs/ConfigurationFailedData",
                   "experiments_changed": "#/$defs/ExperimentsChangedData",
+                  "framework_warning": "#/$defs/FrameworkWarningData",
+                  "gate_finished": "#/$defs/GateFinishedData",
+                  "gate_started": "#/$defs/GateStartedData",
                   "invocation_finished": "#/$defs/InvocationFinishedData",
                   "invocation_started": "#/$defs/InvocationStartedData",
                   "judge_result": "#/$defs/JudgeResultData",
                   "output": "#/$defs/OutputData",
                   "phase": "#/$defs/PhaseData",
                   "round_finished": "#/$defs/RoundFinishedData",
+                  "run_configured": "#/$defs/RunConfiguredData",
                   "run_interrupted": "#/$defs/RunInterruptedData",
                   "run_started": "#/$defs/RunStartedData",
                   "run_status_changed": "#/$defs/RunStatusChangedData",
@@ -2659,7 +3244,8 @@
                   "todo_update": "#/$defs/TodoUpdateData",
                   "tool_call": "#/$defs/ToolCallData",
                   "tool_result": "#/$defs/ToolResultData",
-                  "usage_update": "#/$defs/UsageUpdateData"
+                  "usage_update": "#/$defs/UsageUpdateData",
+                  "workspace_snapshot": "#/$defs/WorkspaceSnapshotData"
                 },
                 "propertyName": "kind"
               },
@@ -2735,6 +3321,21 @@
                 },
                 {
                   "$ref": "#/$defs/UsageUpdateData"
+                },
+                {
+                  "$ref": "#/$defs/GateStartedData"
+                },
+                {
+                  "$ref": "#/$defs/GateFinishedData"
+                },
+                {
+                  "$ref": "#/$defs/WorkspaceSnapshotData"
+                },
+                {
+                  "$ref": "#/$defs/RunConfiguredData"
+                },
+                {
+                  "$ref": "#/$defs/FrameworkWarningData"
                 }
               ]
             },
@@ -3086,6 +3687,11 @@
           ],
           "default": null,
           "title": "Tail"
+        },
+        "store_id": {
+          "default": "",
+          "title": "Store Id",
+          "type": "string"
         }
       },
       "title": "SubscribeRequest",
@@ -3358,6 +3964,60 @@
       ],
       "title": "UsageUpdateData",
       "type": "object"
+    },
+    "WorkspaceSnapshotData": {
+      "description": "A Git tracker outcome: a snapshot, baseline, or exclusion change.\n\nExactly one aspect is populated per event: a snapshot attempt carries\n``label`` (``commit`` is None when there was nothing to commit), a\ntrusted-input baseline carries ``baseline``, and a snapshot-exclusion\nchange carries ``excluded_paths``.",
+      "properties": {
+        "kind": {
+          "const": "workspace_snapshot",
+          "default": "workspace_snapshot",
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "default": "",
+          "title": "Label",
+          "type": "string"
+        },
+        "commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commit"
+        },
+        "baseline": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Baseline"
+        },
+        "excluded_paths": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Paths",
+          "type": "array"
+        },
+        "source": {
+          "$ref": "#/$defs/FrameworkSource",
+          "default": "git_tracking"
+        }
+      },
+      "title": "WorkspaceSnapshotData",
+      "type": "object"
     }
   },
   "properties": {
@@ -3371,6 +4031,7 @@
           "query.chat_options": "#/$defs/ChatOptionsQuery",
           "query.chat_thread_create": "#/$defs/ChatThreadCreateQuery",
           "query.design": "#/$defs/DesignQuery",
+          "query.design_patch": "#/$defs/DesignPatchQuery",
           "query.events": "#/$defs/EventsQuery",
           "query.experiments": "#/$defs/ExperimentQuery",
           "query.history": "#/$defs/HistoryQuery",
@@ -3417,6 +4078,9 @@
         },
         {
           "$ref": "#/$defs/DesignQuery"
+        },
+        {
+          "$ref": "#/$defs/DesignPatchQuery"
         },
         {
           "$ref": "#/$defs/EventsQuery"

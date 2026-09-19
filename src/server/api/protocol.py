@@ -99,10 +99,20 @@ class PerformanceQuery(Request):  # noqa: D101  # tracked: #288
     type: Literal["query.performance"] = "query.performance"
 
 
+class ExperimentCursor(ProtocolModel):
+    """Client's last completely applied experiment projection."""
+
+    run_id: str
+    projection_id: str
+    revision: int = Field(ge=0)
+
+
 class ExperimentQuery(Request):
     """Request the hypothesis-level experiment log for the attached run."""
 
     type: Literal["query.experiments"] = "query.experiments"
+    # Omitted by legacy clients, which continue receiving a complete snapshot.
+    after: ExperimentCursor | None = None
 
 
 class DesignQuery(Request):
@@ -114,6 +124,22 @@ class DesignQuery(Request):
     """
 
     type: Literal["query.design"] = "query.design"
+
+
+class DesignPatchQuery(Request):
+    """Request one file's unified patch from a round's commit range.
+
+    ``base`` and ``head`` are a round's own range exactly as ``query.design``
+    published it (``DesignRound.base`` and ``DesignRound.commit``), and
+    ``path`` must be one of that round's listed file changes. The server
+    validates all three, so a client cannot diff arbitrary revisions or read
+    paths the design log filtered out.
+    """
+
+    type: Literal["query.design_patch"] = "query.design_patch"
+    base: str
+    head: str
+    path: str
 
 
 class EventsQuery(Request):  # noqa: D101  # tracked: #288
@@ -133,6 +159,15 @@ class SubscribeRequest(Request):  # noqa: D101  # tracked: #288
     # ``after_sequence``. An old server forbids the field, so the rejection is
     # the capability probe.
     tail: int | None = Field(default=None, ge=1)
+    # The store the client's ``after_sequence`` numbers, as the last batch named
+    # it. A resume across a dropped connection carries it so the server can tell
+    # whether that cursor still belongs to the live store: if a durable log was
+    # attached while the client was gone, the cursor numbers a store that is
+    # gone, so the server drops it and bootstraps the live store instead of
+    # extending a fold with another log's sequences. Empty (the default, and a
+    # fresh dial that has seen no store) means resume the cursor as before, and
+    # an old server forbids the field, so the client falls back to that.
+    store_id: str = ""
 
 
 ProtocolRequest = Annotated[
@@ -148,6 +183,7 @@ ProtocolRequest = Annotated[
     | PerformanceQuery
     | ExperimentQuery
     | DesignQuery
+    | DesignPatchQuery
     | EventsQuery
     | SubscribeRequest,
     Field(discriminator="type"),
@@ -310,6 +346,22 @@ class HypothesisEntry(ProtocolModel):
     active: bool = False
 
 
+class ExperimentUpdate(ProtocolModel):
+    """How to apply ``Response.experiments`` to a client's prior snapshot.
+
+    A reset replaces the entire list. A delta replaces entries by stable
+    hypothesis ID and then removes the named IDs. ``from_revision`` is None for
+    a reset because no prior client state is trusted.
+    """
+
+    run_id: str
+    projection_id: str
+    from_revision: int | None = Field(default=None, ge=0)
+    through_revision: int = Field(ge=0)
+    reset: bool
+    removed_hypothesis_ids: list[str] = Field(default_factory=list)
+
+
 class DesignFileChange(ProtocolModel):
     """One workspace file a round's commit range touched."""
 
@@ -337,7 +389,36 @@ class DesignRound(ProtocolModel):
     round: int
     # The round's end-of-round checkpoint, and the head of the diffed range.
     commit: str | None = None
+    # The other end of that range, as the projection derived it. Publishing it
+    # lets a client ask ``query.design_patch`` for exactly the range ``files``
+    # describes instead of re-deriving one. None when no base resolved, in
+    # which case ``files`` is None too.
+    base: str | None = None
     files: list[DesignFileChange] | None = None
+
+
+class DesignPatch(ProtocolModel):
+    """One file's unified patch text from a round's commit range.
+
+    ``patch`` is the raw ``git diff`` output for the one file (rename
+    detection on, so a renamed file arrives as a single patch spanning both
+    paths). None means the workspace repository could not produce the text
+    (repository missing or unreadable), which is distinct from an empty
+    string, a file the range lists but whose content did not change.
+
+    ``truncated`` marks a patch cut at the server's size bound. The echoed
+    range and paths let a client show the exact ``git diff`` command that
+    reproduces the full output externally.
+    """
+
+    base: str
+    head: str
+    path: str
+    # The pre-rename path, echoed from the round's file list when the change
+    # is a rename, so the external-command hint can name both sides.
+    renamed_from: str | None = None
+    patch: str | None = None
+    truncated: bool = False
 
 
 class Response(ProtocolModel):  # noqa: D101  # tracked: #288
@@ -363,6 +444,9 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     # distinct from a run whose plot is merely empty so far.
     performance_context: PerformanceContext | None = None
     experiments: list[HypothesisEntry] = Field(default_factory=list)
+    # Present on revision-aware servers. The experiments list is complete when
+    # reset is true and contains only replacements when reset is false.
+    experiment_update: ExperimentUpdate | None = None
     # False means canonical project/run state is not attached yet. Keeping the
     # readiness marker separate preserves the protocol-v1 list contract while
     # distinguishing bootstrap from an authoritative empty experiment log.
@@ -370,6 +454,8 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     design: list[DesignRound] = Field(default_factory=list)
     # Same bootstrap-versus-empty distinction as ``experiments_ready``.
     design_ready: bool | None = None
+    # None means the run has not attached yet, so no patch can be produced.
+    design_patch: DesignPatch | None = None
 
     @classmethod
     def from_exception(
@@ -403,6 +489,13 @@ class EventBatchMessage(ProtocolModel):  # noqa: D101  # tracked: #288
     events: list[RunEvent]
     through_sequence: int = Field(default=0, ge=0)
     active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
+    # Names the event store these sequences number. A run attaches its durable
+    # log after clients subscribe, and sequences are only comparable within one
+    # store, so a batch whose id differs from the previous one supersedes what
+    # the client folded rather than extending it. Empty means the server does
+    # not report store identity, leaving the client on watermark comparison
+    # alone, which is what it had before this field existed.
+    store_id: str = ""
     # "Every event in this stream's history has sequence > this." 0 means the
     # full history was delivered, which is the default and today's behavior.
     # Carried on every batch of the subscription, live ones included.

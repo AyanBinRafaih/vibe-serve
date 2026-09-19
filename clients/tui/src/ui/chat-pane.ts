@@ -22,8 +22,13 @@ import type {Theme} from './theme.js';
  * Columns the chat needs before a question and its answer read as prose rather
  * than as a column of fragments.
  */
-const CHAT_PANE_MIN = 25;
-const CHAT_PANE_MAX = 52;
+export const CHAT_PANE_MIN = 25;
+/**
+ * Ceiling for automatic sizing. An explicit `<`/`>` override is allowed past
+ * it (`clampChatWidthOverride`): asking for a specific width past what
+ * automatic sizing would ever choose on its own is the point of overriding.
+ */
+export const CHAT_PANE_MAX = 52;
 
 /** Stands in until the first render names the active thread. */
 const CHAT_PANE_TITLE = 'Experiment chat';
@@ -55,6 +60,41 @@ export function chatPaneWidth(terminalWidth: number, rightPaneWidth = 0): number
 }
 
 /**
+ * Clamps a requested `<`/`>` override to what the terminal can actually draw:
+ * never narrower than `CHAT_PANE_MIN`, and never so wide the table drops under
+ * `LOG_COMPACT_PANEL_WIDTH`.
+ *
+ * Deliberately asymmetric with automatic sizing, the mirror of how
+ * `agent-map.ts#clampGraphWidthOverride` lets an override go below
+ * `agentPaneFloor`: automatic sizing (`chatPaneWidth`) caps at `CHAT_PANE_MAX`
+ * because that is already comfortable for a question and its answer, but an
+ * explicit ask is allowed past it, since asking for more than automatic
+ * sizing would ever choose is the point of overriding.
+ */
+export function clampChatWidthOverride(
+  requested: number,
+  terminalWidth: number,
+  rightPaneWidth: number,
+): number {
+  const low = CHAT_PANE_MIN;
+  const high = Math.max(low, terminalWidth - rightPaneWidth - LOG_COMPACT_PANEL_WIDTH);
+  return Math.min(high, Math.max(low, requested));
+}
+
+/**
+ * The docked chat's width honoring an explicit `<`/`>` override, or automatic
+ * sizing (`chatPaneWidth`) when there is none.
+ */
+export function chatPaneWidthWithOverride(
+  terminalWidth: number,
+  rightPaneWidth: number,
+  override: number | null,
+): number {
+  if (override === null) return chatPaneWidth(terminalWidth, rightPaneWidth);
+  return clampChatWidthOverride(override, terminalWidth, rightPaneWidth);
+}
+
+/**
  * The experiment chat as a column of the landing view rather than a dialog over
  * it. Its composer is the only surface where ordinary text becomes a question;
  * slash-prefixed text delegates to the shared command path.
@@ -67,6 +107,13 @@ export class ChatPaneView {
   readonly #composer: ChatComposerView;
   #theme: Theme;
   #renderedConversation: ConversationEntry[] | null = null;
+  /**
+   * The thread on screen while the pane is visible, `null` while it is hidden.
+   * Comparing it against the state says which renders are the pane appearing
+   * or a thread switch, the moments that jump to the tail; every other render
+   * leaves the scroll position to stickyScroll.
+   */
+  #visibleThreadId: string | null = null;
 
   constructor(
     renderer: CliRenderer,
@@ -96,7 +143,7 @@ export class ChatPaneView {
     // The surface every other pane sits on. Without it this box falls through
     // to the root's canvas, a lighter shade, so the chat read as a pale band
     // beside panes that did not match it. On its own layer, so the pane keeps
-    // the rounded frame `PANE_BORDER` argues for (tui-conventions.md).
+    // the rounded frame `PANE_BORDER` argues for (tui/conventions.md).
     this.#fill = fillLayer(this.output, 'chat-pane-fill', theme.canvas);
     this.#scroll = new ScrollBoxRenderable(renderer, {
       id: 'chat-pane-scroll',
@@ -125,7 +172,13 @@ export class ChatPaneView {
     this.#composer = new ChatComposerView(
       renderer,
       draft,
-      value => void controller.submitChat(value),
+      value => {
+        // The operator's own message belongs at the tail even when they had
+        // scrolled into history to write it; landing at the bottom also
+        // re-arms sticky-bottom, so the answer streams into view.
+        this.#scrollToTail();
+        void controller.submitChat(value);
+      },
       theme,
       'chat-dock',
       () => controller.focusPane('chat'),
@@ -180,6 +233,8 @@ export class ChatPaneView {
     // hidden still has to stop the composer's spinner.
     this.#composer.syncPending(state.chatPending, visible);
     if (!visible) {
+      // Forgotten while hidden, so the pane reappears on the tail.
+      this.#visibleThreadId = null;
       return;
     }
     this.output.width = width;
@@ -193,9 +248,23 @@ export class ChatPaneView {
     applyPaneFocus(this.output, this.#theme, chatThreadHeading(state), focused);
     this.#composer.activate(Math.max(1, width - 4), focused, state.chatPending);
     this.#composer.renderMenu(state);
-    if (state.chatConversation === this.#renderedConversation) return;
-    this.#renderedConversation = state.chatConversation;
-    this.#conversation.render(state);
+    if (state.chatConversation !== this.#renderedConversation) {
+      this.#renderedConversation = state.chatConversation;
+      this.#conversation.render(state);
+    }
+    // Tailing is stickyScroll's job: it follows appended entries and releases
+    // when the operator scrolls up. The explicit jump is reserved for the
+    // moments the operator asked for the tail, the pane appearing and
+    // switching threads; jumping on every conversation change instead
+    // cancelled a manual scroll-up as soon as an answer streamed in.
+    if (this.#visibleThreadId !== state.activeChatThreadId) {
+      this.#visibleThreadId = state.activeChatThreadId;
+      this.#scrollToTail();
+    }
+  }
+
+  /** Lands the viewport at the bottom, which also re-arms sticky-bottom. */
+  #scrollToTail(): void {
     this.#scroll.scrollTo(this.#scroll.scrollHeight);
   }
 }

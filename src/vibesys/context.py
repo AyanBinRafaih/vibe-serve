@@ -49,6 +49,8 @@ from vibesys.profilers import (
     profiler_definition,
     resolve_profiler_kind,
 )
+from vibesys.render.run_log import RunLogRenderer
+from vibesys.render.sink import output_sink
 from vibesys.resource_paths import profiler_support_dir
 from vibesys.run import (
     AgentRuntimeResources,
@@ -80,6 +82,7 @@ from vibesys.run.events import (
     PhaseData,
     json_value,
 )
+from vibesys.run.git_events import CoreGitTrackerEvents
 from vibesys.run.integration import LocalRunIntegration
 from vibesys.run.project_policy import (
     build_project_path_policy,
@@ -102,6 +105,7 @@ from vs_project import (
     Project,
     RunConfiguration,
     StateTransition,
+    compare_resume_configurations,
     generate_run_id,
 )
 from vs_sandbox import HostResource
@@ -158,49 +162,36 @@ def _resume_configuration_update(
                 ),
             )
         )
-    limit_field = "max_generations" if recorded.outer_loop == "evolve" else "max_rounds"
-    recorded_core = recorded.model_dump(exclude={limit_field})
-    requested_core = requested.model_dump(exclude={limit_field})
-    migrate_agent_objectives = (
-        recorded.outer_loop == "agent"
-        and requested.outer_loop == "agent"
-        and "objectives" not in recorded.model_fields_set
-        and bool(requested_core.get("objectives"))
-    )
-    if migrate_agent_objectives:
-        # Runs created before objective directions entered AgentRunConfiguration
-        # omitted this field entirely. Adopt the requested value once so resume
-        # can normalize legacy hypothesis evidence; an explicitly recorded
-        # value remains immutable like every other non-limit setting.
-        recorded_core["objectives"] = requested_core["objectives"]
-    changed = sorted(
-        field for field, value in requested_core.items() if recorded_core.get(field) != value
-    )
-    if changed:
+    comparison = compare_resume_configurations(recorded, requested)
+    if comparison.changed_fields:
         raise ConfigurationError(
             ConfigurationDiagnostic(
                 code="project_resume_configuration_mismatch",
                 stage="resume_resolution",
                 message=(
                     "resuming a run cannot change its recorded configuration "
-                    f"fields: {', '.join(changed)}"
+                    f"fields: {', '.join(comparison.changed_fields)}"
                 ),
             )
         )
-    recorded_limit = getattr(recorded, limit_field)
-    requested_limit = getattr(requested, limit_field)
-    if requested_limit < recorded_limit:
+    if comparison.requested_limit < comparison.recorded_limit:
         raise ConfigurationError(
             ConfigurationDiagnostic(
                 code="project_resume_configuration_mismatch",
                 stage="resume_resolution",
                 message=(
-                    f"{limit_field} is the run's total limit and cannot decrease when "
-                    f"resuming (recorded {recorded_limit}, requested {requested_limit})"
+                    f"{comparison.limit_field} is the run's total limit and cannot decrease when "
+                    "resuming "
+                    f"(recorded {comparison.recorded_limit}, "
+                    f"requested {comparison.requested_limit})"
                 ),
             )
         )
-    return requested if requested_limit > recorded_limit or migrate_agent_objectives else None
+    return (
+        requested
+        if comparison.requested_limit > comparison.recorded_limit or comparison.migration_required
+        else None
+    )
 
 
 @overload
@@ -568,6 +559,9 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             integration.attach(log_dir)
             logger = RunLogger(log_dir)
             teardown_stack.callback(logger.close)
+            # Registered after logger.close so LIFO teardown unsubscribes the
+            # renderer before the log file closes.
+            teardown_stack.callback(output_sink().subscribe(RunLogRenderer(logger.writer).handle))
             hook_log[0] = logger.lprint
             for message in buffered_logs:
                 logger.lprint(message)
@@ -588,7 +582,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             git = GitTracker(
                 project_root,
                 run_id=run_id,
-                log=logger.lprint,
+                events=CoreGitTrackerEvents(),
                 excluded_dirs=project_excluded_dirs,
                 trusted_input_paths=trusted_project_input_paths(
                     project_root,
@@ -705,9 +699,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 )
 
         with boot_trace.span("round_transaction_recovery"):
-            if project_configuration.outer_loop == "agent":
-                if agent_state_model_type is None:
-                    raise ValueError("agent runs require an agent state model type")  # noqa: TRY003  # tracked: #288
+            if agent_state_model_type is not None:
                 round_transaction_coordinator = RoundTransactionCoordinator(
                     project,
                     git,
@@ -1108,7 +1100,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
     git = GitTracker(
         workspace,
         run_id=parent.run_id,
-        log=logger.lprint,
+        events=CoreGitTrackerEvents(),
         excluded_dirs=parent.EXCLUDED_WORKSPACE_DIRS,
         trusted_input_paths=trusted_project_input_paths(
             workspace,
@@ -1403,6 +1395,20 @@ class _RunContext:
             raise RuntimeError("begin_completed_round must precede project round persistence")  # noqa: TRY003  # tracked: #288
         transaction.complete()
         self._pending_round_transaction = None
+
+    def publish_committed_state(
+        self,
+        namespace: str,
+        state: BaseModel,
+        *,
+        changed_keys: tuple[str, ...] | None = None,
+    ) -> None:
+        """Publish an in-memory hint only after the same state is durable."""
+        self.integration.publish_committed_state(
+            namespace,
+            state,
+            changed_keys=changed_keys,
+        )
 
     @property
     def run_log_path(self) -> Path:

@@ -382,15 +382,16 @@ describe('RoundRailView judge verdict', () => {
       .find(line => line.includes('r1'));
   }
 
-  test('marks a completed round the judge failed, without losing the round-status check', async () => {
+  test('marks a completed round the judge failed as `✗ fail`, not `✗ done`', async () => {
     const rows = await renderedRows(verdictState('fail'), 10);
     const row = rows.find(r => r.text.includes('r1'));
     // The verdict replaces the status glyph rather than sitting beside it: a
     // row carrying both a check and a cross reads as two contradictory claims,
-    // and the status word ('done') already says the round finished.
+    // and the status word follows the glyph: `✗ fail`, never `✗ done`.
     expect(row?.text).toContain('✗');
     expect(row?.text).not.toContain('✓');
-    expect(row?.text).toContain('done');
+    expect(row?.text).toContain('fail');
+    expect(row?.text).not.toContain('done');
   });
 
   test('adds no mark for a pass verdict, a deferred one, or a round not yet judged', async () => {

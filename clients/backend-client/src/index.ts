@@ -13,12 +13,16 @@ export {
   type StreamTransport,
 } from './persistent-event-stream.js';
 export type {
+  AgentStatusData,
   ChatModelOption,
   ChatOptions,
   ChatProviderOptions,
   DesignFileChange,
+  DesignPatch,
   DesignRound,
   Diagnostic,
+  ExperimentCursor,
+  ExperimentUpdate,
   HypothesisEntry,
   HypothesisRound,
   ProtocolRequest,
