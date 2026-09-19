@@ -50,7 +50,7 @@ from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.metrics import MetricSpace, Objective
 from vibesys.run.git_events import NullGitTrackerEvents
 from vibesys.run.git_tracker import GitTracker
-from vs_project import ProjectStateError
+from vs_project import AgentRunConfiguration, ProjectStateError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from server.journal import EventJournal
     from server.settings import InteractiveSetupDefaults
     from vibesys.loops.agent.model import AgentRunState
-    from vs_project import AgentRunConfiguration, Project
+    from vs_project import Project
 
 
 @dataclass(frozen=True)
@@ -73,7 +73,23 @@ class SubscriptionBootstrap:
     """One journal state captured atomically for a subscription bootstrap."""
 
     run_id: str
+    store_id: str
     floor: int
+    through_sequence: int
+    events: list[RunEvent]
+    active_executions: list[ActiveAgentExecution]
+
+
+@dataclass(frozen=True)
+class SubscriptionCheckpoint:
+    """One journal state captured atomically for a live subscription batch.
+
+    ``store_id`` names the store the events came from. A subscription compares
+    it against the store it bootstrapped from, so it can never mistake a
+    replaced log's sequences for a continuation of its own.
+    """
+
+    store_id: str
     through_sequence: int
     events: list[RunEvent]
     active_executions: list[ActiveAgentExecution]
@@ -269,25 +285,50 @@ class RunApi:
             )
 
     def subscription_checkpoint(
-        self, after_sequence: int, *, bootstrap_spine: bool = False
-    ) -> tuple[int, list[RunEvent], list[ActiveAgentExecution]]:
-        """Capture events and executions at one subscription sequence boundary."""
+        self, after_sequence: int, *, store_id: str | None = None, bootstrap_spine: bool = False
+    ) -> SubscriptionCheckpoint:
+        """Capture events and executions at one subscription sequence boundary.
+
+        ``store_id`` names the store the caller's cursor belongs to. When the
+        journal has since attached a different one, that cursor numbers a log
+        that is gone, so the checkpoint reports the new identity and reads
+        nothing: the caller must bootstrap against the new store rather than
+        extend a fold with sequences from another log.
+        """
         with self._condition:
+            current = self._journal.store_id_locked()
+            if store_id is not None and current != store_id:
+                return SubscriptionCheckpoint(current, after_sequence, [], [])
             through_sequence, events = self._journal.checkpoint_locked(
                 after_sequence, bootstrap_spine=bootstrap_spine
             )
-            return through_sequence, events, self._executions.active_locked()
+            return SubscriptionCheckpoint(
+                store_id=current,
+                through_sequence=through_sequence,
+                events=events,
+                active_executions=self._executions.active_locked(),
+            )
 
     def subscription_bootstrap(
-        self, after_sequence: int, tail: int | None
+        self, after_sequence: int, tail: int | None, *, store_id: str | None = None
     ) -> SubscriptionBootstrap:
         """Capture one atomic bootstrap state for a new or restarted subscription.
 
         Appends acquire the same condition, so computing the tail floor and
         reading the checkpoint under one acquisition keeps the replay bounded
         by ``tail`` no matter how many events land during the bootstrap.
+
+        ``store_id`` names the store the caller's ``after_sequence`` belongs to,
+        carried by a resume across a dropped connection. When the journal has
+        since attached a different one, that cursor numbers a log that is gone,
+        so it is dropped and the live store is replayed from its floor: the
+        client re-folds from the batch's identity rather than extending a stale
+        fold. An empty or matching id resumes the cursor as before, which is
+        also what a fresh dial (no store seen yet) and old clients get.
         """
         with self._condition:
+            if store_id and store_id != self._journal.store_id_locked():
+                after_sequence = 0
             latest = self._journal.latest_sequence_locked()
             floor = after_sequence if tail is None else max(after_sequence, latest - tail)
             through_sequence, events = self._journal.checkpoint_locked(
@@ -295,6 +336,7 @@ class RunApi:
             )
             return SubscriptionBootstrap(
                 run_id=self._journal.run_id_locked(),
+                store_id=self._journal.store_id_locked(),
                 floor=floor,
                 through_sequence=through_sequence,
                 events=events,
@@ -332,7 +374,7 @@ class RunApi:
         if project_run is None:
             return None
         manifest = project_run.project.state.load_run(project_run.run_id)
-        if manifest.configuration.outer_loop != "agent":
+        if not isinstance(manifest.configuration, AgentRunConfiguration):
             return None
         return build_performance_context(
             self._agent_run_state(),

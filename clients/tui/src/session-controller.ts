@@ -189,6 +189,8 @@ const BACKFILL_CHUNK = 1_000;
  * outage gets the full schedule again.
  */
 const RECONNECT_DELAYS_MS: readonly number[] = [500, 1_000, 2_000, 4_000, 8_000];
+type EventBatchMessage = Extract<ServerMessage, {events: RunEvent[]}>;
+type ProtocolErrorMessage = Extract<ServerMessage, {message: string}>;
 
 export class SocketSessionController implements SessionController {
   #state: SessionState;
@@ -241,11 +243,21 @@ export class SocketSessionController implements SessionController {
   /**
    * Highest floor the stream itself has declared, which is not the same as the
    * floor in state: backfill lowers the latter and the stream never sees it.
-   * A later batch declaring more than this is a re-bootstrap; see
-   * `#raiseHistoryFloor`. Null until the first batch, whose floor is the
+   * A later batch declaring more than this is a re-bootstrap within one store,
+   * which is what the server does when a burst outruns the tail bound; see
+   * `#resetHistoryFloor`. Null until the first batch, whose floor is the
    * bootstrap's own and therefore raises nothing.
    */
   #declaredFloor: number | null = null;
+  /**
+   * The event store the folded sequences belong to, as the stream last named
+   * it. Sequences only mean anything within one store, and a run swaps in its
+   * durable log after the client subscribes, so a batch that names a different
+   * store supersedes the fold however the two logs compare in length. Null
+   * until the first batch, and empty against a server that does not report
+   * identity, which leaves `#declaredFloor` as the only signal.
+   */
+  #storeId: string | null = null;
   #streamProtocolError = false;
 
   constructor(
@@ -296,6 +308,9 @@ export class SocketSessionController implements SessionController {
       // messages and connection changes land.
       this.#stream.subscribe({
         cursor: () => this.#state.core.sequence,
+        // The store the folded cursor belongs to, so a resume across an outage
+        // can be dropped if the run swapped its durable log while we were gone.
+        storeId: () => this.#storeId ?? '',
         shouldReconnect: () => !hasRunEnded(this.#state.core) && !this.#streamProtocolError,
         onMessage: (message, {resumed}) => this.#onMessage(message, resumed),
         onConnectionState: state => this.#onConnectionState(state),
@@ -1110,59 +1125,97 @@ export class SocketSessionController implements SessionController {
   }
 
   #onMessage(message: ServerMessage, resumed: boolean): void {
-    if (message.type === 'event') {
+    const events = this.#dispatchMessage(message, resumed);
+    if (events === null) return;
+    this.#refreshExperimentsFor(events);
+    this.#refreshPaneFor(events);
+  }
+
+  #dispatchMessage(message: ServerMessage, resumed: boolean): readonly RunEvent[] | null {
+    if ('event' in message) {
       this.#setState(applyEvent(this.#state, message.event));
-      this.#refreshExperimentsFor([message.event]);
-      this.#refreshPaneFor([message.event]);
+      return [message.event];
     }
-    if (message.type === 'event_batch') {
-      if (resumed) {
-        // A resumed subscription replays exactly the events after the
-        // client's own cursor and declares no history floor of its own
-        // (`history_after_sequence` 0 on every batch). Taking that literally
-        // would mark history complete and quietly break scroll-back, so the
-        // floor bookkeeping keeps the boot subscription's answers and the
-        // batch folds at the floor already in state.
-        this.#setState(
-          applyEventBatch(
-            this.#state,
-            message.events,
-            message.active_executions,
-            message.through_sequence,
-            this.#state.core.historyAfterSequence,
-          ),
-        );
-      } else {
-        const declared = message.history_after_sequence ?? 0;
-        const rebootstrap = this.#declaredFloor !== null && declared > this.#declaredFloor;
-        this.#declaredFloor = declared;
-        const floor = rebootstrap
-          ? this.#raiseHistoryFloor(declared)
-          : this.#lowerHistoryFloor(declared);
-        const apply = rebootstrap ? applyEventRebootstrap : applyEventBatch;
-        this.#setState(
-          apply(
-            this.#state,
-            message.events,
-            message.active_executions,
-            message.through_sequence,
-            floor,
-          ),
-        );
-        this.#recordSpine(message.events, declared);
-      }
-      this.#refreshExperimentsFor(message.events);
-      this.#refreshPaneFor(message.events);
+    if ('events' in message) {
+      this.#reconcileBatch(message, resumed);
+      return message.events;
     }
-    if (message.type === 'protocol_error') {
-      this.#streamProtocolError = true;
+    if (!('message' in message)) return null;
+    const protocolError = message as ProtocolErrorMessage;
+    this.#streamProtocolError = true;
+    this.#setState(
+      reportError(markEventStreamUnavailable(this.#state), protocolError.message, {
+        scope: 'protocol',
+        diagnostic: protocolError.diagnostic ?? null,
+      }),
+    );
+    return null;
+  }
+
+  #reconcileBatch(message: EventBatchMessage, resumed: boolean): void {
+    if (resumed) {
+      this.#reconcileResumedBatch(message);
+      return;
+    }
+    this.#reconcileFreshBatch(message);
+  }
+
+  #reconcileResumedBatch(message: EventBatchMessage): void {
+    const store = message.store_id ?? '';
+    const knownStoreChanged = Boolean(this.#storeId && store && store !== this.#storeId);
+    if (knownStoreChanged) {
+      // A changed store invalidates the cursor and its folded state. The
+      // resumed batch is therefore a fresh bootstrap, including spine tracking.
+      const declared = message.history_after_sequence ?? 0;
+      this.#storeId = store;
+      this.#declaredFloor = declared;
       this.#setState(
-        reportError(markEventStreamUnavailable(this.#state), message.message, {
-          scope: 'protocol',
-          diagnostic: message.diagnostic ?? null,
-        }),
+        applyEventRebootstrap(
+          this.#state,
+          message.events,
+          message.active_executions,
+          message.through_sequence,
+          this.#resetHistoryFloor(declared),
+        ),
       );
+      this.#recordSpine(message.events, declared);
+      return;
     }
+    if (store) this.#storeId = store;
+    // Resumed batches declare no new floor. Keep the current floor so
+    // scrollback remains available after reconnecting.
+    this.#setState(
+      applyEventBatch(
+        this.#state,
+        message.events,
+        message.active_executions,
+        message.through_sequence,
+        this.#state.core.historyAfterSequence,
+      ),
+    );
+  }
+
+  #reconcileFreshBatch(message: EventBatchMessage): void {
+    const declared = message.history_after_sequence ?? 0;
+    const store = message.store_id ?? '';
+    const rebootstrap =
+      (this.#storeId !== null && store !== this.#storeId) ||
+      (this.#declaredFloor !== null && declared > this.#declaredFloor);
+    this.#storeId = store;
+    this.#declaredFloor = declared;
+    const floor = rebootstrap
+      ? this.#resetHistoryFloor(declared)
+      : this.#lowerHistoryFloor(declared);
+    this.#setState(
+      (rebootstrap ? applyEventRebootstrap : applyEventBatch)(
+        this.#state,
+        message.events,
+        message.active_executions,
+        message.through_sequence,
+        floor,
+      ),
+    );
+    this.#recordSpine(message.events, declared);
   }
 
   /**
@@ -1179,15 +1232,17 @@ export class SocketSessionController implements SessionController {
   }
 
   /**
-   * Adopts a floor the stream raised, which only a re-bootstrap does.
+   * Takes a re-bootstrapped stream's floor literally, up or down.
    *
    * The run's durable event log is attached after the client subscribes, so a
    * subscription that bootstrapped against the server's own short log is
-   * re-bootstrapped at a tail of the run log. Everything below that tail is
+   * re-bootstrapped against the run log. Everything below the new floor is
    * unread history, whatever the client held before, and the spine set
-   * described a log this one replaces.
+   * described a log this one replaces. Descending is not the backfill's
+   * descent either: a run log shorter than the tail is replayed whole and
+   * declares floor 0, which is the truth about the log now being streamed.
    */
-  #raiseHistoryFloor(floor: number): number {
+  #resetHistoryFloor(floor: number): number {
     this.#historyFloor = floor;
     this.#foldedBelowFloor.clear();
     return floor;

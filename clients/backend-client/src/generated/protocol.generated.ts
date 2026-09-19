@@ -87,6 +87,7 @@ export type Timestamp13 = string;
 export type Type13 = "subscribe";
 export type AfterSequence1 = number;
 export type Tail = number | null;
+export type StoreId = string;
 export type ProtocolVersion14 = 1;
 export type RequestId14 = string;
 export type Timestamp14 = string;
@@ -267,6 +268,7 @@ export type Data =
 export type Kind1 = "chat";
 export type Answer1 = string;
 export type ThreadTitle = string | null;
+export type InvocationId1 = string | null;
 export type Kind2 = "chat_thread_created";
 export type ThreadId3 = string;
 export type Title2 = string;
@@ -532,6 +534,7 @@ export type Type16 = "event_batch";
 export type Events1 = RunEvent[];
 export type ThroughSequence = number;
 export type ActiveExecutions1 = ActiveAgentExecution[];
+export type StoreId1 = string;
 export type HistoryAfterSequence = number;
 export type Type17 = "protocol_error";
 export type RequestId16 = string | null;
@@ -680,6 +683,7 @@ export interface SubscribeRequest {
   type?: Type13;
   after_sequence?: AfterSequence1;
   tail?: Tail;
+  store_id?: StoreId;
 }
 export interface Response {
   protocol_version?: ProtocolVersion14;
@@ -838,6 +842,7 @@ export interface ChatData {
   kind?: Kind1;
   answer: Answer1;
   thread_title?: ThreadTitle;
+  invocation_id?: InvocationId1;
   [k: string]: unknown;
 }
 /**
@@ -1286,6 +1291,7 @@ export interface EventBatchMessage {
   events: Events1;
   through_sequence?: ThroughSequence;
   active_executions?: ActiveExecutions1;
+  store_id?: StoreId1;
   history_after_sequence?: HistoryAfterSequence;
 }
 export interface ProtocolErrorMessage {

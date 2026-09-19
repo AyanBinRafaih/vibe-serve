@@ -4,6 +4,7 @@ import {
   chatPaneFocused,
   chatPaneVisible,
   experimentLogVisible,
+  focusedPane,
   todoListFocused,
 } from '../session-model.js';
 import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
@@ -37,6 +38,7 @@ export interface KeybindingActions {
   showClipboardStatus(result: Exclude<ClipboardCopyResult, 'no-selection'>): void;
 }
 
+// biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
 export function bindKeybindings(
   renderer: CliRenderer,
   controller: SessionController,
@@ -44,6 +46,8 @@ export function bindKeybindings(
   clipboard: SelectionClipboard,
   actions: KeybindingActions,
 ): () => void {
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+  // biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
   const onKey = (key: KeyEvent): void => {
     if (key.ctrl && !key.shift && key.name === 'c') {
       key.preventDefault();
@@ -287,12 +291,15 @@ export function bindKeybindings(
     }
     if (key.name === 'up' || key.name === 'down') {
       if (!actions.navigateSuggestions(key.name === 'up' ? -1 : 1)) {
-        if (controller.state.roundFocus === 'transcript') {
-          controller.selectNextEntry(key.name === 'down' ? 1 : -1);
-          actions.revealSelectedEntry();
-        } else {
+        // `roundFocus` can sit parked on the agents pane while a visualization
+        // hides it, so the keys follow the pane that is actually on screen:
+        // the same authority the focus border reads.
+        if (focusedPane(controller.state) === 'agents') {
           if (key.name === 'down') controller.selectNextAgent();
           else controller.selectPreviousAgent();
+        } else {
+          controller.selectNextEntry(key.name === 'down' ? 1 : -1);
+          actions.revealSelectedEntry();
         }
       }
       key.preventDefault();
@@ -300,7 +307,7 @@ export function bindKeybindings(
     }
     if (
       (key.name === 'return' || key.name === 'enter') &&
-      controller.state.roundFocus === 'transcript' &&
+      focusedPane(controller.state) === 'transcript' &&
       actions.inputIsEmpty() &&
       actions.toggleSelectedTool()
     ) {

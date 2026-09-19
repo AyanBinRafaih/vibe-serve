@@ -292,6 +292,13 @@ export interface ConversationEntry {
   invocationId?: string;
   startsTurn?: boolean;
   toolCall?: string;
+  /**
+   * A shell command to give code treatment instead of word-wrapped prose.
+   * Set from a typed `gate_started` event's `command` field, or, for
+   * recorded/legacy prose, split out by core-state's
+   * `splitFrameworkValidationCommand`.
+   */
+  command?: string;
   toolResponse?: string;
   toolName?: string;
   toolCallId?: string;
@@ -668,66 +675,117 @@ export function openExperimentLog(state: SessionState): SessionState {
 export function setExperiments(state: SessionState, entries: HypothesisEntry[]): SessionState {
   const log = state.experimentLog;
   if (log === null) return state;
+
   const activity = hypothesisPlanningActivity(state);
-  const selectedActivityRound =
-    log.selectedActivity === true
-      ? (log.selectedActivityRound ?? activity?.roundNumber ?? null)
-      : null;
-  const orderedEntries = [...entries].sort(compareHypothesisEntries);
-  const keys = orderedEntries.map(entryKey);
-  const materializedActivity =
-    selectedActivityRound === null
-      ? undefined
-      : orderedEntries.find(entry => scopeRounds(entry).includes(selectedActivityRound));
-  // Keep the operator's row when it still exists; otherwise fall back to the
-  // active hypothesis, then to the first row.
-  const selectedId =
-    materializedActivity !== undefined
-      ? entryKeyFor(orderedEntries, materializedActivity)
-      : log.selectedId !== null && keys.includes(log.selectedId)
-        ? log.selectedId
-        : (keys[orderedEntries.findIndex(entry => entry.active === true)] ?? keys[0] ?? null);
-  const unownedRounds = unownedExperimentRounds(state, orderedEntries);
-  const currentUnownedRound = log.selectedUnownedRound;
-  const selectedUnownedRound =
-    currentUnownedRound !== undefined &&
-    currentUnownedRound !== null &&
-    unownedRounds.includes(currentUnownedRound)
-      ? currentUnownedRound
-      : orderedEntries.length === 0
-        ? (unownedRounds[0] ?? null)
-        : null;
-  const currentDetail = state.hypothesisDetail;
-  const detailEntry =
-    currentDetail === null
-      ? undefined
-      : orderedEntries.find((entry, index) => entryKey(entry, index) === currentDetail.entryKey);
-  const detailRounds = detailEntry === undefined ? [] : scopeRounds(detailEntry);
-  const hypothesisDetail =
-    currentDetail === null || detailEntry === undefined
-      ? null
-      : {
-          entryKey: currentDetail.entryKey,
-          selectedRound:
-            currentDetail.selectedRound !== null &&
-            detailRounds.includes(currentDetail.selectedRound)
-              ? currentDetail.selectedRound
-              : (detailRounds.at(-1) ?? null),
-        };
-  return {
+  const indexed = orderAndIndexExperiments(entries);
+  const selection = reconcileExperimentSelection(log, indexed, activity);
+  const unownedRounds = unownedExperimentRounds(state, indexed.entries);
+  const selectedUnownedRound = reconcileUnownedRoundSelection(
+    log.selectedUnownedRound,
+    unownedRounds,
+    indexed.entries.length === 0,
+  );
+  const hypothesisDetail = reconcileHypothesisDetail(state.hypothesisDetail, indexed.entries);
+  const refreshed: SessionState = {
     ...state,
     hypothesisDetail,
     experimentLog: {
       ...log,
-      entries: orderedEntries,
-      selectedId,
-      selectedActivity: materializedActivity === undefined && log.selectedActivity === true,
-      selectedActivityRound: materializedActivity === undefined ? selectedActivityRound : null,
+      entries: indexed.entries,
+      ...selection,
       selectedUnownedRound,
       pending: false,
       error: null,
     },
   };
+  return refreshLiveHypothesisScope(state, refreshed);
+}
+
+interface IndexedExperiments {
+  entries: HypothesisEntry[];
+  keys: string[];
+}
+
+/** Establish the canonical response order once and retain its stable row identities. */
+function orderAndIndexExperiments(entries: HypothesisEntry[]): IndexedExperiments {
+  const ordered = [...entries].sort(compareHypothesisEntries);
+  return {entries: ordered, keys: ordered.map(entryKey)};
+}
+
+type ExperimentSelection = Pick<
+  ExperimentLogState,
+  'selectedId' | 'selectedActivity' | 'selectedActivityRound'
+>;
+
+/** Reconcile the selected index row, including planning work that became persistent. */
+function reconcileExperimentSelection(
+  log: ExperimentLogState,
+  indexed: IndexedExperiments,
+  activity: HypothesisPlanningActivity | null,
+): ExperimentSelection {
+  const selectedActivityRound =
+    log.selectedActivity === true
+      ? (log.selectedActivityRound ?? activity?.roundNumber ?? null)
+      : null;
+  const materializedActivity =
+    selectedActivityRound === null
+      ? undefined
+      : indexed.entries.find(entry => scopeRounds(entry).includes(selectedActivityRound));
+  // Keep the operator's row when it still exists; otherwise fall back to the
+  // active hypothesis, then to the first row.
+  const selectedId =
+    materializedActivity !== undefined
+      ? entryKeyFor(indexed.entries, materializedActivity)
+      : log.selectedId !== null && indexed.keys.includes(log.selectedId)
+        ? log.selectedId
+        : (indexed.keys[indexed.entries.findIndex(entry => entry.active === true)] ??
+          indexed.keys[0] ??
+          null);
+  return {
+    selectedId,
+    selectedActivity: materializedActivity === undefined && log.selectedActivity === true,
+    selectedActivityRound: materializedActivity === undefined ? selectedActivityRound : null,
+  };
+}
+
+/** Keep an unowned-round cursor only while that row remains in the refreshed index. */
+function reconcileUnownedRoundSelection(
+  current: number | null | undefined,
+  unownedRounds: number[],
+  hasNoHypotheses: boolean,
+): number | null {
+  if (current !== undefined && current !== null && unownedRounds.includes(current)) return current;
+  return hasNoHypotheses ? (unownedRounds[0] ?? null) : null;
+}
+
+/** Keep an open summary on the same hypothesis and fall back to its latest available round. */
+function reconcileHypothesisDetail(
+  currentDetail: HypothesisDetail | null,
+  entries: HypothesisEntry[],
+): HypothesisDetail | null {
+  const detailEntry =
+    currentDetail === null
+      ? undefined
+      : entries.find((entry, index) => entryKey(entry, index) === currentDetail.entryKey);
+  const detailRounds = detailEntry === undefined ? [] : scopeRounds(detailEntry);
+  if (currentDetail === null || detailEntry === undefined) return null;
+  return {
+    entryKey: currentDetail.entryKey,
+    selectedRound:
+      currentDetail.selectedRound !== null && detailRounds.includes(currentDetail.selectedRound)
+        ? currentDetail.selectedRound
+        : (detailRounds.at(-1) ?? null),
+  };
+}
+
+/** Re-derive an open trajectory's scope from the refreshed ownership payload. */
+function refreshLiveHypothesisScope(previous: SessionState, refreshed: SessionState): SessionState {
+  if (previous.hypothesisScope === null) return refreshed;
+  // A live scope must describe the fresh payload: a continuation round joins
+  // its hypothesis's scope, and a scope whose hypothesis vanished degrades to
+  // the round on screen rather than keeping the stale title over it.
+  const anchor = visibleRoundNumber(previous);
+  return anchor === null ? refreshed : {...refreshed, ...scopeStateForRound(refreshed, anchor)};
 }
 
 /** Apply delta replacements and removals by the protocol's stable identity. */
@@ -909,14 +967,9 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
     const roundNumber = state.hypothesisDetail.selectedRound;
     return roundNumber === null ? state : (enterExperimentRound(state, roundNumber) ?? state);
   }
-  const activity = hypothesisPlanningActivity(state);
-  if (
-    activity !== null &&
-    (state.experimentLog?.selectedActivity === true ||
-      (state.experimentLog?.entries.length === 0 &&
-        (state.experimentLog?.selectedUnownedRound ?? null) === null))
-  ) {
-    return enterUnownedExperimentRound(state, activity.roundNumber) ?? state;
+  const activityRound = selectedPlanningActivityRound(state);
+  if (activityRound !== null) {
+    return enterUnownedExperimentRound(state, activityRound) ?? state;
   }
   const selectedRound =
     state.experimentLog?.selectedUnownedRound ??
@@ -929,10 +982,80 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
   return openHypothesisDetail(state);
 }
 
+/** The live planning round when it is the selected, or only, index item. */
+function selectedPlanningActivityRound(state: SessionState): number | null {
+  const activity = hypothesisPlanningActivity(state);
+  if (activity === null) return null;
+  const log = state.experimentLog;
+  const selected = log?.selectedActivity === true;
+  const onlyItem = log?.entries.length === 0 && (log.selectedUnownedRound ?? null) === null;
+  return selected || onlyItem ? activity.roundNumber : null;
+}
+
 /** Leaves a trajectory for its hypothesis summary, preserving the round cursor. */
 export function leaveExperimentDrilldown(state: SessionState): SessionState {
   if (state.hypothesisScope === null) return state;
   return {...state, hypothesisScope: null, selectedRound: null, selectedAgentKind: null};
+}
+
+/**
+ * The scope, its Esc target, and the log selection implied by one round.
+ *
+ * Round navigation deliberately covers the whole run, so the scope follows the
+ * selected round: whichever hypothesis owns the round on screen is the one the
+ * header, the agent map, and Esc must describe. A round no hypothesis claims
+ * is scoped as itself rather than left under another hypothesis's title.
+ * Derived in one place so drilldown entry, round navigation, and an
+ * experiments refresh cannot disagree about what is on screen.
+ */
+function scopeStateForRound(
+  state: SessionState,
+  roundNumber: number,
+): Pick<SessionState, 'hypothesisScope' | 'hypothesisDetail' | 'experimentLog'> {
+  const entries = state.experimentLog?.entries ?? [];
+  const entryIndex = entries.findIndex(candidate => scopeRounds(candidate).includes(roundNumber));
+  const entry = entries[entryIndex];
+  if (entry === undefined) {
+    return {
+      hypothesisScope: reuseScope(state.hypothesisScope, {
+        id: `round-${roundNumber}`,
+        label: `Round ${roundNumber}`,
+        title: `Round ${roundNumber}`,
+        rounds: [roundNumber],
+        source: 'round',
+      }),
+      hypothesisDetail: null,
+      experimentLog: state.experimentLog,
+    };
+  }
+  const entryKeyValue = entryKey(entry, entryIndex);
+  return {
+    hypothesisScope: reuseScope(state.hypothesisScope, {
+      id: entry.hypothesis_id,
+      label: hypothesisLabel(entry),
+      title: hypothesisTitle(entry),
+      rounds: scopeRounds(entry),
+      source: 'hypothesis',
+    }),
+    hypothesisDetail: {entryKey: entryKeyValue, selectedRound: roundNumber},
+    experimentLog:
+      state.experimentLog === null || state.experimentLog.selectedId === entryKeyValue
+        ? state.experimentLog
+        : {...state.experimentLog, selectedId: entryKeyValue},
+  };
+}
+
+/** Keeps the current scope object when the derived one says the same thing. */
+function reuseScope(current: HypothesisScope | null, derived: HypothesisScope): HypothesisScope {
+  return current !== null &&
+    current.id === derived.id &&
+    current.label === derived.label &&
+    current.title === derived.title &&
+    current.source === derived.source &&
+    current.rounds.length === derived.rounds.length &&
+    current.rounds.every((round, index) => round === derived.rounds[index])
+    ? current
+    : derived;
 }
 
 /**
@@ -945,30 +1068,17 @@ export function enterExperimentRound(
   roundNumber: number,
 ): SessionState | null {
   const entries = state.experimentLog?.entries ?? [];
-  const entryIndex = entries.findIndex(candidate => scopeRounds(candidate).includes(roundNumber));
-  const entry = entries[entryIndex];
-  if (entry === undefined) return null;
-  const entryKeyValue = entryKey(entry, entryIndex);
-  const scoped: SessionState = {
+  if (!entries.some(candidate => scopeRounds(candidate).includes(roundNumber))) return null;
+  return {
     ...state,
     overlay: null,
     chatOpen: false,
     layout: {right: null, focus: 'left', zoomedPane: null},
-    hypothesisScope: {
-      id: entry.hypothesis_id,
-      label: hypothesisLabel(entry),
-      title: hypothesisTitle(entry),
-      rounds: scopeRounds(entry),
-      source: 'hypothesis',
-    },
+    ...scopeStateForRound(state, roundNumber),
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
-    hypothesisDetail: {entryKey: entryKeyValue, selectedRound: roundNumber},
-    experimentLog:
-      state.experimentLog === null ? null : {...state.experimentLog, selectedId: entryKeyValue},
   };
-  return scoped;
 }
 
 /**
@@ -986,14 +1096,7 @@ export function enterUnownedExperimentRound(
     overlay: null,
     chatOpen: false,
     layout: {right: null, focus: 'left', zoomedPane: null},
-    hypothesisDetail: null,
-    hypothesisScope: {
-      id: `round-${roundNumber}`,
-      label: `Round ${roundNumber}`,
-      title: `Round ${roundNumber}`,
-      rounds: [roundNumber],
-      source: 'round',
-    },
+    ...scopeStateForRound(state, roundNumber),
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
@@ -1294,8 +1397,31 @@ export function normalizeFocus(state: SessionState): SessionState {
     visiblePaneIds({...state, layout: {...state.layout, focus}}).includes(state.layout.zoomedPane)
       ? state.layout.zoomedPane
       : null;
-  if (focus === state.layout.focus && zoomedPane === state.layout.zoomedPane) return state;
-  return {...state, layout: {...state.layout, focus, zoomedPane}};
+  const next =
+    focus === state.layout.focus && zoomedPane === state.layout.zoomedPane
+      ? state
+      : {...state, layout: {...state.layout, focus, zoomedPane}};
+  return normalizeRoundFocus(next);
+}
+
+/**
+ * The round view's focus obeys the same rule as the columns above: it has to
+ * name a pane that is on screen. Beside a visualization a stored 'agents'
+ * focus is a parked value that `focusedPane` and the key routing both ignore
+ * and closing the pane restores, so it stays. A zoom has no restore point, so
+ * focus stranded behind one moves to the pane the zoom kept. The agent filter
+ * stays: its `filtered to <agent>` header cue is painted above the zoom, so
+ * the transcript is never narrowed without a signal.
+ */
+function normalizeRoundFocus(state: SessionState): SessionState {
+  if (experimentLogVisible(state) || state.layout.right !== null) return state;
+  if (!roundPaneVisible(state, 'agents') && state.roundFocus === 'agents') {
+    return {...state, roundFocus: 'transcript'};
+  }
+  if (!roundPaneVisible(state, 'transcript') && state.roundFocus === 'transcript') {
+    return {...state, roundFocus: 'agents'};
+  }
+  return state;
 }
 
 /** Escape from a round view: close whatever is layered over it, all of it. */
@@ -1330,6 +1456,23 @@ export function focusPane(state: SessionState, focus: PaneFocus): SessionState {
 export function todoListFocused(state: SessionState): boolean {
   if (experimentLogVisible(state) || !state.todosExpanded) return false;
   return visibleTodos(state).length > 0;
+}
+
+/**
+ * True while the named round pane is on screen, mirroring the render path: a
+ * zoom on the other pane hides it, and a visualization takes the agents pane's
+ * place (in a terminal too narrow to split, the visualization's fallback modal
+ * covers the pane and takes the keys, so it is unavailable either way). Round
+ * focus only moves to a pane this returns true for, so the keys and the agent
+ * filter can never land on a pane the operator cannot see.
+ */
+export function roundPaneVisible(state: SessionState, pane: RoundFocus): boolean {
+  if (experimentLogVisible(state)) return false;
+  const zoomed = state.layout.zoomedPane;
+  if (pane === 'agents') {
+    return state.layout.right === null && (zoomed === null || zoomed === 'agents');
+  }
+  return zoomed === null || zoomed === 'transcript';
 }
 
 /**
@@ -1634,13 +1777,7 @@ export function selectNextRound(state: SessionState): SessionState {
   const visible = visibleRoundNumber(state);
   const index = visible === null ? -1 : rounds.findIndex(round => round.number === visible);
   const next = rounds[(index + 1 + rounds.length) % rounds.length];
-  return {
-    ...state,
-    selectedRound: next?.number ?? null,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-    overlay: null,
-  };
+  return withSelectedRound(state, next?.number ?? null);
 }
 
 export function selectPreviousRound(state: SessionState): SessionState {
@@ -1649,19 +1786,26 @@ export function selectPreviousRound(state: SessionState): SessionState {
   const visible = visibleRoundNumber(state);
   const index = visible === null ? 0 : rounds.findIndex(round => round.number === visible);
   const previous = rounds[(index - 1 + rounds.length) % rounds.length];
-  return {
-    ...state,
-    selectedRound: previous?.number ?? null,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-    overlay: null,
-  };
+  return withSelectedRound(state, previous?.number ?? null);
 }
 
 export function selectRound(state: SessionState, roundNumber: number): SessionState {
   if (!stripRounds(state).some(round => round.number === roundNumber)) return state;
+  return withSelectedRound(state, roundNumber);
+}
+
+/**
+ * Lands round navigation on `roundNumber`. Round navigation covers the whole
+ * run, not just the open hypothesis's slice of it, so inside a scope the scope
+ * follows the round: crossing into a round another hypothesis owns re-derives
+ * the scope from that owner.
+ */
+function withSelectedRound(state: SessionState, roundNumber: number | null): SessionState {
   return {
     ...state,
+    ...(state.hypothesisScope !== null && roundNumber !== null
+      ? scopeStateForRound(state, roundNumber)
+      : {}),
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
@@ -1726,6 +1870,11 @@ export function selectNextEntry(state: SessionState, delta: number, id?: string)
  */
 export function focusRound(state: SessionState, focus: RoundFocus): SessionState {
   if (state.roundFocus === focus) return state;
+  // The move happens only between panes that are on screen. Focus landing on
+  // a hidden pane would route the keys, and the auto-selected filter below,
+  // into a surface with no visible cue. The round view has no third pane to
+  // skip to, so at a hidden neighbour the keys stay where they are.
+  if (!roundPaneVisible(state, focus)) return state;
   // Arriving at the graph with nothing picked out puts the cursor on the agent
   // whose turns are on screen, so Tab starts from where the operator is looking.
   if (focus === 'agents' && state.selectedAgentKind === null) {
@@ -1799,10 +1948,21 @@ export function reportError(
   if (report.scope === 'input') {
     return {...state, inputError: message};
   }
+
+  const banner = errorBannerFromReport(message, report);
+  const existing = state.errorBanner;
+  if (existing === null || !equivalentError(existing, banner)) {
+    return {...state, errorBanner: banner};
+  }
+  return {...state, errorBanner: mergeEquivalentError(existing, banner)};
+}
+
+/** Normalize the report boundary into the complete state consumed by the banner view. */
+function errorBannerFromReport(message: string, report: ErrorReport): ErrorBannerState {
   const diagnostic = report.diagnostic ?? null;
   const scope = diagnostic?.scope ?? report.scope;
   const severity = diagnosticSeverity(diagnostic?.severity) ?? report.severity ?? 'recoverable';
-  const banner: ErrorBannerState = {
+  return {
     title: report.title ?? errorTitle(scope),
     message: diagnostic?.summary || message || 'An unknown error occurred.',
     detail: diagnostic?.detail ?? report.detail ?? null,
@@ -1815,27 +1975,28 @@ export function reportError(
     invocationId: report.invocationId ?? null,
     count: 1,
   };
-  const existing = state.errorBanner;
-  if (existing === null || !equivalentError(existing, banner)) {
-    return {...state, errorBanner: banner};
-  }
-  const promoted = existing.severity === 'fatal' || severity === 'fatal' ? 'fatal' : 'recoverable';
+}
+
+/** Fold a repeated report into the standing banner without losing established identity. */
+function mergeEquivalentError(
+  existing: ErrorBannerState,
+  incoming: ErrorBannerState,
+): ErrorBannerState {
+  const promoted =
+    existing.severity === 'fatal' || incoming.severity === 'fatal' ? 'fatal' : 'recoverable';
   return {
-    ...state,
-    errorBanner: {
-      ...existing,
-      message: moreInformativeMessage(existing.message, banner.message),
-      detail: moreInformativeMessage(existing.detail ?? '', banner.detail ?? '') || null,
-      hint: moreInformativeMessage(existing.hint ?? '', banner.hint ?? '') || null,
-      severity: promoted,
-      title: promoted === 'fatal' ? banner.title : existing.title,
-      scope: promoted === 'fatal' ? banner.scope : existing.scope,
-      diagnosticId: existing.diagnosticId ?? banner.diagnosticId,
-      agentKind: existing.agentKind ?? banner.agentKind,
-      roundLabel: existing.roundLabel ?? banner.roundLabel,
-      invocationId: existing.invocationId ?? banner.invocationId,
-      count: existing.count + 1,
-    },
+    ...existing,
+    message: moreInformativeMessage(existing.message, incoming.message),
+    detail: moreInformativeMessage(existing.detail ?? '', incoming.detail ?? '') || null,
+    hint: moreInformativeMessage(existing.hint ?? '', incoming.hint ?? '') || null,
+    severity: promoted,
+    title: promoted === 'fatal' ? incoming.title : existing.title,
+    scope: promoted === 'fatal' ? incoming.scope : existing.scope,
+    diagnosticId: existing.diagnosticId ?? incoming.diagnosticId,
+    agentKind: existing.agentKind ?? incoming.agentKind,
+    roundLabel: existing.roundLabel ?? incoming.roundLabel,
+    invocationId: existing.invocationId ?? incoming.invocationId,
+    count: existing.count + 1,
   };
 }
 

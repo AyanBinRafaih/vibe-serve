@@ -221,6 +221,8 @@ function isRunTerminal(type: string | undefined): boolean {
  * and a terminal run event closes all of them the way the real server's
  * tracker interrupts what is still running.
  */
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
 function activeExecutionsFrom(delivered: RunEventRecord[]): ActiveExecutionCheckpoint {
   const active = new Map<string, ExecutionCheckpoint>();
   for (const event of delivered) {
@@ -339,6 +341,17 @@ class Replay {
   }
 
   /**
+   * The one sequence space this replay ever serves.
+   *
+   * A real server swaps stores when it attaches a run's durable log, and the
+   * client re-folds when the id changes. The mock replays a finished log from
+   * the start, so its id is constant and no batch ever asks for a re-fold.
+   */
+  get storeId(): string {
+    return `mock-store-${this.runId}`;
+  }
+
+  /**
    * Sequence of the newest event delivered so far, or 0 before any.
    *
    * The cursor is a count, not an index, so a zero cursor means nothing has
@@ -445,6 +458,7 @@ class Replay {
       events: [event],
       through_sequence: event.sequence,
       active_executions: this.activeExecutions,
+      store_id: this.storeId,
     });
     if (this.#options.verbose) {
       process.stderr.write(`mock: seq ${String(event.sequence)} ${String(event.type)}\n`);
@@ -481,6 +495,7 @@ function ok(requestId: unknown, body: Record<string, unknown> = {}): Record<stri
   };
 }
 
+// biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
 function main(): void {
   const options = parseOptions(process.argv.slice(2));
   options.fixture = resolveFixture(options.fixture);
@@ -496,7 +511,10 @@ function main(): void {
       `${options.startPaused ? ' (paused; /resume in the TUI to start)' : ''}\n`,
   );
 
+  // biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
   const server = createServer(socket => {
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+    // biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
     readLines(socket, request => {
       const id = request['request_id'];
       const type = request['type'];
@@ -519,6 +537,7 @@ function main(): void {
             events: replay.delivered,
             through_sequence: replay.latestSequence,
             active_executions: replay.activeExecutions,
+            store_id: replay.storeId,
             // 0 means the stream carries its whole history, so the TUI never
             // asks for a backfill it cannot get.
             history_after_sequence: 0,
