@@ -808,13 +808,7 @@ export class SocketSessionController implements SessionController {
       if (response.experiments_ready === false) return;
       const entries = response.experiments ?? [];
       const update = response.experiment_update;
-      if (
-        generation !== this.#experimentRefreshGeneration ||
-        (update !== undefined &&
-          update !== null &&
-          this.#experimentTarget !== null &&
-          this.#experimentTarget.run_id !== update.run_id)
-      ) {
+      if (this.#experimentResponseStale(generation, update)) {
         this.#experimentRefreshPending = true;
         return;
       }
@@ -1270,22 +1264,40 @@ export class SocketSessionController implements SessionController {
     for (const event of events) {
       if (event.type !== 'experiments_changed') continue;
       relevant = true;
-      const revision = event.data?.kind === 'experiments_changed' ? event.data.revision : null;
-      const runId = event.run_id ?? this.#experimentCursor?.run_id;
-      if (revision === undefined || revision === null || runId === undefined) {
-        this.#experimentRefreshGeneration += 1;
-        this.#experimentForceRefresh = true;
-      } else if (
-        this.#experimentTarget === null ||
-        this.#experimentTarget.run_id !== runId ||
-        revision > this.#experimentTarget.revision
-      ) {
-        this.#experimentTarget = {run_id: runId, revision};
-      }
+      this.#noteExperimentsChanged(event);
     }
     if (!relevant || !this.#experimentRefreshNeeded()) return;
     if (this.#experimentFetch !== null) this.#experimentRefreshPending = true;
     void this.#loadExperiments();
+  }
+
+  /** True when a response was fetched for an older refresh or for another run's cursor. */
+  #experimentResponseStale(
+    generation: number,
+    update: {run_id: string} | null | undefined,
+  ): boolean {
+    return (
+      generation !== this.#experimentRefreshGeneration ||
+      (update !== undefined &&
+        update !== null &&
+        this.#experimentTarget !== null &&
+        this.#experimentTarget.run_id !== update.run_id)
+    );
+  }
+
+  #noteExperimentsChanged(event: RunEvent): void {
+    const revision = event.data?.kind === 'experiments_changed' ? event.data.revision : null;
+    const runId = event.run_id ?? this.#experimentCursor?.run_id;
+    if (revision === undefined || revision === null || runId === undefined) {
+      this.#experimentRefreshGeneration += 1;
+      this.#experimentForceRefresh = true;
+    } else if (
+      this.#experimentTarget === null ||
+      this.#experimentTarget.run_id !== runId ||
+      revision > this.#experimentTarget.revision
+    ) {
+      this.#experimentTarget = {run_id: runId, revision};
+    }
   }
 
   #experimentRefreshNeeded(): boolean {

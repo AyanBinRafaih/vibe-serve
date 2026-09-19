@@ -563,9 +563,7 @@ class QueueEnqueue:
     def land(self, request: LandingRequest) -> Enqueued:
         """Enqueue, letting GitHub reject the request if the head moved."""
         data = _mapping(
-            self.api.graphql(
-                ENQUEUE_MUTATION, {"id": request.node_id, "sha": request.head_sha}
-            ),
+            self.api.graphql(ENQUEUE_MUTATION, {"id": request.node_id, "sha": request.head_sha}),
             "GraphQL data",
         )
         payload = _mapping(data.get("enqueuePullRequest"), "enqueue response")
