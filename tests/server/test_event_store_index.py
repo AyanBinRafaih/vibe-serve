@@ -274,7 +274,9 @@ def test_journal_attach_reuses_the_index_despite_server_started(
     for index in range(3):
         first.record(EventType.OUTPUT, f"line-{index}")
     assert event_index_path(events_path).exists()
-    indexed_lines = len(load_event_index(events_path).records)  # type: ignore[union-attr]
+    loaded = load_event_index(events_path)
+    assert loaded is not None
+    indexed_lines = len(loaded.records)
     assert len(events_path.read_text().splitlines()) > indexed_lines + 3
     scanned = _count_header_scans(monkeypatch)
 
