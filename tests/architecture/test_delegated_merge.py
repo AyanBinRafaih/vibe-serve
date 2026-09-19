@@ -289,6 +289,7 @@ def test_checked_in_policy_loads_and_hard_denies() -> None:
     [
         ["docs/contributing/tui/README.md"],
         ["docs/contributing/tui/conventions.md", "clients/tui/src/app.ts"],
+        ["clients/tui/README.md", "clients/tui/src/app.ts"],
     ],
 )
 def test_checked_in_policy_lets_tui_members_land_tui_docs(filenames: list[str]) -> None:
