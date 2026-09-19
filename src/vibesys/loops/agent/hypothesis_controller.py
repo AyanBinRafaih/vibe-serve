@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from vibesys.loops.agent.model import Hypothesis
     from vibesys.loops.agent.state import AgentRunStateStore
     from vibesys.run import LoopContext
+    from vibesys.run.events import ExperimentsChangeReason
     from vibesys.schemas import OrchestratorPlan
     from vs_loop_state import RoundRecord
 
@@ -383,7 +384,7 @@ def plan_changed_keys(plan: OrchestratorPlan) -> tuple[str, ...]:
 def publish_experiments_changed(
     ctx: LoopContext,
     state: AgentRunState,
-    reason: str,
+    reason: ExperimentsChangeReason,
     changed_keys: Sequence[str | None],
 ) -> None:
     """Publish the committed agent state hint, then announce its revision."""
