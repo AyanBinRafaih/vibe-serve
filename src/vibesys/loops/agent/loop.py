@@ -26,7 +26,11 @@ from vibesys.context import create_run_context
 from vibesys.domains.base import DomainDefinition, DomainName, DomainRole
 from vibesys.domains.registry import resolve_domain
 from vibesys.domains.rendering import render_domain_section
-from vibesys.input_manifest import BenchmarkResult, WorkspaceSource  # noqa: TC001  # tracked: #288
+from vibesys.input_manifest import (  # noqa: TC001  # tracked: #288
+    BenchmarkResult,
+    ProfileGuidedInput,
+    WorkspaceSource,
+)
 from vibesys.loops.agent import issue_board
 from vibesys.loops.agent.attempt import (
     JudgeOutcome,
@@ -39,15 +43,20 @@ from vibesys.loops.agent.attempt import (
 from vibesys.loops.agent.hypotheses import (
     ResolutionEvidence,
     adopt_metric_space,
-    append_round,
     apply_strategy_updates,
     metric_baseline,
     record_metric_value,
     resolve_hypothesis_outcome,
     scalar_candidate_retained,
-    start_hypothesis,
     trusted_perf_provenance,
     update_active_hypothesis,
+)
+from vibesys.loops.agent.hypothesis_controller import (
+    HypothesisEngine,
+    ProfileGuidanceOutcome,
+    ProfileGuidanceView,
+    persist_active_hypothesis,
+    persist_agent_run_state,
 )
 from vibesys.loops.agent.model import (
     AgentRunState,
@@ -56,9 +65,12 @@ from vibesys.loops.agent.model import (
 )
 from vibesys.loops.agent.state import AgentRunStateStore
 from vibesys.loops.gates import (
+    GATE_LOG_TAIL_CHARS,
     GATE_RECORD_TAIL_CHARS,
     BenchmarkContract,
     FrameworkBenchmarkOutcome,
+    emit_gate_finished,
+    emit_gate_started,
     framework_command_timeout,
     run_accuracy_gate,
     run_benchmark_gate,
@@ -75,12 +87,14 @@ from vibesys.profilers import (
     require_profiler_kind,
 )
 from vibesys.prompts import PROMPTS_DIR, render_template
+from vibesys.render.sink import output_sink
 from vibesys.run import LoopContext, RepositoryVisibility, RunIntegration, RunStateNamespace
 from vibesys.run.events import (
-    BenchmarkResultData,
     CoreEventType,
     EventStatus,
     ExperimentsChangedData,
+    FrameworkSource,
+    GateKind,
     JudgeResultData,
     RoundFinishedData,
 )
@@ -169,32 +183,6 @@ _FAILED_HYPOTHESIS_OUTCOMES = (
 ) | {"rejected"}
 _MAX_CONTINUATION_ROUNDS_WITHOUT_DESIGN_REVIEW = 2
 _PARETO_ARCHIVE_PENDING_CLAIM_LIMIT = 8
-
-
-def _persist_agent_run_state(
-    ctx: LoopContext,
-    store: AgentRunStateStore,
-    state: AgentRunState,
-    *,
-    label: str,
-) -> None:
-    """Persist only authoritative agent state without staging candidate edits."""
-    store.save(state)
-    ctx.state.commit(label, store.namespace)
-
-
-def _persist_active_hypothesis(
-    ctx: LoopContext,
-    store: AgentRunStateStore,
-    state: AgentRunState,
-    hypothesis: Hypothesis,
-    *,
-    label: str,
-) -> AgentRunState:
-    """Replace and persist the active hypothesis inside its owning aggregate."""
-    updated = update_active_hypothesis(state, hypothesis)
-    _persist_agent_run_state(ctx, store, updated, label=label)
-    return updated
 
 
 def _implementation_requests_continuation(
@@ -345,10 +333,38 @@ def _format_metric_row(metrics: dict[str, float], objectives: Sequence[Objective
 def _pareto_archive_summary(records: list[RoundRecord], space: MetricSpace) -> str:
     """Render trusted frontier parents and any measured points awaiting review."""
     objectives = space.objectives
+    latest = max(records, key=lambda record: record.round_number, default=None)
+    latest_metrics = (
+        _format_metric_row(latest.metrics, objectives)
+        if latest is not None
+        and latest.official_evaluation
+        and trusted_perf_provenance(latest.perf_provenance)
+        and objectives
+        and space.complete(latest.metrics)
+        else (
+            f"{latest.perf_metric:.6g} {latest.perf_unit or ''}".strip()
+            if latest is not None
+            and latest.official_evaluation
+            and trusted_perf_provenance(latest.perf_provenance)
+            and latest.perf_metric is not None
+            else "(none)"
+        )
+    )
+    latest_line = (
+        "Latest completed round: none."
+        if latest is None
+        else (
+            f"Latest completed round: round {latest.round_number}, "
+            f"commit {(latest.commit or '(missing)')[:12]}, "
+            f"official metrics: {latest_metrics}; "
+            f"retained: {_record_candidate_retained(latest)}."
+        )
+    )
     if not objectives:
         return (
             "No objective axes are configured. Use objectives.toml to enable "
-            "multi-objective checkpoint retention; official scalar tracking remains active."
+            "multi-objective checkpoint retention; official scalar tracking remains active.\n"
+            f"{latest_line}"
         )
 
     lines = [
@@ -359,6 +375,7 @@ def _pareto_archive_summary(records: list[RoundRecord], space: MetricSpace) -> s
             f"within {space.relative_noise:.0%} on every axis and better by more than "
             f"{space.relative_noise:.0%} on at least one."
         ),
+        latest_line,
     ]
     frontier = _pareto_frontier_records(records, space)
     if frontier:
@@ -395,10 +412,17 @@ def _pareto_archive_summary(records: list[RoundRecord], space: MetricSpace) -> s
         )
         omitted = pending[:-_PARETO_ARCHIVE_PENDING_CLAIM_LIMIT]
         if omitted:
+            # This line is read by a model, so it agrees with itself: one
+            # omitted claim says "1 older untrusted claim", and a single
+            # omitted round says "round 4" rather than the degenerate
+            # "rounds 4-4".
+            claims = "claim" if len(omitted) == 1 else "claims"
+            first = omitted[0].round_number
+            last = omitted[-1].round_number
+            rounds = f"round {first}" if first == last else f"rounds {first}-{last}"
             lines.append(
-                f"- {len(omitted)} older untrusted claims omitted from this context "
-                f"(rounds {omitted[0].round_number}-{omitted[-1].round_number}); do not "
-                "treat any omitted claim as a trusted parent."
+                f"- {len(omitted)} older untrusted {claims} omitted from this context "
+                f"({rounds}); do not treat any omitted claim as a trusted parent."
             )
         for record in pending[-_PARETO_ARCHIVE_PENDING_CLAIM_LIMIT:]:
             assert record.commit is not None  # noqa: S101  # tracked: #288
@@ -410,6 +434,118 @@ def _pareto_archive_summary(records: list[RoundRecord], space: MetricSpace) -> s
                 f"reason: {record.candidate_retention_reason or '(unspecified)'}"
             )
     return "\n".join(lines)
+
+
+def _headline_measurement(record: RoundRecord) -> Measurement | None:
+    """Return a record's scalar headline as a typed measurement."""
+    if record.perf_metric is None or record.perf_unit is None:
+        return None
+    return Measurement(
+        metric=record.perf_unit,
+        value=record.perf_metric,
+        direction=record.perf_direction,
+    )
+
+
+def _trusted_final_records(records: list[RoundRecord], space: MetricSpace) -> list[RoundRecord]:
+    """Return retained records with canonical framework-owned measurements."""
+    return [
+        record
+        for record in records
+        if record.commit
+        and record.passed
+        and record.reviewed
+        and record.official_evaluation
+        and trusted_perf_provenance(record.perf_provenance)
+        and _record_candidate_retained(record) is True
+        and (
+            space.complete(record.metrics)
+            if space.objectives
+            else space.direction(_headline_measurement(record)) is not None
+        )
+    ]
+
+
+def _select_final_candidate(records: list[RoundRecord], space: MetricSpace) -> RoundRecord | None:
+    """Select the latest noise-aware winner from trusted retained records."""
+    newest_first = sorted(
+        _trusted_final_records(records, space),
+        key=lambda record: record.round_number,
+        reverse=True,
+    )
+    if space.primary is not None:
+        frontier_rounds = {
+            record.round_number for record in _pareto_frontier_records(newest_first, space)
+        }
+        candidates = [record for record in newest_first if record.round_number in frontier_rounds]
+        primary = space.primary
+
+        def primary_measurement(record: RoundRecord) -> Measurement:
+            return Measurement(
+                metric=primary.name,
+                value=record.metrics[primary.name],
+                direction=primary.direction,
+            )
+
+        return space.best(candidates, primary_measurement)
+    return space.best(newest_first, _headline_measurement)
+
+
+def _finalize_agent_run(
+    ctx: LoopContext,
+    *,
+    records: list[RoundRecord],
+    space: MetricSpace,
+    progress_path: Path,
+) -> None:
+    """Persist the final archive, report trusted results, and restore the winner."""
+    issue_board.write_pareto_archive(progress_path, _pareto_archive_summary(records, space))
+    if space.objectives:
+        frontier = _pareto_frontier_records(records, space)
+        ctx.lprint(f"\nFinal Pareto frontier ({len(frontier)} rounds):")
+        for record in frontier:
+            ctx.lprint(
+                f"  round {record.round_number}: "
+                f"{_format_metric_row(_record_candidate_metrics(record), space.objectives)} "
+                f"(commit {(record.commit or 'n/a')[:12]})"
+            )
+
+    winner = _select_final_candidate(records, space)
+    relative_memory = tuple(
+        str(path.relative_to(ctx.workspace))
+        for path in issue_board.framework_memory_paths(ctx.workspace)
+    )
+    if winner is None:
+        baseline = ctx.git.trusted_input_baseline
+        if baseline is None:
+            raise RuntimeError(  # noqa: TRY003
+                "no trusted retained candidate or trusted input baseline is available"
+            )
+        if not ctx.git.checkout_tree(baseline, clean=True, preserve_paths=relative_memory):
+            raise RuntimeError(  # noqa: TRY003
+                f"could not restore trusted input baseline at {baseline}"
+            )
+        ctx.snapshot_workspace("agent: restore trusted input baseline")
+        ctx.lprint(
+            f"\nNo evaluated winner was retained. Restored trusted input baseline {baseline[:12]}."
+        )
+        return
+    assert winner.commit is not None  # noqa: S101  # selected records require a commit
+    ctx.git.retain_candidate(f"selected-round-{winner.round_number:04d}", winner.commit)
+    if not ctx.git.checkout_tree(winner.commit, clean=True, preserve_paths=relative_memory):
+        raise RuntimeError(  # noqa: TRY003
+            f"could not materialize selected round {winner.round_number} at {winner.commit}"
+        )
+    ctx.snapshot_workspace(f"agent: select round {winner.round_number}")
+    metrics = (
+        _format_metric_row(_record_candidate_metrics(winner), space.objectives)
+        if space.objectives
+        else f"{winner.perf_metric:.6g} {winner.perf_unit or ''}"
+    )
+    ctx.lprint(
+        f"\nFinal selected candidate: round {winner.round_number}, "
+        f"commit {winner.commit[:12]}, official metrics: {metrics.strip()}"
+    )
 
 
 def _pareto_archive_conflict(
@@ -941,7 +1077,12 @@ Write bounded durable profile evidence only below
             mcp_servers=[spec] if spec is not None else None,
         )
     except Exception as exc:  # noqa: BLE001  # tracked: #288
-        ctx.lprint(f"[warn] profiler failed: {exc}")
+        output_sink().framework_warning(
+            "profiler failed",
+            detail=str(exc),
+            source=FrameworkSource.LOOP,
+            round_label=f"round-{round_number}",
+        )
         return None
     if summary is None:
         return None
@@ -995,6 +1136,7 @@ def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
     official_eval_every: int = 3,
     provisional_candidates: int = 0,
     official_eval_cadence_due: bool = False,
+    profile_guidance: ProfileGuidanceView | None = None,
 ) -> OrchestratorPlan:
     domain_orchestrator = render_domain_section(
         domain_definition,
@@ -1020,6 +1162,7 @@ def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
         official_eval_every=official_eval_every,
         provisional_candidates=provisional_candidates,
         official_eval_cadence_due=official_eval_cadence_due,
+        **(profile_guidance.plan_prompt_context() if profile_guidance else {}),
     )
     # One corrective reprompt: a plan that fails lifecycle validation (for
     # example a hypothesis_id already used in this run) is a recoverable agent
@@ -1181,19 +1324,29 @@ def _validate_skill_selections(
         return [], []
     skill_sources = ctx.skill_source_paths
     if not skill_sources:
-        ctx.lprint("[skills] ignored recommendations because no skills are installed")
+        output_sink().framework_warning(
+            "ignored skill recommendations because no skills are installed",
+            source=FrameworkSource.LOOP,
+            source_label="skills",
+        )
         return [], []
     try:
         catalog = build_skill_catalog(skill_sources)
         resolved, diagnostics = resolve_skill_selections(selections, catalog)
     except (OSError, ValueError) as exc:
-        ctx.lprint(
-            f"[skills] ignored recommendations because the catalog is invalid: "
-            f"{type(exc).__name__}: {exc}"
+        output_sink().framework_warning(
+            "ignored skill recommendations because the catalog is invalid",
+            detail=f"{type(exc).__name__}: {exc}",
+            source=FrameworkSource.LOOP,
+            source_label="skills",
         )
         return [], []
     for diagnostic in diagnostics:
-        ctx.lprint(f"[skills] {diagnostic}")
+        output_sink().framework_warning(
+            diagnostic,
+            source=FrameworkSource.LOOP,
+            source_label="skills",
+        )
 
     validated = [
         SkillResourceSelection(
@@ -1234,6 +1387,7 @@ def _run_implementer(  # noqa: PLR0913  # tracked: #288
     official_evaluation_due: bool = False,
     official_evaluation_reason: str | None = None,
     prior_attempt_artifact_locations: tuple[str, ...] = (),
+    profile_guidance: ProfileGuidanceView | None = None,
 ) -> _ImplementerAttempt:
     plan.recommended_skills, resolved_skills = _validate_skill_selections(
         ctx, plan.recommended_skills
@@ -1291,6 +1445,7 @@ def _run_implementer(  # noqa: PLR0913  # tracked: #288
         official_evaluation_reason=official_evaluation_reason,
         recommended_skills=resolved_skills,
         prior_attempt_artifact_locations=prior_attempt_artifact_locations,
+        **(profile_guidance.implementer_prompt_context() if profile_guidance else {}),
     )
     # Make this attempt number durable before the turn starts. A process killed
     # mid-invoke writes no completed artifact, so a resume that counted only
@@ -1774,10 +1929,27 @@ def _run_framework_validation_gate(  # noqa: C901, PLR0912, PLR0915  # tracked: 
         reused = _reusable_validation_result(progress_path, recipe, input_digest)
         if reused is not None:
             results.append(reused)
-            ctx.lprint(f"[framework-validation] reused PASS: {recipe.name}")
+            emit_gate_started(
+                GateKind.VALIDATION,
+                recipe=recipe.name,
+                command=recipe.command,
+                round_label=f"round-{round_number}",
+            )
+            emit_gate_finished(
+                GateKind.VALIDATION,
+                passed=True,
+                recipe=recipe.name,
+                reused=True,
+                round_label=f"round-{round_number}",
+            )
             continue
 
-        ctx.lprint(f"[framework-validation] running {recipe.name}: {recipe.command}")
+        emit_gate_started(
+            GateKind.VALIDATION,
+            recipe=recipe.name,
+            command=recipe.command,
+            round_label=f"round-{round_number}",
+        )
         try:
             execution = ctx.judge_backend.execute(
                 recipe.command,
@@ -1813,6 +1985,16 @@ def _run_framework_validation_gate(  # noqa: C901, PLR0912, PLR0915  # tracked: 
                 }
             )
         results.append(result)
+        failure_detail = (
+            None if result.passed else (result.error or result.output or "unknown failure")
+        )
+        emit_gate_finished(
+            GateKind.VALIDATION,
+            passed=result.passed,
+            recipe=recipe.name,
+            output_tail=(None if failure_detail is None else failure_detail[-GATE_LOG_TAIL_CHARS:]),
+            round_label=f"round-{round_number}",
+        )
         if not result.passed:
             break
 
@@ -1843,10 +2025,8 @@ def _run_framework_validation_gate(  # noqa: C901, PLR0912, PLR0915  # tracked: 
 
     failed = next((result for result in results if not result.passed), None)
     if failed is None:
-        ctx.lprint("[framework-validation] PASS")
         return None
     detail = failed.error or failed.output or "unknown failure"
-    ctx.lprint(f"[framework-validation] FAIL: {failed.recipe.name}: {detail}")
     return (
         f"Framework local validation failed for {failed.recipe.name!r}: {detail}. "
         f"Inspect `{artifact_location}` and repair only the affected local contract."
@@ -1900,6 +2080,7 @@ def _run_framework_accuracy_gate(  # noqa: PLR0913  # tracked: #288
         process_id=f"accuracy-{round_number}-{retry}",
         timeout_seconds=framework_command_timeout(ctx, timeout_seconds),
         execution_command=execution_command,
+        round_label=f"round-{round_number}",
     )
     if result.passed and not result.executed:
         return None
@@ -1930,10 +2111,10 @@ def _run_framework_benchmark(  # noqa: PLR0913  # tracked: #288
 ) -> FrameworkBenchmarkOutcome:
     """Run the shared benchmark gate and record its agent-loop bookkeeping.
 
-    The gate itself (result recovery, parsing, and the collision-proof result
-    path) lives in :mod:`vibesys.loops.gates`; this wrapper owns what is
-    agent-loop specific: progress notes, workspace snapshots, and the
-    supervisor's benchmark-result event.
+    The gate itself (result recovery, parsing, the collision-proof result
+    path, and the typed gate events) lives in :mod:`vibesys.loops.gates`;
+    this wrapper owns what is agent-loop specific: progress notes and
+    workspace snapshots.
     """
     execution_base = None
     if ctx.judge_benchmark_command:
@@ -1951,6 +2132,7 @@ def _run_framework_benchmark(  # noqa: PLR0913  # tracked: #288
         output_slug=f"{round_number}-{retry}",
         timeout_seconds=framework_command_timeout(ctx, timeout_seconds),
         execution_base=execution_base,
+        round_label=f"round-{round_number}",
     )
     if not result.executed:
         return result.outcome
@@ -1968,21 +2150,6 @@ def _run_framework_benchmark(  # noqa: PLR0913  # tracked: #288
         output=result.output[-GATE_RECORD_TAIL_CHARS:],
     )
     ctx.snapshot_workspace(f"round-{round_number}-retry-{retry}-framework-benchmark")
-    if (
-        result.passed
-        and result.outcome.metric_name is not None
-        and result.outcome.metric_value is not None
-    ):
-        ctx.events.emit(
-            CoreEventType.BENCHMARK_RESULT,
-            status=EventStatus.COMPLETED,
-            round_label=f"round-{round_number}",
-            data=BenchmarkResultData(
-                metric=result.outcome.metric_name,
-                value=result.outcome.metric_value,
-                unit=result.outcome.metric_unit or result.outcome.metric_name,
-            ),
-        )
     return result.outcome
 
 
@@ -2051,7 +2218,17 @@ def _run_framework_gates(  # noqa: PLR0913  # tracked: #288
                 "commit; a later gate, not accuracy, caused the retry."
             ),
         )
-        ctx.lprint("[framework-accuracy] reused prior PASS for unchanged candidate")
+        emit_gate_started(
+            GateKind.ACCURACY,
+            command=ctx.judge_accuracy_command or None,
+            round_label=f"round-{round_number}",
+        )
+        emit_gate_finished(
+            GateKind.ACCURACY,
+            passed=True,
+            reused=True,
+            round_label=f"round-{round_number}",
+        )
     else:
         feedback = _run_framework_accuracy_gate(
             ctx,
@@ -2128,6 +2305,8 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     remote_repo: str | None = None,
     repo_visibility: RepositoryVisibility = RepositoryVisibility.PRIVATE,
     integration: RunIntegration | None = None,
+    outer_loop: Literal["agent", "profile-guided"] = "agent",
+    profile_guided: ProfileGuidedInput | None = None,
 ) -> bool:
     """Run the orchestrator-driven build loop.
 
@@ -2175,6 +2354,8 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         raise ValueError(f"Unknown interface {interface!r}; choose from {', '.join(_INTERFACES)}")  # noqa: TRY003  # tracked: #288
     if domain is None:
         raise ValueError("domain is required; declare [agent].domain in vibesys.input.toml")  # noqa: TRY003  # tracked: #288
+    if outer_loop == "profile-guided" and profile_guided is None:
+        raise ValueError("profile-guided runs require profile guidance settings")  # noqa: TRY003
     # Resolve the registered domain once (fail fast on an unknown name). The
     # per-role files carry language, tooling, and use-case-specific contracts.
     domain_definition = resolve_domain(domain)
@@ -2204,7 +2385,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         else agent_backend or normalized_config.agent.backend or DEFAULT_AGENT_BACKEND
     )
     project_configuration = AgentRunConfiguration(
-        outer_loop="agent",
+        outer_loop=outer_loop,
         run_environment=run_environment_record(run_environment),
         inner_loop=inner_loop,
         interface=interface,
@@ -2269,10 +2450,11 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         agent_state_model_type=AgentRunState,
         integration=integration,
     )
-    ctx.lprint(f"[log] orchestrate run: {ctx.run_log_path}")
-    ctx.lprint(f"[log] project root: {ctx.project_root}")
-    ctx.lprint(f"[log] objective: {objective.splitlines()[0] if objective else '(empty)'}")
-
+    output_sink().run_configured(
+        run_log_path=str(ctx.run_log_path),
+        project_root=str(ctx.project_root),
+        objective=objective,
+    )
     roadmap_path, progress_path = issue_board.resolve_paths(ctx.workspace, memory_layout)
     issue_board.ensure_progress_file(progress_path)
     issue_board.ensure_roadmap_file(roadmap_path)
@@ -2281,7 +2463,6 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     roadmap_location = issue_board.display_path(roadmap_path, ctx.workspace)
     pareto_archive_path = issue_board.pareto_archive_path(progress_path)
     pareto_archive_location = issue_board.display_path(pareto_archive_path, ctx.workspace)
-
     portable_agent_state = ctx.state.portable(RunStateNamespace.AGENT)
     local_agent_state = ctx.state.local(RunStateNamespace.AGENT)
     state_store = AgentRunStateStore(portable_agent_state)
@@ -2302,24 +2483,36 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         active_hypothesis, agent_run_state.rounds
     ):
         agent_run_state = update_active_hypothesis(agent_run_state, active_hypothesis)
-
     # Replace the legacy portable namespace exactly, then remove the local
     # restart checkpoint only after its unified replacement is committed.
     state_store.save(agent_run_state)
     state_store.cleanup_legacy_portable([record.round_number for record in legacy_records])
     ctx.state.commit("agent: migrate unified hypothesis state", state_store.namespace)
     state_store.cleanup_legacy_local(local_agent_state)
-
     round_history = RoundHistory(records=agent_run_state.rounds)
     records = round_history.records
-
     carry = _CarryOver(regression_info=_terminal_workspace_notice(records))
     round_number = start_round if start_round is not None else len(records) + 1
     if round_number > max_rounds:
-        raise ValueError(  # noqa: TRY003  # tracked: #288
-            f"This run has completed {round_number - 1} rounds; max_rounds={max_rounds} "
-            "is a total limit. Increase --max-rounds to continue."
-        )
+        try:
+            if existing and records:
+                ctx.lprint(
+                    f"This run already completed {len(records)} rounds; "
+                    "finalizing its retained result."
+                )
+                _finalize_agent_run(
+                    ctx,
+                    records=records,
+                    space=agent_run_state.metrics,
+                    progress_path=progress_path,
+                )
+                return True
+            raise ValueError(  # noqa: TRY003  # tracked: #288
+                f"This run has completed {round_number - 1} rounds; max_rounds={max_rounds} "
+                "is a total limit. Increase --max-rounds to continue."
+            )
+        finally:
+            ctx.close()
 
     # When inner_loop == "single-agent", we don't run a separate
     # pre-round decision or profiler invocation. We thread the previous
@@ -2328,7 +2521,10 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     # rounds. The first round has no prior profile to feed forward.
     last_single_agent_response: SingleAgentRoundResponse | None = None
     last_profile_focus: str = "general latency hotspots on /v1/completions"
-
+    engine = HypothesisEngine.create(
+        agent_run_state,
+        config=profile_guided if outer_loop == "profile-guided" else None,
+    )
     try:
         while round_number <= max_rounds:
             ctx.switch_log_file(f"round{round_number:03d}")
@@ -2338,7 +2534,6 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
             )
             round_progress = RoundProgress(round_number, max_rounds)
             ctx.lprint(f"\n{'=' * 60}\n  {round_progress.label()}\n{'=' * 60}\n")
-
             with ctx.progress(round_progress):
                 # The designer runs only when selecting a new causal claim.
                 # A continuing hypothesis remains owned by its persistent
@@ -2346,6 +2541,17 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 profiler_summary: ProfilerSummary | None = None
                 pre_decision: PreRoundDecision | None = None
                 if active_hypothesis is None:
+                    if profile_guided is not None and outer_loop == "profile-guided":
+                        engine = engine.replace_state(agent_run_state).prepare_profile(
+                            ctx, profile_guided, round_number=round_number
+                        )
+                        agent_run_state = engine.state
+                        persist_agent_run_state(
+                            ctx,
+                            state_store,
+                            agent_run_state,
+                            label=f"profile-guided: prepare round {round_number}",
+                        )
                     if inner_loop == "multi-agent":
                         # Round 1 used to skip this decision, which also skipped
                         # the profiler nested under it: the round holding the
@@ -2378,7 +2584,6 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         profiler_summary = _profiler_summary_from_single_agent(
                             last_single_agent_response
                         )
-
                     plateau_warning = _detect_plateau(records)
                     provisional_candidates = _provisional_candidates_since_official(records)
                     plan = _run_orchestrator_plan(
@@ -2402,6 +2607,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         official_eval_cadence_due=(
                             provisional_candidates + 1 >= official_eval_every
                         ),
+                        profile_guidance=engine.controller.guidance,
                     )
                     parent_round = (
                         plan.revert_to_round
@@ -2418,8 +2624,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                         ),
                         None,
                     )
-                    agent_run_state = start_hypothesis(
-                        agent_run_state,
+                    engine = engine.replace_state(agent_run_state).start(
                         plan,
                         started_round=round_number,
                         parent_round=parent_round,
@@ -2429,10 +2634,11 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             else ctx.git.current_sha()
                         ),
                     )
+                    agent_run_state = engine.state
                     active_hypothesis = agent_run_state.active_hypothesis
                     assert active_hypothesis is not None  # noqa: S101  # started above
                     plan = active_hypothesis.plan
-                    _persist_agent_run_state(
+                    persist_agent_run_state(
                         ctx,
                         state_store,
                         agent_run_state,
@@ -2454,7 +2660,6 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     ctx.lprint(
                         f"[hypothesis] continuing {plan.hypothesis_id}; designer invocation skipped"
                     )
-
                 planned_official_reason = _official_evaluation_reason(
                     records=records,
                     round_number=round_number,
@@ -2463,13 +2668,14 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     requested=plan.request_official_evaluation,
                     candidate_ready=True,
                 )
-
-                # No early stop: the loop always consumes the full max_rounds
-                # budget. Previously OrchestratorPlan had a ``done`` field that
+                if outer_loop == "profile-guided" and engine.controller.guidance.active_component:
+                    planned_official_reason = (
+                        planned_official_reason or "profile-guided component measurement"
+                    )
+                # No early stop. Previously OrchestratorPlan had a ``done`` field that
                 # could halt the loop; it was removed because the orchestrator
                 # can't reliably tell when the objective is "fully met" and
                 # early-stopping masks further optimization opportunities.
-
                 # --- Optional rollback ---
                 if plan.revert_to_round is not None and not active_hypothesis.revert_applied:
                     target = next(
@@ -2507,7 +2713,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             active_hypothesis.revert_applied = True
                             active_hypothesis.revert_commit = rollback_commit
                             active_hypothesis.parent_commit = rollback_commit
-                            agent_run_state = _persist_active_hypothesis(
+                            agent_run_state = persist_active_hypothesis(
                                 ctx,
                                 state_store,
                                 agent_run_state,
@@ -2515,15 +2721,16 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                                 label=(f"agent: set hypothesis {plan.hypothesis_id} parent"),
                             )
                         else:
-                            ctx.lprint(
-                                "[warn] rollback was not applied; will retry round "
-                                f"{plan.revert_to_round} on the next continuation"
+                            output_sink().framework_warning(
+                                "rollback was not applied; will retry round "
+                                f"{plan.revert_to_round} on the next continuation",
+                                source=FrameworkSource.LOOP,
                             )
                     else:
-                        ctx.lprint(
-                            f"[warn] cannot revert: no commit recorded for round {plan.revert_to_round}"
+                        output_sink().framework_warning(
+                            f"cannot revert: no commit recorded for round {plan.revert_to_round}",
+                            source=FrameworkSource.LOOP,
                         )
-
                 # --- Implementer / Judge retry loop ---
                 # Round-scoped accumulators: these describe the round as a
                 # whole and intentionally survive every attempt (the best
@@ -2608,6 +2815,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             official_evaluation_due=(planned_official_reason is not None),
                             official_evaluation_reason=planned_official_reason,
                             prior_attempt_artifact_locations=prior_attempt_artifact_locations,
+                            profile_guidance=engine.controller.guidance,
                         )
                         implementation = attempt.response
                         if attempt.synthesized:
@@ -2727,7 +2935,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             if validation_feedback is not None:
                                 feedback = validation_feedback
                                 active_hypothesis.feedback = feedback
-                                agent_run_state = _persist_active_hypothesis(
+                                agent_run_state = persist_active_hypothesis(
                                     ctx,
                                     state_store,
                                     agent_run_state,
@@ -2754,7 +2962,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                                 active_hypothesis.gate_approved_candidate_retention_reason = (
                                     implementation.candidate_retention_reason
                                 )
-                                agent_run_state = _persist_active_hypothesis(
+                                agent_run_state = persist_active_hypothesis(
                                     ctx,
                                     state_store,
                                     agent_run_state,
@@ -2806,7 +3014,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                                 active_hypothesis.gate_approved_evaluation_artifact = (
                                     implementation.evaluation_artifact
                                 )
-                                agent_run_state = _persist_active_hypothesis(
+                                agent_run_state = persist_active_hypothesis(
                                     ctx,
                                     state_store,
                                     agent_run_state,
@@ -2859,7 +3067,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             active_hypothesis.gate_candidate_commit = candidate_commit
                             active_hypothesis.gate_accuracy_passed = accuracy_passed
                             active_hypothesis.feedback = feedback
-                            agent_run_state = _persist_active_hypothesis(
+                            agent_run_state = persist_active_hypothesis(
                                 ctx,
                                 state_store,
                                 agent_run_state,
@@ -2869,7 +3077,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             continue
                         feedback = verdict.feedback
                         active_hypothesis.feedback = feedback
-                        agent_run_state = _persist_active_hypothesis(
+                        agent_run_state = persist_active_hypothesis(
                             ctx,
                             state_store,
                             agent_run_state,
@@ -2971,7 +3179,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             active_hypothesis.gate_candidate_commit = candidate_commit
                             active_hypothesis.gate_accuracy_passed = accuracy_passed
                             active_hypothesis.feedback = feedback
-                            agent_run_state = _persist_active_hypothesis(
+                            agent_run_state = persist_active_hypothesis(
                                 ctx,
                                 state_store,
                                 agent_run_state,
@@ -2981,14 +3189,13 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                             continue
                         feedback = single_agent_response.feedback
                         active_hypothesis.feedback = feedback
-                        agent_run_state = _persist_active_hypothesis(
+                        agent_run_state = persist_active_hypothesis(
                             ctx,
                             state_store,
                             agent_run_state,
                             active_hypothesis,
                             label=f"agent: checkpoint hypothesis {plan.hypothesis_id}",
                         )
-
                 # --- Record round result & update carry-over ---
                 # Only the final attempt describes the round, so its outcome is
                 # the one the record and the lifecycle transition read.
@@ -3117,7 +3324,6 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     candidate_evaluation_artifact = None
                     candidate_operating_point = ""
                     candidate_retention_reason = ""
-
                 # A framework-gate retry may correctly return no fresh candidate
                 # row. Preserve the judge-approved provisional evidence for the
                 # unchanged checkpoint just as canonical evidence is preserved.
@@ -3382,16 +3588,19 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                     next_active_hypothesis.next_step = (
                         implementation.next_step if implementation is not None else None
                     )
-                state_before_round = (
-                    update_active_hypothesis(agent_run_state, next_active_hypothesis)
-                    if next_active_hypothesis is not None
-                    else agent_run_state
+                profile_outcome = (
+                    ProfileGuidanceOutcome.from_round(
+                        round_number, passed, official_evaluation, perf_delta_pct
+                    )
+                    if outer_loop == "profile-guided"
+                    else None
                 )
-                next_agent_run_state = append_round(
-                    state_before_round,
+                engine = engine.replace_state(agent_run_state).complete_round(
                     completed_record,
-                    keep_active=next_active_hypothesis is not None,
+                    next_active=next_active_hypothesis,
+                    profile_outcome=profile_outcome,
                 )
+                next_agent_run_state = engine.state
                 state_transition = state_store.transition(next_agent_run_state)
                 ctx.begin_completed_round(
                     round_number,
@@ -3484,6 +3693,12 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
                 round_number += 1
 
         ctx.lprint(f"Reached max_rounds={max_rounds}. Stopping.")
+        _finalize_agent_run(
+            ctx,
+            records=records,
+            space=agent_run_state.metrics,
+            progress_path=progress_path,
+        )
         return True
     finally:
         ctx.close()

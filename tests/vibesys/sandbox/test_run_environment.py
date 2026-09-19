@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
+from tests.support import provider_profiles as fake_profiles
 
-from vibesys.agents import cli_docker
-from vibesys.agents.cli_docker import DockerAuthPath
 from vibesys.backends import SandboxKind
 from vibesys.constants import ComputeBackend
 from vibesys.domains.environment import EnvironmentBindMount
@@ -29,8 +28,13 @@ from vibesys.profilers import ProfilerKind
 from vibesys.sandbox.run_environment import (
     RunEnvironmentRequest,
     RunEnvironmentSpec,
+    _cli_container_env,
+    _cli_provider_env_and_auth_files,
+    _container_mount_plan,
+    _docker_agent_toolchains,
     _docker_evaluator_tool_mounts,
     _evaluator_container_setup,
+    _evaluator_tools,
     _EvaluatorToolBuildRequiredError,
     _resolve_docker_image_id,
     _SkyPilotRunEnvironmentSession,
@@ -40,9 +44,17 @@ from vibesys.sandbox.run_environment import (
     run_environment_record,
 )
 from vs_project import Project, RunEnvironmentRecord, RunResourceRequest
-from vs_sandbox import BeforeReadyContext, ProjectPathPolicy, SandboxLifecycle
+from vs_sandbox import (
+    BeforeReadyContext,
+    HostResource,
+    HostResourceAccess,
+    ProjectPathPolicy,
+    SandboxLifecycle,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
     from deepagents.backends.protocol import SandboxBackendProtocol
 
     from vibesys.backends.base import ContentionMonitor
@@ -52,6 +64,52 @@ if TYPE_CHECKING:
 # how the run environment expands and quotes nested shell argv, not any
 # particular candidate repository.
 NESTED_SHELL_PROJECT = Path(__file__).parent / "fixtures" / "nested_shell_project"
+
+
+def _as_mount_tuples(resources: Sequence[HostResource]) -> list[tuple[str, str, bool]]:
+    """Invert ``_resource_for_mount`` for assertions written against the old shape.
+
+    Lets tests keep comparing against plain ``(host, container, readonly)``
+    tuples after ``_container_mount_plan`` moved from raw bind mounts to a
+    ``HostResource`` list.
+    """
+    return [
+        (
+            str(resource.path),
+            resource.agent_path if resource.agent_path is not None else str(resource.path),
+            resource.access is HostResourceAccess.READ_ONLY,
+        )
+        for resource in resources
+    ]
+
+
+def _fake_agent_path(
+    host_workspace: str, resources: Sequence[HostResource]
+) -> Callable[[Path | str], str]:
+    """Build a lookup mirroring ``DockerSandbox.agent_path`` from the same inputs.
+
+    Longest host-prefix wins, exactly like the real sandbox, so a test can
+    assert on ``AgentPaths`` without starting a real container.
+    """
+    entries = [
+        (str(Path(host_workspace)), "/workspace"),
+        *(
+            (str(resource.path), resource.agent_path or str(resource.path))
+            for resource in resources
+        ),
+    ]
+    entries.sort(key=lambda pair: len(pair[0]), reverse=True)
+
+    def lookup(host_path: Path | str) -> str:
+        normalized = str(Path(host_path))
+        for host_prefix, container_prefix in entries:
+            if normalized == host_prefix:
+                return container_prefix
+            if normalized.startswith(host_prefix + "/"):
+                return container_prefix + normalized[len(host_prefix) :]
+        return normalized
+
+    return lookup
 
 
 class FakeBackend:
@@ -67,6 +125,13 @@ class FakeBackend:
 
     def make_sandbox(self, kind: SandboxKind, **kwargs: Any) -> SandboxBackendProtocol:  # noqa: ANN401  # tracked: #288
         self.calls.append((kind, kwargs))
+        if kind is SandboxKind.DOCKER:
+            # A real DockerSandbox derives agent_path from (host_workspace,
+            # resources); give the mock the same behavior so AgentPaths
+            # assertions exercise the real lookup instead of a bare Mock.
+            self.sandbox.agent_path.side_effect = _fake_agent_path(
+                kwargs.get("host_workspace", ""), kwargs.get("resources", ())
+            )
         return self.sandbox
 
     def make_monitor(self, log_dir: Path) -> ContentionMonitor | None:  # noqa: ARG002  # tracked: #288
@@ -167,16 +232,98 @@ def _run_rootless_rust_setup(
     )
 
 
+#: The profiles these tests drive container setup with. agentshim registers
+#: `claude` only in the release VibeSys builds against, so `codex` is supplied
+#: here rather than depending on when the library ships it.
+_CLI_PROFILES = {
+    "claude": fake_profiles.profile(
+        "claude",
+        state_dirs=(".claude", ".claude.json", ".config/claude"),
+        auth_files=(".claude/.credentials.json", ".claude.json"),
+        auth_env_vars=(
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+        ),
+        container_install=("install-claude",),
+    ),
+    "codex": fake_profiles.profile(
+        "codex",
+        state_dirs=(".codex", ".config/codex"),
+        auth_files=(".codex/auth.json",),
+        auth_env_vars=("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        container_install=("install-codex",),
+    ),
+}
+
+
+@pytest.fixture(autouse=True)
+def fake_agent_image(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Stub the real Docker build behind ``agent_image`` for every Docker-path test.
+
+    ``DockerEnvironment.open()`` always resolves an agent image before
+    starting the container now; letting it shell out to a real ``docker
+    build`` would make these unit tests into (slow, Docker-dependent)
+    integration tests. Returns the recorded calls so a test can assert on the
+    base image and toolchains it was asked to build.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def fake_agent_image(
+        base_image: str,
+        *,
+        toolchains: Any = (),  # noqa: ANN401  # tracked: #288
+        pip_extras: Any = (),  # noqa: ANN401  # tracked: #288
+        **_kwargs: Any,  # noqa: ANN401  # tracked: #288
+    ) -> str:
+        calls.append(
+            {
+                "base_image": base_image,
+                "toolchains": frozenset(toolchains),
+                "pip_extras": frozenset(pip_extras),
+            }
+        )
+        return "sha256:" + "a" * 64
+
+    monkeypatch.setattr("vibesys.sandbox.images.agent_image", fake_agent_image)
+    return calls
+
+
+_PUSHED_DIGEST = "ghcr.io/uw-syfi/vibesys-agent@sha256:" + "b" * 64
+
+
+@pytest.fixture(autouse=True)
+def fake_ensure_pushed(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub the registry push behind ``ensure_pushed`` for Modal/SkyPilot tests.
+
+    A real push hits the network and a logged-in Docker daemon; letting it
+    run would make these unit tests flaky integration tests. Returns the
+    image IDs it was asked to push, and always reports the same
+    ``repository@sha256:...``-shaped reference, so a test can assert a
+    Modal or SkyPilot sandbox is started from *that* digest.
+    """
+    calls: list[str] = []
+
+    def fake_ensure_pushed(image_id: str, **_kwargs: Any) -> str:  # noqa: ANN401  # tracked: #288
+        calls.append(image_id)
+        return _PUSHED_DIGEST
+
+    monkeypatch.setattr("vibesys.sandbox.images.ensure_pushed", fake_ensure_pushed)
+    return calls
+
+
 @pytest.fixture(autouse=True)
 def _synthetic_cli_auth(monkeypatch):  # noqa: ANN001, ANN202
     """Pin a deterministic host auth source for container CLI setup.
 
-    ``_cli_container_setup`` fails loud when a provider has neither a staged
+    ``_cli_container_env`` fails loud when a provider has neither a staged
     host file nor an auth environment variable, so these tests must not depend
     on whichever CLI the developer running them happens to be logged into.
     """
-    for names in cli_docker.DOCKER_AUTH_ENV_VARS.values():
-        for name in names:
+    fake_profiles.install(monkeypatch, _CLI_PROFILES)
+    for profile in _CLI_PROFILES.values():
+        for name in profile.auth_env_vars:
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai-key")
 
@@ -312,7 +459,10 @@ def test_local_environment_materializes_effective_objective_outside_workspace(tm
     assert not objective_path.is_relative_to(tmp_path / "workspace")
 
 
-def test_docker_environment_opens_one_started_sandbox_with_agent_paths(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+def test_docker_environment_opens_one_started_sandbox_with_agent_paths(
+    tmp_path: Path,
+    fake_agent_image: list[dict[str, Any]],
+) -> None:
     backend = FakeBackend()
     env = build_run_environment(RunEnvironmentSpec("docker"))
 
@@ -333,6 +483,11 @@ def test_docker_environment_opens_one_started_sandbox_with_agent_paths(tmp_path)
     assert session.view.paths.benchmark_command == "uv run python benchmark/benchmark.py"
     assert backend.calls[0][1]["extra_env"]["UV_CACHE_DIR"] == "/workspace/.cache/uv"
     assert backend.calls[0][1]["lifecycle_hooks"] == []
+    # The container always starts from a resolved agent image, built from the
+    # backend's own base image, even when the run needs no evaluator tools.
+    assert backend.calls[0][1]["container_image"] == "sha256:" + "a" * 64
+    assert fake_agent_image[-1]["base_image"] == backend.image
+    assert fake_agent_image[-1]["toolchains"] == frozenset()
     backend.sandbox.start.assert_called_once()
 
     session.close()
@@ -362,7 +517,10 @@ def test_symlink_lifecycle_hooks_reject_failed_setup() -> None:
     sandbox.save_symlink_commands.assert_not_called()
 
 
-def test_isolated_environment_mounts_and_translates_evaluator_package(tmp_path: Path) -> None:
+def test_isolated_environment_mounts_and_translates_evaluator_package(
+    tmp_path: Path,
+    fake_agent_image: list[dict[str, Any]],
+) -> None:
     backend = FakeBackend()
     env = build_run_environment(RunEnvironmentSpec("docker"))
     package = resolve_evaluator_package(
@@ -399,12 +557,11 @@ def test_isolated_environment_mounts_and_translates_evaluator_package(tmp_path: 
         str(package.root),
         "/opt/vibesys-evaluator-package",
         True,
-    ) in backend.calls[0][1]["bind_mounts"]
-    init_commands = backend.calls[0][1]["extra_init_commands"]
-    assert any("go1.23.12" in item for item in init_commands)
-    assert any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
-    assert any("--no-modify-path" in item for item in init_commands)
-    assert any("cargo --version" in item for item in init_commands)
+    ) in _as_mount_tuples(backend.calls[0][1]["resources"])
+    # The evaluator package's declared toolchains (go, rust) are baked into
+    # the agent image at build time now, not installed per-run.
+    assert "extra_init_commands" not in backend.calls[0][1]
+    assert fake_agent_image[-1]["toolchains"] == frozenset({"go", "rust"})
 
 
 def test_rootless_rust_setup_replaces_broken_rustup_cargo_shim(tmp_path: Path) -> None:
@@ -546,8 +703,8 @@ def test_isolated_environments_install_and_translate_evaluator_tools(
             lambda _request, _tools, **_kwargs: [(str(built_root), str(container_root), True)],
         )
         monkeypatch.setattr(
-            "vibesys.sandbox.run_environment._resolve_docker_image_id",
-            lambda _image: "sha256:pinned",
+            "vibesys.sandbox.images.agent_image",
+            lambda *_args, **_kwargs: "sha256:pinned",
         )
 
     session = env.open(
@@ -563,7 +720,6 @@ def test_isolated_environments_install_and_translate_evaluator_tools(
     rendered = session.view.paths.benchmark_command or ""
     assert "${TOOL:" not in rendered
     assert "evaluator-tools" in rendered
-    init_commands = backend.calls[0][1]["extra_init_commands"]
     if environment_name == "docker":
         assert "/opt/vibesys-evaluator-tools" in rendered
         assert backend.calls[0][1]["container_image"] == "sha256:pinned"
@@ -571,9 +727,18 @@ def test_isolated_environments_install_and_translate_evaluator_tools(
             isinstance(hook, EvaluatorToolLifecycleHooks)
             for hook in backend.calls[0][1]["lifecycle_hooks"]
         )
-        assert (str(built_root), str(container_root), True) in backend.calls[0][1]["bind_mounts"]
-        assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
+        assert (str(built_root), str(container_root), True) in _as_mount_tuples(
+            backend.calls[0][1]["resources"]
+        )
+        # Cargo-git tools are prebuilt and mounted read-only; nothing installs
+        # Rust in the running container.
+        assert "extra_init_commands" not in backend.calls[0][1]
     else:
+        # The local editor container starts from a prebuilt agent image and
+        # installs nothing at start; the evaluator's own toolchain setup
+        # (checked below) travels as an argument to the remote evaluator
+        # helper script, not as a container init command.
+        assert "extra_init_commands" not in backend.calls[0][1]
         arguments = shlex.split(rendered)
         separator = arguments.index("--")
         assert arguments[separator + 1].startswith(".vibesys-evaluator-tools/request-factory/")
@@ -593,7 +758,6 @@ def test_isolated_environments_install_and_translate_evaluator_tools(
         assert arguments[arguments.index("--evaluator-package-root") + 1] == (
             "/opt/vibesys-evaluator-package"
         )
-        assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
 
 
 def test_docker_evaluator_tools_use_ephemeral_builder_and_read_only_final_mounts(
@@ -790,7 +954,10 @@ def test_environment_rejects_semantic_tokens_in_top_level_executable_source(
         )
 
 
-def test_microservice_package_does_not_install_rust(tmp_path: Path) -> None:
+def test_microservice_package_does_not_install_rust(
+    tmp_path: Path,
+    fake_agent_image: list[dict[str, Any]],
+) -> None:
     backend = FakeBackend()
     env = build_run_environment(RunEnvironmentSpec("docker"))
     package = resolve_evaluator_package(
@@ -810,9 +977,7 @@ def test_microservice_package_does_not_install_rust(tmp_path: Path) -> None:
         )
     )
 
-    init_commands = backend.calls[0][1]["extra_init_commands"]
-    assert any("go1.23.12" in item for item in init_commands)
-    assert not any("static.rust-lang.org/rustup/dist" in item for item in init_commands)
+    assert fake_agent_image[-1]["toolchains"] == frozenset({"go"})
 
 
 def test_docker_environment_mounts_effective_objective_read_only(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -828,9 +993,62 @@ def test_docker_environment_mounts_effective_objective_read_only(tmp_path):  # n
         str(host_path),
         "/opt/vibesys-runtime/objective.md",
         True,
-    ) in backend.calls[0][1]["bind_mounts"]
+    ) in _as_mount_tuples(backend.calls[0][1]["resources"])
     assert "/opt/vibesys-runtime" in backend.calls[0][1]["passthrough_paths"]
     assert session.view.paths.objective == "/opt/vibesys-runtime/objective.md"
+
+
+def test_local_environment_objective_defaults_to_the_bare_workspace_relative_name(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    """The host answer for an unset objective is identity: no lookup, no rewrite."""
+    backend = FakeBackend()
+    env = build_run_environment(RunEnvironmentSpec("local"))
+
+    session = env.open(_request(tmp_path, backend))
+
+    assert session.view.paths.objective == "OBJECTIVE.md"
+
+
+def test_container_mount_plan_declares_named_resources_with_agent_paths(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    """``_container_mount_plan`` returns ``HostResource`` entries, not bind-mount
+    tuples, with ``access`` and ``agent_path`` set for every named mount."""
+    backend = FakeBackend()
+    history = tmp_path / "experiment-history"
+    history.mkdir()
+    package_root = tmp_path / "evaluator-package"
+    package_root.mkdir()
+    request = _request(
+        tmp_path,
+        backend,
+        objective="Optimize the service.\n",
+        git_history_root=history,
+        evaluator_package_root=package_root,
+        agent_backend="cli",
+        cli_provider="codex",
+    )
+
+    resources, _symlinks, passthrough = _container_mount_plan(request)
+
+    assert all(isinstance(resource, HostResource) for resource in resources)
+    by_agent_path = {resource.agent_path: resource for resource in resources}
+
+    objective_resource = by_agent_path["/opt/vibesys-runtime/objective.md"]
+    assert objective_resource.access is HostResourceAccess.READ_ONLY
+    assert objective_resource.path == tmp_path / "logs" / "effective-objective.md"
+
+    history_resource = by_agent_path["/opt/vibesys-history"]
+    assert history_resource.access is HostResourceAccess.READ_ONLY
+    assert history_resource.path == history
+
+    package_resource = by_agent_path["/opt/vibesys-evaluator-package"]
+    assert package_resource.access is HostResourceAccess.READ_ONLY
+    assert package_resource.path == package_root
+
+    framework_resource = by_agent_path["/opt/vibesys"]
+    assert framework_resource.access is HostResourceAccess.READ_ONLY
+    assert framework_resource.path == request.framework_root
+
+    assert "/opt/vibesys-runtime" in passthrough
+    assert "/opt/vibesys-history" in passthrough
 
 
 @pytest.mark.parametrize("environment_name", ["docker", "modal"])
@@ -858,7 +1076,7 @@ def test_isolated_environment_enforces_project_path_policy(tmp_path, environment
         )
     )
 
-    mounts = backend.calls[0][1]["bind_mounts"]
+    mounts = _as_mount_tuples(backend.calls[0][1]["resources"])
     assert (str(project / ".git"), "/workspace/.git", True) in mounts
     assert (str(project / ".state"), "/workspace/.state", True) in mounts
     assert (
@@ -877,25 +1095,68 @@ def test_isolated_environment_enforces_project_path_policy(tmp_path, environment
     assert hidden_mounts["/workspace/agent.toml"].is_relative_to(tmp_path / "logs")
 
 
+def test_cli_container_env_and_setup_agree_on_the_container_environment(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
+    """``_cli_provider_env_and_auth_files`` (Modal/SkyPilot) agrees with
+    ``_cli_container_env`` (the plain Docker path) on the container
+    environment, and additionally returns the staged auth copy pairs a
+    prebuilt-image container needs instead of a shell install recipe.
+    """
+    backend = FakeBackend()
+    home = tmp_path / "synthetic-home"
+    auth_file = home / ".codex" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text('{"synthetic": true}\n')
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+    request = _request(tmp_path, backend, agent_backend="cli", cli_provider="codex")
+
+    resolved = _cli_container_env(request)
+    env, auth_files = _cli_provider_env_and_auth_files(request)
+
+    assert resolved is not None
+    provider, resolved_env = resolved
+    assert provider == "codex"
+    assert env == resolved_env
+    assert auth_files == [("/opt/vibesys-auth/0", "/home/agent/.codex/auth.json")]
+
+
+def test_cli_container_env_is_none_for_a_non_cli_agent_backend(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    backend = FakeBackend()
+    request = _request(tmp_path, backend, agent_backend="deepagents", cli_provider="codex")
+
+    assert _cli_container_env(request) is None
+
+
+def test_docker_agent_toolchains_adds_rust_only_when_tools_are_needed(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    backend = FakeBackend()
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(
+            name="vibesys-evaluator-request-factory",
+            version="0.1.0",
+        )
+    )
+    request = _request(tmp_path, backend, evaluator_package_root=package.root)
+
+    assert "rust" in _docker_agent_toolchains(request, _evaluator_tools(request))
+    assert _docker_agent_toolchains(_request(tmp_path, backend), {}) == frozenset()
+
+
 def test_docker_environment_copies_cli_auth_from_readonly_staging(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
     backend = FakeBackend()
     env = build_run_environment(RunEnvironmentSpec("docker"))
-    auth_file = tmp_path / "synthetic-codex-home" / "auth.json"
-    auth_file.parent.mkdir()
+    home = tmp_path / "synthetic-home"
+    auth_file = home / ".codex" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
     auth_file.write_text('{"synthetic": true}\n')
-    monkeypatch.setitem(
-        cli_docker.DOCKER_AUTH_PATHS,
-        "codex",
-        [DockerAuthPath(auth_file, "/root/.codex/auth.json")],
-    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
 
     env.open(_request(tmp_path, backend, agent_backend="cli", cli_provider="codex"))
 
     kwargs = backend.calls[0][1]
-    assert (str(auth_file), "/opt/vibesys-auth/0", True) in kwargs["bind_mounts"]
-    assert kwargs["extra_init_commands"][0] == (
-        "mkdir -p /root/.codex && cp -a /opt/vibesys-auth/0 /root/.codex/auth.json"
-    )
+    assert (str(auth_file), "/opt/vibesys-auth/0", True) in _as_mount_tuples(kwargs["resources"])
+    # The plain Docker path copies staged auth files into the agent HOME as a
+    # start-time DockerSandbox step, not via extra_init_commands.
+    assert "extra_init_commands" not in kwargs
+    assert kwargs["auth_files"] == [("/opt/vibesys-auth/0", "/home/agent/.codex/auth.json")]
 
 
 def test_docker_environment_forwards_host_cli_auth_environment(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
@@ -913,7 +1174,9 @@ def test_docker_environment_forwards_host_cli_auth_environment(tmp_path, monkeyp
     # VibeSys owns per-role model selection, so a host export must not reach
     # the container and override it.
     assert "ANTHROPIC_MODEL" not in container_env
-    assert container_env["IS_SANDBOX"] == "1"
+    # The agent image runs the CLI as the non-root "agent" user, so Claude's
+    # root-only IS_SANDBOX=1 escape hatch is no longer needed or forwarded.
+    assert "IS_SANDBOX" not in container_env
     assert container_env["PYTHONPATH"] == "/opt/vibesys"
 
 
@@ -923,18 +1186,16 @@ def test_docker_environment_rejects_a_cli_provider_without_any_auth_source(  # n
 ):
     backend = FakeBackend()
     env = build_run_environment(RunEnvironmentSpec("docker"))
-    monkeypatch.setitem(
-        cli_docker.DOCKER_AUTH_PATHS,
-        "codex",
-        [DockerAuthPath(tmp_path / "absent-codex-home" / "auth.json", "/root/.codex/auth.json")],
-    )
+    home = tmp_path / "absent-home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     with pytest.raises(ValueError, match="no 'codex' CLI authentication") as excinfo:
         env.open(_request(tmp_path, backend, agent_backend="cli", cli_provider="codex"))
 
     message = str(excinfo.value)
-    assert str(tmp_path / "absent-codex-home" / "auth.json") in message
+    assert str(home / ".codex" / "auth.json") in message
     assert "OPENAI_API_KEY" in message
     assert "OPENAI_BASE_URL" in message
     assert backend.calls == []
@@ -957,7 +1218,7 @@ def test_docker_environment_exposes_framework_git_history_read_only(tmp_path):  
     )
 
     kwargs = backend.calls[0][1]
-    assert (str(history), "/opt/vibesys-history", True) in kwargs["bind_mounts"]
+    assert (str(history), "/opt/vibesys-history", True) in _as_mount_tuples(kwargs["resources"])
     assert "/opt/vibesys-history" in kwargs["passthrough_paths"]
     assert kwargs["extra_env"]["VIBESYS_GIT_HISTORY"] == "/opt/vibesys-history"
     assert "/opt/vibesys-history" in session.view.prompt_notes
@@ -979,7 +1240,7 @@ def test_docker_environment_uses_environment_bind_mounts(tmp_path):  # noqa: ANN
     )
 
     kwargs = backend.calls[0][1]
-    assert (str(model_dir), "/model", True) in kwargs["bind_mounts"]
+    assert (str(model_dir), "/model", True) in _as_mount_tuples(kwargs["resources"])
     assert "/model" in kwargs["passthrough_paths"]
 
 
@@ -999,7 +1260,9 @@ def test_docker_environment_mounts_selected_profiler_support(tmp_path):  # noqa:
     )
 
     kwargs = backend.calls[0][1]
-    assert (str(support), "/workspace/fixture_profiler", True) in kwargs["bind_mounts"]
+    assert (str(support), "/workspace/fixture_profiler", True) in _as_mount_tuples(
+        kwargs["resources"]
+    )
     assert session.view.paths.profiler_support == "fixture_profiler"
 
 
@@ -1011,8 +1274,8 @@ def test_docker_environment_does_not_infer_model_mount_from_reference_dir(tmp_pa
 
     env.open(_request(tmp_path, backend, ref_dir=ref_dir))
 
-    bind_mounts = backend.calls[0][1]["bind_mounts"]
-    assert all(container_path != "/model" for _, container_path, _ in bind_mounts)
+    mounts = _as_mount_tuples(backend.calls[0][1]["resources"])
+    assert all(container_path != "/model" for _, container_path, _ in mounts)
 
 
 def test_environment_session_context_manager_closes(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1028,7 +1291,11 @@ def test_environment_session_context_manager_closes(tmp_path):  # noqa: ANN001, 
     backend.sandbox.stop.assert_called_once()
 
 
-def test_modal_environment_uses_local_docker_for_editing(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+def test_modal_environment_uses_local_docker_for_editing(
+    tmp_path,  # noqa: ANN001  # tracked: #288
+    fake_agent_image: list[dict[str, Any]],
+    fake_ensure_pushed: list[str],
+) -> None:
     """Post-refactor (April 2026): Modal mode runs the agent in a local
     Docker container; only GPU-bound work the implementer dispatches via
     `modal run` actually touches Modal."""
@@ -1040,6 +1307,11 @@ def test_modal_environment_uses_local_docker_for_editing(tmp_path):  # noqa: ANN
     # The sandbox is local Docker, not a Modal Sandbox.
     assert backend.calls[0][0] is SandboxKind.DOCKER
     assert backend.calls[0][1]["attach_accelerator"] is False
+    # The container starts from the same kind of agent image the plain
+    # Docker path builds, pushed to and pulled back from a registry.
+    assert fake_agent_image[-1]["base_image"] == backend.image
+    assert fake_ensure_pushed == ["sha256:" + "a" * 64]
+    assert backend.calls[0][1]["container_image"] == _PUSHED_DIGEST
     assert session.view.cli_sandboxed is True
     assert session.view.profile_execution == "remote"
     assert session.view.deployment_namespace is not None
@@ -1090,7 +1362,7 @@ def test_modal_environment_wraps_service_evaluators_with_remote_dispatch(tmp_pat
     assert session.view.framework_setup_timeout_seconds == 1200
     assert any(
         container_path == helper and read_only
-        for _, container_path, read_only in backend.calls[0][1]["bind_mounts"]
+        for _, container_path, read_only in _as_mount_tuples(backend.calls[0][1]["resources"])
     )
 
 
@@ -1123,19 +1395,41 @@ def test_modal_environment_wraps_custom_deployment_entrypoint(tmp_path) -> None:
     assert session.view.paths.benchmark_command == f"{prefix} trusted-benchmark"
 
 
-def test_modal_environment_installs_modal_sdk_in_docker(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    """The local Docker container needs the Modal Python SDK installed so
-    the implementer-authored `modal run` calls work."""
+def test_modal_environment_installs_nothing_at_container_start(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    """The local Docker container starts from a prebuilt, pushed agent image
+    and installs nothing at start, including the Modal Python SDK an earlier
+    revision `pip install`ed here: that install ran through
+    `extra_init_commands`, which `DockerSandbox` has ignored since the
+    agent-image work landed (#675), so it was already dead code."""
     backend = FakeBackend()
     env = build_run_environment(RunEnvironmentSpec("modal"))
 
     env.open(_request(tmp_path, backend, agent_backend="cli", cli_provider="codex"))
 
-    commands = backend.calls[0][1]["extra_init_commands"]
-    assert any("pip install" in c and "modal" in c for c in commands), (
-        f"expected `pip install modal` in init commands, got: {commands}"
-    )
+    assert "extra_init_commands" not in backend.calls[0][1]
     assert backend.calls[0][1]["extra_env"]["UV_CACHE_DIR"] == "/workspace/.cache/uv"
+
+
+def test_modal_environment_mounts_modal_auth_under_the_agent_home(tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
+    """The Modal SDK inside the editor container reads its token from the
+    HOME of the ``agent`` user the image runs as, so the host's
+    ``~/.modal.toml`` must land there, not under ``/root``. The first real
+    Modal round after #675 failed its accuracy gate with "Token missing"
+    because the mount still targeted root's HOME."""
+    backend = FakeBackend()
+    env = build_run_environment(RunEnvironmentSpec("modal"))
+    home = tmp_path / "synthetic-home"
+    home.mkdir()
+    (home / ".modal.toml").write_text("[profile]\ntoken_id = 'synthetic'\n")
+    (home / ".modal").mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+
+    env.open(_request(tmp_path, backend, agent_backend="cli", cli_provider="codex"))
+
+    mounts = _as_mount_tuples(backend.calls[0][1]["resources"])
+    assert (str(home / ".modal.toml"), "/home/agent/.modal.toml", True) in mounts
+    assert (str(home / ".modal"), "/home/agent/.modal", True) in mounts
+    assert not any(container.startswith("/root/") for _host, container, _ro in mounts)
 
 
 def test_modal_environment_prompt_references_runtime_document(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1159,7 +1453,7 @@ def test_modal_environment_prompt_references_runtime_document(tmp_path):  # noqa
     assert "GPU" in runtime
     assert any(
         container_path == "/opt/vibesys-runtime/environment.md" and read_only
-        for _, container_path, read_only in backend.calls[0][1]["bind_mounts"]
+        for _, container_path, read_only in _as_mount_tuples(backend.calls[0][1]["resources"])
     )
     assert "/opt/vibesys-runtime" in backend.calls[0][1]["passthrough_paths"]
     # Tell the agent where to look up volume names rather than baking them in.
@@ -1207,7 +1501,7 @@ def test_modal_environment_mounts_effective_objective_read_only(tmp_path):  # no
         str(host_path),
         "/opt/vibesys-runtime/objective.md",
         True,
-    ) in backend.calls[0][1]["bind_mounts"]
+    ) in _as_mount_tuples(backend.calls[0][1]["resources"])
     assert session.view.paths.objective == "/opt/vibesys-runtime/objective.md"
 
 
@@ -1255,7 +1549,7 @@ def test_modal_environment_documents_history_and_exact_measurement_source(tmp_pa
     kwargs = backend.calls[0][1]
     notes = _modal_runtime_document(tmp_path)
 
-    assert (str(history), "/opt/vibesys-history", True) in kwargs["bind_mounts"]
+    assert (str(history), "/opt/vibesys-history", True) in _as_mount_tuples(kwargs["resources"])
     assert kwargs["extra_env"]["VIBESYS_GIT_HISTORY"] == "/opt/vibesys-history"
     assert "git -c safe.directory=/opt/vibesys-history" in notes
     assert "ls-tree -r --name-only <commit>" in notes
@@ -1362,7 +1656,10 @@ def test_unknown_environment_name_raises():  # noqa: ANN201  # tracked: #288
 
 
 def test_skypilot_environment_uses_cpu_editor_and_narrow_bridge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_agent_image: list[dict[str, Any]],
+    fake_ensure_pushed: list[str],
 ) -> None:
     profiles = tmp_path / "clusters.toml"
     profiles.write_text(
@@ -1416,7 +1713,15 @@ remote_artifact_root = "/remote/vibesys"
     kind, kwargs = backend.calls[0]
     assert kind is SandboxKind.DOCKER
     assert kwargs["attach_accelerator"] is False
-    mounts = kwargs["bind_mounts"]
+    # The local editor container starts from the same kind of pushed agent
+    # image the plain Docker path builds, and installs nothing at start; this
+    # is unrelated to the accelerator job's own `image_id`, which stays the
+    # operator-declared `remote_runtime_image` from the cluster profile.
+    assert fake_agent_image[-1]["base_image"] == backend.image
+    assert fake_ensure_pushed == ["sha256:" + "a" * 64]
+    assert kwargs["container_image"] == _PUSHED_DIGEST
+    assert "extra_init_commands" not in kwargs
+    mounts = _as_mount_tuples(kwargs["resources"])
     assert any(target == "/opt/vibesys-skypilot/bridge.sock" for _, target, _ in mounts)
     assert any(target == "/opt/vibesys-skypilot-evaluator.py" for _, target, _ in mounts)
     assert all(".ssh" not in source and ".sky" not in source for source, _, _ in mounts)
@@ -1658,3 +1963,117 @@ def test_modal_environment_prompt_notes_cover_seeded_checkouts(tmp_path):  # noq
     unseeded_notes = _modal_runtime_document(unseeded_dir)
     assert "add_local_dir('vllm'" not in unseeded_notes
     assert "seeded starting-point" not in unseeded_notes.lower()
+
+
+def test_docker_modal_and_skypilot_build_the_same_kind_of_sandbox_from_one_resource_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Docker, Modal, and SkyPilot all put the agent in a ``SandboxKind.DOCKER``
+    editor container built from the same resource list (#679): only GPU-bound
+    work dispatches remotely (the candidate's own ``modal run`` entrypoint, or
+    a SkyPilot job), the agent itself never runs in a ``ModalSandbox`` or any
+    other remote sandbox kind.
+    """
+    home = tmp_path / "synthetic-home"
+    auth_file = home / ".codex" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text('{"synthetic": true}\n')
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+
+    package = resolve_evaluator_package(
+        EvaluatorPackageRequirement(name="vibesys-evaluator-queue", version="0.1.0")
+    )
+
+    def _open(env_name: str, env: Any, backend: FakeBackend, **overrides: Any) -> None:  # noqa: ANN401  # tracked: #288
+        root = tmp_path / env_name
+        root.mkdir()
+        env.open(
+            _request(
+                root,
+                backend,
+                objective="Optimize the service.\n",
+                evaluator_package_root=package.root,
+                agent_backend="cli",
+                cli_provider="codex",
+                **overrides,
+            )
+        )
+
+    docker_backend = FakeBackend()
+    _open("docker", build_run_environment(RunEnvironmentSpec("docker")), docker_backend)
+
+    modal_backend = FakeBackend()
+    _open("modal", build_run_environment(RunEnvironmentSpec("modal")), modal_backend)
+
+    profiles = tmp_path / "clusters.toml"
+    profiles.write_text(
+        """schema_version = 1
+[profiles.gpu]
+runner = "skypilot"
+infra = "slurm/example/gpu"
+accelerator_backend = "rocm"
+accelerator_type = "MI300A"
+accelerators_per_node = 4
+remote_artifact_root = "/remote/vibesys"
+"""
+    )
+
+    class _FakeBridge:
+        def __init__(self, **kwargs: Any) -> None:  # noqa: ANN401  # tracked: #288
+            self.socket_path = kwargs["socket_path"]
+
+        def start(self) -> None:
+            self.socket_path.write_text("socket")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("vibesys.sandbox.run_environment.SkyPilotBridge", _FakeBridge)
+    skypilot_backend = FakeBackend()
+    skypilot_env = build_run_environment(
+        make_run_environment_spec(
+            use_skypilot=True,
+            cluster_profile="gpu",
+            cluster_profiles_file=profiles,
+            resources=RunResourceRequest(
+                nodes=1, accelerators_per_node=4, accelerator_backend="rocm"
+            ),
+        )
+    )
+    _open("skypilot", skypilot_env, skypilot_backend, state_namespace=MagicMock())
+
+    backends = {"docker": docker_backend, "modal": modal_backend, "skypilot": skypilot_backend}
+
+    # (a) One sandbox kind across all three environments.
+    for env_name, backend in backends.items():
+        assert backend.calls[0][0] is SandboxKind.DOCKER, env_name
+
+    # (b) The common mount set declared by `_container_mount_plan` — the
+    # objective doc, the evaluator package, and the CLI auth/framework
+    # mounts — carries identical access and agent_path everywhere.
+    resources_by_env = {
+        env_name: {r.agent_path: r for r in backend.calls[0][1]["resources"]}
+        for env_name, backend in backends.items()
+    }
+    common_agent_paths = {
+        "/opt/vibesys-runtime/objective.md",
+        "/opt/vibesys-evaluator-package",
+        "/opt/vibesys",
+        "/opt/vibesys-auth/0",
+    }
+    for agent_path in common_agent_paths:
+        by_env = {env_name: mounts[agent_path] for env_name, mounts in resources_by_env.items()}
+        accesses = {resource.access for resource in by_env.values()}
+        assert accesses == {HostResourceAccess.READ_ONLY}, (agent_path, by_env)
+
+    # (c) Nothing outside the workspace-related mounts each plan legitimately
+    # marks writable (SkyPilot's caller-state bridge) is READ_WRITE.
+    legitimately_writable = {
+        "/opt/vibesys-skypilot/bridge.sock",
+        "/opt/vibesys-skypilot/caller-state",
+    }
+    for env_name, mounts in resources_by_env.items():
+        for agent_path, resource in mounts.items():
+            if resource.access is HostResourceAccess.READ_WRITE:
+                assert agent_path in legitimately_writable, (env_name, agent_path)

@@ -17,7 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "agentshim>=0.5.0",
+    "agentshim>=0.6.1,<0.7",
     "cbor2<6",
     "cryptography<50",
     "deepagents",
@@ -53,7 +53,7 @@ vibesys = "entrypoints.launcher:main"
 [tool.setuptools.package-data]
 # ``entrypoints/_tui`` is produced at build time by setup.py's build_py step;
 # the glob keeps it as package data when present.
-vibesys = ["prompts/*.j2", "prompts/**/*.j2", "prompts/**/*.md", "domains/README.md", "_resources/**/*", "_sdk/**/*"]
+vibesys = ["prompts/*.j2", "prompts/**/*.j2", "prompts/**/*.md", "domains/README.md", "_resources/**/*", "_sdk/**/*", "sandbox/images/**"]
 entrypoints = ["py.typed", "_tui/**/*"]
 server = ["py.typed"]
 vs_evaluator_protocol = ["py.typed"]
@@ -106,6 +106,10 @@ markers = [
     # maps it onto an xdist scheduling group so CI's `-n auto --dist loadgroup`
     # keeps these tests off each other's worker.
     "serial: claims a process-wide or host-wide resource and must not run beside another such test",
+    # Real provider CLIs, real credentials, real network. Every such test is
+    # skipped unless its opt-in environment variable is set, so no addopts
+    # deselection is needed; the marker exists to select or exclude them.
+    "e2e: drives an installed agent CLI for real; opt in with VIBESYS_E2E_AGENTS=1",
 ]
 
 [tool.coverage.run]
@@ -172,6 +176,32 @@ allowlist = [
     # enforcement. See #298.
     "src/vibesys/_model_config/",
 ]
+
+[tool.vibesys.file_length]
+# God-file ceiling for first-party Python, in physical lines (`wc -l`).
+# Enforced by `scripts/check_file_length.py`. Ruff's C901/PL rules bound
+# individual functions but say nothing about how many of them one module may
+# accumulate, and `biome.json` has the TypeScript counterpart
+# (`style/noExcessiveLinesPerFile`) at the same 2000-line ceiling.
+max_lines = 2000
+
+# Directories scanned for `*.py`. Any path with a `tests` or `__pycache__`
+# component is skipped: long test modules are normal, and `biome.json`
+# exempts `*.test.ts` from its file-length rule for the same reason.
+roots = ["src", "libs", "scripts", "sdk"]
+
+# Temporary migration debt only. Do not add entries or raise recorded counts.
+# Remove each entry as its file is refactored below the ceiling. Exceeding a
+# recorded count fails, and an entry that drops back to 2000 or below is stale.
+# These counts record the existing debt on 2026-09-13.
+[tool.vibesys.file_length.allowlist]
+# The agent loop: round orchestration, agent invocation, and result handling in
+# one module. The largest single refactor target in the repo.
+"src/vibesys/loops/agent/loop.py" = 3704
+# CLI entry point; every subcommand's argument wiring lives here.
+"src/entrypoints/headless.py" = 2663
+# Sandbox run environment: setup, execution, and teardown across strategies.
+"src/vibesys/sandbox/run_environment.py" = 2253
 
 [tool.ruff]
 line-length = 100

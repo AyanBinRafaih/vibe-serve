@@ -1,17 +1,14 @@
 """Headless Python entry point for VibeSys runs.
 
-The loop is picked by ``--outer-loop {agent, plain, evolve}``:
+The loop is picked by ``--outer-loop {agent, profile-guided, plain, evolve}``:
 
-  "agent"  — an LLM Orchestrator decides per-round what to build next.
+  "agent" / "profile-guided": orchestrated hypothesis loops.
              Its issue board lives in the workspace as roadmap.md +
              progress.md, owned by the orchestrator.
-  "plain"  — deterministic outer loop. Its issue board is a structured
+  "plain": deterministic outer loop. Its issue board is a structured
              :class:`IssueBoard` (issues.json) that perf_eval files into
              and the implementer drains one issue at a time.
-  "evolve" — population-based evolutionary search.
-
-The TypeScript launcher owns interactive orchestration. This module owns
-Python-side argument parsing, validation, and loop dispatch.
+  "evolve": population-based evolutionary search.
 """
 
 from __future__ import annotations
@@ -28,6 +25,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from vibesys import boot_trace
+from vibesys import objective as _objective
+from vibesys.agents.provider_policy import SHIPPED_PROVIDERS
 from vibesys.config import Config, load_config
 from vibesys.constants import (
     KNOWN_COMPUTE_BACKENDS,
@@ -51,6 +50,7 @@ from vibesys.repository import (
 from vibesys.resource_paths import default_skill_roots
 from vibesys.run.events import CoreEventType, EventStatus, RunStartedData
 from vibesys.run.experiment_repo import ExperimentRepository
+from vibesys.run.git_events import NullGitTrackerEvents
 from vibesys.run.git_tracker import GitTracker
 from vibesys.run.integration import LocalRunIntegration, RunIntegration
 from vibesys.sandbox.run_environment import (
@@ -77,7 +77,10 @@ if TYPE_CHECKING:
 
 __all__ = ["PROJECT_ROOT"]
 
-_OUTER_LOOPS = ("agent", "plain", "evolve")
+_load_objective = _objective.load_objective
+_with_operator_constraints = _objective.with_operator_constraints
+
+_OUTER_LOOPS = ("agent", "profile-guided", "plain", "evolve")
 _MODALITIES = (
     "text_generation",
     "image_generation",
@@ -129,7 +132,6 @@ _RUN_ENVIRONMENT_OPTION_CLI_FIELDS: dict[str, str] = {
     "modal_model_volume": "model_volume",
     "modal_app": "app",
 }
-
 _AGENT_RESUME_CLI_FIELDS: dict[str, str] = {
     "inner_loop": "inner_loop",
     "interface": "interface",
@@ -438,7 +440,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "Which profiler to use between rounds. "
             "'none' to disable standalone profiling, "
             "'nsys' for NVIDIA Nsight Systems (needs /proc/driver/nvidia), "
-            "'torch' for torch.profiler (works in Modal sandboxes), "
+            "'torch' for torch.profiler (works under the Modal run environment), "
             "'neuron' for AWS neuron-explorer (Trainium/NeuronCores), "
             "'otel' for OpenTelemetry service/span/datastore latency on "
             "microservice benchmarks (opt-in; needs an instrumented input bundle), "
@@ -620,7 +622,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cli-provider",
-        choices=["claude", "gemini", "codex", "opencode"],
+        choices=list(SHIPPED_PROVIDERS),
         default=None,
         help=(
             "Which CLI tool to drive when --agent-backend=cli. Overrides "
@@ -1478,7 +1480,7 @@ def _switch_project_resume_branch(project_root: Path, run_id: str) -> None:
         return
     tracker = GitTracker(
         project_root,
-        log=lambda _message: None,
+        events=NullGitTrackerEvents(),
         run_id=run_id,
     )
     try:
@@ -1746,20 +1748,6 @@ def _load_selected_input(project_root: Path, task_name: str | None) -> InputBund
     if task_name is not None:
         raise ValueError("--task requires a project with .vibesys/tasks")  # noqa: TRY003
     return load_input_bundle(project_root)
-
-
-def _load_objective(bundle: InputBundle) -> str:
-    """Return the input bundle's objective text."""
-    return bundle.objective
-
-
-def _with_operator_constraints(objective: str, constraints: list[str]) -> str:
-    """Add run-specific invariants without mutating the input bundle."""
-    normalized = [constraint.strip() for constraint in constraints if constraint.strip()]
-    if not normalized:
-        return objective
-    lines = "\n".join(f"- {constraint}" for constraint in normalized)
-    return f"{objective.rstrip()}\n\n## Operator constraints\n\n{lines}\n"
 
 
 # ===========================================================================
@@ -2043,6 +2031,15 @@ def _validate_agent(args: argparse.Namespace) -> None:
         _configuration_error("Error: --judge-every must be >= 1.")
     if args.official_eval_every < 1:
         _configuration_error("Error: --official-eval-every must be >= 1.")
+    if (
+        getattr(args, "outer_loop", "agent") == "profile-guided"
+        and args.input_bundle.manifest.profile_guided is None
+    ):
+        _configuration_error(
+            "The profile-guided outer loop requires a [profile_guided] input section.",
+            code="missing_profile_guided_input",
+            stage="input_validation",
+        )
 
 
 def _run_agent(args: argparse.Namespace, integration: RunIntegration) -> None:
@@ -2057,7 +2054,7 @@ def _run_agent(args: argparse.Namespace, integration: RunIntegration) -> None:
         with boot_trace.span("import_run_agent_loop"):
             from vibesys.loops.agent.loop import run_agent_loop  # noqa: PLC0415  # tracked: #288
         with boot_trace.span("load_objective"):
-            objective = _with_operator_constraints(_load_objective(bundle), args.constraint)
+            objective = _with_operator_constraints(bundle.objective, args.constraint)
 
         existing = False
         exp_name = args.exp_name
@@ -2120,6 +2117,8 @@ def _run_agent(args: argparse.Namespace, integration: RunIntegration) -> None:
         remote_repo=args.repo,
         repo_visibility=args.repo_visibility,
         integration=integration,
+        outer_loop=getattr(args, "outer_loop", "agent"),
+        profile_guided=bundle.manifest.profile_guided,
     )
 
     if success:
@@ -2371,7 +2370,7 @@ def _run_evolve(args: argparse.Namespace, integration: RunIntegration) -> None:
     _prepare_experiment_repository(args, config)
     from vibesys.loops.evolve.loop import run_evolve_loop  # noqa: PLC0415  # tracked: #288
 
-    objective = _load_objective(bundle)
+    objective = bundle.objective
     space = _resolve_metric_space(args)
 
     existing = False
@@ -2533,6 +2532,7 @@ class _LoopCommand:
 
 _LOOP_COMMANDS: dict[str, _LoopCommand] = {
     "agent": _LoopCommand(_build_agent_parser, _validate_agent, _run_agent),
+    "profile-guided": _LoopCommand(_build_agent_parser, _validate_agent, _run_agent),
     "plain": _LoopCommand(_build_plain_parser, _validate_plain, _run_plain),
     "evolve": _LoopCommand(_build_evolve_parser, _validate_evolve, _run_evolve),
 }
@@ -2561,7 +2561,9 @@ def parse_cli_invocation(argv: list[str]) -> CliInvocation:
     loop_kind, remaining = _extract_loop_selection(argv)
     command = _LOOP_COMMANDS[loop_kind]
     parser = command.build_parser()
+    parser.prog = f"vibesys --outer-loop {loop_kind}"
     args = parser.parse_args(remaining)
+    args.outer_loop = loop_kind
     args.explicit_cli_dests = _explicit_cli_dests(parser, remaining)
     _normalize_runs_dir(args)
     _resolve_resume_args(args, loop_kind=loop_kind)

@@ -21,9 +21,9 @@ import {
   graphWindow,
   layoutAgentGraph,
   NODE_HEIGHT,
-  stageKinds,
 } from './agent-graph.js';
 import {agentRuntimeLabel} from './agent-runtime-label.js';
+import {fillLayer} from './box-fill.js';
 import {applyPaneFocus, paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
 import {elapsedLabel} from './previews.js';
 import type {Theme} from './theme.js';
@@ -46,7 +46,7 @@ const HEADING_ROWS = 1;
 /** Columns the transcript needs to stay worth reading beside the graph. */
 export const TRANSCRIPT_MIN = 42;
 /** Share of the terminal the graph takes when there is room for it. */
-const GRAPH_SHARE = 0.55;
+const GRAPH_SHARE = 0.4;
 
 function statusColor(theme: Theme, status: AgentPhase['status']): string {
   if (status === 'active') return theme.success;
@@ -76,12 +76,22 @@ function edgeColor(theme: Theme, tone: EdgeTone): string {
 }
 
 /**
- * Width for the Agents pane, or null when the terminal cannot carry the graph
- * beside a readable transcript. Derived from the terminal rather than fixed, so
- * a wide terminal gives the graph room while the transcript keeps its floor.
+ * A node's label at its widest, selected: caret, status marker, and kind. The
+ * graph is sized for it, so no name is ever cut and picking a node never moves
+ * the graph.
  */
-export function agentPaneWidth(terminalWidth: number, stageCount: number): number | null {
-  const bounds = graphPaneBounds(stageCount);
+function selectedLabelWidth(phase: AgentPhase): number {
+  return nodeLabel(phase, true).length;
+}
+
+/**
+ * Width for the Agents pane, or null when the terminal cannot carry a graph
+ * that names every agent in full beside a readable transcript; the stacked list
+ * takes over then. Derived from the terminal rather than fixed, so a wide
+ * terminal gives the graph room while the transcript keeps its floor.
+ */
+export function agentPaneWidth(terminalWidth: number, phases: AgentPhase[]): number | null {
+  const bounds = graphPaneBounds(phases, selectedLabelWidth);
   // Never narrower than the pane used to be: a one-stage round needs less room
   // than the heading above it, and a wrapped heading reads worse than slack.
   const floor = Math.max(bounds.min, STACKED_WIDTH);
@@ -92,15 +102,52 @@ export function agentPaneWidth(terminalWidth: number, stageCount: number): numbe
   return Math.min(ceiling, room, Math.max(floor, share));
 }
 
+export interface AgentMapLayout {
+  paneWidth: number;
+  graphWidth: number | null;
+  graphRows: number;
+}
+
+/**
+ * Resolve the pane geometry once, before rendering chooses an empty, stacked,
+ * or graph presentation. An explicit width comes from zoom mode: it always
+ * owns the pane width, but still falls back to the stacked presentation when
+ * the graph cannot name every agent in full.
+ */
+export function agentMapLayout(
+  terminalWidth: number,
+  phases: AgentPhase[],
+  widthOverride: number | undefined,
+  rows: number,
+): AgentMapLayout {
+  const graphWidth =
+    widthOverride === undefined
+      ? agentPaneWidth(terminalWidth, phases)
+      : widthOverride >= graphPaneBounds(phases, selectedLabelWidth).min
+        ? widthOverride
+        : null;
+  return {
+    paneWidth: widthOverride ?? graphWidth ?? STACKED_WIDTH,
+    graphWidth,
+    graphRows: Math.max(0, rows - PANE_VCHROME - HEADING_ROWS),
+  };
+}
+
 const AGENTS_TITLE = 'Agents';
 
 export class AgentMapView {
   readonly output: BoxRenderable;
+  /**
+   * Everything this view draws, in a box that outlives what it draws. `#clear`
+   * destroys the graph on every repaint, and while this pane is zoomed the
+   * command column is a child of `output` too: without the separation the first
+   * repaint after a zoom destroyed the command input along with the graph.
+   */
+  readonly #content: BoxRenderable;
   #theme: Theme;
   #renderedState: SessionState | null = null;
   #renderedWidth = 0;
   #renderedRows = 0;
-  #renderedFocus = false;
   #elapsedTimer: ReturnType<typeof setInterval> | null = null;
   #runningRound: {round: RoundSummary; text: TextRenderable} | null = null;
 
@@ -124,6 +171,15 @@ export class AgentMapView {
       title: paneTitle(AGENTS_TITLE, false),
       onMouseUp: () => this.controller.focusRound('agents'),
     });
+    this.#content = new BoxRenderable(renderer, {
+      id: 'agent-map-content',
+      width: '100%',
+      flexGrow: 1,
+      flexShrink: 1,
+      flexDirection: 'column',
+      onMouseUp: () => this.controller.focusRound('agents'),
+    });
+    this.output.add(this.#content);
   }
 
   applyTheme(theme: Theme): void {
@@ -133,50 +189,34 @@ export class AgentMapView {
   }
 
   /**
-   * `railWidth` is the column the rounds rail has taken, 0 when it is off
-   * screen. It sizes this pane against what is left, so the transcript keeps
-   * its floor beside a rail rather than being squeezed by it, and it says
-   * whether the rail is a surface the round keys can be on.
-   *
-   * `rows` is the pane's height including its border, the same budget the rail
-   * draws from. A round whose stages stack taller than that is windowed rather
-   * than drawn off the bottom of the pane; callers that manage their own height
-   * (tests driving the view directly) can omit it and get the unclamped graph.
+   * `rows` is the pane's height including its border. A round whose stages
+   * stack taller than that is windowed rather than drawn off the bottom of the
+   * pane; callers that manage their own height (tests driving the view
+   * directly) can omit it and get the unclamped graph.
    */
-  render(
-    state: SessionState,
-    widthOverride?: number,
-    railWidth = 0,
-    rows = Number.POSITIVE_INFINITY,
-  ): void {
+
+  render(state: SessionState, widthOverride?: number, rows = Number.POSITIVE_INFINITY): void {
     const phases = visiblePhases(state);
     // The pane's width follows the terminal, so a resize has to redraw even
-    // when the state is unchanged.
-    const width =
-      widthOverride ??
-      agentPaneWidth(this.renderer.terminalWidth - railWidth, stageKinds(phases).length);
-    const paneWidth = width ?? STACKED_WIDTH;
-    // A stale `rounds` focus lands here once the rail goes off screen, so the
-    // border follows the keys rather than the raw field: `keybindings` drives
-    // this pane in exactly that case, and a round view with no focus border on
-    // any pane is a view that does not say where its arrows go.
-    const focused =
-      state.roundFocus === 'agents' || (state.roundFocus === 'rounds' && railWidth === 0);
+    // when the state is unchanged. A zoom hands the pane the whole terminal,
+    // and one narrower than the graph needs stacks the agents rather than cut a
+    // name.
+    // Null either way means the stacked list: the pane is drawn at `paneWidth`
+    // whatever that decides.
+    const layout = agentMapLayout(this.renderer.terminalWidth, phases, widthOverride, rows);
     if (
       state === this.#renderedState &&
-      paneWidth === this.#renderedWidth &&
-      rows === this.#renderedRows &&
-      focused === this.#renderedFocus
+      layout.paneWidth === this.#renderedWidth &&
+      rows === this.#renderedRows
     ) {
       return;
     }
     // Selection and focus are drawn into the nodes, so a change to either is a
     // reason to redraw even when the phases are identical.
     this.#renderedState = state;
-    this.#renderedWidth = paneWidth;
+    this.#renderedWidth = layout.paneWidth;
     this.#renderedRows = rows;
-    this.#renderedFocus = focused;
-    this.output.width = paneWidth;
+    this.output.width = layout.paneWidth;
     // The pane that owns the arrow keys says so, the way every other focusable
     // surface in the client does. `focusedPane` is that single authority:
     // reading `roundFocus` directly lit this pane while a visualization too
@@ -184,26 +224,36 @@ export class AgentMapView {
     applyPaneFocus(this.output, this.#theme, AGENTS_TITLE, focusedPane(state) === 'agents');
     this.#clear();
     if (phases.length === 0) {
-      // A round the run has not reached has no agents, and never will until it
-      // runs. "Waiting" would suggest something is on its way.
-      const roundNumber = visibleRoundNumber(state);
-      const round =
-        roundNumber === null
-          ? null
-          : (stripRounds(state).find(item => item.number === roundNumber) ?? null);
-      this.output.add(
-        new TextRenderable(this.renderer, {
-          content:
-            round?.status === 'planned'
-              ? `Round ${roundNumber} has not run yet.`
-              : 'Waiting for phases…',
-          fg: this.#theme.textSubtle,
-          width: '100%',
-        }),
-      );
+      this.#renderEmptyState(state);
       return;
     }
 
+    this.#renderHeading(state, phases, layout.paneWidth);
+    this.#renderPhases(phases, state.selectedAgentKind, layout);
+    this.#syncElapsedTimer();
+  }
+
+  #renderEmptyState(state: SessionState): void {
+    // A round the run has not reached has no agents, and never will until it
+    // runs. "Waiting" would suggest something is on its way.
+    const roundNumber = visibleRoundNumber(state);
+    const round =
+      roundNumber === null
+        ? null
+        : (stripRounds(state).find(item => item.number === roundNumber) ?? null);
+    this.#content.add(
+      new TextRenderable(this.renderer, {
+        content:
+          round?.status === 'planned'
+            ? `Round ${roundNumber} has not run yet.`
+            : 'Waiting for phases…',
+        fg: this.#theme.textSubtle,
+        width: '100%',
+      }),
+    );
+  }
+
+  #renderHeading(state: SessionState, phases: AgentPhase[], paneWidth: number): void {
     const roundNumber = visibleRoundNumber(state);
     const round =
       roundNumber === null
@@ -234,20 +284,17 @@ export class AgentMapView {
         }),
       );
     }
-    this.output.add(headingRow);
+    this.#content.add(headingRow);
     // Elapsed time only advances while an agent is running, so the heading
     // ticks for exactly as long as one is.
     if (round !== null && hasActiveAgentTiming(round)) this.#runningRound = {round, text: heading};
-    if (width === null) this.#renderStacked(phases, state.selectedAgentKind);
+  }
+
+  #renderPhases(phases: AgentPhase[], selectedKind: string | null, layout: AgentMapLayout): void {
+    if (layout.graphWidth === null) this.#renderStacked(phases, selectedKind);
     else {
-      this.#renderGraph(
-        phases,
-        state.selectedAgentKind,
-        width,
-        Math.max(0, rows - PANE_VCHROME - HEADING_ROWS),
-      );
+      this.#renderGraph(phases, selectedKind, layout.graphWidth, layout.graphRows);
     }
-    this.#syncElapsedTimer();
   }
 
   destroy(): void {
@@ -271,17 +318,17 @@ export class AgentMapView {
     // out past the bottom border and simply never seen.
     const fitted = graphWindow(phases, graphRows);
     if (fitted.hidden > 0) {
-      this.output.add(
+      this.#content.add(
         new TextRenderable(this.renderer, {
           // The oldest attempts are the ones dropped, so the count points up at
-          // them the way the rounds rail points at the rounds above its window.
+          // them.
           content: `↑ ${fitted.hidden}`,
           fg: this.#theme.textSubtle,
           width: '100%',
         }),
       );
     }
-    const graph = layoutAgentGraph(fitted.phases, paneWidth - 4);
+    const graph = layoutAgentGraph(fitted.phases, paneWidth - 4, selectedLabelWidth);
     // The graph sits in the middle of the pane rather than hugging the heading:
     // a chain is a few rows tall and a pane is not. `area` centres, `canvas`
     // gives the absolutely positioned cells their origin.
@@ -301,7 +348,7 @@ export class AgentMapView {
       flexShrink: 0,
       onMouseUp: () => this.controller.focusRound('agents'),
     });
-    this.output.add(area);
+    this.#content.add(area);
     area.add(canvas);
     for (const run of edgeRuns(graph)) {
       canvas.add(
@@ -336,17 +383,26 @@ export class AgentMapView {
       // No horizontal padding: two columns of it is the difference between
       // "implementer" and "implement…" at the widths a four-stage round leaves.
       border: true,
-      borderStyle: 'rounded',
+      // Square, and not because of the fill: that sits on an inner layer
+      // (tui-conventions.md), so the shape is free either way and this is a
+      // look decision. A stage reads as a slot in a pipeline rather than as a
+      // card, and the map's edges arrive at its sides. Unconditional rather
+      // than square-only-when-selected, because swapping the shape on
+      // selection reads as the node becoming a different kind of object,
+      // which is why `PANE_BORDER` rejected the same swap for focus.
+      borderStyle: 'single',
       borderColor: selected
         ? this.#theme.borderFocus
         : phase.status === 'pending'
           ? this.#theme.borderStrong
           : color,
-      ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
       // Clicking a node filters the transcript to it, and clicking the selected
       // one clears the filter: the same toggle Tab and Esc give the keyboard.
       onMouseUp: () => this.controller.selectAgent(phase.kind),
     });
+    // Inside the frame, so the fill stops at the border line instead of
+    // painting the ring the edges arrive at (tui-conventions.md).
+    if (selected) fillLayer(box, `agent-${phase.kind}-${node.y}-fill`, this.#theme.selectedSurface);
     const inner = node.width - 2;
     box.add(
       new TextRenderable(this.renderer, {
@@ -377,9 +433,9 @@ export class AgentMapView {
   /** The pane before the graph: used when the terminal is too narrow for it. */
   #renderStacked(phases: AgentPhase[], selectedKind: string | null): void {
     for (const [index, phase] of phases.entries()) {
-      this.output.add(this.#renderStackedPhase(phase, selectedKind === phase.kind));
+      this.#content.add(this.#renderStackedPhase(phase, selectedKind === phase.kind));
       if (index < phases.length - 1) {
-        this.output.add(
+        this.#content.add(
           new TextRenderable(this.renderer, {
             content: '        ↓',
             fg: this.#theme.textSubtle,
@@ -400,16 +456,19 @@ export class AgentMapView {
       paddingRight: 1,
       // Passing borderStyle without border draws a frame that the layout does
       // not reserve rows for, and the phase's lines then overlap it.
+      //
+      // Square for the same reason as `#renderNode`: this is that node in the
+      // stacked layout, so the two layouts read as one object.
       ...(selected
         ? {
             border: true,
-            borderStyle: 'rounded' as const,
+            borderStyle: 'single' as const,
             borderColor: this.#theme.borderFocus,
           }
         : {}),
-      ...(selected ? {backgroundColor: this.#theme.selectedSurface} : {}),
       onMouseUp: () => this.controller.selectAgent(phase.kind),
     });
+    if (selected) fillLayer(row, `agent-${phase.kind}-fill`, this.#theme.selectedSurface);
     const color = statusColor(this.#theme, phase.status);
     row.add(
       new TextRenderable(this.renderer, {
@@ -465,8 +524,8 @@ export class AgentMapView {
   #clear(): void {
     this.#runningRound = null;
     this.#stopElapsedTimer();
-    for (const child of [...this.output.getChildren()]) {
-      this.output.remove(child);
+    for (const child of [...this.#content.getChildren()]) {
+      this.#content.remove(child);
       child.destroyRecursively();
     }
   }
@@ -521,8 +580,8 @@ function truncate(text: string, width: number): string {
 
 /**
  * The agent-active elapsed time of the round on screen: wall clock minus the
- * gaps where no agent was running, which is what the rounds rail reports for
- * the running round.
+ * gaps where no agent was running, which is what the round tabs report for the
+ * live round.
  */
 function headingLabel(roundNumber: number | null, round: RoundSummary | null): string {
   if (roundNumber === null) return 'Run flow';

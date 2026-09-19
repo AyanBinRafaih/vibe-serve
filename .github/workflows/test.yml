@@ -3,15 +3,8 @@ name: Tests
 on:
   push:
     branches: [main]
-    # Skip CI for changes that can't affect backend correctness:
-    # pure-documentation changes and the Docusaurus site (checked separately
-    # by website.yml). Root-level Markdown, docs/, website/, and the website
-    # workflow itself are ignored by exact name, not `.github/workflows/**`,
-    # so edits to this workflow (or publish.yml) still run the full matrix.
-    # Markdown under resources/skills/ and test fixtures is consumed by
-    # prompt/skill snapshot tests, so it is deliberately not listed here. A
-    # change touching any non-ignored file still runs the full matrix
-    # (paths-ignore skips only when every changed file matches).
+    # Post-merge CI can still skip pure documentation and website changes.
+    # Pull-request CI always runs below so Required PR CI is always reported.
     paths-ignore:
       - '*.md'
       - 'docs/**'
@@ -19,11 +12,6 @@ on:
       - '.github/workflows/website.yml'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '*.md'
-      - 'docs/**'
-      - 'website/**'
-      - '.github/workflows/website.yml'
 
 env:
   # Wall-clock budget for a whole run, enforced as a warning by `ci-budget`
@@ -32,16 +20,17 @@ env:
   CI_WALL_TIME_BUDGET_SECONDS: '300'
 
 jobs:
-  # The workflow-level `paths-ignore` above already skips everything for
-  # docs-only changes. This job covers the case it deliberately cannot express:
-  # which *parts* of the tree a non-doc change can affect. It is the only place
-  # that decides, so a new job opts in by reading one of these outputs.
+  # This job decides which parts of the tree a change can affect. The workflow
+  # itself always runs so Required PR CI is always reported; expensive jobs opt
+  # in by reading these outputs and can skip for documentation-only changes.
   changes:
     runs-on: ubuntu-latest
     outputs:
       python: ${{ steps.filter.outputs.python }}
       tui: ${{ steps.filter.outputs.tui }}
       examples: ${{ steps.filter.outputs.examples }}
+      agent_image: ${{ steps.filter.outputs.agent_image }}
+      evaluators: ${{ steps.filter.outputs.evaluators }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,12 +39,27 @@ jobs:
         id: filter
         with:
           filters: |
-            # Ruff and ty never read clients/, so a change confined to the
-            # TypeScript workspace cannot change their verdict. Everything else
-            # (including this workflow) does.
+            # What `python-checks` actually reads: `ruff`/`lint-imports`'s
+            # source roots (`[tool.ruff] src` in pyproject.toml), the dirs
+            # `check_format.sh` also formats, and dependency/lint config.
+            # Deliberately coarse rather than chasing every edge case (e.g.
+            # `check_doc_links.py` also covers Markdown under `clients/`): the
+            # job is cheap, so an occasional unnecessary run costs less than
+            # the upkeep of a fully precise filter.
             python:
-              - '**'
-              - '!clients/**'
+              - 'src/**'
+              - 'tests/**'
+              - 'libs/**'
+              - 'sdk/**'
+              - 'scripts/**'
+              - '.github/delegated-merge.toml'
+              - '.github/workflows/delegated-merge.yml'
+              - 'examples/**'
+              - 'resources/**'
+              - '*.py'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.github/workflows/test.yml'
             # Mirrors the rebuild watch set the repository launcher uses in
             # src/entrypoints/launcher.py: the TUI is affected by the TypeScript
             # workspace itself and by the Python modules that feed the
@@ -89,6 +93,24 @@ jobs:
               - 'scripts/example_repositories.py'
               - 'tests/vibesys/test_microservice_inputs.py'
               - 'tests/vibesys/test_input_sources.py'
+              - '.github/workflows/test.yml'
+            # The agent image build: its Dockerfile, the module that builds
+            # it, and the version pins it takes as build args.
+            agent_image:
+              - 'src/vibesys/sandbox/images/**'
+              - 'src/vibesys/sandbox/images.py'
+              - 'src/vibesys/agents/provider_policy.py'
+              - '.github/workflows/test.yml'
+            # What `queue-native` builds and tests: the queue evaluator and its
+            # native runner, the queue and priority-queue reference
+            # candidates, the evaluator SDK, and the microservice evaluator.
+            evaluators:
+              - 'resources/evaluators/queue/**'
+              - 'resources/evaluators/microservice/**'
+              - 'examples/data-structures/repositories/queue-rs/**'
+              - 'examples/evaluators/priority-queue/**'
+              - 'examples/starters/priority-queue-rs/**'
+              - 'sdk/vs-evaluator/vseval/**'
               - '.github/workflows/test.yml'
 
   # One environment setup for every cheap Python check. Issue #89 split these
@@ -125,6 +147,13 @@ jobs:
       - name: Check Python lint
         run: ./scripts/check_lint.sh
 
+      # Ruff bounds individual functions (C901, PL) but not module size, so a
+      # file can grow without bound while every function in it stays legal.
+      # Ratchets against the allowlist in [tool.vibesys.file_length]; the
+      # TypeScript counterpart rides `pnpm check:ts` in the `tui` job.
+      - name: Check Python file length
+        run: uv run python scripts/check_file_length.py
+
       - name: Check Python package boundaries
         run: uv run lint-imports
 
@@ -140,10 +169,10 @@ jobs:
       - name: Test repository launcher
         run: uv run vibesys --headless --help >/dev/null
 
-  # Fully independent: no `needs:`, so it starts with the run rather than after
-  # the filter, and nothing waits on it. Type checking is not sequenced with
-  # anything else, and at ~20s it is not worth a filter's latency.
+  # Python type checking is unnecessary when the Python watch set is untouched.
   typecheck:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -256,6 +285,8 @@ jobs:
           bun "$deploy_dir/dist/self-test.js"
 
   queue-native:
+    needs: changes
+    if: needs.changes.outputs.evaluators == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -431,11 +462,46 @@ jobs:
           go run ./cmd/servicebench --workload "$GITHUB_WORKSPACE/examples/microservices/repositories/deathstarbench/.vibesys/tasks/social-network-read-timeline/benchmark/workload.toml" --validate-only
           go run ./cmd/servicebench --workload "$GITHUB_WORKSPACE/examples/microservices/repositories/deathstarbench/.vibesys/tasks/hotel-reservation/benchmark/workload.toml" --telemetry-command-json '["go","run","./cmd/otelcapture","--input-json","/tmp/vibesys-hotel-traces.otlp.ndjson","--settle-seconds","5"]' --telemetry-output /tmp/vibesys-hotel-telemetry.json --telemetry-timeout 60 --validate-only
           go run ./cmd/servicebench --mode accuracy --workload "$GITHUB_WORKSPACE/examples/microservices/repositories/deathstarbench/.vibesys/tasks/hotel-reservation/benchmark/workload.toml" --validate-only
+          go run ./cmd/servicebench --workload "$GITHUB_WORKSPACE/examples/microservices/hotel-correctness/benchmark/workload.toml" --telemetry-command-json '["go","run","./cmd/otelcapture","--input-json","/tmp/vibesys-hotel-traces.otlp.ndjson","--settle-seconds","5"]' --telemetry-output /tmp/vibesys-hotel-telemetry.json --telemetry-timeout 60 --validate-only
+          go -C "$GITHUB_WORKSPACE/examples/microservices/hotel-correctness/evaluator" run ./cmd/hotel-correctness --mode accuracy --workload "$GITHUB_WORKSPACE/examples/microservices/hotel-correctness/benchmark/workload.toml" --validate-only
 
-  # Deliberately unfiltered: several tests read clients/ directly (packaging,
-  # theme, and distribution tests), so a TypeScript-only change still needs
-  # this job.
+  # Builds the CPU agent image for real and runs every shipped CLI inside it
+  # as the non-root `agent` user (issue #675). ubuntu-latest ships Docker, so
+  # no separate engine setup is needed. Filtered narrowly: only a change that
+  # can actually change the image's contents pays for this job's build time.
+  agent-image:
+    needs: changes
+    if: needs.changes.outputs.agent_image == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Build the CPU agent image and run every shipped CLI in it
+        env:
+          VIBESYS_E2E_DOCKER: "1"
+        run: uv run pytest tests/e2e/test_agent_image_e2e.py -v -s --no-cov
+
+  # Several tests read clients/ directly (packaging, theme, and distribution
+  # tests), so a TypeScript-only change still needs this job. Documentation-only
+  # changes do not.
   test:
+    needs: changes
+    if: >-
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.tui == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -500,6 +566,8 @@ jobs:
   # forces the tests to run — VIBESYS_REQUIRE_SANDBOX_TESTS=1 turns a missing or
   # broken sandbox into a failure instead of a silent skip.
   sandbox-linux:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -536,13 +604,15 @@ jobs:
       - name: Run workspace-confinement tests
         env:
           VIBESYS_REQUIRE_SANDBOX_TESTS: "1"
-        run: uv run python -m pytest tests/vibesys/_agent_cli/test_hostsandbox.py -v
+        run: uv run python -m pytest tests/vibesys/agents/test_hostsandbox.py -v
 
   # macOS counterpart of sandbox-linux: exercises the Seatbelt confinement
   # boundary on a real macOS host. sandbox-exec ships with macOS, so no install
   # step is needed; VIBESYS_REQUIRE_SANDBOX_TESTS=1 forces the Seatbelt test to
   # run (and fail loudly) rather than skip.
   sandbox-macos:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: macos-latest
 
     steps:
@@ -563,7 +633,62 @@ jobs:
       - name: Run workspace-confinement tests
         env:
           VIBESYS_REQUIRE_SANDBOX_TESTS: "1"
-        run: uv run python -m pytest tests/vibesys/_agent_cli/test_hostsandbox.py -v
+        run: uv run python -m pytest tests/vibesys/agents/test_hostsandbox.py -v
+
+  # One stable, always-present result for branch protection and delegated merge
+  # policy. Filtered jobs may skip, but every job that ran must succeed. Keep
+  # this independent of ci-budget, which is intentionally advisory.
+  required-pr-ci:
+    name: Required PR CI
+    needs:
+      - changes
+      - python-checks
+      - typecheck
+      - tui
+      - queue-native
+      - validate-examples
+      - agent-image
+      - test
+      - sandbox-linux
+      - sandbox-macos
+    if: always()
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Require every applicable test job to succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          results = {
+              name: details["result"]
+              for name, details in json.loads(os.environ["JOB_RESULTS"]).items()
+          }
+          failed = {name: result for name, result in results.items() if result not in {"success", "skipped"}}
+          if failed:
+              raise SystemExit(f"Required test jobs did not succeed: {failed}")
+          PY
+
+  # Temporary branch-protection compatibility alias. Remove this after main
+  # requires Required PR CI instead of Scoped merge gate.
+  scoped-merge-gate:
+    name: Scoped merge gate
+    needs: required-pr-ci
+    if: always()
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Mirror Required PR CI
+        env:
+          REQUIRED_PR_CI_RESULT: ${{ needs.required-pr-ci.result }}
+        run: |
+          if [[ "$REQUIRED_PR_CI_RESULT" != "success" ]]; then
+            echo "Required PR CI did not succeed: $REQUIRED_PR_CI_RESULT" >&2
+            exit 1
+          fi
 
   # Reports the run's wall time against CI_WALL_TIME_BUDGET_SECONDS (issue
   # #474). Warns rather than fails: a green run that is merely slow should still
@@ -571,10 +696,9 @@ jobs:
   # reasons no workflow change can fix, so the summary reports queue time
   # separately from execution time.
   #
-  # `typecheck` is deliberately absent from `needs` so that nothing in this
-  # workflow sequences it. It still appears in the table: the step reads every
-  # job of the run from the API, not just the ones listed here, and at ~20s it
-  # has long finished by the time the jobs below have.
+  # `typecheck` is deliberately absent from `needs`; Required PR CI owns that
+  # dependency. It still appears in the table because this step reads every job
+  # of the run from the API, not just the ones listed here.
   ci-budget:
     needs:
       - changes
@@ -582,6 +706,7 @@ jobs:
       - tui
       - queue-native
       - validate-examples
+      - agent-image
       - test
       - sandbox-linux
       - sandbox-macos

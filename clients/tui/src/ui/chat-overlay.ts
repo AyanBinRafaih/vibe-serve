@@ -49,6 +49,13 @@ export class ChatOverlayView {
   readonly #composer: ChatComposerView;
   #bounds: PaneBounds | null = null;
   /**
+   * The thread on screen while the modal is open, `null` while it is closed.
+   * Comparing it against the state says which renders are an open or a thread
+   * switch, the moments that jump to the tail; every other render leaves the
+   * scroll position to stickyScroll.
+   */
+  #openThreadId: string | null = null;
+  /**
    * Columns inside the modal's chrome, as the geometry below just set them.
    * `output.width` answers with the last width the layout computed rather than
    * the one assigned, so after a resize it still describes the previous
@@ -71,9 +78,12 @@ export class ChatOverlayView {
       paddingLeft: 1,
       paddingRight: 1,
       border: true,
-      borderStyle: 'rounded',
+      // Square with an outer fill, the overlay exception (tui-conventions.md):
+      // the fill is what makes this modal opaque over the run behind it, ring
+      // included, and a fill that reaches the ring needs a square corner.
+      borderStyle: 'single',
       borderColor: theme.conversation.analysis.label,
-      backgroundColor: theme.elevatedSurface,
+      backgroundColor: theme.canvas,
       title: ' Experiment chat ',
       zIndex: 20,
       visible: false,
@@ -100,7 +110,13 @@ export class ChatOverlayView {
     this.#composer = new ChatComposerView(
       renderer,
       draft,
-      value => void controller.submitChat(value),
+      value => {
+        // The operator's own message belongs at the tail even when they had
+        // scrolled into history to write it; landing at the bottom also
+        // re-arms sticky-bottom, so the answer streams into view.
+        this.#scrollToTail();
+        void controller.submitChat(value);
+      },
       theme,
       'chat-modal',
     );
@@ -179,7 +195,7 @@ export class ChatOverlayView {
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.output.borderColor = theme.conversation.analysis.label;
-    this.output.backgroundColor = theme.elevatedSurface;
+    this.output.backgroundColor = theme.canvas;
     this.#composer.applyTheme(theme);
     this.#conversation.applyTheme(theme, markdownStyle);
   }
@@ -189,11 +205,28 @@ export class ChatOverlayView {
     // Ahead of the visibility gate: an answer that lands while the modal is
     // closed still has to stop the composer's spinner.
     this.#composer.syncPending(state.chatPending, state.chatOpen);
-    if (!state.chatOpen) return;
+    if (!state.chatOpen) {
+      // Forgotten while closed, so reopening lands on the tail again.
+      this.#openThreadId = null;
+      return;
+    }
     this.output.title = ` ${chatThreadHeading(state)} `;
     this.#composer.activate(this.#contentWidth, true, state.chatPending);
     this.#composer.renderMenu(state);
     this.#conversation.render(state);
+    // Tailing is stickyScroll's job: it follows appended entries and releases
+    // when the operator scrolls up. The explicit jump is reserved for the
+    // moments the operator asked for the tail, opening the modal and
+    // switching threads; jumping on every render instead cancelled a manual
+    // scroll-up on the next state notification.
+    if (this.#openThreadId !== state.activeChatThreadId) {
+      this.#openThreadId = state.activeChatThreadId;
+      this.#scrollToTail();
+    }
+  }
+
+  /** Lands the viewport at the bottom, which also re-arms sticky-bottom. */
+  #scrollToTail(): void {
     this.#transcript.scrollTo(this.#transcript.scrollHeight);
   }
 

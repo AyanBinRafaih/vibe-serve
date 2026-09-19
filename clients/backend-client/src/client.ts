@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {createConnection, type Socket} from 'node:net';
+import {NewlineFramer} from './newline-framer.js';
 import type {
   Diagnostic,
   ProtocolRequest,
@@ -26,6 +27,13 @@ export interface SubscribeOptions {
    * which is exactly how a caller probes for the capability.
    */
   tail?: number;
+  /**
+   * The store the caller's `afterSequence` numbers, carried by a resume so the
+   * server can tell whether that cursor still belongs to the live store. Sent
+   * only when non-empty; a server that predates the field forbids it and
+   * rejects the subscription, so the caller falls back to a plain resume.
+   */
+  storeId?: string;
 }
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
@@ -59,7 +67,7 @@ export class ServerClient {
   readonly #connectTimeoutMs: number;
   readonly #requestTimeoutMs: number;
   readonly #longRunningSockets = new Set<Socket>();
-  #buffer = '';
+  readonly #responseFrames = new NewlineFramer();
 
   private constructor(socket: Socket, path: string, options: ServerClientOptions) {
     this.#socket = socket;
@@ -164,7 +172,7 @@ export class ServerClient {
   ): Promise<EventSubscription> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.#path);
-      let buffer = '';
+      const frames = new NewlineFramer();
       let subscribed = false;
       let closing = false;
       let disconnected = false;
@@ -181,6 +189,31 @@ export class ServerClient {
         if (subscribed) onDisconnect(error);
         else reject(error);
       };
+      const handleSubscriptionLine = (line: string): boolean => {
+        if (!line) return true;
+        let message: ServerMessage;
+        try {
+          message = parseServerMessage(line);
+          onMessage(message);
+        } catch (error) {
+          disconnect(toError(error));
+          socket.destroy();
+          return false;
+        }
+        if (message.type === 'protocol_error') protocolErrorReceived = true;
+        if (!subscribed && message.type === 'subscribed') {
+          subscribed = true;
+          clearTimeout(handshakeTimeout);
+          resolve({
+            close: () => {
+              closing = true;
+              clearTimeout(handshakeTimeout);
+              return closeSocket(socket);
+            },
+          });
+        }
+        return true;
+      };
       socket.setEncoding('utf8');
       socket.once('connect', () => {
         socket.write(
@@ -194,43 +227,13 @@ export class ServerClient {
             // fields, so a default subscribe must stay byte-for-byte what it
             // has always been.
             ...(options.tail === undefined ? {} : {tail: options.tail}),
+            ...(options.storeId ? {store_id: options.storeId} : {}),
           })}\n`,
         );
       });
       socket.on('data', chunk => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          if (!line) continue;
-          let message: ServerMessage;
-          try {
-            message = parseServerMessage(line);
-          } catch (error) {
-            const parseError = error instanceof Error ? error : new Error(String(error));
-            disconnect(parseError);
-            socket.destroy();
-            return;
-          }
-          try {
-            onMessage(message);
-          } catch (error) {
-            disconnect(error instanceof Error ? error : new Error(String(error)));
-            socket.destroy();
-            return;
-          }
-          if (message.type === 'protocol_error') protocolErrorReceived = true;
-          if (!subscribed && message.type === 'subscribed') {
-            subscribed = true;
-            clearTimeout(handshakeTimeout);
-            resolve({
-              close: () => {
-                closing = true;
-                clearTimeout(handshakeTimeout);
-                return closeSocket(socket);
-              },
-            });
-          }
+        for (const line of frames.push(chunk.toString())) {
+          if (!handleSubscriptionLine(line)) return;
         }
       });
       socket.once('error', disconnect);
@@ -267,7 +270,7 @@ export class ServerClient {
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.#path);
       this.#longRunningSockets.add(socket);
-      let buffer = '';
+      const frames = new NewlineFramer();
       let settled = false;
       const connectTimeout = setTimeout(() => {
         fail(new Error(`Timed out connecting to server after ${this.#connectTimeoutMs}ms`));
@@ -304,6 +307,15 @@ export class ServerClient {
         if (response.ok) resolve(response);
         else reject(responseError(response));
       };
+      const handleChatResponseLine = (line: string): boolean => {
+        if (!line) return false;
+        try {
+          finish(parseProtocolResponse(line));
+        } catch (error) {
+          fail(toError(error));
+        }
+        return true;
+      };
 
       socket.setEncoding('utf8');
       socket.once('connect', () => {
@@ -313,17 +325,8 @@ export class ServerClient {
         });
       });
       socket.on('data', chunk => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          if (!line) continue;
-          try {
-            finish(parseProtocolResponse(line));
-          } catch (error) {
-            fail(error instanceof Error ? error : new Error(String(error)));
-          }
-          return;
+        for (const line of frames.push(chunk.toString())) {
+          if (handleChatResponseLine(line)) return;
         }
       });
       socket.once('error', fail);
@@ -332,10 +335,7 @@ export class ServerClient {
   }
 
   #onData(chunk: string): void {
-    this.#buffer += chunk;
-    const lines = this.#buffer.split('\n');
-    this.#buffer = lines.pop() ?? '';
-    for (const line of lines) {
+    for (const line of this.#responseFrames.push(chunk)) {
       if (!line) continue;
       let response: ProtocolResponse;
       try {
@@ -380,6 +380,10 @@ function isRetryableConnectError(error: unknown): error is Error {
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function responseError(response: ProtocolResponse): ServerError {

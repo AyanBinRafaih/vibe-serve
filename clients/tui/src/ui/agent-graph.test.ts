@@ -12,6 +12,9 @@ const CHAIN = [
   phase('judge', 'pending'),
 ];
 
+/** The width of a node's label when it is selected, as the agent map draws it. */
+const selectedLabel = (item: AgentPhase): number => `› ● ${item.kind}`.length;
+
 describe('stageKinds', () => {
   test('keeps the order the round first mentions each kind', () => {
     expect(stageKinds(CHAIN)).toEqual(['orchestrator', 'implementer', 'judge']);
@@ -25,7 +28,7 @@ describe('stageKinds', () => {
 
 describe('layoutAgentGraph', () => {
   test('places one column per stage, left to right', () => {
-    const graph = layoutAgentGraph(CHAIN, graphPaneBounds(3).max - 4);
+    const graph = layoutAgentGraph(CHAIN, graphPaneBounds(CHAIN).max - 4);
     const xs = graph.nodes.map(node => node.x);
     expect(xs).toEqual([...xs].sort((a, b) => a - b));
     expect(new Set(xs).size).toBe(3);
@@ -38,7 +41,7 @@ describe('layoutAgentGraph', () => {
       phase('implementer', 'active'),
       phase('implementer', 'active'),
     ];
-    const graph = layoutAgentGraph(parallel, graphPaneBounds(2).max - 4);
+    const graph = layoutAgentGraph(parallel, graphPaneBounds(parallel).max - 4);
     const implementers = graph.nodes.filter(node => node.phase.kind === 'implementer');
     expect(implementers).toHaveLength(2);
     expect(implementers[0]?.x).toBe(implementers[1]?.x as number);
@@ -53,13 +56,13 @@ describe('layoutAgentGraph', () => {
       phase('implementer', 'active'),
       phase('implementer', 'active'),
     ];
-    const graph = layoutAgentGraph(parallel, graphPaneBounds(2).max - 4);
+    const graph = layoutAgentGraph(parallel, graphPaneBounds(parallel).max - 4);
     const orchestrator = graph.nodes.find(node => node.phase.kind === 'orchestrator');
     expect(orchestrator?.y).toBeGreaterThan(0);
   });
 
   test('draws an arrow into every target and keeps edges inside the gutter', () => {
-    const graph = layoutAgentGraph(CHAIN, graphPaneBounds(3).max - 4);
+    const graph = layoutAgentGraph(CHAIN, graphPaneBounds(CHAIN).max - 4);
     const arrows = graph.cells.filter(cell => cell.glyph === '▶');
     expect(arrows).toHaveLength(2);
     const nodeWidth = graph.nodes[0]?.width as number;
@@ -70,25 +73,76 @@ describe('layoutAgentGraph', () => {
   });
 
   test('tones an edge by the phases it connects', () => {
-    const graph = layoutAgentGraph(
-      [...CHAIN, phase('profiler', 'pending')],
-      graphPaneBounds(4).max - 4,
-    );
-    // The frontier glows: an edge is live while either end is running. Two
-    // stages that have not run yet stay idle.
+    const four = [...CHAIN, phase('profiler', 'pending')];
+    const graph = layoutAgentGraph(four, graphPaneBounds(four).max - 4);
+    // Live means data has flowed: a completed source feeding an active
+    // target. A stage that has not produced anything yet, or that feeds a
+    // stage that has not started, stays idle.
     expect(graph.cells.some(cell => cell.tone === 'live')).toBe(true);
     expect(graph.cells.some(cell => cell.tone === 'idle')).toBe(true);
   });
 
+  test('an edge from an active source to a pending target is idle, not live', () => {
+    // The active node has not produced anything yet, so its outbound edge
+    // must not be painted as live dataflow.
+    const activeToPending = [phase('implementer', 'active'), phase('judge', 'pending')];
+    const graph = layoutAgentGraph(activeToPending, graphPaneBounds(activeToPending).max - 4);
+    expect(graph.cells.every(cell => cell.tone === 'idle')).toBe(true);
+  });
+
+  test('an edge from a completed source to an active target is still live', () => {
+    const completedToActive = [phase('implementer', 'completed'), phase('judge', 'active')];
+    const graph = layoutAgentGraph(completedToActive, graphPaneBounds(completedToActive).max - 4);
+    expect(graph.cells.every(cell => cell.tone === 'live')).toBe(true);
+  });
+
+  test.each([
+    'failed',
+    'cancelled',
+    'interrupted',
+  ] as const)('a %s source still fails the edge, even into an active target', status => {
+    const badSource = [phase('implementer', status), phase('judge', 'active')];
+    const graph = layoutAgentGraph(badSource, graphPaneBounds(badSource).max - 4);
+    expect(graph.cells.every(cell => cell.tone === 'failed')).toBe(true);
+  });
+
+  test('a completed source into any non-pending target still reads as done', () => {
+    const completedToFailed = [phase('implementer', 'completed'), phase('judge', 'failed')];
+    const graph = layoutAgentGraph(completedToFailed, graphPaneBounds(completedToFailed).max - 4);
+    expect(graph.cells.every(cell => cell.tone === 'done')).toBe(true);
+  });
+
+  test('an active fan-out node leaves every outbound edge idle', () => {
+    const fanOut = [
+      phase('orchestrator', 'active'),
+      phase('implementer', 'pending'),
+      phase('implementer', 'pending'),
+      phase('implementer', 'pending'),
+    ];
+    const graph = layoutAgentGraph(fanOut, graphPaneBounds(fanOut).max - 4);
+    expect(graph.cells.every(cell => cell.tone === 'idle')).toBe(true);
+  });
+
+  test('an active fan-in node has every completed-source inbound edge live', () => {
+    const fanIn = [
+      phase('implementer', 'completed'),
+      phase('implementer', 'completed'),
+      phase('implementer', 'completed'),
+      phase('judge', 'active'),
+    ];
+    const graph = layoutAgentGraph(fanIn, graphPaneBounds(fanIn).max - 4);
+    expect(graph.cells.every(cell => cell.tone === 'live')).toBe(true);
+  });
+
   test('a finished handover between finished stages reads as done', () => {
     const done = [phase('implementer', 'completed'), phase('judge', 'completed')];
-    const graph = layoutAgentGraph(done, graphPaneBounds(2).max - 4);
+    const graph = layoutAgentGraph(done, graphPaneBounds(done).max - 4);
     expect(graph.cells.every(cell => cell.tone === 'done')).toBe(true);
   });
 
   test('a failed phase colors the edge leaving it', () => {
     const failed = [phase('implementer', 'failed'), phase('judge', 'pending')];
-    const graph = layoutAgentGraph(failed, graphPaneBounds(2).max - 4);
+    const graph = layoutAgentGraph(failed, graphPaneBounds(failed).max - 4);
     expect(graph.cells.every(cell => cell.tone === 'failed')).toBe(true);
   });
 
@@ -99,16 +153,32 @@ describe('layoutAgentGraph', () => {
       phase('implementer', 'active'),
       phase('implementer', 'active'),
     ];
-    const graph = layoutAgentGraph(fan, graphPaneBounds(2).max - 4);
+    const graph = layoutAgentGraph(fan, graphPaneBounds(fan).max - 4);
     // Every implementer must be reachable: one arrow head each.
     expect(graph.cells.filter(cell => cell.glyph === '▶')).toHaveLength(3);
   });
 
   test('narrow panes shrink the node, never below the readable floor', () => {
-    const wide = layoutAgentGraph(CHAIN, graphPaneBounds(3).max - 4);
-    const narrow = layoutAgentGraph(CHAIN, graphPaneBounds(3).min - 4);
+    const wide = layoutAgentGraph(CHAIN, graphPaneBounds(CHAIN).max - 4);
+    const narrow = layoutAgentGraph(CHAIN, graphPaneBounds(CHAIN).min - 4);
     expect(narrow.nodes[0]?.width).toBeLessThan(wide.nodes[0]?.width as number);
     expect(narrow.nodes[0]?.width).toBeGreaterThanOrEqual(14);
+  });
+
+  test('gives a long name the columns a short one does not need', () => {
+    // 56 columns split evenly are three nodes of 15, one short of `✓ orchestrator`,
+    // while `judge` leaves six of its own unused.
+    const graph = layoutAgentGraph(CHAIN, 56, selectedLabel);
+    expect(graph.nodes.map(node => node.width)).toEqual([16, 16, 14]);
+    expect(graph.width).toBeLessThanOrEqual(56);
+    // Every edge still ends on the next node's border.
+    const heads = graph.cells.filter(cell => cell.glyph === '▶').map(cell => cell.x);
+    expect(heads).toEqual(graph.nodes.slice(1).map(node => node.x - 1));
+  });
+
+  test('keeps the columns even while every name fits them', () => {
+    const graph = layoutAgentGraph(CHAIN, graphPaneBounds(CHAIN).max - 4, selectedLabel);
+    expect(graph.nodes.map(node => node.width)).toEqual([18, 18, 18]);
   });
 
   test('handles an empty round without throwing', () => {
@@ -121,8 +191,27 @@ describe('layoutAgentGraph', () => {
 
 describe('graphPaneBounds', () => {
   test('grows with the number of stages', () => {
-    expect(graphPaneBounds(4).min).toBeGreaterThan(graphPaneBounds(3).min);
-    expect(graphPaneBounds(4).max).toBeGreaterThan(graphPaneBounds(4).min);
+    const four = [...CHAIN, phase('profiler', 'pending')];
+    expect(graphPaneBounds(four).min).toBeGreaterThan(graphPaneBounds(CHAIN).min);
+    expect(graphPaneBounds(four).max).toBeGreaterThan(graphPaneBounds(four).min);
+  });
+
+  test('its floor is the narrowest pane that holds every label in full', () => {
+    // `performance_profiler` is wider than a node at its widest even split.
+    const long = [phase('performance_profiler', 'active'), phase('judge', 'pending')];
+    for (const phases of [CHAIN, long]) {
+      const {min, max} = graphPaneBounds(phases, selectedLabel);
+      const whole = (paneWidth: number): boolean =>
+        layoutAgentGraph(phases, paneWidth - 4, selectedLabel).nodes.every(
+          node => node.width - 2 >= selectedLabel(node.phase),
+        );
+      expect({kinds: stageKinds(phases), atFloor: whole(min), below: whole(min - 1)}).toEqual({
+        kinds: stageKinds(phases),
+        atFloor: true,
+        below: false,
+      });
+      expect(max).toBeGreaterThanOrEqual(min);
+    }
   });
 });
 
@@ -135,7 +224,7 @@ describe('a round with many agents', () => {
   ];
 
   test('gives every agent its own node and every fed agent an arrow', () => {
-    const graph = layoutAgentGraph(many, graphPaneBounds(4).max - 4);
+    const graph = layoutAgentGraph(many, graphPaneBounds(many).max - 4);
     expect(graph.nodes).toHaveLength(10);
     // One arrow head per node that is fed, not one per edge: several sources
     // converging on a judge share the head they point at.
@@ -143,7 +232,7 @@ describe('a round with many agents', () => {
   });
 
   test('never stacks two nodes on the same cell', () => {
-    const graph = layoutAgentGraph(many, graphPaneBounds(4).max - 4);
+    const graph = layoutAgentGraph(many, graphPaneBounds(many).max - 4);
     const seen = new Set<string>();
     for (const node of graph.nodes) {
       for (let row = node.y; row < node.y + NODE_HEIGHT; row += 1) {
@@ -155,7 +244,7 @@ describe('a round with many agents', () => {
   });
 
   test('keeps edge cells out of the columns the nodes occupy', () => {
-    const graph = layoutAgentGraph(many, graphPaneBounds(4).max - 4);
+    const graph = layoutAgentGraph(many, graphPaneBounds(many).max - 4);
     const width = graph.nodes[0]?.width as number;
     for (const cell of graph.cells) {
       expect(cell.x % (width + 5)).toBeGreaterThanOrEqual(width);
@@ -163,7 +252,7 @@ describe('a round with many agents', () => {
   });
 
   test('resolves crossing edges into junctions rather than overwriting', () => {
-    const graph = layoutAgentGraph(many, graphPaneBounds(4).max - 4);
+    const graph = layoutAgentGraph(many, graphPaneBounds(many).max - 4);
     const junctions = graph.cells.filter(cell => '┼├┤┬┴'.includes(cell.glyph));
     expect(junctions.length).toBeGreaterThan(0);
   });
