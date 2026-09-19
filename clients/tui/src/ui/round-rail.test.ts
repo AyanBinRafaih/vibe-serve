@@ -5,6 +5,7 @@ import type {HypothesisRound} from '@vibesys/backend-client';
 import type {RoundSummary} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
 import {initialSessionState, type SessionState} from '../session-model.js';
+import {SPINNER_FRAMES, SPINNER_INTERVAL_MS} from './activity-bar.js';
 import {
   RAIL_COMPACT_WIDTH,
   RAIL_FULL_WIDTH,
@@ -290,6 +291,56 @@ describe('RoundRailView elapsed timer refresh', () => {
     const text = textOf(view.output.getChildren()[0] as TextRenderable);
     view.destroy();
     expect(text).toContain(' run ');
+  });
+
+  test('draws a spinner frame, not the static glyph, on the running round and advances it', async () => {
+    const {renderer} = await createTestRenderer({width: 120, height: 40});
+    const view = new RoundRailView(
+      renderer,
+      {} as unknown as SessionController,
+      resolveTheme(null),
+    );
+    view.render(activeRoundState(), RAIL_FULL_WIDTH, 10);
+    const row = view.output.getChildren()[0] as TextRenderable;
+    const first = textOf(row);
+    expect(first).toContain(` ${SPINNER_FRAMES[0]} run`);
+    expect(first).not.toContain('⟳');
+    await new Promise(resolve => setTimeout(resolve, SPINNER_INTERVAL_MS * 3));
+    const later = textOf(row);
+    view.destroy();
+    expect(later).not.toBe(first);
+    expect(later).toMatch(new RegExp(`[${SPINNER_FRAMES.join('')}] run`));
+    // Same cell, same width: the row does not jitter as frames change.
+    expect(later.length).toBe(first.length);
+  });
+
+  test('spins the compact glyph in place at a compact width', async () => {
+    const {renderer} = await createTestRenderer({width: 120, height: 40});
+    const view = new RoundRailView(
+      renderer,
+      {} as unknown as SessionController,
+      resolveTheme(null),
+    );
+    view.render(activeRoundState(), RAIL_COMPACT_WIDTH, 10);
+    const text = textOf(view.output.getChildren()[0] as TextRenderable);
+    view.destroy();
+    expect(text).toContain(`r1${SPINNER_FRAMES[0]}`);
+    expect(text.length).toBeLessThanOrEqual(RAIL_COMPACT_WIDTH);
+  });
+
+  test('stops the spinner once the view is destroyed', async () => {
+    const {renderer} = await createTestRenderer({width: 120, height: 40});
+    const view = new RoundRailView(
+      renderer,
+      {} as unknown as SessionController,
+      resolveTheme(null),
+    );
+    view.render(activeRoundState(), RAIL_FULL_WIDTH, 10);
+    const row = view.output.getChildren()[0] as TextRenderable;
+    view.destroy();
+    const frozen = textOf(row);
+    await new Promise(resolve => setTimeout(resolve, SPINNER_INTERVAL_MS * 3));
+    expect(textOf(row)).toBe(frozen);
   });
 });
 

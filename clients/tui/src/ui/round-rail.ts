@@ -8,6 +8,7 @@ import {
   stripRounds,
   visibleRoundNumber,
 } from '../session-model.js';
+import {SPINNER_FRAMES, SPINNER_INTERVAL_MS} from './activity-bar.js';
 import {STACKED_WIDTH, TRANSCRIPT_MIN} from './agent-map.js';
 import {elapsedLabel} from './previews.js';
 import {splitFits} from './right-pane.js';
@@ -174,6 +175,7 @@ export class RoundRailView {
   #renderedWidth = 0;
   #renderedRows = 0;
   #elapsedTimer: ReturnType<typeof setInterval> | null = null;
+  #spinnerFrame = 0;
   #runningRound: {
     round: RoundState;
     state: SessionState;
@@ -343,7 +345,7 @@ export class RoundRailView {
   ): string {
     const marker = isSelected ? '▸' : ' ';
     const outcome = roundOutcome(round, state);
-    const glyph = OUTCOME_GLYPH[outcome];
+    const glyph = outcome === 'live' ? this.#spinnerGlyph() : OUTCOME_GLYPH[outcome];
     if (compact) return `${marker}r${round.number}${glyph}`;
     const metric = roundMetric(round, state, new Date());
     const parts = [`${marker}r${round.number}`, glyph, OUTCOME_WORD[outcome]];
@@ -351,10 +353,26 @@ export class RoundRailView {
     return parts.join(' ');
   }
 
+  /**
+   * The live round's glyph cell shows the current spinner frame instead of the
+   * static `⟳`: same cell and width (every `SPINNER_FRAMES` glyph is one
+   * column), one glyph animating in place of another. The frame persists across
+   * redraws so the animation does not restart on every state change.
+   */
+  #spinnerGlyph(): string {
+    return SPINNER_FRAMES[this.#spinnerFrame % SPINNER_FRAMES.length] ?? OUTCOME_GLYPH.live;
+  }
+
+  /**
+   * One timer rewrites the running row's own text cell in place, so neither the
+   * spinner nor the elapsed time ever re-lays out the rail. It ticks at the
+   * spinner's rate; the elapsed label only changes when a whole second does.
+   */
   #syncElapsedTimer(): void {
     if (this.#runningRound === null || this.#elapsedTimer !== null) return;
     this.#elapsedTimer = setInterval(() => {
       if (this.#runningRound === null) return;
+      this.#spinnerFrame = (this.#spinnerFrame + 1) % SPINNER_FRAMES.length;
       const {round, state, text, compact} = this.#runningRound;
       text.content = this.#roundLabel(
         round,
@@ -362,7 +380,7 @@ export class RoundRailView {
         round.number === visibleRoundNumber(state),
         compact,
       );
-    }, 1000);
+    }, SPINNER_INTERVAL_MS);
   }
 
   #stopElapsedTimer(): void {
