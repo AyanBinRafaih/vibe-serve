@@ -38,10 +38,6 @@ def agent_driver_supports_mcp_servers(spec: AgentSpec) -> bool | None:
         from vs_agent.drivers.omnigent import OMNIGENT_CAPABILITIES  # noqa: PLC0415
 
         return OMNIGENT_CAPABILITIES.mcp_servers
-    if driver_name is Driver.MOCK:
-        from vs_agent.drivers.mock import MOCK_CAPABILITIES  # noqa: PLC0415
-
-        return MOCK_CAPABILITIES.mcp_servers
 
     from vs_agent.drivers.agentshim import AGENTSHIM_CAPABILITIES  # noqa: PLC0415
 
@@ -91,11 +87,7 @@ def build_agent_client(  # noqa: PLR0913
             f"agent.driver={driver_name.value!r} is not supported with --docker"
         )
 
-    if driver_name == Driver.MOCK:
-        from vs_agent.drivers.mock import MockDriver  # noqa: PLC0415
-
-        driver = MockDriver()
-    elif driver_name == Driver.OMNIGENT:
+    if driver_name == Driver.OMNIGENT:
         from vs_agent.drivers.omnigent import (  # noqa: PLC0415
             OmnigentDriver,
             OmnigentDriverError,
