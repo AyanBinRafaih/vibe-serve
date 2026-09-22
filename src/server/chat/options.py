@@ -14,7 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from vibesys.api import supported_cli_providers
+from vs_agent.catalog import agent_catalog
+from vs_agent.spec import Driver
 
 ChatModelSource = Literal["run", "role", "suggested"]
 
@@ -97,7 +98,7 @@ def build_chat_options(settings: ChatRunSettings) -> ChatOptions:
     return ChatOptions(
         providers=[
             ChatProviderOptions(provider=provider, models=_models_for(provider, settings))
-            for provider in supported_cli_providers(settings.driver)
+            for provider in agent_catalog()[Driver(settings.driver)].providers
         ]
     )
 

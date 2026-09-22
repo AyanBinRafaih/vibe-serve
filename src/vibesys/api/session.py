@@ -13,7 +13,6 @@ import asyncio
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol, cast
 
-from vibesys.agents.contracts import MCPServerSpec
 from vibesys.api._agent_state import load_agent_run_state
 from vibesys.api._dispatch import dispatch_loop, resolved_run_id
 from vibesys.api._readmodel import project_committed_run_view, project_run_view
@@ -24,7 +23,9 @@ from vibesys.loops.agent.model import AgentRunState
 from vibesys.loops.roles import expected_agent_roles
 from vibesys.profilers import ProfilerKind
 from vibesys.run.integration import LocalRunIntegration
+from vibesys.skills import platform_skill_selection
 from vs_agent import expose_as_tools
+from vs_agent.contracts import MCPServerSpec
 from vs_project import Project
 from vs_sandbox import HostResource, HostResourceAccess
 
@@ -36,9 +37,9 @@ if TYPE_CHECKING:
 
     from vibesys.api.contracts import AgentEnvironment, EventSink, RunRequest, RunView
     from vibesys.config import Config
-    from vibesys.constants import ComputeBackend
     from vibesys.run.integration import RunResourceHandoff
     from vibesys.sandbox.run_environment import RunEnvironmentSession
+    from vibesys.skills import SkillSelection
     from vs_sandbox import ProjectPathPolicy, Sandbox
 
 
@@ -229,7 +230,7 @@ class _LocalRunSession:
         return _OpenedAgentEnvironment(
             opened,
             config=handoff.config,
-            compute_backend=handoff.compute_backend,
+            skill_selection=platform_skill_selection(handoff.compute_backend),
             skill_source_dirs=handoff.skill_source_dirs,
             project_path_policy=handoff.project_path_policy,
             host_resources=handoff.host_resources,
@@ -353,7 +354,7 @@ class _OpenedAgentEnvironment:
 
     _session: RunEnvironmentSession
     config: Config
-    compute_backend: ComputeBackend
+    skill_selection: SkillSelection
     skill_source_dirs: tuple[Path, ...]
     project_path_policy: ProjectPathPolicy
     host_resources: tuple[HostResource, ...]

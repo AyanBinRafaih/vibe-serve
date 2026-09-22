@@ -19,8 +19,9 @@ from server.chat.session import (
 )
 from server.events import ChatThreadCreatedData
 from server.run_attachment import AgentSelection, RunAttachment
-from vibesys.api import build_agent_client
+from vibesys.api import agent_spec_from_config, output_sink
 from vs_agent import AgentSessionKey, SessionScope
+from vs_agent.factory import build_agent_client
 from vs_project import RunLogger
 from vs_sandbox import HostResource, HostResourceAccess
 
@@ -31,7 +32,8 @@ if TYPE_CHECKING:
     from server.chat.options import ChatRunSettings
     from server.controller import RunController
     from server.execution import ExecutionTracker
-    from vibesys.api import MCPServerSpec, RunSession
+    from vibesys.api import RunSession
+    from vs_agent.contracts import MCPServerSpec
     from vs_project import Project
 
 
@@ -130,14 +132,18 @@ def build_chat_agent(
         config = env.config.model_copy(
             update={"agent": env.config.agent.model_copy(update={"driver": selection.driver})}
         )
-        client = build_agent_client(
+        agent_spec = agent_spec_from_config(
             config,
-            agent_backend=attachment.agent_backend,
-            cli_provider=selection.provider,
+            backend=attachment.agent_backend,
+            driver=selection.driver,
+            provider=selection.provider,
+            model=selection.model,
+        )
+        client = build_agent_client(
+            spec=agent_spec,
             backends=env.backends,
             skill_source_dirs=list(env.skill_source_dirs),
-            compute_backend=env.compute_backend,
-            model_name=selection.model,
+            skill_selection=env.skill_selection,
             run_log_file=logger.writer,
             use_docker=env.use_docker,
             log_dir=attachment.log_dir,
@@ -151,6 +157,7 @@ def build_chat_agent(
                     "server chat transcript",
                 ),
             ),
+            events=output_sink(),
         )
         resources.callback(client.close)
         owner = resources.pop_all()

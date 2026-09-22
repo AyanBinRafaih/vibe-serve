@@ -14,14 +14,15 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from vibesys.agents.contracts import MCPServerSpec
 from vibesys.config import Config
 from vibesys.constants import DEFAULT_COMPUTE_BACKEND, ComputeBackend
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.evaluators.input_manifest import InputBundle
 from vibesys.events import CoreEvent, EventStatus
+from vs_agent.contracts import MCPServerSpec
 
 if TYPE_CHECKING:
+    from vibesys.skills import SkillSelection
     from vs_sandbox import HostResource, ProjectPathPolicy, Sandbox
 
 # Objective/MetricSpace live in vibesys.loops.metrics because the
@@ -312,7 +313,7 @@ class AgentEnvironment(Protocol):
     Returned by `vibesys.api.session.RunAgentHost.open_agent_environment`.
     Carries exactly what `server.chat.factory.build_chat_agent` needs to build
     a sibling agent over the run's workspace: the construction inputs (`config`,
-    `compute_backend`,
+    `skill_selection`,
     `skill_source_dirs`, `project_path_policy`, `host_resources`), the opened
     sandbox's shape (`backends`, `use_docker`, `isolated`), its path
     translation (`agent_path`), and its lifetime (`close`).
@@ -330,8 +331,8 @@ class AgentEnvironment(Protocol):
         ...
 
     @property
-    def compute_backend(self) -> ComputeBackend:
-        """The compute backend this environment was opened for."""
+    def skill_selection(self) -> SkillSelection:
+        """The skill-pruning policy a sibling agent should apply while copying."""
         ...
 
     @property

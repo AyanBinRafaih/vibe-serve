@@ -16,18 +16,10 @@ from typing import Any, TextIO, TypeVar, overload
 from pydantic import BaseModel
 
 from vibesys import backends, boot_trace
-from vibesys.agents import AgentClientProtocol, build_agent_client
-from vibesys.agents.factory import (
-    agent_driver_supports_mcp_servers,
-    resolve_agent_driver,
-)
-from vibesys.agents.host_resource_declarations import task_agent_host_resources
-from vibesys.agents.progress import AgentProgress
-from vibesys.agents.session_store import AgentSessionState, DurableSessionStore
+from vibesys.agent_spec_config import agent_spec_from_config, resolve_agent_driver
 from vibesys.backends.base import ComputeBackendImpl, ContentionMonitor
 from vibesys.config import Config, as_config
 from vibesys.constants import (
-    DEFAULT_AGENT_BACKEND,
     DEFAULT_COMPUTE_BACKEND,
     PROJECT_ROOT,
     ComputeBackend,
@@ -100,6 +92,13 @@ from vibesys.sandbox.run_environment import (
     build_run_environment,
     make_run_environment_spec,
 )
+from vibesys.skills import platform_skill_selection
+from vs_agent import AgentClientProtocol, build_agent_client
+from vs_agent.factory import agent_driver_supports_mcp_servers
+from vs_agent.host_resource_declarations import task_agent_host_resources
+from vs_agent.progress import AgentProgress
+from vs_agent.session_store import AgentSessionState, DurableSessionStore
+from vs_agent.spec import AgentBackend
 from vs_project import (
     Project,
     RunConfiguration,
@@ -423,9 +422,15 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 log=buffered_logs.append,
                 image=environment.backend_image,
             )
-            resolved_backend = agent_backend or config.agent.backend or DEFAULT_AGENT_BACKEND
+            resolved_backend = str(agent_backend or config.agent.backend or AgentBackend.CLI)
             resolved_cli_provider = cli_provider or config.agent.cli_provider or "codex"
             model_name = config.model.name
+            agent_spec = agent_spec_from_config(
+                config,
+                backend=agent_backend,
+                provider=cli_provider,
+                model=model_name,
+            )
         with boot_trace.span("profiler_preflight"):
             resolved_profiler_kind = resolve_profiler_kind(
                 profiler_kind,
@@ -434,10 +439,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 environment_default_profiler_kind=environment.default_profiler_kind,
                 environment_supported_profiler_kinds=environment.supported_profiler_kinds,
             )
-            driver_supports_mcp = agent_driver_supports_mcp_servers(
-                config,
-                agent_backend=agent_backend,
-            )
+            driver_supports_mcp = agent_driver_supports_mcp_servers(agent_spec)
             if resolved_profiler_kind in ACTIVE_PROFILER_KINDS and driver_supports_mcp is False:
                 driver_name = resolve_agent_driver(config)
                 definition = profiler_definition(resolved_profiler_kind)
@@ -447,7 +449,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                         stage="agent_capability_validation",
                         message=(
                             f"Profiler {resolved_profiler_kind.value!r} requires session MCP server "
-                            f"{definition.mcp_name!r}, but agent driver {driver_name!r} does not "
+                            f"{definition.mcp_name!r}, but agent driver {driver_name.value!r} does not "
                             "support session MCP servers. Select agent.driver='agentshim' or "
                             "disable profiling with --profiler none."
                         ),
@@ -903,9 +905,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             # backend is rejected if --docker is set; build_agent_client raises
             # SystemExit with a clear message in that case.
             agent_client = build_agent_client(
-                config,
-                agent_backend=agent_backend,
-                cli_provider=cli_provider,
+                spec=agent_spec,
                 session_store=agent_session_store,
                 backends={
                     "implementer": session.sandbox,
@@ -922,14 +922,14 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                     "orchestrator": session.sandbox,
                 },
                 skill_source_dirs=skill_source_paths,
-                compute_backend=backend,
-                model_name=model_name,
+                skill_selection=platform_skill_selection(backend),
                 run_log_file=logger.writer,
                 use_docker=session.view.cli_sandboxed,
                 log_dir=log_dir,
                 project_path_policy=project_path_policy,
                 require_host_sandbox=not session.view.cli_sandboxed,
                 host_resources=agent_host_resources,
+                events=output_sink(),
             )
         teardown_stack.callback(agent_client.close)
 
@@ -980,7 +980,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 workspace=project_root,
                 log_dir=log_dir,
                 agent_backend=resolved_backend,
-                driver=resolve_agent_driver(config),
+                driver=resolve_agent_driver(config).value,
                 provider=resolved_cli_provider,
                 model=model_name,
                 role_models=tuple(
@@ -1080,7 +1080,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
     logger = RunLogger(log_dir, tee_stderr=False, emit=log_and_print)
     teardown_stack.callback(logger.close)
 
-    resolved_backend = agent_backend or config.agent.backend or DEFAULT_AGENT_BACKEND
+    resolved_backend = str(agent_backend or config.agent.backend or AgentBackend.CLI)
     resolved_cli_provider = cli_provider or config.agent.cli_provider or "codex"
     effective_objective = getattr(parent, "effective_objective", None)
 
@@ -1151,10 +1151,14 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
     # role-scoped conversations are never checkpointed (they belong to one
     # process). Candidates also share the parent's run ID and local namespace
     # and run concurrently, so a single per-run map would alias them anyway.
-    agent_client = build_agent_client(
+    agent_spec = agent_spec_from_config(
         config,
-        agent_backend=agent_backend,
-        cli_provider=cli_provider,
+        backend=agent_backend,
+        provider=cli_provider,
+        model=parent.model_name,
+    )
+    agent_client = build_agent_client(
+        spec=agent_spec,
         backends={
             "implementer": session.sandbox,
             "judge": session.sandbox,
@@ -1163,8 +1167,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
             "orchestrator": session.sandbox,
         },
         skill_source_dirs=parent.skill_source_paths,
-        compute_backend=parent.backend,
-        model_name=parent.model_name,
+        skill_selection=platform_skill_selection(parent.backend),
         run_log_file=logger.writer,
         use_docker=session.view.cli_sandboxed,
         log_dir=log_dir,
@@ -1174,6 +1177,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         # container access; recomputing is impossible here because a candidate
         # context carries neither the profiler domain nor the task name.
         host_resources=parent.agent_host_resources,
+        events=output_sink(),
     )
     teardown_stack.callback(agent_client.close)
 
