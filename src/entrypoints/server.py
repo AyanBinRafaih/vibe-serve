@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from entrypoints import headless
 from server.settings import InteractiveSetupDefaults, TuiTheme, load_tui_theme
-from vibesys.errors import ConfigurationError
+from vibesys.api import ConfigurationError
 from vibesys.repository import (
     generate_experiment_name,
     repository_name_from_experiment,
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     import argparse
     from collections.abc import Callable
 
-    from vibesys.config import Config
+    from vibesys.api import Config
 
 
 def _control_socket_from_argv(argv: list[str]) -> Path | None:
@@ -173,14 +173,16 @@ def main(argv: list[str] | None = None) -> None:
         tui_defaults=_tui_defaults_from_argv(arguments),
     )
     try:
-        runtime.run(
-            lambda: headless.dispatch(
-                _headless_argv(arguments),
-                integration=runtime.integration,
-            )
-        )
+        invocation = headless.parse_cli_invocation(_headless_argv(arguments))
+        request = headless.build_run_request(invocation)
+        result = runtime.run(lambda: runtime.drive(request))
     except ConfigurationError as exc:
         raise SystemExit(exc.diagnostic.exit_code) from None
+    # `result` is `None` when `ServerRuntime.run` absorbed an operator stop
+    # (`RunStopped`) as a clean backend exit; only a completed run's
+    # `RunResult.succeeded` decides the process exit code.
+    if result is not None and not result.succeeded:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
