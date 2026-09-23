@@ -12,10 +12,12 @@ import entrypoints.server as server_entrypoint
 from entrypoints.server import (
     _control_socket_from_argv,
     _headless_argv,
+    _web_instance_from_argv,
     _web_port_from_argv,
     _web_requested,
     main,
 )
+from server.transport.discovery import WebInstanceRecord
 
 
 def test_control_socket_argument_forms() -> None:
@@ -37,6 +39,48 @@ def test_web_server_arguments_are_consumed_before_run_parsing() -> None:
 def test_web_port_rejects_out_of_range_values() -> None:
     with pytest.raises(ValueError, match="between 0 and 65535"):
         _web_port_from_argv(["--web-port", "65536"])
+
+
+def test_web_instance_record_is_project_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project_a = tmp_path / "a"
+    project_b = tmp_path / "b"
+    project_a.mkdir()
+    project_b.mkdir()
+
+    monkeypatch.chdir(project_a)
+    instance_a = _web_instance_from_argv(["--web"])
+    monkeypatch.chdir(project_b)
+    instance_b = _web_instance_from_argv(["--web"])
+
+    assert instance_a == project_a / ".vibesys" / "web-gateway.json"
+    assert instance_b == project_b / ".vibesys" / "web-gateway.json"
+    assert instance_a != instance_b
+
+
+def test_second_web_launch_reuses_live_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    instance_path = tmp_path / ".vibesys" / "web-gateway.json"
+    record = WebInstanceRecord(
+        pid=123,
+        port=43_211,
+        token="capability",  # noqa: S106
+        url="http://127.0.0.1:43211/?token=capability",
+        project_root=str(tmp_path),
+        started_at=1.0,
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(server_entrypoint, "_discover_web_instance", lambda _path: record)
+    monkeypatch.setattr(
+        server_entrypoint.webbrowser, "open", lambda url, **_kwargs: opened.append(url)
+    )
+
+    main(["--web", "--web-instance", str(instance_path)])
+
+    assert capsys.readouterr().out == f"VibeSys web UI: {record.url}\n"
+    assert opened == [record.url]
 
 
 def test_tui_defaults_use_launch_config_and_normalize_runs_dir(
