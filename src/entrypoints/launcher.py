@@ -124,18 +124,25 @@ def _headless_requested(args: list[str]) -> bool:
         or "-h" in args
     ):
         return True
-    if args and args[0] in {"tui-defaults", "validate"}:
+    if args and args[0] in {"tui-defaults", "validate", "web"}:
         return True
     return not (sys.stdin.isatty() and sys.stdout.isatty())
 
 
 def _run_headless(args: list[str]) -> int:
     module = (
-        "entrypoints.server"
+        "entrypoints.web"
+        if args and args[0] == "web"
+        else "entrypoints.server"
         if (args and args[0] == "tui-defaults") or "--web" in args or "--web-reopen" in args
         else "entrypoints.headless"
     )
-    command_args = args if module == "entrypoints.server" else _without_option(args, "--theme")
+    if module == "entrypoints.web":
+        command_args = args[1:]
+    elif module == "entrypoints.server":
+        command_args = args
+    else:
+        command_args = _without_option(args, "--theme")
     return subprocess.call(  # noqa: S603  # tracked: #288
         [sys.executable, "-m", module, *command_args]
     )

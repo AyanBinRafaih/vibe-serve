@@ -61,6 +61,7 @@ def test_headless_requested_detects_noninteractive_commands():  # noqa: ANN201  
     assert cli._headless_requested(["--headless", "--input", "x"]) is True  # noqa: SLF001  # tracked: #288
     assert cli._headless_requested(["validate", "bundle"]) is True  # noqa: SLF001  # tracked: #288
     assert cli._headless_requested(["tui-defaults"]) is True  # noqa: SLF001
+    assert cli._headless_requested(["web", "dev"]) is True  # noqa: SLF001
     assert cli._headless_requested(["--help"]) is True  # noqa: SLF001  # tracked: #288
     assert cli._headless_requested(["-h"]) is True  # noqa: SLF001  # tracked: #288
 
