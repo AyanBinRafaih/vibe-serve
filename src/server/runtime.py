@@ -50,7 +50,7 @@ _TERMINAL_EVENT_TYPES = frozenset(
 class ServerRuntime:
     """Compose and run one frontend-facing JSONL server."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         socket_path: Path,
@@ -58,12 +58,19 @@ class ServerRuntime:
         web: bool = False,
         web_port: int = 0,
         web_assets: Path | None = None,
+        instance_path: Path | None = None,
+        detach: bool = False,
+        read_only_log: Path | None = None,
     ) -> None:
         """Compose all server components around one shared condition."""
         self.socket_path = socket_path
         self.web = web
         self.web_port = web_port
         self.web_assets = web_assets
+        self.instance_path = instance_path
+        self.detach = detach
+        self.read_only_log = read_only_log
+        self._shutdown = threading.Event()
         self.condition = threading.Condition(threading.RLock())
         self.journal = EventJournal(self.condition)
         self.executions = ExecutionTracker(self.condition, self.journal)
@@ -129,21 +136,27 @@ class ServerRuntime:
             with self.condition:
                 self.session = None
 
-    def run(self, run: Callable[[], Any]) -> Any:  # noqa: ANN401, C901, PLR0915
+    def run(self, run: Callable[[], Any]) -> Any:  # noqa: ANN401, C901, PLR0912, PLR0915
         """Serve requests while executing ``run`` in the calling thread."""
-        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        install_sigterm = threading.current_thread() is threading.main_thread()
+        previous_sigterm = signal.getsignal(signal.SIGTERM) if install_sigterm else None
 
         def interrupt_from_launcher(signum: int, frame: object) -> None:
             del signum, frame
+            self._shutdown.set()
             raise KeyboardInterrupt
 
-        signal.signal(signal.SIGTERM, interrupt_from_launcher)
-        self.controller.attach(self.socket_path.parent)
-        self.journal.record(
-            EventType.SERVER_READY,
-            status=EventStatus.ACTIVE,
-            data=ServerReadyData(),
-        )
+        if install_sigterm:
+            signal.signal(signal.SIGTERM, interrupt_from_launcher)
+        if self.read_only_log is not None:
+            self.controller.attach_read_only(self.read_only_log)
+        else:
+            self.controller.attach(self.socket_path.parent)
+            self.journal.record(
+                EventType.SERVER_READY,
+                status=EventStatus.ACTIVE,
+                data=ServerReadyData(),
+            )
         run_error: BaseException | None = None
         try:
             subscriptions = SubscriptionTracker()
@@ -158,6 +171,7 @@ class ServerRuntime:
                             assets_dir=self.web_assets,
                             port=self.web_port,
                             subscriptions=subscriptions,
+                            instance_path=self.instance_path,
                         )
                     )
                     if self.web
@@ -165,8 +179,11 @@ class ServerRuntime:
                 )
                 if web_transport is not None:
                     print(f"VibeSys web UI: {web_transport.url}", flush=True)  # noqa: T201
-                if not transport.wait_for_subscriber(timeout=30.0):
+                if not self._detachable_mode and not transport.wait_for_subscriber(timeout=30.0):
                     raise RuntimeError("Timed out waiting for a server client")  # noqa: TRY003, TRY301
+                if self.read_only_log is not None:
+                    self._wait_for_detached_shutdown(transport)
+                    return None
                 terminal_cursor = self.journal.latest_sequence
                 try:
                     value = run()
@@ -182,7 +199,7 @@ class ServerRuntime:
                     # unwinds before landing. Returning, not re-raising, is
                     # what makes an operator stop a clean backend exit.
                     self.controller.finish(record_event=False)
-                    transport.wait_for_subscriber_disconnect()
+                    self._wait_for_detached_shutdown(transport)
                     return None
                 except ConfigurationError as exc:
                     configuration_diagnostic = exc.diagnostic
@@ -216,19 +233,19 @@ class ServerRuntime:
                         ),
                         diagnostic=event_diagnostic,
                     )
-                    transport.wait_for_subscriber_disconnect()
+                    self._wait_for_detached_shutdown(transport)
                     raise
                 except BaseException as exc:
                     self.controller.finish(
                         exc,
                         record_event=not self._terminal_recorded_after(terminal_cursor),
                     )
-                    transport.wait_for_subscriber_disconnect()
+                    self._wait_for_detached_shutdown(transport)
                     raise
                 self.controller.finish(
                     record_event=not self._terminal_recorded_after(terminal_cursor)
                 )
-                transport.wait_for_subscriber_disconnect()
+                self._wait_for_detached_shutdown(transport)
                 return value
         except BaseException as exc:
             run_error = exc
@@ -251,7 +268,24 @@ class ServerRuntime:
                             source="experiment-chat",
                         )
             finally:
-                signal.signal(signal.SIGTERM, previous_sigterm)
+                if install_sigterm and previous_sigterm is not None:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+
+    @property
+    def _detachable_mode(self) -> bool:
+        """Whether the server lifetime is independent of its subscribers."""
+        return self.detach or self.read_only_log is not None
+
+    def shutdown(self) -> None:
+        """Request a clean shutdown of a detached or read-only server."""
+        self._shutdown.set()
+
+    def _wait_for_detached_shutdown(self, transport: UnixJsonlServer) -> None:
+        if not self._detachable_mode:
+            transport.wait_for_subscriber_disconnect()
+            return
+        while not self._shutdown.wait(timeout=0.1):
+            pass
 
     def _finish_after_launcher_interrupt(self, terminal_cursor: int) -> None:
         """End a run the launcher terminated, recording the interruption once."""
