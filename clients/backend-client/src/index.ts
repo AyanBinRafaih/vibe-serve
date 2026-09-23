@@ -1,10 +1,4 @@
 export {
-  type EventSubscription,
-  ServerClient,
-  type ServerClientOptions,
-  type SubscribeOptions,
-} from './client.js';
-export {
   BackendClientError,
   type BackendErrorKind,
   isServerRejection,
@@ -39,3 +33,4 @@ export type {
   ServerMessage,
   TuiDefaults,
 } from './protocol.js';
+export type {EventSubscription, ServerTransport, SubscribeOptions} from './transport.js';
