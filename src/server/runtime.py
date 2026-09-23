@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import threading
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from typing import TYPE_CHECKING, Any
 
 from server.api.service import RunApi
@@ -29,7 +29,9 @@ from server.execution import ExecutionTracker
 from server.integration import RunIntegrationAdapter
 from server.journal import EventJournal
 from server.read_model import RunInspector
+from server.transport.subscriptions import SubscriptionTracker
 from server.transport.unix_jsonl import UnixJsonlServer
+from server.transport.websocket import WebSocketGateway
 from vibesys.api import ConfigurationError, RunStopped, create_session
 
 if TYPE_CHECKING:
@@ -53,9 +55,15 @@ class ServerRuntime:
         *,
         socket_path: Path,
         tui_defaults: Callable[[], InteractiveSetupDefaults] | None = None,
+        web: bool = False,
+        web_port: int = 0,
+        web_assets: Path | None = None,
     ) -> None:
         """Compose all server components around one shared condition."""
         self.socket_path = socket_path
+        self.web = web
+        self.web_port = web_port
+        self.web_assets = web_assets
         self.condition = threading.Condition(threading.RLock())
         self.journal = EventJournal(self.condition)
         self.executions = ExecutionTracker(self.condition, self.journal)
@@ -121,7 +129,7 @@ class ServerRuntime:
             with self.condition:
                 self.session = None
 
-    def run(self, run: Callable[[], Any]) -> Any:  # noqa: ANN401, PLR0915
+    def run(self, run: Callable[[], Any]) -> Any:  # noqa: ANN401, C901, PLR0915
         """Serve requests while executing ``run`` in the calling thread."""
         previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -138,7 +146,25 @@ class ServerRuntime:
         )
         run_error: BaseException | None = None
         try:
-            with UnixJsonlServer(self.socket_path, self.api) as transport:
+            subscriptions = SubscriptionTracker()
+            with ExitStack() as transports:
+                transport = transports.enter_context(
+                    UnixJsonlServer(self.socket_path, self.api, subscriptions)
+                )
+                web_transport = (
+                    transports.enter_context(
+                        WebSocketGateway(
+                            self.api,
+                            assets_dir=self.web_assets,
+                            port=self.web_port,
+                            subscriptions=subscriptions,
+                        )
+                    )
+                    if self.web
+                    else None
+                )
+                if web_transport is not None:
+                    print(f"VibeSys web UI: {web_transport.url}", flush=True)  # noqa: T201
                 if not transport.wait_for_subscriber(timeout=30.0):
                     raise RuntimeError("Timed out waiting for a server client")  # noqa: TRY003, TRY301
                 terminal_cursor = self.journal.latest_sequence
