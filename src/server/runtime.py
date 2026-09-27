@@ -30,6 +30,9 @@ from server.integration import RunIntegrationAdapter
 from server.journal import WireJournal
 from server.read_model import RunInspector
 from server.transport.discovery import (
+    WebInstanceClaim as WebInstanceClaim,  # noqa: PLC0414  # lint-waiver: LW-101062 [PLC0414]; re-export discovery locking through the allowed runtime composition boundary
+)
+from server.transport.discovery import (
     WebInstanceRecord as WebInstanceRecord,  # noqa: PLC0414  # lint-waiver: LW-101061 [PLC0414]; re-export the discovery record through the allowed runtime composition boundary
 )
 from server.transport.subscriptions import SubscriptionTracker
