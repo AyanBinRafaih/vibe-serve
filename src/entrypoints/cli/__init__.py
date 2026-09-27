@@ -7,9 +7,8 @@ this package is the shared surface between them.
 
 The loop is picked by ``--outer-loop {agent, profile-guided, plain, evolve}``:
 
-  "agent" / "profile-guided": orchestrated hypothesis loops.
-             Its issue board lives in the workspace as roadmap.md +
-             progress.md, owned by the orchestrator.
+  "agent" / "profile-guided": orchestrated hypothesis loops. Their policy
+             memory lives below ``roadmap/`` and ``progress/``.
   "plain": deterministic outer loop. Its issue board is a structured
              :class:`IssueBoard` (issues.json) that perf_eval files into
              and the implementer drains one issue at a time.
@@ -39,9 +38,8 @@ from entrypoints.cli.args import (
     _parse_runs_dir,
 )
 from entrypoints.cli.config import (
-    _load_config_or_stub_default,
+    _load_config_or_default,
     _prepare_experiment_repository,
-    _prepare_stub_agent_smoke_defaults,
     load_config_and_skills,
 )
 from entrypoints.cli.constants import _MODALITIES, _OUTER_LOOPS
@@ -88,7 +86,7 @@ __all__ = [
     "_configuration_error",
     "_extract_flag",
     "_extract_loop_selection",
-    "_load_config_or_stub_default",
+    "_load_config_or_default",
     "_load_metric_space_toml",
     "_load_objective",
     "_option_from_argv",
@@ -105,7 +103,7 @@ __all__ = [
     "configuration_error",
     "dispatch",
     "load_config_and_skills",
-    "load_config_or_stub_default",
+    "load_config_or_default",
     "option_from_argv",
     "parse_cli_invocation",
     "parse_runs_dir",
@@ -166,7 +164,6 @@ def _explicit_cli_dests(
 
 def parse_cli_invocation(argv: list[str]) -> CliInvocation:
     """Parse and validate one invocation without printing or exiting."""
-    argv = _prepare_stub_agent_smoke_defaults(argv)
     loop_kind, remaining = _extract_loop_selection(argv)
     command = _LOOP_COMMANDS[loop_kind]
     parser = command.build_parser()
@@ -213,7 +210,7 @@ def _render_configuration_error(error: ConfigurationError) -> NoReturn:
 # Public bootstrap helpers shared with the serving entrypoint.
 RunArgumentParser = _RunArgumentParser
 configuration_error = _configuration_error
-load_config_or_stub_default = _load_config_or_stub_default
+load_config_or_default = _load_config_or_default
 option_from_argv = _option_from_argv
 parse_runs_dir = _parse_runs_dir
 render_configuration_error = _render_configuration_error

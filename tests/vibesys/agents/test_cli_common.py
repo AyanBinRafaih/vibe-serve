@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Never
 import pytest
 
 from vibesys.constants import ComputeBackend
-from vibesys.roles.judge import JudgeResponse
-from vibesys.skills import platform_skill_selection
+from vibesys.orchestration.multi.contracts import JudgeResponse
+from vibesys.orchestration.skill_selection import platform_skill_selection
 from vs_agent.cli_common import (
     CLI_SKILL_DIRS,
     agent_label,

@@ -20,13 +20,14 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from vibesys.constants import DEFAULT_COMPUTE_BACKEND, PROJECT_ROOT, ComputeBackend
-from vibesys.features import FeatureFlag
 from vibesys.repository import REPOSITORY_COMPONENT, RepositoryVisibility
-from vs_feature_flags.api import parse_feature_flag_overrides
+from vs_runtime.api import AgentRoleId
+from vs_runtime.api.infrastructure import BundledResources
+
+BUNDLED_RESOURCES = BundledResources(PROJECT_ROOT / "resources", package="vibesys")
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-Provider = Literal["vertex-ai", "anthropic", "google-genai", "openai", "openai-compatible"]
 
 
 class _Strict(BaseModel):
@@ -36,14 +37,9 @@ class _Strict(BaseModel):
 
 
 class ModelCfg(_Strict):
-    """Model identifier and deprecated provider key from agent.toml."""
+    """Model identifier from agent.toml."""
 
     name: str = Field(description="Model identifier, e.g. 'claude-sonnet-4-6'. Required.")
-    # Deprecated: accepted so existing agent.toml files load, but ignored.
-    provider: Provider | None = Field(
-        default=None,
-        description="Deprecated and ignored: the agent CLI provider is selected by [agent].",
-    )
 
 
 class ThinkingCfg(_Strict):
@@ -73,87 +69,6 @@ class ThinkingCfg(_Strict):
         return self
 
 
-class VertexCfg(_Strict):
-    """Deprecated Vertex AI fields accepted for configuration compatibility."""
-
-    # Deprecated: accepted so existing agent.toml files load, but ignored.
-    # The attribute is ``json_path`` to avoid shadowing ``BaseModel.json``; the
-    # TOML key stays ``json`` via the alias.
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    json_path: str | None = Field(
-        default=None,
-        alias="json",
-        description=("Path to the Vertex AI service-account JSON key file. Accepted but ignored."),
-    )
-    project: str | None = Field(
-        default=None,
-        description=("GCP project id. Accepted but ignored."),
-    )
-    region: str = Field(
-        default="us-east5",
-        description="Vertex AI region/location.",
-    )
-
-
-class OpenAICompatCfg(_Strict):
-    """Deprecated OpenAI-compatible endpoint fields."""
-
-    # Deprecated: accepted so existing agent.toml files load, but ignored.
-    base_url: str | None = Field(
-        default=None,
-        description=(
-            "Base URL of the OpenAI-compatible endpoint "
-            "(e.g. 'http://localhost:8000/v1'). Required for this provider."
-        ),
-    )
-    api_key: str = Field(
-        default="no-key",
-        description="API key for the endpoint; 'no-key' for unauthenticated local servers.",
-    )
-
-
-class _CredEnvProviderCfg(_Strict):
-    """A provider whose credentials come from the environment (``.env``).
-
-    The ``[providers.<name>]`` table carries no keys; it exists only as a marker.
-    Declared so the table validates under ``extra="forbid"`` while still
-    rejecting stray keys placed under it.
-    """
-
-
-class ProvidersCfg(_Strict):
-    """Deprecated provider tables accepted while configuration migrates."""
-
-    # Deprecated: every [providers.*] table is accepted so existing agent.toml
-    # files load, but none is read.
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    vertex_ai: VertexCfg | None = Field(
-        default=None,
-        alias="vertex-ai",
-        description="Vertex AI provider settings ([providers.vertex-ai]).",
-    )
-    openai_compatible: OpenAICompatCfg | None = Field(
-        default=None,
-        alias="openai-compatible",
-        description=("OpenAI-compatible endpoint settings ([providers.openai-compatible])."),
-    )
-    anthropic: _CredEnvProviderCfg | None = Field(
-        default=None,
-        description="Anthropic provider marker. Accepted but ignored.",
-    )
-    google_genai: _CredEnvProviderCfg | None = Field(
-        default=None,
-        alias="google-genai",
-        description="Google GenAI provider marker. Accepted but ignored.",
-    )
-    openai: _CredEnvProviderCfg | None = Field(
-        default=None,
-        description="OpenAI provider marker. Accepted but ignored.",
-    )
-
-
 class BackendCfg(_Strict):
     """Compute backend selected for the run."""
 
@@ -171,10 +86,14 @@ class AgentRoleCfg(_Strict):
 
     model: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=256,
         description="CLI model override for this role. None uses [model].name.",
     )
     reasoning_effort: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=256,
         description=(
             "CLI reasoning-effort override for this role (for Codex, for example "
             "'low'/'medium'/'high'/'xhigh'). None uses [thinking].level."
@@ -214,13 +133,12 @@ class AgentCfg(_Strict):
             "Per-invocation timeout for the CLI agent, in seconds. None → the runner default."
         ),
     )
-    outer: AgentRoleCfg = Field(
-        default_factory=AgentRoleCfg,
-        description="[agent.outer] — model controls for orchestrator invocations.",
-    )
-    inner: AgentRoleCfg = Field(
-        default_factory=AgentRoleCfg,
-        description="[agent.inner] — model controls for implementer invocations.",
+    roles: dict[AgentRoleId, AgentRoleCfg] = Field(
+        default_factory=dict,
+        description=(
+            "Sparse model overrides keyed by plugin-declared agent role ID. "
+            "Omitted roles inherit [model] and [thinking]."
+        ),
     )
 
 
@@ -251,29 +169,6 @@ class RepositoryCfg(_Strict):
         return owner
 
 
-class LoadLevelCfg(_Strict):
-    """One benchmark load level fed to the perf_eval prompt template.
-
-    Distinct from the ``LoadLevelMetrics`` *output* schema in ``schemas.py``.
-    """
-
-    rate: int = Field(gt=0, description="Request rate (requests/sec) for this load level.")
-    duration: int = Field(gt=0, description="Benchmark duration in seconds at this load level.")
-    max_tokens: int = Field(gt=0, description="Max output tokens per request at this load level.")
-
-
-class PerfEvalCfg(_Strict):
-    """Optional benchmark load ladder for performance evaluation."""
-
-    load_levels: list[LoadLevelCfg] | None = Field(
-        default=None,
-        description=(
-            "Benchmark load levels handed to the perf evaluator. None → the "
-            "evaluator uses its built-in default ladder."
-        ),
-    )
-
-
 class Config(_Strict):
     """Validated project configuration for one VibeSys run."""
 
@@ -282,10 +177,6 @@ class Config(_Strict):
     model: ModelCfg = Field(description="[model] — model name and provider. Required.")
     thinking: ThinkingCfg = Field(
         default_factory=ThinkingCfg, description="[thinking] — reasoning/thinking controls."
-    )
-    providers: ProvidersCfg = Field(
-        default_factory=ProvidersCfg,
-        description="[providers.*] — per-provider credentials and endpoints.",
     )
     backend: BackendCfg = Field(
         default_factory=BackendCfg, description="[backend] — compute backend selection."
@@ -298,19 +189,6 @@ class Config(_Strict):
         default_factory=RepositoryCfg,
         description="[repository] — defaults for remote experiment repositories.",
     )
-    perf_eval: PerfEvalCfg = Field(
-        default_factory=PerfEvalCfg,
-        description="[perf_eval] — performance-evaluation settings.",
-    )
-    feature_flags: dict[FeatureFlag, bool] = Field(
-        default_factory=dict,
-        description="[feature_flags] — typed feature-flag overrides.",
-    )
-
-    @field_validator("feature_flags", mode="before")
-    @classmethod
-    def _parse_feature_flags(cls, value: object) -> dict[FeatureFlag, bool]:
-        return parse_feature_flag_overrides(value, FeatureFlag)
 
 
 def as_config(config: "Config | Mapping[str, Any]") -> "Config":

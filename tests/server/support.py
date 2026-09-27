@@ -13,29 +13,34 @@ from server.execution import AgentExecutionRequest, ExecutionHandle, ExecutionTr
 from server.integration import RunIntegrationAdapter
 from server.journal import WireJournal
 from server.read_model import RunInspector
-from vibesys.evaluators.metrics import MetricSpace
-from vibesys.loops.agent_options import (
+from vibesys.api import AuxiliaryAgentDriver, CoreEventType, open_run_store
+from vibesys.api.metrics import MetricSpace
+from vibesys.orchestration.agent_options import (
     AgentOrchestrationOptions,
-    descriptor_from_options,
 )
 from vibesys.run.event_journal import EventJournal as CoreEventJournal
-from vibesys.run.run_control import RunControlChannel
+from vs_project.api import OrchestrationDescriptor
+from vs_runtime.api.infrastructure import (
+    RunControlChannel,
+    RunControlTransition,
+    create_run_control_channel,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
     from server.chat.factory import ChatAgentBuilder
+    from server.run_attachment import AgentSelection
     from server.settings import InteractiveSetupDefaults
-    from vibesys.api import RunView
-    from vs_agent.api import AgentSelection
-    from vs_project.api import OrchestrationDescriptor, Project
+    from vibesys.api import RunRecord, RunView
+    from vs_project.api import Project
 
 
 class _ControlBridge:
     """Adapt a `RunControlChannel` to the `vibesys.api.RunControl` shape.
 
-    Mirrors what `vibesys.api.session._LocalRunSession`'s `steer`/`pause`/
+    Mirrors what `vibesys.api._session._LocalRunSession`'s `steer`/`pause`/
     `resume`/`stop` methods do in production: translate the `RunControl`
     protocol's names onto the channel's writer-side methods. `RunApi`'s
     `session_provider` returns this so `_execute_command` can route through
@@ -58,6 +63,19 @@ class _ControlBridge:
         self._channel.request_stop()
 
 
+def _record_control_transition(
+    events: CoreEventJournal, transition: RunControlTransition
+) -> object:
+    """Adapt runtime transitions to the core journal in test composition."""
+    return events.emit(
+        CoreEventType(transition.kind.value),
+        transition.text,
+        agent_kind=transition.agent_kind,
+        round_label=transition.round_label,
+        execution_id=transition.execution_id,
+    )
+
+
 def agent_descriptor(
     *,
     metric_space: MetricSpace | None = None,
@@ -69,10 +87,29 @@ def agent_descriptor(
         max_retries_per_round=1,
         judge_every=1,
         official_eval_every=1,
-        memory_layout="files",
         metric_space=metric_space or MetricSpace(),
     )
-    return descriptor_from_options(options, orchestration_id="single-agent")
+    return OrchestrationDescriptor(
+        id="single-agent",
+        config_version=1,
+        options=options.model_dump(mode="json"),
+    )
+
+
+def auxiliary_agent_drivers() -> tuple[AuxiliaryAgentDriver, ...]:
+    """Return stable driver/provider facts for server composition tests."""
+    return (
+        AuxiliaryAgentDriver(
+            driver="agentshim",
+            providers=("claude", "codex", "gemini", "opencode"),
+        ),
+        AuxiliaryAgentDriver(driver="omnigent", providers=("claude", "codex")),
+    )
+
+
+def run_record(project: Project, run_id: str) -> RunRecord:
+    """Open the semantic record used by server-facing integration tests."""
+    return open_run_store(project).get_record(run_id)
 
 
 @dataclass(frozen=True)
@@ -120,8 +157,7 @@ class ServerParts:
         self,
         log_dir: Path,
         *,
-        project: Project | None = None,
-        run_id: str | None = None,
+        record: RunRecord | None = None,
     ) -> None:
         """Attach the integration and core event journal to durable state.
 
@@ -130,8 +166,11 @@ class ServerParts:
         session, so `core_events` needs its own attach call to write
         ``core-events.jsonl`` under *log_dir*.
         """
-        self.integration.attach(log_dir, project=project, run_id=run_id)
-        self.core_events.attach(log_dir, run_id or log_dir.parent.name)
+        self.integration.attach(log_dir, record=record)
+        self.core_events.attach(
+            log_dir,
+            record.run_id if record is not None else log_dir.parent.name,
+        )
 
     def close(self) -> None:
         """Release subscriptions owned by the integration adapter."""
@@ -152,8 +191,7 @@ class ServerParts:
 def build_server_parts(
     log_dir: Path | None = None,
     *,
-    project: Project | None = None,
-    run_id: str | None = None,
+    record: RunRecord | None = None,
     tui_defaults: Callable[[], InteractiveSetupDefaults] | None = None,
     chat_agent_builder: ChatAgentBuilder | None = None,
 ) -> ServerParts:
@@ -177,7 +215,9 @@ def build_server_parts(
     chat.set_fallback_answer(RunInspector(integration).answer)
     core_events = CoreEventJournal()
     core_events.subscribe(integration.project_event)
-    control = RunControlChannel(core_events)
+    control = create_run_control_channel(
+        lambda transition: _record_control_transition(core_events, transition)
+    )
     control_bridge = _ControlBridge(control)
     api = RunApi(
         condition,
@@ -201,5 +241,5 @@ def build_server_parts(
         control=control,
     )
     if log_dir is not None:
-        parts.attach(log_dir, project=project, run_id=run_id)
+        parts.attach(log_dir, record=record)
     return parts

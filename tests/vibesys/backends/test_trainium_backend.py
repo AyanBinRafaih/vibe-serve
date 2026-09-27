@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import argparse
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 from tests.support import capture_docker_start_argv
 
 from entrypoints.cli import _add_common_args
-from vibesys import backends
-from vibesys.backends import SandboxKind
-from vibesys.backends.trainium import TrainiumBackend
-from vibesys.constants import ComputeBackend
-from vibesys.profilers import ProfilerKind
-from vs_sandbox.api import DockerSandbox, HostResource, HostResourceAccess, LocalShellSandbox
+from vs_sandbox.api import (
+    AcceleratorInventory,
+    ComputeBackend,
+    DockerSandbox,
+    HostResource,
+    HostResourceAccess,
+    LocalShellSandbox,
+    SandboxKind,
+    TrainiumBackend,
+    create_compute_backend,
+)
+from vs_sandbox.api.testing import FakeAcceleratorDiscovery
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -22,18 +27,19 @@ if TYPE_CHECKING:
 
 
 def _make_backend(tmp_path: Path, devices: Iterable[str] = ("/dev/neuron0",)) -> TrainiumBackend:
-    with patch("vibesys.backends.trainium._discover_neuron_devices", return_value=list(devices)):
-        impl = backends.get(ComputeBackend.TRAINIUM, log_dir=tmp_path / "logs")
-    assert isinstance(impl, TrainiumBackend)
-    return impl
+    return TrainiumBackend(
+        tmp_path / "logs",
+        accelerator_discovery=FakeAcceleratorDiscovery(
+            trainium=AcceleratorInventory(tuple(devices))
+        ),
+    )
 
 
 class TestTrainiumRegistry:
     def test_trainium_in_registry(self, tmp_path: Path) -> None:
-        impl = backends.get(ComputeBackend.TRAINIUM, log_dir=tmp_path)
+        impl = create_compute_backend(ComputeBackend.TRAINIUM, log_dir=tmp_path)
         assert isinstance(impl, TrainiumBackend)
         assert impl.name is ComputeBackend.TRAINIUM
-        assert impl.profiler_kind is ProfilerKind.NEURON
 
 
 class TestTrainiumSandbox:

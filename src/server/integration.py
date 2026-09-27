@@ -26,18 +26,17 @@ from server.events import (
 from server.read_model import RunInspector
 from server.run_attachment import AgentSelection, RunAttachment
 from server.run_lifecycle import RunTrigger
-from vibesys.api import CoreEventType, output_sink
+from vibesys.api import CoreEventType
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
     from server.chat.manager import ChatManager
-    from server.controller import ProjectRunState, RunController
+    from server.controller import RunController
     from server.execution import ExecutionTracker
     from server.journal import WireJournal
-    from vibesys.api import CoreEvent, RunResourceHandoff, RunSession
-    from vs_project.api import Project
+    from vibesys.api import CoreEvent, RunReady, RunRecord, RunSession
 
 _EVENT_DATA_ADAPTER = TypeAdapter(EventData)
 _TERMINAL_TRIGGERS: dict[EventType, RunTrigger] = {
@@ -198,16 +197,15 @@ class RunIntegrationAdapter:
         self.journal = journal
         self.chat = chat
         self._chat_agent_builder = chat_agent_builder
-        self._unsubscribe_output = output_sink().subscribe(self._route_output_event)
         self._chat_factory: ExperimentChatFactory | None = None
         self._detach_run: Callable[[], None] | None = None
         self._closed = False
         self._failure_diagnostics: dict[str, Diagnostic] = {}
 
     @property
-    def project_run(self) -> ProjectRunState | None:
-        """Return the attached canonical project run, if available."""
-        return self.controller.project_run
+    def attached_run(self) -> RunRecord | None:
+        """Return the attached semantic run record, if available."""
+        return self.controller.attached_run
 
     @property
     def current_round(self) -> str | None:
@@ -227,37 +225,29 @@ class RunIntegrationAdapter:
         self,
         log_dir: Path,
         *,
-        project: Project | None = None,
-        run_id: str | None = None,
+        record: RunRecord | None = None,
     ) -> None:
         """Attach the wire journal to durable run storage."""
         self._failure_diagnostics.clear()
-        self.controller.attach(log_dir, project=project, run_id=run_id)
+        self.controller.attach(log_dir, record=record)
 
-    def handle_run_resources(self, session: RunSession, handoff: RunResourceHandoff) -> None:
-        """Convert a core resource handoff into durable attach plus experiment chat.
+    def handle_run_ready(self, session: RunSession, ready: RunReady) -> None:
+        """Attach frontend projection and chat from narrow readiness facts.
 
-        Registered as this run's sole `RunSession.on_run_resources` listener,
-        bound to *session* by `server.runtime.ServerRuntime.drive`. *session*
-        is threaded through to `ExperimentChatFactory` so it can open its own
-        agent-construction environment through
-        `vibesys.api.RunSession.open_agent_environment`. Durable attach runs
-        first so the wire journal is attached before any experiment-chat setup
-        that might read it.
+        Registered as this run's sole ``RunSession.on_ready`` listener. Durable
+        attach runs first so the wire journal is ready before experiment chat
+        can read the run history.
         """
-        self.attach(handoff.log_dir, project=handoff.project, run_id=handoff.run_id)
+        self.attach(ready.log_directory, record=ready.record)
         attachment = RunAttachment(
-            project=handoff.project,
-            run_id=handoff.run_id,
-            workspace=handoff.workspace,
-            log_dir=handoff.log_dir,
-            agent_backend=handoff.agent_backend,
+            chat_state_dir=ready.frontend_state_directory / "chat",
             agent_defaults=AgentSelection(
-                driver=handoff.driver,
-                provider=handoff.provider,
-                model=handoff.model,
-                role_models=handoff.role_models,
+                driver=ready.agent_driver,
+                provider=ready.agent_provider,
+                model=ready.agent_model,
+                role_models=ready.role_models,
             ),
+            agent_drivers=ready.agent_drivers,
         )
         self._detach_run = self._attach_run(attachment, session)
 
@@ -303,7 +293,6 @@ class RunIntegrationAdapter:
         if detach_run is not None:
             detach_run()
         self.chat.close_terminal_resource()
-        self._unsubscribe_output()
 
     def record(
         self,
@@ -375,10 +364,7 @@ class RunIntegrationAdapter:
                 event.agent_kind, event.round_label, event.execution_id
             )
         if event_type in _PRESENTATION_EVENTS:
-            # Delivered by `_route_output_event`'s own `output_sink()`
-            # subscription instead: both subscriptions see the same events,
-            # so handling presentation events here too would double-deliver
-            # them.
+            self._route_output_event(event)
             return
         terminal_trigger = _TERMINAL_TRIGGERS.get(event_type)
         if terminal_trigger is not None:
@@ -429,15 +415,9 @@ class RunIntegrationAdapter:
             self.controller.land_stop_at_boundary()
 
     def _route_output_event(self, event: CoreEvent) -> None:
-        """Publish a presentation event straight from `output_sink()`.
-
-        This is now the sole delivery path for `_PRESENTATION_EVENTS`, for
-        both the main run and experiment chat alike: `project_event` early
-        returns for these event types (see its own docstring note), and
-        chat's presentation never needed the full core-event pipeline in the
-        first place (`ExecutionTracker.presentation_scope` is its real entry
-        point).
-        """
+        """Publish one explicitly delivered presentation event."""
+        if self._closed:
+            return
         event_type = EventType(event.type.value)
         if event_type not in _PRESENTATION_EVENTS or event.data is None:
             return

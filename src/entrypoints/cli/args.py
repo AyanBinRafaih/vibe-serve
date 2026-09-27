@@ -14,11 +14,11 @@ from vibesys.api import (
     ConfigurationDiagnostic,
     ConfigurationError,
     DomainName,
-    Objective,
     ProfilerKind,
     RepositoryVisibility,
 )
-from vibesys.api.request import CLI_PROFILER_CHOICES, coerce_profiler_kind
+from vibesys.api.metrics import Objective
+from vibesys.api.profilers import CLI_PROFILER_CHOICES, coerce_profiler_kind
 from vs_agent.api import SHIPPED_PROVIDERS
 
 
@@ -396,11 +396,6 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help="SkyPilot CLI executable. Default: sky.",
     )
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Pause for Enter at each step in loop mode.",
-    )
-    parser.add_argument(
         "--repo",
         default=None,
         metavar="[OWNER/]NAME",
@@ -537,20 +532,6 @@ def _build_agent_parser() -> argparse.ArgumentParser:
             "accepted candidate checkpoints; orchestrator requests and the final "
             "round run them immediately (default: 3)."
         ),
-    )
-    parser.add_argument(
-        "--memory-layout",
-        choices=["files", "directories"],
-        default="files",
-        help=(
-            "Store roadmap/progress as roadmap.md + progress.md (files), or as "
-            "roadmap/index.md + progress/round-NNNN.md (directories)."
-        ),
-    )
-    parser.add_argument(
-        "--stub-agent",
-        action="store_true",
-        help="Use deterministic local agent responses for fast TUI smoke tests.",
     )
     parser.add_argument("--modality", default=None, choices=_MODALITIES)
     parser.add_argument(

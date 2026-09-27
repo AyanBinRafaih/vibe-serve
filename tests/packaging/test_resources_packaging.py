@@ -15,8 +15,10 @@ from resources_packaging import (
     stage_sdk,
 )
 
-from vibesys import resource_paths
+from vibesys.api.request import default_skill_roots
+from vibesys.config import BUNDLED_RESOURCES
 from vibesys.constants import PROJECT_ROOT
+from vibesys.orchestration.profilers import PROFILERS_COMMON_STAGED_NAME
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -114,64 +116,27 @@ def test_required_sdk_staging_rejects_an_incomplete_project(tmp_path: Path) -> N
 
 
 def test_resources_root_prefers_the_checkout() -> None:
-    assert resource_paths.resources_root() == PROJECT_ROOT / "resources"
+    assert BUNDLED_RESOURCES.root() == PROJECT_ROOT / "resources"
 
 
 def test_profiler_support_dir_resolves_known_kind_and_rejects_unknown() -> None:
-    nsys = resource_paths.profiler_support_dir("nsys")
+    nsys = BUNDLED_RESOURCES.directory("profilers", "nsys")
     assert nsys is not None
     assert (nsys / "server.py").is_file()
-    assert resource_paths.profiler_support_dir("no-such-profiler") is None
+    assert BUNDLED_RESOURCES.directory("profilers", "no-such-profiler") is None
 
 
 def test_profiler_support_common_dir_points_at_the_shared_capture_runtime() -> None:
-    common = resource_paths.profiler_support_common_dir()
+    common = BUNDLED_RESOURCES.directory("profilers", "_common")
     assert common is not None
     assert (common / "capture_runtime.py").is_file()
-    assert resource_paths.PROFILERS_COMMON_STAGED_NAME == "profilers_common"
+    assert PROFILERS_COMMON_STAGED_NAME == "profilers_common"
 
 
 def test_default_skill_roots_point_at_the_resources_tree() -> None:
-    roots = resource_paths.default_skill_roots()
+    roots = default_skill_roots()
     assert roots == (PROJECT_ROOT / "resources" / "skills",)
 
 
 def test_evaluator_packages_dir_points_at_the_resources_tree() -> None:
-    assert resource_paths.evaluator_packages_dir() == PROJECT_ROOT / "resources" / "evaluators"
-
-
-def test_resources_root_falls_back_to_the_staged_wheel_copy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    fake_checkout = tmp_path / "no-checkout"
-    fake_package = tmp_path / "site-packages" / "vibesys"
-    staged = fake_package / "_resources"
-    (staged / "evaluators").mkdir(parents=True)
-    (staged / "profilers" / "nsys").mkdir(parents=True)
-    (staged / "profilers" / "nsys" / "server.py").write_text("# server")
-    (staged / "profilers" / "_common").mkdir(parents=True)
-    (staged / "profilers" / "_common" / "capture_runtime.py").write_text("# capture runtime")
-    (staged / "skills").mkdir()
-
-    monkeypatch.setattr(resource_paths, "PROJECT_ROOT", fake_checkout)
-    monkeypatch.setattr(resource_paths, "files", lambda _package: fake_package)
-
-    assert resource_paths.resources_root() == staged
-    assert resource_paths.evaluator_packages_dir() == staged / "evaluators"
-    support = resource_paths.profiler_support_dir("nsys")
-    assert support == staged / "profilers" / "nsys"
-    common = resource_paths.profiler_support_common_dir()
-    assert common == staged / "profilers" / "_common"
-    assert resource_paths.default_skill_roots() == (staged / "skills",)
-
-
-def test_resources_root_is_none_without_checkout_or_staged_copy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(resource_paths, "PROJECT_ROOT", tmp_path / "nowhere")
-    monkeypatch.setattr(resource_paths, "files", lambda _package: tmp_path / "no-package")
-
-    assert resource_paths.resources_root() is None
-    assert resource_paths.profiler_support_dir("nsys") is None
-    assert resource_paths.profiler_support_common_dir() is None
-    assert resource_paths.default_skill_roots() == ()
+    assert BUNDLED_RESOURCES.directory("evaluators") == (PROJECT_ROOT / "resources" / "evaluators")

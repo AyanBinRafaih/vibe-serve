@@ -1,9 +1,9 @@
-"""``vibesys.search`` stays pure: deterministic state transitions, no effects.
+"""Search policy stays pure: deterministic state transitions, no effects.
 
 Rules (see the orchestration-simplify design brief):
-  - No imports of vibesys.orchestration, vibesys.loops, vibesys.roles,
-    vibesys.prompts (search answers questions and returns new state; it never
-    drives agents, renders prompts, or touches RunContext).
+  - No imports of orchestration execution policy or vibesys.loops,
+    vibesys.orchestration.prompts (search answers questions and returns new state; it never
+    drives agents, renders prompts, or uses runtime capabilities).
   - No os / subprocess / pathlib / time / datetime imports (search must do no
     I/O and touch no clock; every effect is deterministic and resume-safe).
   - ``random`` may be imported freely (for the ``Random`` type and
@@ -14,8 +14,8 @@ Rules (see the orchestration-simplify design brief):
     its state from the persisted state value, so RNG state always lives in
     the state value, never in an unseeded instance or the global singleton.
 
-All three checks are pure ``ast`` scans, so they do not require importing
-``vibesys.search`` (which would pull in its third-party dependencies).
+All three checks are pure ``ast`` scans, so they do not require importing the
+policy packages (which would pull in their third-party dependencies).
 """
 
 from __future__ import annotations
@@ -24,19 +24,30 @@ import ast
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[3] / "src" / "vibesys"
-_SEARCH = _SRC / "search"
+_POLICY_ROOTS = (
+    _SRC / "orchestration" / "hypothesis",
+    _SRC / "orchestration" / "profile_focus",
+    _SRC / "orchestration" / "evolve" / "population",
+)
 
-_FORBIDDEN_PACKAGES = ("vibesys.orchestration", "vibesys.loops", "vibesys.roles", "vibesys.prompts")
+_FORBIDDEN_PACKAGES = (
+    "vibesys.loops",
+    "vibesys.orchestration.agents",
+    "vibesys.run.evaluation",
+    "vibesys.orchestration.single",
+    "vibesys.orchestration.multi",
+    "vibesys.orchestration.prompts",
+)
 
-# vibesys.agent_run has fully dissolved into search/hypothesis, roles/,
-# loops/, and vibesys.orchestration.{memory,artifacts}. No search/ module
+# vibesys.agent_run has fully dissolved into search/hypothesis, policy packages,
+# and vibesys.orchestration.{memory,artifacts}. No search/ module
 # re-exports from it any more.
 _ALLOWED_AGENT_RUN_REEXPORTS: set[str] = set()
 
 _FORBIDDEN_CLOCK_OR_IO_MODULES = ("os", "subprocess", "pathlib", "time", "datetime")
 
 # Process-global RNG accessors upstream OpenEvolve code itself reads/writes.
-# ``_upstream_random`` (search/population/openevolve_selector.py) is the one
+# ``_upstream_random`` (orchestration/evolve/population/openevolve_selector.py) is the one
 # place search/ may call these directly: it swaps the global singleton's
 # state for an explicit, state-derived ``random.Random`` around a call into
 # upstream code that only knows the global RNG, then restores the process's
@@ -73,21 +84,26 @@ def _is_type_checking_guard(node: ast.AST) -> bool:
     return False
 
 
-def test_search_imports_nothing_from_orchestration_loops_roles_or_prompts() -> None:
+def _policy_paths() -> list[Path]:
+    return [path for root in _POLICY_ROOTS for path in root.rglob("*.py")]
+
+
+def test_search_imports_nothing_from_execution_policy_or_prompts() -> None:
     violations: list[str] = []
-    for path in _SEARCH.rglob("*.py"):
+    for path in _policy_paths():
+        relative_path = str(path.relative_to(_SRC))
         for node, module_name in _module_level_import_nodes(path):
             if any(
                 module_name == pkg or module_name.startswith(pkg + ".")
                 for pkg in _FORBIDDEN_PACKAGES
             ):
-                violations.append(f"{path.relative_to(_SRC)}:{node.lineno} imports {module_name}")
+                violations.append(f"{relative_path}:{node.lineno} imports {module_name}")
     assert not violations, "search/ imports a forbidden layer: " + "; ".join(violations)
 
 
 def test_search_has_no_module_level_io_or_clock_imports() -> None:
     violations: list[str] = []
-    for path in _SEARCH.rglob("*.py"):
+    for path in _policy_paths():
         rel = str(path.relative_to(_SRC))
         for node, module_name in _module_level_import_nodes(path):
             if module_name.startswith("vibesys.agent_run"):
@@ -139,7 +155,7 @@ def _restores_from_state(stmt: ast.stmt, target: str) -> bool:
 
 def test_search_uses_no_global_rng_and_seeds_every_random_instance() -> None:
     violations: list[str] = []
-    for path in _SEARCH.rglob("*.py"):
+    for path in _policy_paths():
         rel = str(path.relative_to(_SRC))
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):

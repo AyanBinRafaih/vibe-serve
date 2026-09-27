@@ -20,18 +20,16 @@ from pathlib import Path
 from typing import Never, cast
 
 from entrypoints.launcher import bundled_tui
-from vibesys.evaluators import EvaluatorPackageRequirement, resolve_evaluator_package
-from vibesys.input_project import materialize_input_project
-from vibesys.loops.registry import built_in_orchestrations
-from vibesys.orchestration.contracts import project_run
-from vibesys.orchestration.view import RunStatus
-from vibesys.profilers import ACTIVE_PROFILER_KINDS
-from vibesys.resource_paths import (
-    default_skill_roots,
-    profiler_support_dir,
-    resources_root,
+from vibesys.api.request import default_skill_roots
+from vibesys.config import BUNDLED_RESOURCES
+from vibesys.orchestration.profilers import ACTIVE_PROFILER_KINDS
+from vs_runtime.api.infrastructure import (
+    EvaluatorPackageRequirement,
+    SDKRoots,
+    materialize_input_project,
+    resolve_evaluator_package,
+    resolve_packaged_tree,
 )
-from vs_project.api import Project, ProjectError
 
 FRAMEWORK_PACKAGES = (
     "vibesys",
@@ -40,12 +38,12 @@ FRAMEWORK_PACKAGES = (
     "headless",
     "vs_agent",
     "vs_evaluator_protocol",
-    "vs_feature_flags",
     "vs_github",
     "vs_issue_tracker",
     "vs_loop_state",
     "vs_project",
     "vs_prompts",
+    "vs_runtime",
     "vs_sandbox",
 )
 REQUIRED_SYSTEM_TOOLS = ("git",)
@@ -144,10 +142,6 @@ def verify_console_entry_point() -> None:
     if executable is None:
         _fail("Installed vibesys console script is absent from PATH")
     _run([executable, "--headless", "--help"], timeout=30)
-    issue_mcp = shutil.which("vibesys-issue-mcp")
-    if issue_mcp is None:
-        _fail("Installed vibesys-issue-mcp console script is absent from PATH")
-    _run([issue_mcp, "--help"], timeout=30)
 
 
 def verify_first_launch_defaults() -> None:
@@ -211,18 +205,24 @@ def _parse_first_launch_defaults(output: str, *, source: str) -> dict[str, objec
 
 
 def _verify_resources() -> None:
-    root = resources_root()
+    root = BUNDLED_RESOURCES.root()
     if root is None or "site-packages" not in str(root.resolve()):
         _fail(f"Installed resources did not resolve from site-packages: {root}")
     skill_roots = default_skill_roots()
     if len(skill_roots) != 1 or not any(skill_roots[0].rglob("SKILL.md")):
         _fail(f"Installed skills did not resolve: {skill_roots}")
     for kind in ACTIVE_PROFILER_KINDS:
-        support = profiler_support_dir(kind.value)
+        support = BUNDLED_RESOURCES.directory("profilers", kind.value)
         if support is None or "site-packages" not in str(support.resolve()):
             _fail(f"Installed profiler resources did not resolve for {kind.value}: {support}")
+    evaluator_packages = BUNDLED_RESOURCES.directory("evaluators")
+    if evaluator_packages is None:
+        _fail("Installed evaluator package resources did not resolve")
     for name in ("vibesys-evaluator-microservice", "vibesys-evaluator-queue"):
-        package = resolve_evaluator_package(EvaluatorPackageRequirement(name=name, version="0.1.0"))
+        package = resolve_evaluator_package(
+            evaluator_packages,
+            EvaluatorPackageRequirement(name=name, version="0.1.0"),
+        )
         if "site-packages" not in str(package.root.resolve()):
             _fail(f"Installed evaluator package did not resolve for {name}: {package.root}")
 
@@ -247,11 +247,15 @@ def _verify_materialized_sdk() -> None:
         )
         workspace = root / "workspace"
         workspace.mkdir()
+        sdk_roots = SDKRoots(
+            checkout=project_root / "sdk",
+            packaged=resolve_packaged_tree(package="vibesys", packaged_subdir="_sdk"),
+        )
         dependencies = materialize_input_project(
             input_project,
             workspace,
-            project_root=project_root,
-            copy_dir=_copy_tree,
+            sdk_roots=sdk_roots,
+            copy_directory=_copy_tree,
         )
         if [dependency.name for dependency in dependencies] != ["vs-bench"]:
             _fail(f"Packaged SDK did not materialize: {dependencies}")
@@ -315,15 +319,9 @@ def _verify_tui() -> None:
         runtime_root=_RUNTIME_ROOT,
         timeout=60,
     )
-    run_headless_stub_smoke(
-        [executable],
-        env=environment,
-        runtime_root=_RUNTIME_ROOT,
-        timeout=60,
-    )
 
 
-def _write_stub_input(input_root: Path) -> None:
+def _write_smoke_input(input_root: Path) -> None:
     input_root.mkdir()
     (input_root / "OBJECTIVE.md").write_text("Verify the installed release.\n")
     (input_root / "candidate.py").write_text("VALUE = 1\n")
@@ -341,17 +339,14 @@ def _write_stub_input(input_root: Path) -> None:
     )
 
 
-def _copied_project_stub_smoke_command(
+def _copied_project_smoke_command(
     command_prefix: list[str],
     *,
     input_root: Path,
     runs_root: Path,
-    headless: bool,
 ) -> list[str]:
     return [
         *command_prefix,
-        *(["--headless"] if headless else []),
-        "--stub-agent",
         "--input",
         str(input_root),
         "--exp-name",
@@ -369,25 +364,6 @@ def _copied_project_stub_smoke_command(
     ]
 
 
-def _direct_project_stub_smoke_command(command_prefix: list[str]) -> list[str]:
-    return [
-        *command_prefix,
-        "--headless",
-        "--stub-agent",
-        "--agent-backend",
-        "cli",
-        "--exp-name",
-        "installed-release-smoke",
-        "--max-rounds",
-        "1",
-        "--no-skills",
-        "--backend",
-        "cpu",
-        "--profiler",
-        "none",
-    ]
-
-
 def run_interactive_tui_smoke(
     command_prefix: list[str],
     *,
@@ -399,96 +375,18 @@ def run_interactive_tui_smoke(
     with tempfile.TemporaryDirectory(prefix="vibesys-tui-smoke-", dir=runtime_root) as temporary:
         smoke_root = Path(temporary)
         input_root = smoke_root / "input"
-        _write_stub_input(input_root)
+        _write_smoke_input(input_root)
         marker = smoke_root / "controller-started"
         runs_root = smoke_root / "runs"
         smoke_environment = {**env, TUI_SMOKE_MARKER_ENV: str(marker)}
-        command = _copied_project_stub_smoke_command(
+        command = _copied_project_smoke_command(
             command_prefix,
             input_root=input_root,
             runs_root=runs_root,
-            headless=False,
         )
         _run_in_pty(command, env=smoke_environment, timeout=timeout)
         if not marker.is_file() or marker.read_text() != TUI_SMOKE_MARKER_CONTENT:
             _fail("Interactive TUI did not write its control-protocol marker")
-
-
-def run_headless_stub_smoke(
-    command_prefix: list[str],
-    *,
-    env: dict[str, str],
-    runtime_root: Path,
-    timeout: int,
-) -> None:
-    """Run a configless installed loop from a complete project working directory."""
-    mutable_prefix_paths_before = _mutable_install_paths(Path(sys.prefix))
-    with tempfile.TemporaryDirectory(
-        prefix="vibesys-headless-smoke-", dir=runtime_root
-    ) as temporary:
-        smoke_root = Path(temporary)
-        project_root = smoke_root / "project"
-        _write_stub_input(project_root)
-        command = _direct_project_stub_smoke_command(command_prefix)
-        _run(command, env=env, cwd=project_root, timeout=timeout)
-        _verify_project_state(project_root)
-    added_prefix_paths = _mutable_install_paths(Path(sys.prefix)) - mutable_prefix_paths_before
-    if added_prefix_paths:
-        _fail(
-            "Headless smoke created a mutable run tree or cache beneath the Python "
-            f"installation prefix: {sorted(added_prefix_paths)}"
-        )
-
-
-def _verify_project_state(project_root: Path) -> None:
-    if (project_root / "agent.toml").exists():
-        _fail("Configless headless smoke unexpectedly created agent.toml")
-    try:
-        project = Project.open(project_root)
-        store = project.state
-        store.load_project()
-        runs = store.list_runs()
-    except ProjectError as exc:
-        _fail(f"Project smoke did not create valid project state: {exc}")
-    if len(runs) != 1 or not runs[0].run_id.endswith("-installed-release-smoke"):
-        _fail(f"Project smoke did not create exactly one run: {runs}")
-    run = runs[0]
-    manifest = store.load_run(run.run_id)
-    loop = manifest.orchestration.id
-    registry = built_in_orchestrations()
-    try:
-        registration = registry.resolve(loop)
-    except ValueError:
-        registration = None
-    view = project_run(
-        registration, project, run_id=run.run_id, status=RunStatus.UNKNOWN, loop=loop
-    )
-    if len(view.rounds) != 1 or view.rounds[0].number != 1:
-        _fail("Project smoke did not persist exactly one completed round")
-    if store.current_run_id() != run.run_id:
-        _fail("Project smoke did not persist its local current-run pointer")
-    if not store.log_directory(run.run_id).is_dir():
-        _fail("Project smoke did not create its machine-local log directory")
-    if not (project_root / ".git").is_dir():
-        _fail("Project smoke did not initialize Git in the project directory")
-
-
-def _mutable_install_paths(prefix: Path) -> set[Path]:
-    if not prefix.is_dir():
-        return set()
-    mutable_paths: set[Path] = set()
-    for path in prefix.rglob("*"):
-        parts = path.relative_to(prefix).parts
-        if (
-            "exp_env" in parts
-            or ".hf_cache" in parts
-            or any(
-                parts[index : index + 2] == (".cache", "huggingface")
-                for index in range(len(parts) - 1)
-            )
-        ):
-            mutable_paths.add(path.resolve())
-    return mutable_paths
 
 
 def _run_in_pty(command: list[str], *, env: dict[str, str], timeout: int) -> None:

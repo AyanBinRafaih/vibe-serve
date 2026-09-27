@@ -1,4 +1,4 @@
-"""Restore one v4 descriptor-backed run before building its request."""
+"""Restore one current-generation run before building its request."""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from entrypoints.cli.args import _parse_cli_objective
 from entrypoints.cli.constants import _RUN_ENVIRONMENT_OPTION_CLI_FIELDS
 from entrypoints.cli.errors import _configuration_error, _project_resume_mismatch
 from entrypoints.cli.loops import _resolve_project_root
-from vibesys.api import ComputeBackend, Objective, ProfilerKind
-from vibesys.api.request import coerce_profiler_kind, validate_descriptor
+from vibesys.api import ComputeBackend, ProfilerKind
+from vibesys.api.profilers import coerce_profiler_kind
+from vibesys.api.request import validate_descriptor
 from vs_project.api import (
     GitTracker,
     NullGitTrackerEvents,
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     import argparse
     from collections.abc import Mapping
 
+    from vibesys.api.metrics import Objective
     from vs_project.api import RunEnvironmentRecord
 
 
@@ -46,10 +48,6 @@ _CONFIG_ONLY_OPTIONS = frozenset(
         "agent_driver",
         "cli_timeout",
         "default_reasoning_effort",
-        "outer_model",
-        "outer_reasoning_effort",
-        "inner_model",
-        "inner_reasoning_effort",
         "metric_space",
         "profile_guided",
     }
@@ -152,11 +150,7 @@ def _normalized_resume_cli_value(destination: str, value: object) -> object:
 
 
 def _set_resume_cli_value(args: argparse.Namespace, destination: str, value: object) -> None:
-    if destination == "agent_backend":
-        is_stub = value == "stub"
-        args.stub_agent = is_stub
-        value = None if is_stub else value
-    elif destination == "objective":
+    if destination == "objective":
         value = [_parse_cli_objective(item) for item in cast("list[str]", value)]
     elif destination == "constraint":
         value = list(cast("list[str]", value))
@@ -196,15 +190,9 @@ def _restore_cli_fields(
         destination = _OPTION_TO_CLI.get(field, field)
         if not hasattr(args, destination):
             continue
-        is_explicit = destination in explicit or (
-            destination == "agent_backend" and "stub_agent" in explicit
-        )
+        is_explicit = destination in explicit
         if is_explicit:
-            requested = (
-                "stub"
-                if destination == "agent_backend" and getattr(args, "stub_agent", False)
-                else _normalized_resume_cli_value(destination, getattr(args, destination))
-            )
+            requested = _normalized_resume_cli_value(destination, getattr(args, destination))
             if requested != (tuple(expected) if isinstance(expected, list) else expected):
                 changed.append(field)
         else:
@@ -329,7 +317,7 @@ def _resolve_resume_args(args: argparse.Namespace, *, loop_kind: str) -> None:
         )
     if not isinstance(manifest, OrchestrationRunManifest):
         _configuration_error(
-            f"Run {run_id!r} uses an unsupported run schema; only v4 runs can resume",
+            f"Run {run_id!r} uses an unsupported run schema; only v5 runs can resume",
             code="unsupported_run_schema",
             stage="resume_resolution",
         )

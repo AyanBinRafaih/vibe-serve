@@ -18,14 +18,14 @@ bundles, and the TUI.
 ## Repository layout
 
 ```text
-src/vibesys/             Headless optimization core and loop implementation
+src/vibesys/             Orchestration policy and thin product API/composition
 src/server/              Frontend-serving runtime and protocol
 src/entrypoints/         Process composition and command entrypoints
 clients/backend-client/  TypeScript server protocol and transport
 clients/core-state/      Pure backend-event projection
 clients/tui/             TypeScript terminal UI and launcher
 libs/                    Reusable standalone libraries
-examples/                Candidate repositories, tasks, and legacy input bundles
+examples/                Candidate repositories, tasks, and input bundles
 resources/evaluators/    Reusable versioned evaluator packages
 resources/skills/        Bundled Agent Skills and reference material
 resources/profilers/     Profiler MCP servers and support packages
@@ -39,15 +39,25 @@ The main framework boundaries are:
   `libs/`.
 - `src/server/` owns serving and frontend-specific behavior. It may depend on
   `src/vibesys/`, but the headless core does not depend on it.
-- `src/vibesys/loops/` owns the outer-loop policies and shared loop helpers.
+- `src/vibesys/orchestration/` owns built-in orchestration plugins: agent
+  roles, prompts, reply schemas, search and selection policy, evaluation
+  cadence, and policy state. See
+  [Orchestration plugins and runtime](orchestration-runtime.md).
+- `src/vibesys/api/`, `src/vibesys/run/`, and
+  `src/vibesys/composition.py` form the thin product facade and composition
+  layer over the reusable runtime libraries.
 - `libs/` owns reusable libraries. Import each library through its public
   `<package>.api` surface, for example `vs_agent.api` or `vs_project.api`.
-  `vs_agent.api.testing` provides the library-owned fake. Tach rejects imports
-  of root-level exports and internal modules.
-- `src/vibesys/domains/` owns domain-specific prompt context and hooks.
-- `src/vibesys/backends/` owns compute and execution backends.
+  Each library exposes its owned fakes through `<package>.api.testing` where
+  applicable. Orchestration policy normally uses
+  `vs_runtime.api.testing.FakeRun`. Tach rejects imports of root-level
+  exports and internal modules.
+- `src/vibesys/orchestration/domains/` owns domain-specific prompt policy.
+  Generic execution mechanisms belong in `libs/vs-runtime/`; agent harnesses,
+  compute isolation, and project persistence belong in `libs/vs-agent/`,
+  `libs/vs-sandbox/`, and `libs/vs-project/`, respectively.
 - Candidate repositories own target-specific tasks and candidate contracts
-  below `.vibesys/tasks/`. Legacy input bundles remain under `examples/`.
+  below `.vibesys/tasks/`. Input bundles remain under `examples/`.
 - `resources/evaluators/` owns reusable versioned evaluator packages.
 
 ## Local development
@@ -117,7 +127,7 @@ uv run pytest
 For a focused test, use for example:
 
 ```bash
-uv run pytest tests/vibesys/loops/issue_queue/test_plain_loop.py
+uv run pytest tests/vibesys/orchestration/issue_queue/test_plugin.py
 uv run pytest -k orchestrator
 ```
 
@@ -154,8 +164,6 @@ Use the guide that matches the surface you are adding:
   MCP tools, and profiler prompts.
 - [Update CLI flags and combinations](../cli-flags.md) when changing the user
   facing command contract.
-- [Update feature flags](feature-flags.md) for opt-in
-  experiments and optional framework behavior.
 
 The experimental Omnigent adapter is a developer-facing alternative to the
 standard CLI adapter. It currently supports Claude and Codex on the host path
@@ -165,13 +173,7 @@ Keep target-specific APIs, ABIs, ownership rules, and service protocols in the
 task's `CANDIDATE_CONTRACT.md` or design documentation rather than in the
 neutral framework prompts.
 
-## Internal tools and workflows
-
-The plain loop's issue MCP server is an internal development tool:
-
-```bash
-uv run vibesys-issue-mcp
-```
+## Internal workflows
 
 For issue forms and repository issue conventions, see
 [`docs/contributing/issue-authoring.md`](issue-authoring.md). For evolutionary search policy
@@ -239,8 +241,8 @@ The test job enforces two independent coverage floors:
 `uv run pytest` (with `--cov` already wired in via `pyproject.toml`) must
 reach 75 % combined statement + branch coverage across the tracked packages
 (`entrypoints`, `server`, `vibesys`, `vs_agent`, `vs_bench`,
-`vs_evaluator_protocol`, `vs_feature_flags`, `vs_github`, `vs_issue_tracker`,
-`vs_loop_state`, `vs_project`, `vs_prompts`, and `vs_sandbox`; the list is
+`vs_evaluator_protocol`, `vs_github`, `vs_issue_tracker`, `vs_loop_state`,
+`vs_project`, `vs_prompts`, `vs_runtime`, and `vs_sandbox`; the list is
 `[tool.coverage.run] source` in `pyproject.toml`).
 
 **Per-module floor — 40 %**  

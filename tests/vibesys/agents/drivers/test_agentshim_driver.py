@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,12 +37,12 @@ from agentshim.testing import (
 )
 
 from vibesys.events import CommandResultPayload
-from vibesys.roles.implementer import ImplementerResponse
-from vibesys.roles.judge import JudgeResponse
+from vibesys.orchestration.multi.contracts import ImplementerResponse, JudgeResponse
 from vs_agent import docker_executor
 from vs_agent.api import (
     AgentEvent,
     AgentEventKind,
+    AgentTurnTimeoutError,
     MCPServerSpec,
 )
 from vs_agent.contracts import (
@@ -928,10 +927,10 @@ def test_a_container_timeout_reports_no_docker_transport_in_its_message(
     driver, _fake = _driver(provider, run, docker_sandboxes={"implementer": sandbox})
     session = driver.create_session(_container_spec(tmp_path, provider))
 
-    with pytest.raises(subprocess.TimeoutExpired) as raised:
+    with pytest.raises(AgentTurnTimeoutError) as raised:
         session.run_turn(AgentTurnRequest(message="one", timeout=timedelta(seconds=5)))
 
-    assert raised.value.cmd == [agentshim.get_provider(provider).profile.binary]
+    assert raised.value.timeout_seconds == 5
     assert "secret" not in str(raised.value)
     assert "docker" not in str(raised.value)
 
@@ -1329,22 +1328,20 @@ def test_a_fresh_turn_that_fails_is_not_retried(
 
 
 @pytest.mark.parametrize("provider", SCRIPTED_PROVIDERS)
-def test_a_turn_that_times_out_is_reported_as_a_subprocess_timeout(
+def test_a_turn_that_times_out_is_reported_as_a_driver_timeout(
     sandbox_builds: list[dict[str, Any]],
     tmp_path: Path,
     provider: str,
 ) -> None:
-    """Loops fail closed on ``subprocess.TimeoutExpired`` and read its budget."""
+    """Every AgentShim provider reports the driver-neutral timeout contract."""
     del sandbox_builds
     session, _fake = _session(tmp_path, provider, FakeRun(timeout=True), timeout=45)
 
-    with pytest.raises(subprocess.TimeoutExpired) as raised:
+    with pytest.raises(AgentTurnTimeoutError) as raised:
         session.run_turn(AgentTurnRequest(message="one"))
 
-    assert raised.value.timeout == 45
-    # Only the provider is named. ``str(TimeoutExpired)`` renders ``cmd``, and
-    # callers log that string.
-    assert raised.value.cmd == [agentshim.get_provider(provider).profile.binary]
+    assert raised.value.timeout_seconds == 45
+    assert isinstance(raised.value.__cause__, agentshim.CliTimeoutError)
 
 
 def test_the_codex_thread_budget_retires_a_conversation(
@@ -1509,7 +1506,7 @@ def test_capabilities_report_the_provider_and_execution_mode(provider: str) -> N
 
     profile = agentshim.get_provider(provider).profile
     assert capabilities.provider_session_resume is profile.supports_resume
-    assert capabilities.mcp_servers is True
+    assert capabilities.tool_servers is True
     assert capabilities.host_path_grants is True
     assert capabilities.container_execution is False
 

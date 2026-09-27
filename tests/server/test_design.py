@@ -2,24 +2,22 @@
 
 from __future__ import annotations
 
-import subprocess
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 import pytest
-from tests.server.support import agent_descriptor, build_server_parts
+from tests.server.support import agent_descriptor, build_server_parts, run_record
 from tests.support import run_test_command
 from tests.support.run_execution import run_execution_record
 
-import server.api.service as service_module
 from server.api.design import _PATCH_CHAR_LIMIT, DesignLog
 from server.api.protocol import DesignPatchQuery, DesignQuery
-from server.api.workspace_git import WorkspacePatchReader
+from vibesys.api import RunRecordReadError, WorkspaceChange, WorkspaceChangeKind
 from vibesys.api.contracts import RunStatus
-from vibesys.loops.hypothesis_readmodel import project_run_view
-from vibesys.run.git_events import NullGitTrackerEvents
-from vibesys.run.git_tracker import GitTracker
-from vibesys.search.hypothesis import OrchestratorPlan
-from vibesys.search.hypothesis.state import Hypothesis, HypothesisState
+from vibesys.api.testing import FakeRunRecord
+from vibesys.orchestration.hypothesis import OrchestratorPlan
+from vibesys.orchestration.hypothesis.readmodel import project_run_view
+from vibesys.orchestration.hypothesis.state import Hypothesis, HypothesisState
+from vibesys.orchestration.single.models import SingleState
 from vs_loop_state.api import RoundRecord
 from vs_project.api import Project, RunEnvironmentRecord
 
@@ -27,7 +25,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from vibesys.api import RunView
-    from vs_project.api import GitTrackerEvents
 
 
 class _RoundFields(TypedDict, total=False):
@@ -66,6 +63,7 @@ def _round(number: int, **overrides: Unpack[_RoundFields]) -> RoundRecord:
         "perf_metric": None,
         "perf_unit": None,
         "passed": False,
+        "judge_verdict": "deferred",
     }
     fields.update(overrides)
     return RoundRecord(**fields)
@@ -127,31 +125,38 @@ def _commit_all(path: Path, message: str) -> str:
     return _git(path, "rev-parse", "HEAD")
 
 
-def _name_status(*fields: str) -> str:
-    """Render NUL-delimited ``--name-status`` fields exactly as git emits them."""
-    return "".join(f"{field}\0" for field in fields)
-
-
 def _no_patch(_base: str, _head: str, _paths: tuple[str, ...]) -> str | None:
     """Patch reader stand-in for projections that never read patch text."""
     return None
 
 
 def _tracked(workspace: Path) -> DesignLog:
-    """Bind a projection to the real read-only git callables for *workspace*."""
-    tracker = GitTracker(workspace, run_id="design-test", events=NullGitTrackerEvents())
-    reader = WorkspacePatchReader(workspace, warning=NullGitTrackerEvents().warning)
-    return DesignLog(workspace=workspace, diff=tracker.diff_name_status, patch=reader.diff_patch)
+    """Bind a projection to one real public semantic run record."""
+    project, run_id = _project_run(workspace, trusted_input_baseline="0" * 40)
+    record = run_record(project, run_id)
+
+    def changes(base: str, head: str) -> tuple[WorkspaceChange, ...] | None:
+        try:
+            return record.workspace_changes(base, head)
+        except RunRecordReadError:
+            return None
+
+    def patch(base: str, head: str, paths: tuple[str, ...]) -> str | None:
+        try:
+            return record.workspace_patch(base, head, paths)
+        except RunRecordReadError:
+            return None
+
+    return DesignLog(changes=changes, patch=patch)
 
 
-class _RecordingGitEvents(NullGitTrackerEvents):
-    """Capture tracker warnings; the read-only tracker emits nothing else."""
-
-    def __init__(self) -> None:
-        self.warnings: list[str] = []
-
-    def warning(self, summary: str, *, detail: str | None = None) -> None:
-        self.warnings.append(summary if detail is None else f"{summary}: {detail}")
+def _change(
+    kind: WorkspaceChangeKind,
+    path: str,
+    *,
+    renamed_from: str | None = None,
+) -> WorkspaceChange:
+    return WorkspaceChange(path=path, kind=kind, renamed_from=renamed_from)
 
 
 def test_design_log_derives_per_round_file_changes(tmp_path: Path) -> None:
@@ -166,6 +171,10 @@ def test_design_log_derives_per_round_file_changes(tmp_path: Path) -> None:
     (workspace / ".vibesys" / "state" / "note").write_text("bookkeeping\n", encoding="utf-8")
     (workspace / "progress.md").write_text("round 1\n", encoding="utf-8")
     (workspace / "pareto-frontier.md").write_text("# Pareto frontier\n", encoding="utf-8")
+    (workspace / "progress").mkdir()
+    (workspace / "progress" / "round-0001.md").write_text("framework\n", encoding="utf-8")
+    (workspace / "roadmap").mkdir()
+    (workspace / "roadmap" / "index.md").write_text("framework\n", encoding="utf-8")
     first = _commit_all(workspace, "round 1")
 
     (workspace / "src" / "ffi.rs").unlink()
@@ -194,6 +203,8 @@ def test_design_log_derives_per_round_file_changes(tmp_path: Path) -> None:
     assert (second_entry.base, second_entry.commit) == (first, second)
     assert first_entry.files is not None
     assert sorted((change.change, change.path) for change in first_entry.files) == [
+        ("added", "pareto-frontier.md"),
+        ("added", "progress.md"),
         ("added", "src/ffi.rs"),
         ("modified", "src/lib.rs"),
     ]
@@ -204,7 +215,7 @@ def test_design_log_derives_per_round_file_changes(tmp_path: Path) -> None:
     ]
 
 
-def test_design_log_publishes_only_the_round_and_its_files(tmp_path: Path) -> None:
+def test_design_log_publishes_only_the_round_and_its_files() -> None:
     """Stage fields belong to the experiment log; the design log has no copy."""
     state = HypothesisState(
         hypotheses=[
@@ -216,7 +227,7 @@ def test_design_log_publishes_only_the_round_and_its_files(tmp_path: Path) -> No
         ]
     )
 
-    (entry,) = DesignLog(workspace=tmp_path, diff=lambda _base, _head: "", patch=_no_patch).rounds(
+    (entry,) = DesignLog(changes=lambda _base, _head: (), patch=_no_patch).rounds(
         _view(state), baseline="0" * 40
     )
 
@@ -289,13 +300,13 @@ def test_design_log_leaves_unresolvable_ranges_unknown(tmp_path: Path) -> None:
     assert [entry.files for entry in entries] == [None, None]
 
 
-def test_design_log_never_passes_a_non_hex_commit_to_git(tmp_path: Path) -> None:
+def test_design_log_never_passes_a_non_hex_commit_to_git() -> None:
     """A revision that could read as a git option must not reach the diff."""
     attempted: list[tuple[str, str]] = []
 
-    def diff(base: str, head: str) -> str | None:
+    def changes(base: str, head: str) -> tuple[WorkspaceChange, ...] | None:
         attempted.append((base, head))
-        return ""
+        return ()
 
     state = HypothesisState(
         hypotheses=[
@@ -308,7 +319,7 @@ def test_design_log_never_passes_a_non_hex_commit_to_git(tmp_path: Path) -> None
         ]
     )
 
-    entries = DesignLog(workspace=tmp_path, diff=diff, patch=_no_patch).rounds(
+    entries = DesignLog(changes=changes, patch=_no_patch).rounds(
         _view(state), baseline="--upload-pack=sh"
     )
 
@@ -316,71 +327,12 @@ def test_design_log_never_passes_a_non_hex_commit_to_git(tmp_path: Path) -> None
     assert [entry.files for entry in entries] == [None]
 
 
-def test_diff_name_status_rejects_a_revision_expression(tmp_path: Path) -> None:
-    workspace = _repo(tmp_path / "workspace")
-    tracker = GitTracker(workspace, run_id="design-test", events=NullGitTrackerEvents())
-
-    with pytest.raises(ValueError, match="not a commit object name"):
-        tracker.diff_name_status("HEAD~1", "HEAD")
-
-
-@pytest.mark.parametrize(
-    "failure", [OSError("git is missing"), subprocess.TimeoutExpired(["git"], 10.0)]
-)
-def test_diff_name_status_logs_a_failed_subprocess(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
-) -> None:
-    workspace = _repo(tmp_path / "workspace")
-    events = _RecordingGitEvents()
-    tracker = GitTracker(workspace, run_id="design-test", events=events)
-
-    def explode(*_args: object, **_kwargs: object) -> None:
-        raise failure
-
-    monkeypatch.setattr(subprocess, "run", explode)
-
-    assert tracker.diff_name_status("a" * 40, "b" * 40) is None
-    assert [line for line in events.warnings if "read-only diff failed" in line]
-
-
-def test_diff_name_status_logs_a_nonzero_exit(tmp_path: Path) -> None:
-    workspace = _repo(tmp_path / "workspace")
-    events = _RecordingGitEvents()
-    tracker = GitTracker(workspace, run_id="design-test", events=events)
-
-    assert tracker.diff_name_status("a" * 40, "b" * 40) is None
-    assert [line for line in events.warnings if "read-only diff exit" in line]
-
-
-def test_design_log_drops_a_rename_out_of_framework_memory(tmp_path: Path) -> None:
-    """Both sides of a rename are filtered, not only the new path."""
-    output = _name_status("R100", "progress/round-0001.md", "notes/round-1.md", "M", "src/lib.rs")
-
-    state = HypothesisState(
-        hypotheses=[
-            _hypothesis(
-                "H-01",
-                1,
-                parent_commit="a" * 40,
-                rounds=[_round(1, hypothesis_id="H-01", commit="b" * 40)],
-            )
-        ]
-    )
-
-    (entry,) = DesignLog(
-        workspace=tmp_path, diff=lambda _base, _head: output, patch=_no_patch
-    ).rounds(_view(state), baseline="0" * 40)
-
-    assert entry.files is not None
-    assert [(change.change, change.path) for change in entry.files] == [("modified", "src/lib.rs")]
-
-
-def test_design_log_caches_each_commit_range(tmp_path: Path) -> None:
+def test_design_log_caches_each_commit_range() -> None:
     calls: list[tuple[str, str]] = []
 
-    def diff(base: str, head: str) -> str | None:
+    def changes(base: str, head: str) -> tuple[WorkspaceChange, ...]:
         calls.append((base, head))
-        return _name_status("M", "src/lib.rs")
+        return (_change(WorkspaceChangeKind.MODIFIED, "src/lib.rs"),)
 
     state = HypothesisState(
         hypotheses=[
@@ -395,7 +347,7 @@ def test_design_log_caches_each_commit_range(tmp_path: Path) -> None:
             )
         ]
     )
-    design = DesignLog(workspace=tmp_path, diff=diff, patch=_no_patch)
+    design = DesignLog(changes=changes, patch=_no_patch)
 
     first = design.rounds(_view(state), baseline="0" * 40)
     second = design.rounds(_view(state), baseline="0" * 40)
@@ -406,11 +358,14 @@ def test_design_log_caches_each_commit_range(tmp_path: Path) -> None:
     assert [entry.files for entry in first] == [entry.files for entry in second]
 
 
-def test_design_log_retries_a_failed_range(tmp_path: Path) -> None:
+def test_design_log_retries_a_failed_range() -> None:
     """A transient git failure must not be cached as a permanent blank."""
-    outputs: list[str | None] = [None, _name_status("A", "src/lib.rs")]
+    outputs: list[tuple[WorkspaceChange, ...] | None] = [
+        None,
+        (_change(WorkspaceChangeKind.ADDED, "src/lib.rs"),),
+    ]
 
-    def diff(_base: str, _head: str) -> str | None:
+    def changes(_base: str, _head: str) -> tuple[WorkspaceChange, ...] | None:
         return outputs.pop(0)
 
     state = HypothesisState(
@@ -423,7 +378,7 @@ def test_design_log_retries_a_failed_range(tmp_path: Path) -> None:
             )
         ]
     )
-    design = DesignLog(workspace=tmp_path, diff=diff, patch=_no_patch)
+    design = DesignLog(changes=changes, patch=_no_patch)
 
     (failed,) = design.rounds(_view(state), baseline="0" * 40)
     (recovered,) = design.rounds(_view(state), baseline="0" * 40)
@@ -433,14 +388,14 @@ def test_design_log_retries_a_failed_range(tmp_path: Path) -> None:
     assert [change.path for change in recovered.files] == ["src/lib.rs"]
 
 
-def test_design_log_evicts_oldest_ranges_past_capacity(tmp_path: Path) -> None:
+def test_design_log_evicts_oldest_ranges_past_capacity() -> None:
     calls: list[tuple[str, str]] = []
 
-    def diff(base: str, head: str) -> str | None:
+    def changes(base: str, head: str) -> tuple[WorkspaceChange, ...]:
         calls.append((base, head))
-        return ""
+        return ()
 
-    design = DesignLog(workspace=tmp_path, diff=diff, patch=_no_patch, capacity=1)
+    design = DesignLog(changes=changes, patch=_no_patch, capacity=1)
     state = HypothesisState(
         hypotheses=[
             _hypothesis(
@@ -520,8 +475,8 @@ def test_design_patch_truncates_at_the_size_bound(tmp_path: Path) -> None:
     assert result.patch.endswith("\n")
 
 
-def test_design_patch_rejects_a_revision_expression(tmp_path: Path) -> None:
-    design = DesignLog(workspace=tmp_path, diff=lambda _base, _head: "", patch=_no_patch)
+def test_design_patch_rejects_a_revision_expression() -> None:
+    design = DesignLog(changes=lambda _base, _head: (), patch=_no_patch)
 
     with pytest.raises(ValueError, match="not a commit object name"):
         design.patch("HEAD~1", "a" * 40, "lib.rs")
@@ -529,7 +484,7 @@ def test_design_patch_rejects_a_revision_expression(tmp_path: Path) -> None:
         design.patch("a" * 40, "--output=escape", "lib.rs")
 
 
-def test_design_patch_rejects_paths_outside_the_filtered_change_list(tmp_path: Path) -> None:
+def test_design_patch_rejects_paths_outside_the_filtered_change_list() -> None:
     """Framework paths and unknown paths never reach the git command line."""
     attempted: list[tuple[str, ...]] = []
 
@@ -537,8 +492,10 @@ def test_design_patch_rejects_paths_outside_the_filtered_change_list(tmp_path: P
         attempted.append(paths)
         return ""
 
-    output = _name_status("M", "src/lib.rs", "M", "progress.md")
-    design = DesignLog(workspace=tmp_path, diff=lambda _base, _head: output, patch=patch)
+    design = DesignLog(
+        changes=lambda _base, _head: (_change(WorkspaceChangeKind.MODIFIED, "src/lib.rs"),),
+        patch=patch,
+    )
 
     with pytest.raises(ValueError, match="not in the round's change list"):
         design.patch("a" * 40, "b" * 40, "progress.md")
@@ -547,7 +504,7 @@ def test_design_patch_rejects_paths_outside_the_filtered_change_list(tmp_path: P
     assert attempted == []
 
 
-def test_design_patch_reads_a_rename_with_both_paths(tmp_path: Path) -> None:
+def test_design_patch_reads_a_rename_with_both_paths() -> None:
     """Both sides go into the pathspec, or git would report a bare delete."""
     attempted: list[tuple[str, ...]] = []
 
@@ -555,8 +512,16 @@ def test_design_patch_reads_a_rename_with_both_paths(tmp_path: Path) -> None:
         attempted.append(paths)
         return "diff --git a/old.rs b/new.rs\n"
 
-    output = _name_status("R100", "old.rs", "new.rs")
-    design = DesignLog(workspace=tmp_path, diff=lambda _base, _head: output, patch=patch)
+    design = DesignLog(
+        changes=lambda _base, _head: (
+            _change(
+                WorkspaceChangeKind.RENAMED,
+                "new.rs",
+                renamed_from="old.rs",
+            ),
+        ),
+        patch=patch,
+    )
 
     result = design.patch("a" * 40, "b" * 40, "new.rs")
 
@@ -564,7 +529,7 @@ def test_design_patch_reads_a_rename_with_both_paths(tmp_path: Path) -> None:
     assert result.renamed_from == "old.rs"
 
 
-def test_design_patch_caches_successes_and_retries_failures(tmp_path: Path) -> None:
+def test_design_patch_caches_successes_and_retries_failures() -> None:
     outputs: list[str | None] = [None, "diff --git a/lib.rs b/lib.rs\n"]
     calls: list[tuple[str, ...]] = []
 
@@ -572,8 +537,10 @@ def test_design_patch_caches_successes_and_retries_failures(tmp_path: Path) -> N
         calls.append(paths)
         return outputs.pop(0)
 
-    output = _name_status("M", "lib.rs")
-    design = DesignLog(workspace=tmp_path, diff=lambda _base, _head: output, patch=patch)
+    design = DesignLog(
+        changes=lambda _base, _head: (_change(WorkspaceChangeKind.MODIFIED, "lib.rs"),),
+        patch=patch,
+    )
 
     failed = design.patch("a" * 40, "b" * 40, "lib.rs")
     recovered = design.patch("a" * 40, "b" * 40, "lib.rs")
@@ -587,7 +554,7 @@ def test_design_patch_caches_successes_and_retries_failures(tmp_path: Path) -> N
     assert len(calls) == 2
 
 
-def test_design_patch_degrades_when_the_file_list_is_unreadable(tmp_path: Path) -> None:
+def test_design_patch_degrades_when_the_file_list_is_unreadable() -> None:
     """No file list means nothing to validate against and nothing to read."""
     attempted: list[tuple[str, ...]] = []
 
@@ -595,7 +562,7 @@ def test_design_patch_degrades_when_the_file_list_is_unreadable(tmp_path: Path) 
         attempted.append(paths)
         return ""
 
-    design = DesignLog(workspace=tmp_path, diff=lambda _base, _head: None, patch=patch)
+    design = DesignLog(changes=lambda _base, _head: None, patch=patch)
 
     result = design.patch("a" * 40, "b" * 40, "lib.rs")
 
@@ -621,6 +588,13 @@ def _project_run(project: Path, *, trusted_input_baseline: str) -> tuple[Project
     return vibesys_project, manifest.run_id
 
 
+def _save_single_state(project: Project, run_id: str, search: HypothesisState) -> None:
+    """Persist the exact aggregate declared by the registered single plugin."""
+    project.state.portable_namespace(run_id, "single-agent").slot("state.json", SingleState).save(
+        SingleState(search=search)
+    )
+
+
 def test_service_builds_design_from_workspace_history(tmp_path: Path) -> None:
     workspace = _repo(tmp_path / "project")
     (workspace / "OBJECTIVE.md").write_text("Make the queue fast.\n", encoding="utf-8")
@@ -629,8 +603,9 @@ def test_service_builds_design_from_workspace_history(tmp_path: Path) -> None:
     first = _commit_all(workspace, "round 1")
 
     project, run_id = _project_run(workspace, trusted_input_baseline=baseline)
-    portable = project.state.portable_namespace(run_id, "single")
-    portable.slot("state.json", HypothesisState).save(
+    _save_single_state(
+        project,
+        run_id,
         HypothesisState(
             hypotheses=[
                 _hypothesis(
@@ -639,9 +614,11 @@ def test_service_builds_design_from_workspace_history(tmp_path: Path) -> None:
                     rounds=[_round(1, hypothesis_id="H-01", commit=first, passed=True)],
                 )
             ]
-        )
+        ),
     )
-    parts = build_server_parts(project.state.log_directory(run_id), project=project, run_id=run_id)
+    parts = build_server_parts(
+        project.state.log_directory(run_id), record=run_record(project, run_id)
+    )
 
     response = parts.api.execute(DesignQuery())
 
@@ -661,14 +638,18 @@ def test_service_serves_patches_for_published_design_ranges(tmp_path: Path) -> N
     first = _commit_all(workspace, "round 1")
 
     project, run_id = _project_run(workspace, trusted_input_baseline=baseline)
-    project.state.portable_namespace(run_id, "single").slot("state.json", HypothesisState).save(
+    _save_single_state(
+        project,
+        run_id,
         HypothesisState(
             hypotheses=[
                 _hypothesis("H-01", 1, rounds=[_round(1, hypothesis_id="H-01", commit=first)])
             ],
-        )
+        ),
     )
-    parts = build_server_parts(project.state.log_directory(run_id), project=project, run_id=run_id)
+    parts = build_server_parts(
+        project.state.log_directory(run_id), record=run_record(project, run_id)
+    )
 
     (entry,) = parts.api.execute(DesignQuery()).design
     assert (entry.base, entry.commit) == (baseline, first)
@@ -692,9 +673,7 @@ def test_service_reports_no_design_patch_before_attach(tmp_path: Path) -> None:
     assert response.design_patch is None
 
 
-def test_service_reuses_one_design_projection_per_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_service_reuses_one_design_projection_per_run(tmp_path: Path) -> None:
     """Repeated public queries reuse the same immutable commit-range diff."""
     workspace = _repo(tmp_path / "project")
     (workspace / "OBJECTIVE.md").write_text("Make the queue fast.\n", encoding="utf-8")
@@ -703,36 +682,33 @@ def test_service_reuses_one_design_projection_per_run(
     first = _commit_all(workspace, "round 1")
 
     project, run_id = _project_run(workspace, trusted_input_baseline=baseline)
-    project.state.portable_namespace(run_id, "single").slot("state.json", HypothesisState).save(
+    _save_single_state(
+        project,
+        run_id,
         HypothesisState(
             hypotheses=[
                 _hypothesis("H-01", 1, rounds=[_round(1, hypothesis_id="H-01", commit=first)])
             ],
-        )
+        ),
     )
-    constructions = 0
-    diff_calls = 0
+    persisted = run_record(project, run_id)
+    record = FakeRunRecord(
+        run_id=run_id,
+        run_view=persisted.view(),
+        record_facts=persisted.facts(),
+    )
+    record.set_workspace_changes(
+        baseline,
+        first,
+        _change(WorkspaceChangeKind.ADDED, "ring.rs"),
+    )
+    parts = build_server_parts(project.state.log_directory(run_id), record=record)
 
-    class _CountingGitTracker(GitTracker):
-        def __init__(self, root: Path, *, run_id: str, events: GitTrackerEvents) -> None:
-            nonlocal constructions
-            constructions += 1
-            super().__init__(root, run_id=run_id, events=events)
+    first_response = parts.api.execute(DesignQuery())
+    second_response = parts.api.execute(DesignQuery())
 
-        def diff_name_status(self, base: str, head: str) -> str | None:
-            nonlocal diff_calls
-            diff_calls += 1
-            return super().diff_name_status(base, head)
-
-    monkeypatch.setattr(service_module, "GitTracker", _CountingGitTracker)
-    parts = build_server_parts(project.state.log_directory(run_id), project=project, run_id=run_id)
-
-    first = parts.api.execute(DesignQuery())
-    second = parts.api.execute(DesignQuery())
-
-    assert first.design == second.design
-    assert constructions == 1
-    assert diff_calls == 1
+    assert first_response.design == second_response.design
+    assert record.workspace_change_requests == [(baseline, first)]
 
 
 def test_service_reports_design_not_ready_before_attach(tmp_path: Path) -> None:

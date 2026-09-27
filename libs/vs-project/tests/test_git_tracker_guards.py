@@ -54,6 +54,29 @@ def _committed_repository(root: Path) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
+def test_diff_patch_reads_only_the_requested_literal_paths(tmp_path: Path) -> None:
+    base = _committed_repository(tmp_path)
+    (tmp_path / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("OTHER = True\n", encoding="utf-8")
+    _git(tmp_path, "add", "main.py", "other.py")
+    _git(tmp_path, "commit", "-q", "-m", "change files")
+    head = _git(tmp_path, "rev-parse", "HEAD")
+
+    patch = _tracker(tmp_path).diff_patch(base, head, ("main.py",))
+
+    assert patch is not None
+    assert "+VALUE = 2" in patch
+    assert "other.py" not in patch
+
+
+@pytest.mark.parametrize("value", ["HEAD~1", "--output=escape"])
+def test_diff_patch_rejects_revision_expressions(tmp_path: Path, value: str) -> None:
+    _committed_repository(tmp_path)
+
+    with pytest.raises(ValueError, match="not a commit object name"):
+        _tracker(tmp_path).diff_patch(value, "a" * 40, ("main.py",))
+
+
 def _initialized_tracker(root: Path, run_id: str = "guard-run") -> GitTracker:
     (root / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
     tracker = _tracker(root, run_id)
@@ -197,6 +220,34 @@ def test_checkout_tree_reports_failed_restore_of_preserved_memory(
         "failed to restore preserved workspace memory after tree restore error",
         f"git tree restore {sha[:8]} failed",
     ]
+
+
+def test_checkout_tree_keeps_index_clean_when_restoring_an_earlier_revision(
+    tmp_path: Path,
+) -> None:
+    tracker = _initialized_tracker(tmp_path)
+    (tmp_path / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
+    tracker.snapshot("candidate one")
+    first_candidate = tracker.current_sha()
+    assert first_candidate is not None
+
+    (tmp_path / "main.py").write_text("VALUE = 3\n", encoding="utf-8")
+    (tmp_path / "later.py").write_text("LATER = True\n", encoding="utf-8")
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "notes.txt").write_text("keep across rollback\n", encoding="utf-8")
+    tracker.snapshot("candidate two")
+    latest_head = tracker.current_sha()
+    assert latest_head is not None
+    assert latest_head != first_candidate
+
+    assert tracker.checkout_tree(first_candidate, clean=True, preserve_paths=["memory"])
+
+    assert tracker.current_sha() == latest_head
+    assert (tmp_path / "main.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert not (tmp_path / "later.py").exists()
+    assert (memory / "notes.txt").read_text(encoding="utf-8") == "keep across rollback\n"
+    assert tracker.run(["git", "diff", "--cached", "--quiet"], check=False).returncode == 0
 
 
 @pytest.mark.parametrize("bad", ["/abs/memory", "", "a/../../etc"])

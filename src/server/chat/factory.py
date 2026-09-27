@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import threading
-from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from server.chat.manager import (
     ChatManager,
@@ -14,16 +13,17 @@ from server.chat.manager import (
     TerminalChatResource,
 )
 from server.chat.options import ChatRunSettings
+from server.chat.prompts import (
+    experiment_chat_continuation_prompt,
+    experiment_chat_system_prompt,
+)
 from server.chat.session import (
     ExperimentChatDependencies,
     ExperimentChatSession,
 )
 from server.events import ChatThreadCreatedData
 from server.run_attachment import AgentSelection, RunAttachment
-from vibesys.api import agent_spec_from_config, output_sink
-from vs_agent.api import AgentSessionKey, Driver, SessionScope, agent_catalog, build_agent_client
-from vs_project.api import RunLogger
-from vs_sandbox.api import HostResource, HostResourceAccess
+from vibesys.api import AgentDriver, AuxiliaryAgentLaunch, AuxiliaryReadableInput
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -31,8 +31,7 @@ if TYPE_CHECKING:
 
     from server.controller import RunController
     from server.execution import ExecutionTracker
-    from vibesys.api import RunSession
-    from vs_agent.api import ToolServerDescriptor
+    from vibesys.api import ManagedAgent
 
 
 #: Session-key identifier for the run's default chat, which has no thread ID of
@@ -40,20 +39,25 @@ if TYPE_CHECKING:
 #: the same name the client already shows the default thread under
 #: (``DEFAULT_CHAT_THREAD_ID`` in ``clients/core-state``).
 DEFAULT_CHAT_THREAD = "default"
+_CHAT_STATE_ENV = "VIBESYS_CHAT_STATE_DIR"
 
 
 @dataclass(frozen=True)
-class ChatAgentResources:
-    """One server-owned chat agent and its runtime callbacks."""
+class ChatAgentBuildRequest:
+    """Inputs needed to construct one independently owned chat agent."""
 
-    client: Any
-    close: Callable[[], None]
-    log: Callable[[str], None]
-    flush_logs: Callable[[], None]
-    environment: Callable[[], dict[str, str]]
-    progress: Callable[[], object | None]
-    agent_shared_state_dir: str
-    tool_servers: tuple[ToolServerDescriptor, ...]
+    session: AuxiliaryAgentFactory
+    selection: AgentSelection
+    instance_id: str | None
+    shared_state_dir: Path
+
+
+class AuxiliaryAgentFactory(Protocol):
+    """The single run-session capability needed to construct chat."""
+
+    def create_auxiliary_agent(self, launch: AuxiliaryAgentLaunch) -> ManagedAgent:
+        """Create one fresh run-attached auxiliary conversation."""
+        ...
 
 
 class ChatAgentBuilder(Protocol):
@@ -61,109 +65,38 @@ class ChatAgentBuilder(Protocol):
 
     def __call__(
         self,
-        session: RunSession,
-        attachment: RunAttachment,
-        selection: AgentSelection,
-        instance_id: str | None,
-        shared_state_dir: Path,
+        request: ChatAgentBuildRequest,
         /,
-    ) -> ChatAgentResources:
-        """Build resources for one independently owned chat agent."""
+    ) -> ManagedAgent:
+        """Build one independently owned chat conversation."""
         ...
 
 
-#: Fixed container path the chat shared-state directory is mounted at inside
-#: an isolated agent-construction environment. A deployment constant, not a
-#: derived value: `vibesys.api.RunSession.open_agent_environment` folds this
-#: into the run's own environment request as a plain bind-mount target, the
-#: same way `HostResource.agent_path` names any other fixed container path.
-_CHAT_CONTAINER_STATE_DIR = "/opt/vibesys-chat"
-
-
 def build_chat_agent(
-    session: RunSession,
-    attachment: RunAttachment,
-    selection: AgentSelection,
-    instance_id: str | None,
-    shared_state_dir: Path,
-) -> ChatAgentResources:
-    """Build one chat agent without making the core aware of chat sessions."""
-    resources = ExitStack()
-    try:
-        logger = RunLogger(attachment.log_dir, tee_stderr=False)
-        resources.callback(logger.close)
-        logger_name = (
-            "experiment-chat" if instance_id is None else f"experiment-chat-{instance_id[:8]}"
-        )
-        logger.switch(logger_name)
-
-        env = session.open_agent_environment(
-            mounts=(
-                HostResource(
-                    shared_state_dir,
-                    HostResourceAccess.READ_ONLY,
-                    "server chat transcript",
-                    agent_path=_CHAT_CONTAINER_STATE_DIR,
-                ),
-            )
-        )
-        resources.callback(env.close)
-        agent_shared_state_dir = (
-            env.agent_path(shared_state_dir) if env.isolated else str(shared_state_dir)
-        )
-        tool_servers = env.investigation_tools()
-
-        config = env.config.model_copy(
-            update={"agent": env.config.agent.model_copy(update={"driver": selection.driver})}
-        )
-        agent_spec = agent_spec_from_config(
-            config,
-            backend=attachment.agent_backend,
+    request: ChatAgentBuildRequest,
+) -> ManagedAgent:
+    """Declare one chat conversation through the managed public boundary."""
+    selection = request.selection
+    shared_state_dir = request.shared_state_dir
+    state_path = f"${_CHAT_STATE_ENV}"
+    return request.session.create_auxiliary_agent(
+        AuxiliaryAgentLaunch(
+            role="chat",
+            member_id=request.instance_id or DEFAULT_CHAT_THREAD,
             driver=selection.driver,
             provider=selection.provider,
             model=selection.model,
-        )
-        client = build_agent_client(
-            spec=agent_spec,
-            backends=env.backends,
-            skill_source_dirs=list(env.skill_source_dirs),
-            skill_selection=env.skill_selection,
-            run_log_file=logger.writer,
-            use_docker=env.use_docker,
-            log_dir=attachment.log_dir,
-            project_path_policy=env.project_path_policy,
-            require_host_sandbox=not env.use_docker,
-            host_resources=(
-                *env.host_resources,
-                HostResource(
-                    shared_state_dir,
-                    HostResourceAccess.READ_ONLY,
-                    "server chat transcript",
+            system_prompt=experiment_chat_system_prompt(state_path),
+            continuation_prompt=experiment_chat_continuation_prompt(state_path),
+            readable_inputs=(
+                AuxiliaryReadableInput(
+                    path=shared_state_dir,
+                    environment_variable=_CHAT_STATE_ENV,
+                    purpose="server chat transcript",
                 ),
             ),
-            events=output_sink(),
         )
-        resources.callback(client.close)
-        owner = resources.pop_all()
-        return ChatAgentResources(
-            client=client,
-            close=owner.close,
-            log=logger.lprint,
-            flush_logs=logger.writer.flush,
-            environment=dict,
-            progress=lambda: None,
-            agent_shared_state_dir=agent_shared_state_dir,
-            tool_servers=tool_servers,
-        )
-    except BaseException as construction_error:
-        try:
-            resources.close()
-        except BaseException as cleanup_error:  # noqa: BLE001  # lint-waiver: LW-010245 [BLE001]; cleanup must run after cancellation and annotate, not replace, the construction failure.
-            construction_error.add_note(
-                "Additional error while cleaning up chat-agent construction: "
-                f"{type(cleanup_error).__name__}: {cleanup_error}"
-            )
-        raise
+    )
 
 
 class ExperimentChatFactory:
@@ -175,7 +108,7 @@ class ExperimentChatFactory:
         manager: ChatManager,
         controller: RunController,
         executions: ExecutionTracker,
-        session: RunSession,
+        session: AuxiliaryAgentFactory,
         attachment: RunAttachment,
         build_agent: ChatAgentBuilder,
         fallback: Callable[[str], str],
@@ -184,17 +117,15 @@ class ExperimentChatFactory:
         self._manager = manager
         self._controller = controller
         self._executions = executions
-        self._project = attachment.project
-        self._run_id = attachment.run_id
-        self._workspace = attachment.workspace
+        self._chat_state_dir = attachment.chat_state_dir
         self._defaults = ChatRunSettings(
             driver=attachment.agent_defaults.driver,
             provider=attachment.agent_defaults.provider,
             model=attachment.agent_defaults.model,
+            agent_drivers=attachment.agent_drivers,
             role_models=attachment.agent_defaults.role_models,
         )
         self._session = session
-        self._attachment = attachment
         self._build_agent = build_agent
         self._fallback = fallback
         self._lock = threading.Lock()
@@ -281,16 +212,10 @@ class ExperimentChatFactory:
         model: str | None,
     ) -> AgentSelection:
         """Resolve one chat thread's agent choice against the attached run."""
-        if self._attachment.agent_backend != "cli":
-            message = (
-                "experiment chat threads require the CLI agent backend, "
-                f"but this run uses agent backend {self._attachment.agent_backend!r}"
-            )
-            raise ValueError(message)
-        resolved_driver = driver or self._defaults.driver
+        resolved_driver = _agent_driver(driver or self._defaults.driver)
         resolved_provider = provider or self._defaults.provider
         resolved_model = model or self._defaults.model
-        supported = agent_catalog()[Driver(resolved_driver)].providers
+        supported = self._defaults.providers_for(resolved_driver)
         if resolved_provider not in supported:
             message = (
                 f"agent driver {resolved_driver!r} does not support provider "
@@ -309,56 +234,40 @@ class ExperimentChatFactory:
         with self._lock:
             if self._closed:
                 raise _factory_closed_error()
-        shared_state_dir = self._project.state.local_namespace(
-            self._run_id, "server"
-        ).external_directory("chat")
-        resources = self._build_agent(
-            self._session, self._attachment, selection, thread_id, shared_state_dir
+        shared_state_dir = self._chat_state_dir
+        agent = self._build_agent(
+            ChatAgentBuildRequest(
+                session=self._session,
+                selection=selection,
+                instance_id=thread_id,
+                shared_state_dir=shared_state_dir,
+            )
         )
         state_dir = (
             shared_state_dir if thread_id is None else shared_state_dir / "threads" / thread_id
-        )
-        agent_state_dir = (
-            resources.agent_shared_state_dir
-            if thread_id is None
-            else f"{resources.agent_shared_state_dir}/threads/{thread_id}"
         )
         try:
             session = ExperimentChatSession(
                 ExperimentChatDependencies(
                     controller=self._controller,
                     executions=self._executions,
-                    agent_client=resources.client,
-                    # One conversation per thread. The run's default chat has no
-                    # thread ID of its own, so it names the identifier the threads
-                    # cannot collide with.
-                    session_key=AgentSessionKey(
-                        SessionScope.CHAT,
-                        DEFAULT_CHAT_THREAD if thread_id is None else thread_id,
-                    ),
+                    agent=agent,
                     # The wire leaves the default thread's ID absent instead of
-                    # naming it, so the session key above and this field disagree
-                    # for that one thread on purpose. Stamping DEFAULT_CHAT_THREAD
-                    # here would file the session's events under a thread the
-                    # terminal answer event does not claim.
+                    # naming it. Stamping DEFAULT_CHAT_THREAD here would file the
+                    # session's events under a thread the terminal answer event
+                    # does not claim.
                     chat_thread_id=thread_id,
-                    workspace=self._workspace,
                     state_dir=state_dir,
-                    agent_state_dir=agent_state_dir,
-                    tool_servers=resources.tool_servers,
-                    log=resources.log,
-                    environment=resources.environment,
-                    progress=resources.progress,
                     driver=selection.driver,
                     provider=selection.provider,
                     model=selection.model,
                     fallback=self._fallback,
                 ),
-                _CloseCallback(resources.close),
+                agent,
             )
         except BaseException as construction_error:
             try:
-                resources.close()
+                agent.close()
             except BaseException as cleanup_error:  # noqa: BLE001  # lint-waiver: LW-010247 [BLE001]; failed construction still closes resources and preserves the original exception.
                 construction_error.add_note(
                     "Additional error while cleaning up chat-session construction: "
@@ -374,20 +283,13 @@ class ExperimentChatFactory:
         raise _factory_closed_error()
 
 
-class _CloseCallback:
-    """Adapt a resource close callback to the session ownership protocol."""
-
-    def __init__(self, close: Callable[[], None]) -> None:
-        self._close = close
-
-    def close(self) -> None:
-        close, self._close = self._close, _noop
-        close()
-
-
-def _noop() -> None:
-    pass
-
-
 def _factory_closed_error() -> RuntimeError:
     return RuntimeError("Experiment chat factory is closed")
+
+
+def _agent_driver(value: str) -> AgentDriver:
+    """Validate a wire-supplied driver against the public closed set."""
+    if value not in ("agentshim", "omnigent"):
+        message = f"auxiliary agent driver is unavailable: {value!r}"
+        raise ValueError(message)
+    return value

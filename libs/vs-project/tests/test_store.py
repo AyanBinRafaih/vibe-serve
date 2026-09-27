@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Json, ValidationError
 from tests.support.run_execution import run_execution_record
 
 from vs_project.api import (
@@ -39,6 +39,10 @@ class _Cursor(BaseModel):
 
     round: int
     phase: str
+
+
+class _JsonState(BaseModel):
+    value: Json[Any]
 
 
 def _descriptor() -> OrchestrationDescriptor:
@@ -98,7 +102,7 @@ def _run(store: Project, *, minute: int = 0) -> OrchestrationRunManifest:
     return manifest
 
 
-def test_version_4_run_manifest_round_trips_without_loop_configuration(tmp_path: Path) -> None:
+def test_version_5_run_manifest_round_trips_without_loop_configuration(tmp_path: Path) -> None:
     store = _store(tmp_path)
     new_run = _run(store)
 
@@ -107,6 +111,7 @@ def test_version_4_run_manifest_round_trips_without_loop_configuration(tmp_path:
     raw = json.loads(_run_manifest_path(store, new_run.run_id).read_text())
     assert "configuration" not in raw
     assert raw["orchestration"]["id"] == "team-search"
+    assert raw["execution"]["agent_roles"] == {}
 
 
 @pytest.mark.parametrize(
@@ -127,7 +132,7 @@ def test_orchestration_descriptor_rejects_invalid_envelope(field: str, value: ob
         OrchestrationDescriptor.model_validate(payload, strict=True)
 
 
-def test_version_4_run_rejects_unknown_keys_on_load(tmp_path: Path) -> None:
+def test_version_5_run_rejects_unknown_keys_on_load(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run = _run(store)
     path = _run_manifest_path(store, run.run_id)
@@ -139,7 +144,7 @@ def test_version_4_run_rejects_unknown_keys_on_load(tmp_path: Path) -> None:
         store.state.load_run(run.run_id)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 99])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 99])
 def test_loading_unknown_run_schema_fails_explicitly(tmp_path: Path, version: int) -> None:
     store = _store(tmp_path)
     run = _run(store)
@@ -149,6 +154,18 @@ def test_loading_unknown_run_schema_fails_explicitly(tmp_path: Path, version: in
     path.write_text(json.dumps(raw), encoding="utf-8")
 
     with pytest.raises(ProjectStateError, match=f"unsupported run schema version {version}"):
+        store.state.load_run(run.run_id)
+
+
+def test_version_5_run_rejects_removed_feature_flags_field(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run = _run(store)
+    path = _run_manifest_path(store, run.run_id)
+    raw = json.loads(path.read_text())
+    raw["execution"]["feature_flags"] = {"example": True}
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ProjectStateError, match="feature_flags"):
         store.state.load_run(run.run_id)
 
 
@@ -351,7 +368,7 @@ def test_same_named_projects_have_distinct_external_state_directories(tmp_path: 
     assert second_log.parent.parent.parent.name.startswith("project-")
 
 
-def test_legacy_local_state_moves_without_rewriting_and_leaves_worktrees(
+def test_repository_local_state_is_not_migrated_or_deleted(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
@@ -370,29 +387,28 @@ def test_legacy_local_state_moves_without_rewriting_and_leaves_worktrees(
     state = Project.open(project).state
 
     local_state_dir = Project.log_directory_for(project, "run-1").parents[2]
-    assert (local_state_dir / "current-run").read_bytes() == b"run-1\n"
-    assert (local_state_dir / "runs/run-1/logs/run-events.jsonl").read_bytes() == (
-        b'{"type":"server_started"}\n'
-    )
-    assert (local_state_dir / "runs/run-1/agent/active.json").read_bytes() == (
-        b'{"schema_version":1}\n'
-    )
-    assert not (legacy / "current-run").exists()
-    assert not (legacy / "runs/run-1/logs").exists()
-    assert not (legacy / "runs/run-1/agent").exists()
+    assert not (local_state_dir / "current-run").exists()
+    assert not (local_state_dir / "runs/run-1/logs/run-events.jsonl").exists()
+    assert not (local_state_dir / "runs/run-1/agent/active.json").exists()
+    assert (legacy / "current-run").read_bytes() == b"run-1\n"
+    assert (logs / "run-events.jsonl").read_bytes() == b'{"type":"server_started"}\n'
+    assert (agent / "active.json").read_bytes() == b'{"schema_version":1}\n'
     assert (worktree / "candidate.py").read_bytes() == b"candidate = True\n"
     assert state.sandbox_paths().hidden_path == Path(".vibesys/state/local")
 
 
-def test_log_directory_rejects_symlinked_parent(tmp_path: Path) -> None:
+def test_log_directory_does_not_probe_repository_local_symlinked_parent(tmp_path: Path) -> None:
     project = tmp_path / "project"
     outside = tmp_path / "outside"
     (project / ".vibesys/state" / "local").mkdir(parents=True)
     outside.mkdir()
-    (project / ".vibesys/state" / "local" / "runs").symlink_to(outside, target_is_directory=True)
+    legacy_runs = project / ".vibesys/state" / "local" / "runs"
+    legacy_runs.symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(ProjectStateError, match=r"(?:escapes|must not be a symlink)"):
-        Project.log_directory_for(project, "run-1")
+    log_directory = Project.log_directory_for(project, "run-1")
+
+    assert not log_directory.is_relative_to(project)
+    assert legacy_runs.is_symlink()
 
 
 def test_model_cache_directory_rejects_symlinked_parent(tmp_path: Path) -> None:
@@ -766,7 +782,7 @@ def test_list_runs_skips_an_incompatible_run_and_surfaces_it(tmp_path: Path) -> 
     store = _store(tmp_path)
     first = _run(store, minute=1)
     second = _run(store, minute=2)
-    _corrupt_schema_version(store, first.run_id, version=3)
+    _corrupt_schema_version(store, first.run_id, version=4)
 
     assert store.state.list_runs() == [second]
 
@@ -940,6 +956,17 @@ def test_state_namespace_round_trips_strict_models_atomically(tmp_path: Path) ->
         "round": 3,
     }
     assert not list(raw_path.parent.glob("*.tmp"))
+
+
+def test_state_namespace_preserves_pydantic_round_trip_values(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run = _run(store)
+    namespace = store.state.portable_namespace(run.run_id, "json-value")
+    state = _JsonState(value='{"nested":[1,2]}')
+
+    namespace.save("state.json", state)
+
+    assert namespace.load("state.json", _JsonState) == state
 
 
 def test_state_namespace_prepares_and_applies_exact_typed_transition(tmp_path: Path) -> None:

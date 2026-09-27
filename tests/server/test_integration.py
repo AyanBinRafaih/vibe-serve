@@ -7,11 +7,16 @@ import uuid
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from tests.server.support import ServerParts, agent_descriptor, build_server_parts
+from tests.server.support import (
+    ServerParts,
+    agent_descriptor,
+    auxiliary_agent_drivers,
+    build_server_parts,
+    run_record,
+)
 from tests.support.run_execution import run_execution_record
 
 from server.api.protocol import ChatQuery, ChatThreadCreateQuery
-from server.chat.factory import ChatAgentResources
 from server.diagnostics import DiagnosticScope, DiagnosticSeverity
 from server.events import (
     EventStatus,
@@ -23,8 +28,8 @@ from server.integration import (
     _EVENT_DATA_ADAPTER,
 )
 from server.journal import DIAGNOSTIC_FAILURE_EVENTS
-from server.run_attachment import AgentSelection, RunAttachment
-from vibesys.constants import ComputeBackend
+from server.run_attachment import AgentSelection
+from vibesys.api import RunReady
 from vibesys.events import (
     AgentExecutionActivityData,
     AgentExecutionFinishedData,
@@ -43,19 +48,13 @@ from vibesys.events import (
     EventStatus as CoreEventStatus,
 )
 from vibesys.events import RunStartedData as CoreRunStartedData
-from vibesys.render import output_sink
-from vibesys.run.integration import RunResourceHandoff
-from vs_agent.api import AgentSessionKey, SessionScope
-from vs_agent.api.testing import FakeAgentClient
 from vs_project.api import Project, RunEnvironmentRecord
-from vs_sandbox.api import ProjectPathPolicy
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from server.chat.factory import ChatAgentBuildRequest
     from vibesys.api import RunSession
-    from vibesys.config import Config
-    from vibesys.sandbox.run_environment import RunEnvironment, RunEnvironmentRequest
 
 
 def _project_run(root: Path) -> tuple[Project, str]:
@@ -114,28 +113,27 @@ def _emit_execution_started(
     return execution_id
 
 
-def _attach_test_run(parts: ServerParts, attachment: RunAttachment) -> None:
-    """Publish run resources through the integration's public handoff path."""
-    parts.integration.handle_run_resources(
+def _attach_test_run(
+    parts: ServerParts,
+    project: Project,
+    run_id: str,
+    defaults: AgentSelection,
+    log_dir: Path,
+) -> None:
+    """Publish the narrow public run-readiness contract."""
+    parts.integration.handle_run_ready(
         cast("RunSession", object()),
-        RunResourceHandoff(
-            project=attachment.project,
-            run_id=attachment.run_id,
-            workspace=attachment.workspace,
-            log_dir=attachment.log_dir,
-            agent_backend=attachment.agent_backend,
-            driver=attachment.agent_defaults.driver,
-            provider=attachment.agent_defaults.provider,
-            model=attachment.agent_defaults.model,
-            role_models=attachment.agent_defaults.role_models,
-            config=cast("Config", object()),
-            compute_backend=ComputeBackend.CPU,
-            skill_source_dirs=(),
-            environment=cast("RunEnvironment", object()),
-            environment_request=cast("RunEnvironmentRequest", object()),
-            run_environment_sandboxed=False,
-            project_path_policy=ProjectPathPolicy(),
-            host_resources=(),
+        RunReady(
+            record=run_record(project, run_id),
+            log_directory=log_dir,
+            frontend_state_directory=project.state.local_namespace(
+                run_id, "server"
+            ).external_directory(),
+            agent_driver=defaults.driver,
+            agent_provider=defaults.provider,
+            agent_model=defaults.model,
+            agent_drivers=auxiliary_agent_drivers(),
+            role_models=defaults.role_models,
         ),
     )
 
@@ -148,14 +146,14 @@ def test_core_events_project_to_wire_journal_and_execution_activity(tmp_path: Pa
         _execution_started_data("implementer", "work", driver="agentshim", provider="codex"),
     )
 
-    output_sink().emit(
+    parts.core_events.emit(
         CoreEventType.TOOL_CALL,
         agent_kind="implementer",
         round_label="round-1",
         execution_id=execution_id,
         data=ToolCallData(tool="Bash", args={}),
     )
-    output_sink().emit(
+    parts.core_events.emit(
         CoreEventType.AGENT_OUTPUT_CHUNK,
         agent_kind="implementer",
         round_label="round-1",
@@ -180,7 +178,7 @@ def test_framework_events_bypass_execution_stamping_and_lift_warnings(tmp_path: 
 
     # All three events arrive without an agent_kind while an implementer
     # execution is active. Only the presentation event may inherit it.
-    output_sink().emit(
+    parts.core_events.emit(
         CoreEventType.AGENT_OUTPUT_CHUNK,
         data=AgentOutputChunkData(channel="assistant", content="working"),
     )
@@ -385,111 +383,126 @@ def test_track_started_does_not_double_track_a_repeated_start_event(
 
 def test_attach_run_installs_chat_with_isolated_session_state(tmp_path: Path) -> None:
     project, run_id = _project_run(tmp_path / "project")
-    client = FakeAgentClient().set_text("chat", "It improved in round 2.")
+    messages: list[str] = []
     closed: list[str] = []
 
-    def build_agent(
-        _session: RunSession,
-        _attachment: RunAttachment,
-        selection: AgentSelection,
-        thread_id: str | None,
-        shared_state_dir: Path,
-    ) -> ChatAgentResources:
-        assert selection == AgentSelection(driver="agentshim", provider="codex", model="gpt-test")
-        assert thread_id is None
-        return ChatAgentResources(
-            client=client,
-            close=lambda: closed.append("closed"),
-            log=lambda _message: None,
-            flush_logs=lambda: None,
-            environment=dict,
-            progress=lambda: None,
-            agent_shared_state_dir=str(shared_state_dir),
-            tool_servers=(),
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            messages.append(message)
+            assert invocation_id
+            return "It improved in round 2."
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    def build_agent(request: ChatAgentBuildRequest) -> FakeManagedAgent:
+        assert request.selection == AgentSelection(
+            driver="agentshim", provider="codex", model="gpt-test"
         )
+        assert request.instance_id is None
+        return FakeManagedAgent()
 
     parts = build_server_parts(chat_agent_builder=build_agent)
     _attach_test_run(
         parts,
-        RunAttachment(
-            project=project,
-            run_id=run_id,
-            workspace=project.root,
-            log_dir=project.state.log_directory(run_id),
-            agent_backend="cli",
-            agent_defaults=AgentSelection(driver="agentshim", provider="codex", model="gpt-test"),
-        ),
+        project,
+        run_id,
+        AgentSelection(driver="agentshim", provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
     )
     response = parts.api.execute(ChatQuery(text="what improved?"))
 
     assert response.chat is not None
     assert response.chat.answer == "It improved in round 2."
-    call = client.calls_for("chat")[0]
-    assert call.reuse_session is True
-    assert call.session_key == AgentSessionKey(SessionScope.CHAT, "default")
-    assert call.user_prompt == "what improved?"
+    assert messages == ["what improved?"]
     transcript = project.state.log_directory(run_id).parent / "server/chat/conversation.jsonl"
     assert json.loads(transcript.read_text()) == {
         "question": "what improved?",
         "answer": "It improved in round 2.",
     }
     assert not (project.root / ".vibesys/server").exists()
-    assert str(transcript.parent) in call.system_prompt
     parts.integration.close()
     assert closed == ["closed"]
 
 
-def test_non_cli_run_rejects_new_chat_threads(tmp_path: Path) -> None:
+def test_chat_thread_rejects_an_unsupported_provider(tmp_path: Path) -> None:
     project, run_id = _project_run(tmp_path / "project")
-    client = FakeAgentClient()
 
-    def build_agent(
-        _session: RunSession,
-        _attachment: RunAttachment,
-        _selection: AgentSelection,
-        _thread_id: str | None,
-        shared_state_dir: Path,
-    ) -> ChatAgentResources:
-        return ChatAgentResources(
-            client=client,
-            close=lambda: None,
-            log=lambda _message: None,
-            flush_logs=lambda: None,
-            environment=dict,
-            progress=lambda: None,
-            agent_shared_state_dir=str(shared_state_dir),
-            tool_servers=(),
-        )
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            del message
+            del invocation_id
+            return "answer"
+
+        def close(self) -> None:
+            pass
+
+    def build_agent(request: ChatAgentBuildRequest) -> FakeManagedAgent:
+        del request
+        return FakeManagedAgent()
 
     parts = build_server_parts(chat_agent_builder=build_agent)
     _attach_test_run(
         parts,
-        RunAttachment(
-            project=project,
-            run_id=run_id,
-            workspace=project.root,
-            log_dir=project.state.log_directory(run_id),
-            agent_backend="stub",
-            agent_defaults=AgentSelection(driver="agentshim", provider="codex", model="gpt-test"),
-        ),
+        project,
+        run_id,
+        AgentSelection(driver="agentshim", provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
     )
 
-    with pytest.raises(ValueError, match="require the CLI agent backend"):
-        parts.api.execute(ChatThreadCreateQuery(provider="codex", model="gpt-test"))
+    with pytest.raises(ValueError, match="does not support provider"):
+        parts.api.execute(ChatThreadCreateQuery(provider="not-a-provider", model="gpt-test"))
     parts.integration.close()
 
 
-def test_close_is_idempotent_and_stops_event_projection(tmp_path: Path) -> None:
+def test_chat_thread_uses_snapshotted_cross_driver_support_and_free_text_model(
+    tmp_path: Path,
+) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+    selections: list[AgentSelection] = []
+
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            del message, invocation_id
+            return "answer"
+
+        def close(self) -> None:
+            pass
+
+    def build_agent(request: ChatAgentBuildRequest) -> FakeManagedAgent:
+        selections.append(request.selection)
+        return FakeManagedAgent()
+
+    parts = build_server_parts(chat_agent_builder=build_agent)
+    _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(driver="agentshim", provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
+    )
+
+    response = parts.api.execute(
+        ChatThreadCreateQuery(
+            driver="omnigent",
+            provider="claude",
+            model="future-free-text-model",
+        )
+    )
+
+    assert response.chat_thread is not None
+    assert selections[-1] == AgentSelection(
+        driver="omnigent",
+        provider="claude",
+        model="future-free-text-model",
+    )
+    parts.integration.close()
+
+
+def test_close_is_idempotent(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.integration.close()
     parts.integration.close()
-
-    output_sink().emit(
-        CoreEventType.AGENT_OUTPUT_CHUNK,
-        data=AgentOutputChunkData(channel="assistant", content="after close"),
-    )
-
-    assert not any(event.type is EventType.AGENT_OUTPUT_CHUNK for event in parts.journal.read())
 
 
 def test_run_started_identity_round_trip_through_the_wire_bridge() -> None:

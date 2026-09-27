@@ -1,7 +1,7 @@
 """Unit tests for :class:`~vs_agent.fake_client.FakeAgentClient`.
 
 Each test exercises one capability described in the fake's docstring/spec:
-zero-config scripted returns, the enqueue/constant/fallback resolution order,
+zero-config fallback, the enqueue/constant/fallback resolution order,
 callable and dict responses, failures, attribution and model overrides, call
 recording, streamed output, ``on_invoke`` side effects, session reuse, and
 ``invoke_text``'s parallel behavior.
@@ -16,7 +16,7 @@ import pytest
 from pydantic import BaseModel
 
 from vs_agent.api import StdioServerDescriptor
-from vs_agent.contracts import AgentCapabilities, MCPServerSpec
+from vs_agent.contracts import AgentCapabilities
 from vs_agent.fake_client import FakeAgentClient, FakeInvocation
 from vs_agent.session_key import AgentSessionKey, SessionScope
 from vs_agent.sink import AgentEventSink
@@ -113,7 +113,6 @@ class _InvokeOptions(TypedDict, total=False):
     invocation_id: str | None
     progress: AgentProgress | None
     tool_servers: list[ToolServerDescriptor] | None
-    mcp_servers: list[MCPServerSpec] | None
     reuse_session: bool | None
     session_key: AgentSessionKey | None
 
@@ -166,7 +165,7 @@ def test_zero_config_invoke_falls_back_to_fallback_factory_for_unscripted_model(
     assert response == _Response(verdict="fallback")
 
 
-def test_zero_config_invoke_returns_scripted_payload_for_known_response_model() -> None:
+def test_zero_config_does_not_infer_policy_from_the_response_model_name() -> None:
     client = FakeAgentClient()
 
     class JudgeResponse(BaseModel):
@@ -184,7 +183,7 @@ def test_zero_config_invoke_returns_scripted_payload_for_known_response_model() 
         round_label="round 2",
     )
 
-    assert response.verdict == "pass"
+    assert response.verdict == "fail"
 
 
 def test_enqueue_pops_responses_in_order_then_falls_back_to_constant() -> None:
@@ -264,7 +263,6 @@ def test_calls_records_every_kwarg_and_calls_for_filters_by_kind() -> None:
         round_label="round 3",
         env={"A": "1"},
         invocation_id="inv-1",
-        mcp_servers=None,
         reuse_session=True,
         session_key=key,
     )
@@ -284,7 +282,7 @@ def test_calls_records_every_kwarg_and_calls_for_filters_by_kind() -> None:
     assert record.response_cls is _Response
     assert record.env == {"A": "1"}
     assert record.invocation_id == "inv-1"
-    assert record.mcp_servers is None
+    assert record.tool_servers is None
     assert record.reuse_session is True
     assert record.session_key == key
 
@@ -303,9 +301,6 @@ def test_tool_server_descriptors_are_recorded_without_transport_types() -> None:
 
     record = client.calls[0]
     assert record.tool_servers == [descriptor]
-    assert record.mcp_servers == [
-        MCPServerSpec(name="issues", command="python", args=("-m", "issues"), env=(("X", "1"),))
-    ]
 
 
 def test_stream_output_emits_through_the_event_sink() -> None:
@@ -443,20 +438,18 @@ def test_set_log_file_records_the_wired_streams() -> None:
 def test_capabilities_and_backend_name_are_configurable() -> None:
     default = FakeAgentClient()
     assert default.backend_name == "fake"
-    assert default.capabilities.mcp_servers is False
     assert default.capabilities.tool_servers is False
 
     client = FakeAgentClient(
         backend_name="cli",
-        capabilities=AgentCapabilities(mcp_servers=True, session_reuse=True),
+        capabilities=AgentCapabilities(tool_servers=True, session_reuse=True),
     )
     assert client.backend_name == "cli"
-    assert client.capabilities.mcp_servers is True
     assert client.capabilities.tool_servers is True
     assert client.capabilities.session_reuse is True
 
-    client.set_capabilities(AgentCapabilities(mcp_servers=False))
-    assert client.capabilities.mcp_servers is False
+    client.set_capabilities(AgentCapabilities(tool_servers=False))
+    assert client.capabilities.tool_servers is False
 
 
 def test_fail_can_raise_a_base_exception() -> None:

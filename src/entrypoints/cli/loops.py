@@ -19,8 +19,6 @@ from entrypoints.cli.remote import _clone_project, _is_remote_project
 from headless import run as headless_run
 from vibesys.api import (
     DomainName,
-    MetricSpace,
-    Objective,
     OrchestrationDescriptor,
     ResumeRef,
     RunRequest,
@@ -28,6 +26,7 @@ from vibesys.api import (
     boot_trace,
 )
 from vibesys.api.evolve import resolve_openevolve_options
+from vibesys.api.metrics import MetricSpace, Objective
 from vibesys.api.request import (
     InputBundle,
     validate_descriptor,
@@ -259,7 +258,6 @@ def _agent_policy_descriptor(
         "max_retries_per_round": args.max_retries_per_round,
         "judge_every": args.judge_every,
         "official_eval_every": args.official_eval_every,
-        "memory_layout": args.memory_layout,
         "operator_constraints": [item.strip() for item in args.constraint if item.strip()],
         "metric_space": metrics.model_dump(mode="json"),
         "profile_guided": bundle.manifest.profile_guided.model_dump(mode="json")
@@ -338,11 +336,10 @@ def _build_run_request(args: argparse.Namespace) -> RunRequest:
             resume=ResumeRef(run_id=args.resume) if args.resume is not None else None,
             exp_name=args.exp_name,
             runs_dir=args.runs_dir,
-            debug=args.debug,
             profiler_kind=args.profiler,
             skills_dirs=skills,
             run_environment=run_environment,
-            agent_backend="stub" if getattr(args, "stub_agent", False) else args.agent_backend,
+            agent_backend=args.agent_backend,
             cli_provider=args.cli_provider,
             backend=backend,
             remote_repo=args.repo,
@@ -354,9 +351,9 @@ def _run_request(args: argparse.Namespace) -> None:
     request = _build_run_request(args)
     result = _execute_run_request(request)
     if result.succeeded:
-        sys.stdout.write(f"\n{request.orchestration_id} run completed.\n")
+        sys.stdout.write(f"\n{request.orchestration.id} run completed.\n")
     else:
-        sys.stdout.write(f"\n{request.orchestration_id} run stopped early.\n")
+        sys.stdout.write(f"\n{request.orchestration.id} run stopped early.\n")
         sys.exit(1)
 
 

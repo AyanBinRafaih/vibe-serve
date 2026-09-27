@@ -15,9 +15,8 @@ from typing import Literal
 
 import pytest
 
-import vibesys.sandbox.skypilot_evaluator as helper_module
-from vibesys.sandbox.skypilot_evaluator import run_evaluator
-from vibesys.skypilot.protocol import (
+import vs_sandbox.skypilot_evaluator as helper_module  # test-isolation: failure injection exercises the private remote helper process boundary.
+from vs_sandbox.api.skypilot import (
     AckedFrame,
     ArtifactFrame,
     ErrorFrame,
@@ -25,6 +24,9 @@ from vibesys.skypilot.protocol import (
     ResultFrame,
     encode_message,
 )
+from vs_sandbox.skypilot_evaluator import (
+    run_evaluator,
+)  # test-isolation: remote helper execution is tested directly.
 
 type _Frame = ArtifactFrame | ErrorFrame | OutputFrame | ResultFrame
 

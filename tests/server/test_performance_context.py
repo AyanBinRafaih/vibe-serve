@@ -4,22 +4,23 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tests.server.support import agent_descriptor, build_server_parts
+from tests.server.support import agent_descriptor, build_server_parts, run_record
 from tests.support.run_execution import run_execution_record
 
 from server.api.performance import build_performance_context, summarize_objective
 from server.api.protocol import PerformanceQuery
 from vibesys.api.contracts import RunStatus
-from vibesys.evaluators.metrics import MetricSpace
-from vibesys.loops.hypothesis_readmodel import project_run_view
-from vibesys.search.hypothesis import OrchestratorPlan
-from vibesys.search.hypothesis.state import (
+from vibesys.api.metrics import MetricSpace
+from vibesys.orchestration.hypothesis import OrchestratorPlan
+from vibesys.orchestration.hypothesis.readmodel import project_run_view
+from vibesys.orchestration.hypothesis.state import (
     Hypothesis,
     HypothesisMeasurement,
     HypothesisState,
 )
-from vibesys.search.hypothesis.transitions import reproject_run_evidence
-from vs_loop_state.api import RoundRecord
+from vibesys.orchestration.hypothesis.transitions import reproject_run_evidence
+from vibesys.orchestration.single.models import SingleState
+from vs_loop_state.api import MetricComparison, RoundRecord
 from vs_project.api import Project, RunEnvironmentRecord
 
 if TYPE_CHECKING:
@@ -99,7 +100,7 @@ def _view(state: HypothesisState) -> RunView:
 
 def _service(project: Project, run_id: str) -> RunApi:
     return build_server_parts(
-        project.state.log_directory(run_id), project=project, run_id=run_id
+        project.state.log_directory(run_id), record=run_record(project, run_id)
     ).api
 
 
@@ -114,6 +115,7 @@ def test_service_projects_context_from_round_evidence_and_objective_prose(
     )
     state = reproject_run_evidence(
         HypothesisState(
+            metrics=_configuration(("total_ops_per_sec:max",)),
             hypotheses=[
                 _hypothesis(
                     "H-01",
@@ -127,18 +129,21 @@ def test_service_projects_context_from_round_evidence_and_objective_prose(
                             official_evaluation=True,
                             perf_metric=2000.0,
                             perf_unit="total_ops_per_sec",
+                            perf_provenance="framework",
+                            perf_comparison=MetricComparison.BETTER,
+                            judge_verdict="pass",
                             perf_baseline_round=1,
                             perf_baseline_commit="e17fce8123abc",
                             perf_baseline_metric=1000.0,
                         )
                     ],
                 )
-            ]
+            ],
         )
     )
 
-    project.state.portable_namespace(run_id, "single").slot("state.json", HypothesisState).save(
-        state
+    project.state.portable_namespace(run_id, "single-agent").slot("state.json", SingleState).save(
+        SingleState(search=state)
     )
     response = _service(project, run_id).execute(PerformanceQuery())
 
@@ -157,8 +162,8 @@ def test_service_projects_context_from_round_evidence_and_objective_prose(
 
 def test_service_names_the_objective_before_the_first_measurement(tmp_path: Path) -> None:
     project, run_id = _project_run(tmp_path / "project", ("total_ops_per_sec:max",))
-    project.state.portable_namespace(run_id, "single").slot("state.json", HypothesisState).save(
-        HypothesisState()
+    project.state.portable_namespace(run_id, "single-agent").slot("state.json", SingleState).save(
+        SingleState(search=HypothesisState(metrics=_configuration(("total_ops_per_sec:max",))))
     )
 
     response = _service(project, run_id).execute(PerformanceQuery())

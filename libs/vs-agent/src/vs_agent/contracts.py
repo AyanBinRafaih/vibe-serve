@@ -23,6 +23,15 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound=BaseModel)
 
 
+class AgentTurnTimeoutError(TimeoutError):
+    """An agent turn exceeded its configured wall-clock budget."""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        """Record the configured budget, independent of driver mechanism."""
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"agent turn timed out after {timeout_seconds:g} seconds")
+
+
 class SessionDisposition(StrEnum):
     """Whether a session remains safe to use after a turn."""
 
@@ -70,9 +79,6 @@ class AgentCapabilities:
     """Features a driver can provide without weakening requested semantics."""
 
     tool_servers: bool = False
-    # Deprecated compatibility spelling. Normalized to ``tool_servers`` so
-    # callers can migrate without changing driver capability behavior.
-    mcp_servers: bool | None = None
     nested_read_only_paths: bool = False
     hidden_paths: bool = False
     host_path_grants: bool = False
@@ -83,12 +89,6 @@ class AgentCapabilities:
     # earlier process, so a resumed run continues the same conversation instead
     # of replaying it. ``session_reuse`` only promises reuse within one process.
     provider_session_resume: bool = False
-
-    def __post_init__(self) -> None:
-        """Keep the old MCP capability spelling as an alias."""
-        if self.mcp_servers is not None:
-            object.__setattr__(self, "tool_servers", self.mcp_servers)
-        object.__setattr__(self, "mcp_servers", self.tool_servers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +187,7 @@ class AgentSession(Protocol):
         request: AgentTurnRequest,
         observer: AgentObserver | None = None,
     ) -> AgentTurnResult:
-        """Add one turn to the conversation and return its raw result."""
+        """Add one turn or raise :class:`AgentTurnTimeoutError` on timeout."""
         ...
 
     def resume_provider_session(self, session_id: str) -> bool:
@@ -291,8 +291,6 @@ class AgentClientProtocol(Protocol):
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
         tool_servers: list[ToolServerDescriptor] | None = None,
-        # Deprecated. Convert legacy callers at the client boundary.
-        mcp_servers: list[MCPServerSpec] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,
     ) -> T:
@@ -311,8 +309,6 @@ class AgentClientProtocol(Protocol):
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
         tool_servers: list[ToolServerDescriptor] | None = None,
-        # Deprecated. Convert legacy callers at the client boundary.
-        mcp_servers: list[MCPServerSpec] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,
     ) -> str:

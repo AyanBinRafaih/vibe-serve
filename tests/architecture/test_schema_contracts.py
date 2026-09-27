@@ -7,23 +7,17 @@ from pydantic import ValidationError
 from tests.support import make_orchestrator_plan
 
 from server.api.protocol import PerformanceRound
-from vibesys.evaluators.perf_reply import (
-    LatencyStats,
-    LoadLevelMetrics,
-    ThroughputStats,
-)
-from vibesys.roles.common import Verdict
-from vibesys.roles.implementer import ImplementerResponse
-from vibesys.roles.judge import JudgeResponse
-from vibesys.roles.profiler import ProfilerSummary
-from vibesys.roles.single_agent import SingleAgentRoundResponse
-from vibesys.schemas import (
+from vibesys.orchestration.hypothesis import (
     HYPOTHESIS_TITLE_MAX_LEN,
+    OrchestratorPlan,
     SkillResourceSelection,
     derive_hypothesis_title,
     normalize_hypothesis_title,
 )
-from vibesys.search.hypothesis import OrchestratorPlan
+from vibesys.orchestration.multi.contracts import ImplementerResponse, JudgeResponse
+from vibesys.orchestration.profilers import ProfilerSummary
+from vibesys.orchestration.review import Verdict
+from vibesys.orchestration.single.models import SingleAgentRoundResponse
 
 
 def _profiler_summary(
@@ -113,30 +107,7 @@ def test_single_agent_response_rejects_non_finite_perf_metric(value: float) -> N
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_performance_stats_reject_non_finite_values(value: float) -> None:
-    with pytest.raises(ValidationError, match="finite number"):
-        LatencyStats(
-            mean_ms=value,
-            p50_ms=1.0,
-            p90_ms=1.0,
-            p95_ms=1.0,
-            p99_ms=1.0,
-        )
-
-    with pytest.raises(ValidationError, match="finite number"):
-        ThroughputStats(request_throughput=value, token_throughput=1.0)
-
-    with pytest.raises(ValidationError, match="finite number"):
-        LoadLevelMetrics(
-            target_rate=value,
-            actual_rate=1.0,
-            num_requests=1,
-            num_completed=1,
-            num_failed=0,
-            duration=1.0,
-            throughput=ThroughputStats(request_throughput=1.0, token_throughput=1.0),
-        )
-
+def test_performance_round_rejects_non_finite_values(value: float) -> None:
     with pytest.raises(ValidationError, match="finite number"):
         PerformanceRound(
             round=1,

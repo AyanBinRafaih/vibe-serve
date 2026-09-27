@@ -13,11 +13,6 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, ValidationError, model_validator
 
-# AgentOutputChannel, AgentStatusData, TodoItemData, and ToolResultPayload are
-# used directly below. CommandResultPayload and JsonResultPayload are only the
-# ToolResultPayload union members; re-exported here (like vs_loop_state's
-# enums in vibesys.schemas) so existing importers of server.events keep working.
-import vs_agent.api as _agent_api
 from server.diagnostics import Diagnostic
 from server.event_index import (
     EventIndexRecord,
@@ -26,16 +21,21 @@ from server.event_index import (
     write_event_index,
 )
 from server.run_lifecycle import RunStatus
-from vs_agent.api import (
+from vibesys.api import (
     AgentOutputChannel,
     AgentStatusData,
     TodoItemData,
     ToolResultPayload,
 )
+from vibesys.api import (
+    CommandResultPayload as _CommandResultPayload,
+)
+from vibesys.api import (
+    JsonResultPayload as _JsonResultPayload,
+)
 
-# Compatibility re-exports for existing ``server.events`` importers.
-CommandResultPayload = _agent_api.CommandResultPayload
-JsonResultPayload = _agent_api.JsonResultPayload
+CommandResultPayload = _CommandResultPayload
+JsonResultPayload = _JsonResultPayload
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -376,9 +376,8 @@ class RoundFinishedData(EventPayload):
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
     # True when no fresh profile ran this round; such a round records no perf
-    # reading (perf_metric stays None). Defaults False so legacy persisted
-    # events stay valid.
-    profile_skipped: bool = False
+    # reading (perf_metric stays None).
+    profile_skipped: bool
 
 
 class GateStartedData(EventPayload):

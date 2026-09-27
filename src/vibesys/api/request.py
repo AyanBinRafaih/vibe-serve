@@ -22,47 +22,66 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from vibesys.agent_spec_config import resolve_agent_driver
-from vibesys.evaluators.input_manifest import InputBundle, load_input_bundle, load_project_task
-from vibesys.evaluators.input_synthesis import (
+from vibesys.composition import resolve_agent_driver
+from vibesys.config import BUNDLED_RESOURCES
+from vibesys.inputs import (
+    InputBundle,
     InputSynthesisError,
     SynthesizedInputSpec,
+    load_input_bundle,
+    load_project_task,
     synthesize_input_bundle,
 )
-from vibesys.evaluators.objective import load_objective, with_operator_constraints
-from vibesys.profilers import CLI_PROFILER_CHOICES, coerce_profiler_kind
 from vibesys.repository import (
     REPOSITORY_SLUG,
     generate_experiment_name,
     repository_name_from_experiment,
     validate_experiment_name,
 )
-from vibesys.resource_paths import default_skill_roots
+from vibesys.run.contracts import ProfilerKind
 from vibesys.run.experiment_repo import ExperimentRepository
-from vibesys.sandbox.run_environment import (
+from vibesys.run.skill_sources import resolve_skill_source_dirs
+from vs_agent.api.images import build_task_image
+from vs_runtime.api.infrastructure import (
     RunEnvironmentSpec,
     build_run_environment,
     make_run_environment_spec,
     run_environment_record,
 )
-from vibesys.sandbox.task_image import build_task_image
-from vibesys.skills import resolve_skill_source_dirs
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from vibesys.profilers import ProfilerKind
     from vs_project.api import OrchestrationDescriptor
 
+
+def default_skill_roots() -> tuple[Path, ...]:
+    """Return the bundled skill collection, when one is installed."""
+    skills = BUNDLED_RESOURCES.directory("skills")
+    return () if skills is None else (skills,)
+
+
+def load_objective(bundle: InputBundle) -> str:
+    """Return one input bundle's objective text."""
+    return bundle.objective
+
+
+def with_operator_constraints(objective: str, constraints: list[str]) -> str:
+    """Add run-specific invariants without mutating the input bundle."""
+    normalized = [constraint.strip() for constraint in constraints if constraint.strip()]
+    if not normalized:
+        return objective
+    lines = "\n".join(f"- {constraint}" for constraint in normalized)
+    return f"{objective.rstrip()}\n\n## Operator constraints\n\n{lines}\n"
+
+
 __all__ = [
-    "CLI_PROFILER_CHOICES",
     "REPOSITORY_SLUG",
     "InputBundle",
     "InputSynthesisError",
     "RunEnvironmentSpec",
     "SynthesizedInputSpec",
     "build_task_image",
-    "coerce_profiler_kind",
     "default_skill_roots",
     "experiment_origin_matches",
     "generate_experiment_name",
@@ -84,23 +103,27 @@ __all__ = [
 
 def validate_descriptor(descriptor: OrchestrationDescriptor) -> None:
     """Validate a selected policy before the CLI creates run resources."""
-    # lint-waiver: LW-020003 [PLC0415]; the built-in orchestration registry imports every loop implementation, so it loads only when a caller needs it.
-    from vibesys.loops.registry import built_in_orchestrations  # noqa: PLC0415
+    # lint-waiver: LW-020007 [PLC0415]; the product catalog imports every built-in policy, so it loads only when a caller needs it.
+    from vibesys.plugin_builtins import built_in_orchestrations  # noqa: PLC0415
 
-    built_in_orchestrations().resolve(descriptor.id).orchestrator(descriptor)
+    registration = built_in_orchestrations().resolve(descriptor.id)
+    registration.parse_options(descriptor)
 
 
 def supported_profilers(spec: RunEnvironmentSpec) -> frozenset[ProfilerKind] | None:
     """Return the profiler kinds `spec`'s run environment supports.
 
     `None` means the environment supports every profiler kind (no
-    restriction), matching `RunEnvironment.supported_profiler_kinds` and its
+    restriction), matching `RunEnvironment.supported_profiler_ids` and its
     use in `entrypoints.cli._validate_run_environment_profiler`. Building
     the environment just to read this one attribute is intentional here so
     callers never need to import `build_run_environment` (which returns a
     live, potentially side-effecting environment handle) themselves.
     """
-    return build_run_environment(spec).supported_profiler_kinds
+    supported_ids = build_run_environment(spec).supported_profiler_ids
+    if supported_ids is None:
+        return None
+    return frozenset(ProfilerKind(profiler_id) for profiler_id in supported_ids)
 
 
 def experiment_origin_matches(destination: Path, repository: str) -> bool:
@@ -109,6 +132,6 @@ def experiment_origin_matches(destination: Path, repository: str) -> bool:
     `repository` is a GitHub `OWNER/NAME` slug. Delegates to
     `ExperimentRepository.origin_matches` with a no-op logger so callers get
     the git-origin check without importing `ExperimentRepository` itself,
-    which also carries `push`/`sync`/`create_remote`.
+    which also carries `push`/`create_remote`.
     """
     return ExperimentRepository(destination, lambda _message: None).origin_matches(repository)

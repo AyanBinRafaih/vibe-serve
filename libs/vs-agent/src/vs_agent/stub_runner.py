@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel
 
-from vs_agent.contracts import AgentCapabilities, MCPServerSpec
-from vs_agent.scripted_rounds import round_number_from_label, scripted_round_payload
+from vs_agent.contracts import AgentCapabilities
 from vs_agent.sink import NULL_AGENT_EVENT_SINK, AgentEventSink
 
 if TYPE_CHECKING:
@@ -22,18 +21,26 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class StubAgentClient:
-    """Return valid canned responses without invoking an external agent."""
+    """Exercise the agent-client contract without invoking an external agent."""
 
     backend_name = "stub"
 
-    def __init__(self, *, event_sink: AgentEventSink = NULL_AGENT_EVENT_SINK) -> None:
+    def __init__(
+        self,
+        *,
+        event_sink: AgentEventSink = NULL_AGENT_EVENT_SINK,
+    ) -> None:
         """Create a stateless deterministic client."""
         self._sink = event_sink
 
     @property
     def capabilities(self) -> AgentCapabilities:
-        """The deterministic stub does not expose external tools."""
-        return AgentCapabilities(session_reuse=False)
+        """Emulate the conversation capabilities used by interface smoke runs."""
+        return AgentCapabilities(
+            tool_servers=True,
+            session_reuse=True,
+            provider_session_resume=True,
+        )
 
     @property
     def driver_name(self) -> str | None:
@@ -81,22 +88,19 @@ class StubAgentClient:
         **kwargs: object,
     ) -> T:
         """Emit a deterministic stub response for one requested agent turn."""
-        del workspace, system_prompt, user_prompt, progress, kwargs
+        del workspace, system_prompt, user_prompt, response_cls, progress, kwargs
         self._sink.agent_output(
             f"[stub-agent] {round_label}: starting {kind}\n",
             channel="diagnostic",
             agent_kind=kind,
         )
         time.sleep(0.05)
-        response = scripted_round_payload(
-            response_cls.__name__, round_number_from_label(round_label)
-        )
         self._sink.agent_output(
             f"[stub-agent] {round_label}: completed {kind}\n",
             channel="diagnostic",
             agent_kind=kind,
         )
-        return response_cls.model_validate(response) if response is not None else fallback_factory()
+        return fallback_factory()
 
     def invoke_text(  # noqa: PLR0913  # lint-waiver: LW-010192 [PLR0913]; Preserve StubAgentClient.invoke_text's named-argument contract because callers pass these independent settings directly.
         self,
@@ -110,8 +114,6 @@ class StubAgentClient:
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
         tool_servers: list[ToolServerDescriptor] | None = None,
-        # Deprecated compatibility spelling.
-        mcp_servers: list[MCPServerSpec] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,
     ) -> str:
@@ -122,7 +124,6 @@ class StubAgentClient:
             env,
             progress,
             tool_servers,
-            mcp_servers,
             reuse_session,
             session_key,
         )

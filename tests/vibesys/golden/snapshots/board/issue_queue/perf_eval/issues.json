@@ -5,8 +5,8 @@
     {
       "id": 1,
       "type": "feature",
-      "title": "Initial task: Maximize tok/s throughput.",
-      "description": "## Task objective\n\nMaximize tok/s throughput.\n\n\nImplement and validate the candidate against this objective and the task's\ncandidate contract. Treat the objective and repository documentation as the\nsource of truth for required behavior.\n\n## Acceptance criteria\n\n- Use the reference material at `.` where it helps explain the task contract.\n- The configured correctness checker passes: `python -c 'print('\"'\"'ok'\"'\"')'`.\n- The configured benchmark completes and reports its declared metric: `python -c 'print('\"'\"'ok'\"'\"')'`.\n- Add or update focused tests for behavior you change, and run the relevant tests.",
+      "title": "Build inference server for the reference model",
+      "description": "## Background\n\nBuild a production-ready inference server for the reference implementation at\n`reference/model.py`. Inspect the reference and checker rather than\nsubstituting a generic model wrapper. Keep all candidate work in this workspace.\n\nObjective: Maximize token throughput without losing correctness.\n\nUse CUDA with bfloat16.\n\n## Acceptance criteria\n\n- Implement the model and its weight loading from the provided local inputs.\n- Expose `/v1/completions` streaming non-empty token deltas and `/health`.\n- Preserve the checker-required `VibeServeModel.from_pretrained` and `generate` interface.\n- Add pytest coverage for health, completion streaming, accuracy, and a benchmark smoke run.\n- Run the configured checks and leave a reproducible candidate.\n\n## Commands\n\nAccuracy command: uv run check-accuracy\nBenchmark command: uv run benchmark",
       "status": "closed",
       "created_by": "loop:bootstrap",
       "created_iter": 1,
@@ -42,7 +42,7 @@
             "files_touched": [
               "server.py"
             ],
-            "self_check": "ran the accuracy checker locally"
+            "self_check": "Ran the accuracy checker locally."
           }
         },
         {
@@ -53,7 +53,7 @@
           "note": "closed by judge after attempt 1",
           "payload": {
             "issue_id": 1,
-            "analysis": "reviewed the diff and the accuracy checks",
+            "analysis": "Reviewed the diff and the accuracy checks.",
             "feedback": "",
             "verdict": "pass",
             "new_issues_filed": []

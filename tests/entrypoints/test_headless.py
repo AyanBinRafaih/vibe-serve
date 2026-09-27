@@ -32,36 +32,47 @@ from entrypoints.cli import (
     run_environment_spec_from_args,
 )
 from entrypoints.headless import main
+from vibesys.api.metrics import MetricSpace, Objective
 from vibesys.config import Config
 from vibesys.constants import ComputeBackend, DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
-from vibesys.evaluators.input_manifest import ProfileGuidedInput, load_input_bundle
-from vibesys.evaluators.metrics import MetricSpace, Objective
 from vibesys.events import CoreEventType
-from vibesys.loops.agent_options import (
+from vibesys.inputs import ProfileGuidedInput, load_input_bundle
+from vibesys.orchestration.agent_options import (
     AgentOrchestrationOptions,
 )
-from vibesys.loops.agent_options import (
-    descriptor_from_options as agent_descriptor,
-)
-from vibesys.loops.evolve.orchestration import EvolveOptions
-from vibesys.loops.evolve.orchestration import descriptor_from_options as evolve_descriptor
-from vibesys.loops.issue_queue.orchestration import IssueQueueOptions, descriptor_from_options
-from vibesys.profilers import ProfilerKind
-from vibesys.sandbox.run_environment import run_environment_record
+from vibesys.orchestration.evolve import PLUGIN as EVOLVE_PLUGIN
+from vibesys.orchestration.evolve.models import EvolveOptions
+from vibesys.orchestration.issue_queue import PLUGIN as ISSUE_QUEUE_PLUGIN
+from vibesys.orchestration.issue_queue import IssueQueueOptions
+from vibesys.orchestration.profilers import ProfilerKind
 from vs_project.api import (
+    AgentRoleExecutionRecord,
     OrchestrationDescriptor,
     OrchestrationRunManifest,
     Project,
     RunEnvironmentRecord,
     RunExecutionRecord,
 )
+from vs_runtime.api import RunStatus as PluginRunStatus
+from vs_runtime.api.infrastructure import run_environment_record
 
 _LOOP_RUN_TARGETS = {
-    "agent": "vibesys.api.session.run_orchestration",
-    "plain": "vibesys.api.session.run_orchestration",
-    "evolve": "vibesys.api.session.run_orchestration",
+    "agent": "vibesys.api._session.run_plugin",
+    "plain": "vibesys.api._session.run_plugin",
+    "evolve": "vibesys.api._session.run_plugin",
 }
+
+
+def agent_descriptor(
+    options: AgentOrchestrationOptions, *, orchestration_id: str
+) -> OrchestrationDescriptor:
+    """Build the persisted descriptor at the product composition boundary."""
+    return OrchestrationDescriptor(
+        id=orchestration_id,
+        config_version=1,
+        options=options.model_dump(mode="json"),
+    )
 
 
 def _write_input_project(parent: Path, name: str = "queue-spsc") -> Path:
@@ -176,10 +187,6 @@ class _CommonConfiguration(TypedDict):
     profiler: str
     modality: str
     default_reasoning_effort: str
-    outer_model: str
-    outer_reasoning_effort: str
-    inner_model: str
-    inner_reasoning_effort: str
 
 
 _LOCAL_ENVIRONMENT = RunEnvironmentRecord(name="local")
@@ -202,14 +209,12 @@ def _common_configuration() -> _CommonConfiguration:
         "profiler": "none",
         "modality": "kv_store",
         "default_reasoning_effort": "high",
-        "outer_model": "gpt-outer",
-        "outer_reasoning_effort": "medium",
-        "inner_model": "gpt-inner",
-        "inner_reasoning_effort": "low",
     }
 
 
-def _execution_record() -> RunExecutionRecord:
+def _execution_record(
+    role_ids: tuple[str, ...] = ("orchestrator", "implementer"),
+) -> RunExecutionRecord:
     common = _common_configuration()
     return RunExecutionRecord(
         model=common["model"],
@@ -221,10 +226,13 @@ def _execution_record() -> RunExecutionRecord:
         requested_profiler=common["profiler"],
         resolved_profiler=common["profiler"],
         default_reasoning_effort=common["default_reasoning_effort"],
-        outer_model=common["outer_model"],
-        outer_reasoning_effort=common["outer_reasoning_effort"],
-        inner_model=common["inner_model"],
-        inner_reasoning_effort=common["inner_reasoning_effort"],
+        agent_roles={
+            role_id: AgentRoleExecutionRecord(
+                model=f"gpt-{role_id}",
+                reasoning_effort="medium" if role_id == "orchestrator" else "low",
+            )
+            for role_id in role_ids
+        },
     )
 
 
@@ -235,7 +243,13 @@ class _RecordedRun:
 
     @property
     def execution(self) -> RunExecutionRecord:
-        return _execution_record()
+        roles = {
+            "single-agent": ("orchestrator", "implementer"),
+            "profile-guided-single-agent": ("orchestrator", "implementer"),
+            "plain": ("implementer", "judge", "perf_eval"),
+            "evolve": ("implementer", "judge", "profiler"),
+        }.get(self.orchestration.id, ("orchestrator", "implementer"))
+        return _execution_record(roles)
 
 
 def _agent_configuration(
@@ -251,7 +265,6 @@ def _agent_configuration(
         max_retries_per_round=4,
         judge_every=2,
         official_eval_every=5,
-        memory_layout="directories",
         operator_constraints=("Preserve the ABI.",),
         profile_guided=profile_guided,
     )
@@ -267,7 +280,13 @@ def _plain_configuration(*, max_rounds: int = 6) -> _RecordedRun:
         max_attempts_per_issue=4,
         max_issues_per_perf_eval=2,
     )
-    return _RecordedRun(descriptor_from_options(options))
+    return _RecordedRun(
+        OrchestrationDescriptor(
+            id=ISSUE_QUEUE_PLUGIN.id,
+            config_version=ISSUE_QUEUE_PLUGIN.config_version,
+            options=options.model_dump(mode="json"),
+        )
+    )
 
 
 def _evolve_configuration(*, max_generations: int = 5) -> _RecordedRun:
@@ -286,7 +305,7 @@ def _evolve_configuration(*, max_generations: int = 5) -> _RecordedRun:
         openevolve_migration_rate=0.25,
         frontier_bias=0.6,
         bootstrap_max_attempts=7,
-        keep_deployments=True,
+        keep_deployments=False,
         max_parallelism=2,
         metric_space=MetricSpace(
             objectives=(
@@ -295,7 +314,13 @@ def _evolve_configuration(*, max_generations: int = 5) -> _RecordedRun:
             )
         ),
     )
-    return _RecordedRun(evolve_descriptor(options))
+    return _RecordedRun(
+        OrchestrationDescriptor(
+            id=EVOLVE_PLUGIN.id,
+            config_version=EVOLVE_PLUGIN.config_version,
+            options=options.model_dump(mode="json"),
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -1367,7 +1392,6 @@ def test_agent_resume_restores_its_configuration(
     assert args.official_eval_every == 5
     assert args.inner_loop == "single-agent"
     assert args.interface == "service"
-    assert args.memory_layout == "directories"
     assert args.constraint == ["Preserve the ABI."]
     assert args.profiler is ProfilerKind.NONE
     assert args.cli_provider == "claude"
@@ -1375,12 +1399,12 @@ def test_agent_resume_restores_its_configuration(
     assert config.model.name == "gpt-recorded"
     assert config.agent.cli_timeout == 321
     assert config.agent.driver == "omnigent"
-    assert config.agent.outer.model == "gpt-outer"
-    assert config.agent.inner.model == "gpt-inner"
+    assert config.agent.roles["orchestrator"].model == "gpt-orchestrator"
+    assert config.agent.roles["implementer"].model == "gpt-implementer"
 
 
 @pytest.mark.parametrize("loop_kind", ["agent", "profile-guided"])
-def test_v4_agent_resume_restores_config_constraints_and_budget(
+def test_v5_agent_resume_restores_config_constraints_and_budget(
     loop_kind: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1389,7 +1413,7 @@ def test_v4_agent_resume_restores_config_constraints_and_budget(
     if loop_kind == "profile-guided":
         with (project / "vibesys.input.toml").open("a") as input_manifest:
             input_manifest.write('\n[profile_guided]\ncommand = ["python", "profile.py"]\n')
-    run_id = f"20260811-120000-11111111-{loop_kind}-v4"
+    run_id = f"20260811-120000-11111111-{loop_kind}-v5"
     configuration = _agent_configuration(
         orchestration_id=(
             "profile-guided-single-agent" if loop_kind == "profile-guided" else "single-agent"
@@ -1434,7 +1458,7 @@ def test_v4_agent_resume_restores_config_constraints_and_budget(
         parse_cli_invocation(
             ["--outer-loop", loop_kind, "--resume", run_id, "--constraint", "Change the ABI."]
         )
-    with pytest.raises(ConfigurationError, match="agent_backend"):
+    with pytest.raises(ConfigurationError, match="unrecognized arguments: --stub-agent"):
         parse_cli_invocation(["--outer-loop", loop_kind, "--resume", run_id, "--stub-agent"])
 
 
@@ -1463,12 +1487,12 @@ def test_plain_resume_restores_its_configuration(
     assert args.profiler is ProfilerKind.NONE
 
 
-def test_v4_plain_resume_restores_options_and_budget(
+def test_v5_plain_resume_restores_options_and_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project = _write_input_project(tmp_path)
-    run_id = "20260811-120000-11111111-plain-v4"
+    run_id = "20260811-120000-11111111-plain-v5"
     configuration = _plain_configuration()
     store = Project.open(project).state
     store.create_project(project.name)
@@ -1531,7 +1555,7 @@ def test_evolve_resume_restores_its_configuration(
     assert args.openevolve_migration_rate == 0.25
     assert args.frontier_bias == 0.6
     assert args.bootstrap_max_attempts == 7
-    assert args.keep_deployments is True
+    assert args.keep_deployments is False
     assert args.max_parallelism == 2
     assert [(item.name, item.direction) for item in args.objective] == [
         ("latency", "min"),
@@ -1539,12 +1563,12 @@ def test_evolve_resume_restores_its_configuration(
     ]
 
 
-def test_v4_evolve_resume_restores_openevolve_settings_and_budget(
+def test_v5_evolve_resume_restores_openevolve_settings_and_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project = _write_input_project(tmp_path)
-    run_id = "20260811-120000-11111111-evolve-v4"
+    run_id = "20260811-120000-11111111-evolve-v5"
     configuration = _evolve_configuration()
     store = Project.open(project).state
     store.create_project(project.name)
@@ -1666,10 +1690,10 @@ def test_resume_rejects_changes_to_immutable_configuration(
 
 
 def _write_unsupported_schema_run(project: Path, run_id: str) -> None:
-    """Rewrite a v4 manifest with an unsupported schema version."""
+    """Rewrite a v5 manifest with an unsupported schema version."""
     path = project / ".vibesys" / "state" / "runs" / run_id / "run.json"
     raw = json.loads(path.read_text())
-    raw["schema_version"] = 3
+    raw["schema_version"] = 4
     path.write_text(json.dumps(raw, indent=2, sort_keys=True))
 
 
@@ -1775,7 +1799,7 @@ def test_resume_rejects_an_unsupported_run_schema(
         parse_cli_invocation(["--resume", run_id])
 
     assert exc.value.diagnostic.code == "unsupported_run_schema"
-    assert "requires version 4" in exc.value.diagnostic.message
+    assert "requires version 5" in exc.value.diagnostic.message
     assert run_id in exc.value.diagnostic.message
 
 
@@ -1838,7 +1862,7 @@ def test_main_routes_to_the_selected_loop(
 ) -> None:
     """The selected descriptor reaches the shared orchestration runner."""
     project = _write_input_project(tmp_path)
-    runner = AsyncMock(return_value=True)
+    runner = AsyncMock(return_value=PluginRunStatus.SUCCEEDED)
     monkeypatch.setattr(_LOOP_RUN_TARGETS[loop], runner)
     argv = ["vibesys", "--outer-loop", loop, "--input", str(project)]
 
@@ -1860,7 +1884,9 @@ def test_dispatch_owns_headless_rendering(
     project = _write_input_project(tmp_path)
     renderer = Mock()
     monkeypatch.setattr(headless_run_module, "HeadlessRenderer", lambda: renderer)
-    monkeypatch.setattr(_LOOP_RUN_TARGETS["agent"], AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        _LOOP_RUN_TARGETS["agent"], AsyncMock(return_value=PluginRunStatus.SUCCEEDED)
+    )
 
     cli.dispatch(["--input", str(project)])
 

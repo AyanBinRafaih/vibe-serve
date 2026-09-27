@@ -52,10 +52,9 @@ def is_codex(provider: str | None) -> bool:
 # --- Docker container environment -------------------------------------------
 
 _COMMON_DOCKER_ENV: dict[str, str] = {"PYTHONPATH": "/opt/vibesys"}
-"""Every shipped provider's container CLI needs this so it can spawn
-``python -m vs_issue_tracker.mcp`` against the bind-mounted project root (added
-in ``DockerSandbox.start`` for all four CLI providers). Without it the MCP
-server module would not be importable inside the container.
+"""Every shipped provider's container CLI needs this so agent-launched product
+tool modules can import VibeSys from the bind-mounted project root (added in
+``DockerSandbox.start`` for all four CLI providers).
 
 This is the whole of ``DOCKER_PROVIDER_ENV``'s per-provider contribution: the
 rest of a containerized run's extra environment (``UV_CACHE_DIR``, and
@@ -113,8 +112,8 @@ def cli_skill_dirs() -> tuple[str, ...]:
 
 # --- Agent image ------------------------------------------------------------
 #
-# Versions baked into ``vibesys/sandbox/images/agent.Dockerfile`` as build
-# args (see ``vibesys.sandbox.images.agent_image``). Pinned rather than left
+# Versions baked into ``vs_agent/images/agent.Dockerfile`` as build args
+# (see ``vs_agent.api.images.agent_image``). Pinned rather than left
 # to float so the container CLI matches the feature set VibeSys prompts were
 # validated against, and so a rebuild with unchanged pins resolves to the same
 # image from Docker's layer cache.

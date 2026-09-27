@@ -1,30 +1,35 @@
 """The public surface of VibeSys core: the only module other packages import.
 
 Everything else under `vibesys.*` is private to core. `server.*` and
-`entrypoints` talk to core only through this module and its `request` submodule:
-no deep imports, no escape hatch. This module is the run/observe contract (build
-a session from a `RunRequest`, then read back its events and views);
-`vibesys.api.request` is the surface for assembling a `RunRequest`.
+`entrypoints` talk to core only through this package: the package root is the
+policy-neutral run/observe contract, while explicitly named submodules expose
+built-in policy projections and configuration. `vibesys.api.request` is the
+surface for assembling a `RunRequest`.
 
 Most symbols here are contracts and Protocols; the rest are re-exports of
-core-owned types that consumers legitimately need (events, control signals,
-the resource-handoff seam) so they never import their private home modules.
+core-owned types that consumers legitimately need, so they never import their
+private home modules.
 """
 
 from __future__ import annotations
 
-from vibesys import boot_trace
-from vibesys.agent_spec_config import agent_spec_from_config
+from vibesys.api.auxiliary import (
+    AgentDriver,
+    AuxiliaryAgentDriver,
+    AuxiliaryAgentLaunch,
+    AuxiliaryReadableInput,
+    ManagedAgent,
+    RunReady,
+)
 from vibesys.api.contracts import (
     Config,
     ConfigurationDiagnostic,
     ConfigurationError,
     CoreEvent,
     EventStatus,
-    MetricSpace,
-    Objective,
     OrchestrationDescriptor,
-    PerfDeltaReason,
+    PluginProjection,
+    ProfilerKind,
     ResumeRef,
     RunRequest,
     RunResult,
@@ -34,64 +39,84 @@ from vibesys.api.contracts import (
 from vibesys.api.entry import load_config
 from vibesys.api.session import RunControl, RunSession, create_session
 from vibesys.api.store import (
+    RunDocument,
+    RunRecord,
+    RunRecordFacts,
+    RunRecordReadError,
     RunStore,
+    WorkspaceChange,
+    WorkspaceChangeKind,
     open_run_store,
 )
-from vibesys.api.store import (
-    portable_history_snapshots as _portable_history_snapshots,  # noqa: F401  # lint-waiver: LW-020001 [F401]; server.controller imports this private facade helper by name, so the alias is a deliberate re-export.
-)
+from vibesys.composition import agent_spec_from_config
 from vibesys.constants import KNOWN_COMPUTE_BACKENDS, ComputeBackend, DomainName
 from vibesys.events import (
     AgentExecutionStartedData,
+    AgentOutputChannel,
     AgentOutputChunkData,
+    AgentStatusData,
+    CommandResultPayload,
     CoreEventType,
+    FrameworkWarningData,
+    GateFinishedData,
+    GateStartedData,
+    JsonResultPayload,
+    RunConfiguredData,
     TodoItemData,
     TodoUpdateData,
     ToolCallData,
     ToolResultData,
+    ToolResultPayload,
+    WorkspaceSnapshotData,
 )
-from vibesys.orchestration.contracts import OrchestrationRegistry, Orchestrator
-from vibesys.profilers import ProfilerKind
-from vibesys.render.format import format_status_prefix
-from vibesys.render.run_log import format_framework_event
-from vibesys.render.sink import output_sink
+from vibesys.plugin_catalog import OrchestrationRegistry
 from vibesys.repository import RepositoryVisibility
-from vibesys.run.integration import RunResourceHandoff
-from vibesys.run.run_control import RunStopped
-from vibesys.runtime import AgentDefinition, AgentHandle, VibeSysRuntime
+from vibesys.run import CoreAgentEventSink
 from vs_agent.api import AgentBackend, AgentSpec
-from vs_sandbox.api import HostResource, HostResourceAccess
+from vs_runtime.api import boot_trace
+from vs_runtime.api.infrastructure import RunStopped
 
 __all__ = [
     "KNOWN_COMPUTE_BACKENDS",
     "AgentBackend",
-    "AgentDefinition",
+    "AgentDriver",
     "AgentExecutionStartedData",
-    "AgentHandle",
+    "AgentOutputChannel",
     "AgentOutputChunkData",
     "AgentSpec",
+    "AgentStatusData",
+    "AuxiliaryAgentDriver",
+    "AuxiliaryAgentLaunch",
+    "AuxiliaryReadableInput",
+    "CommandResultPayload",
     "ComputeBackend",
     "Config",
     "ConfigurationDiagnostic",
     "ConfigurationError",
+    "CoreAgentEventSink",
     "CoreEvent",
     "CoreEventType",
     "DomainName",
     "EventStatus",
-    "HostResource",
-    "HostResourceAccess",
-    "MetricSpace",
-    "Objective",
+    "FrameworkWarningData",
+    "GateFinishedData",
+    "GateStartedData",
+    "JsonResultPayload",
+    "ManagedAgent",
     "OrchestrationDescriptor",
     "OrchestrationRegistry",
-    "Orchestrator",
-    "PerfDeltaReason",
+    "PluginProjection",
     "ProfilerKind",
     "RepositoryVisibility",
     "ResumeRef",
+    "RunConfiguredData",
     "RunControl",
+    "RunDocument",
+    "RunReady",
+    "RunRecord",
+    "RunRecordFacts",
+    "RunRecordReadError",
     "RunRequest",
-    "RunResourceHandoff",
     "RunResult",
     "RunSession",
     "RunStatus",
@@ -102,13 +127,13 @@ __all__ = [
     "TodoUpdateData",
     "ToolCallData",
     "ToolResultData",
-    "VibeSysRuntime",
+    "ToolResultPayload",
+    "WorkspaceChange",
+    "WorkspaceChangeKind",
+    "WorkspaceSnapshotData",
     "agent_spec_from_config",
     "boot_trace",
     "create_session",
-    "format_framework_event",
-    "format_status_prefix",
     "load_config",
     "open_run_store",
-    "output_sink",
 ]

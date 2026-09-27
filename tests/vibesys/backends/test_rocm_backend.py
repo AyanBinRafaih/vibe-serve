@@ -3,28 +3,29 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 from tests.support import capture_docker_start_argv
 
 from entrypoints.cli import _add_common_args
-from vibesys import backends
-from vibesys.backends import SandboxKind
-from vibesys.backends.rocm import (
-    _DEFAULT_IMAGE,
+from vibesys.orchestration.prompts import PROMPTS_DIR, RocmComputeBackendFragment
+from vibesys.orchestration.prompts.renderer import _FRAGMENT_IMPLS, ComputeBackendFragment
+from vs_sandbox.api import (
+    AcceleratorInventory,
+    ComputeBackend,
+    DockerSandbox,
+    HostResource,
+    HostResourceAccess,
+    LocalShellSandbox,
     RocmBackend,
-    _discover_rocm_devices,
+    SandboxKind,
+    create_compute_backend,
 )
-from vibesys.constants import ComputeBackend
-from vibesys.profilers import ProfilerKind
-from vibesys.prompts import PROMPTS_DIR, RocmComputeBackendFragment
-from vibesys.prompts.renderer import _FRAGMENT_IMPLS, ComputeBackendFragment
-from vs_sandbox.api import DockerSandbox, HostResource, HostResourceAccess, LocalShellSandbox
+from vs_sandbox.api.testing import FakeAcceleratorDiscovery
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from pathlib import Path
 
     import pytest
 
@@ -32,24 +33,22 @@ if TYPE_CHECKING:
 def _make_backend(
     tmp_path: Path, devices: Iterable[str] = ("/dev/kfd", "/dev/dri/renderD128")
 ) -> RocmBackend:
-    with (
-        patch("vibesys.backends.rocm._discover_rocm_devices", return_value=list(devices)),
-        patch("vibesys.backends.rocm._query_rocm_gpu_count", return_value=1),
-    ):
-        impl = backends.get(ComputeBackend.ROCM, log_dir=tmp_path / "logs")
-    assert isinstance(impl, RocmBackend)
-    return impl
+    return RocmBackend(
+        tmp_path / "logs",
+        accelerator_discovery=FakeAcceleratorDiscovery(
+            rocm=AcceleratorInventory(tuple(devices), reported_device_count=1)
+        ),
+    )
 
 
 class TestRocmRegistry:
     def test_rocm_in_registry(self, tmp_path: Path) -> None:
-        impl = backends.get(ComputeBackend.ROCM, log_dir=tmp_path)
+        impl = create_compute_backend(ComputeBackend.ROCM, log_dir=tmp_path)
         assert isinstance(impl, RocmBackend)
         assert impl.name is ComputeBackend.ROCM
         # rocprofv3 / rocprof-compute is the dedicated system- and
         # kernel-altitude toolkit for ROCm; torch.profiler is still
         # selectable via --profiler torch.
-        assert impl.profiler_kind is ProfilerKind.ROCPROF
 
 
 class TestRocmSandbox:
@@ -149,10 +148,10 @@ class TestRocmSandbox:
         env = [argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "-e"]
         assert any(value.startswith("UV_EXTRA_INDEX_URL=") and "rocm" in value for value in env)
 
-    def test_default_image_is_pinned(self) -> None:
+    def test_default_image_is_pinned(self, tmp_path: Path) -> None:
         """A floating :latest tag can drift past the host kernel driver."""
 
-        assert not _DEFAULT_IMAGE.endswith(":latest")
+        assert not _make_backend(tmp_path).image.endswith(":latest")
 
     def test_hip_visible_devices_is_respected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -188,26 +187,6 @@ class TestRocmSandbox:
         argv = capture_docker_start_argv(sb)
         env = [argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "-e"]
         assert "HIP_VISIBLE_DEVICES=0" in env
-
-
-class TestRocmDeviceDiscovery:
-    def test_no_kfd_means_no_devices(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A host without /dev/kfd yields an empty list rather than raising."""
-        monkeypatch.setattr(Path, "exists", lambda _self: False)
-        assert _discover_rocm_devices() == []
-
-    def test_kfd_leads_and_render_nodes_follow(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(Path, "exists", lambda _self: True)
-        monkeypatch.setattr(
-            Path,
-            "glob",
-            lambda _self, _pattern: [Path("/dev/dri/renderD129"), Path("/dev/dri/renderD128")],
-        )
-        assert _discover_rocm_devices() == [
-            "/dev/kfd",
-            "/dev/dri/renderD128",
-            "/dev/dri/renderD129",
-        ]
 
 
 class TestRocmDevice:

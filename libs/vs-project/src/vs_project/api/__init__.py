@@ -4,10 +4,11 @@
 errors describe its configuration, run state, Git integration, and task paths.
 ``strip_ansi`` is also public for consumers of ``RunLogger`` output.
 
-Runs use one version 4 manifest containing an ``OrchestrationDescriptor``.
+Runs use one version 5 manifest containing an ``OrchestrationDescriptor``.
 """
 
 from vs_project._git_events import GitTrackerEvents, NullGitTrackerEvents
+from vs_project._git_remote import GitRemoteRepository
 from vs_project._git_tracker import FrameworkSnapshotStatus, GitTracker
 from vs_project._layout import (
     AmbiguousTaskError,
@@ -25,6 +26,7 @@ from vs_project._layout import (
 )
 from vs_project._logger import RunLogger, strip_ansi
 from vs_project._manifests import (
+    AgentRoleExecutionRecord,
     GitObjectId,
     OrchestrationDescriptor,
     OrchestrationRunManifest,
@@ -62,10 +64,12 @@ __all__ = [
     "MAX_SOCKET_PATH_BYTES",
     "PROJECT_SCHEMA_VERSION",
     "RUN_SCHEMA_VERSION",
+    "AgentRoleExecutionRecord",
     "AmbiguousTaskError",
     "ConfigurationRoot",
     "FrameworkSnapshotStatus",
     "GitObjectId",
+    "GitRemoteRepository",
     "GitSnapshotFile",
     "GitSnapshotPlan",
     "GitTracker",

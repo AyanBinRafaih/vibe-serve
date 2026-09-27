@@ -24,12 +24,12 @@ FRAMEWORK_PACKAGES = (
     "headless",
     "vs_agent",
     "vs_evaluator_protocol",
-    "vs_feature_flags",
     "vs_github",
     "vs_issue_tracker",
     "vs_loop_state",
     "vs_project",
     "vs_prompts",
+    "vs_runtime",
     "vs_sandbox",
 )
 PLATLIB = ""
@@ -58,12 +58,12 @@ dependencies = ["example>=1"]
         "headless": "src/headless",
         "vs_agent": "libs/vs-agent/src/vs_agent",
         "vs_evaluator_protocol": "libs/vs-evaluator-protocol/src/vs_evaluator_protocol",
-        "vs_feature_flags": "libs/vs-feature-flags/src/vs_feature_flags",
         "vs_github": "libs/vs-github/src/vs_github",
         "vs_issue_tracker": "libs/vs-issue-tracker/src/vs_issue_tracker",
         "vs_loop_state": "libs/vs-loop-state/src/vs_loop_state",
         "vs_project": "libs/vs-project/src/vs_project",
         "vs_prompts": "libs/vs-prompts/src/vs_prompts",
+        "vs_runtime": "libs/vs-runtime/src/vs_runtime",
         "vs_sandbox": "libs/vs-sandbox/src/vs_sandbox",
     }
     for package, source in roots.items():
@@ -99,12 +99,12 @@ def _packaged_source_files(source_root: Path) -> dict[str, bytes]:
         "src/headless": "headless",
         "libs/vs-agent/src/vs_agent": "vs_agent",
         "libs/vs-evaluator-protocol/src/vs_evaluator_protocol": "vs_evaluator_protocol",
-        "libs/vs-feature-flags/src/vs_feature_flags": "vs_feature_flags",
         "libs/vs-github/src/vs_github": "vs_github",
         "libs/vs-issue-tracker/src/vs_issue_tracker": "vs_issue_tracker",
         "libs/vs-loop-state/src/vs_loop_state": "vs_loop_state",
         "libs/vs-project/src/vs_project": "vs_project",
         "libs/vs-prompts/src/vs_prompts": "vs_prompts",
+        "libs/vs-runtime/src/vs_runtime": "vs_runtime",
         "libs/vs-sandbox/src/vs_sandbox": "vs_sandbox",
         "resources/evaluators": "vibesys/_resources/evaluators",
         "resources/profilers": "vibesys/_resources/profilers",
@@ -166,9 +166,7 @@ Root-Is-Purelib: false
 Tag: py3-none-manylinux_2_28_x86_64
 """
     files[f"{DIST_INFO}/entry_points.txt"] = (
-        b"[console_scripts]\n"
-        b"vibesys = entrypoints.launcher:main\n"
-        b"vibesys-issue-mcp = vs_issue_tracker.mcp:main\n"
+        b"[console_scripts]\nvibesys = entrypoints.launcher:main\n"
     )
     files[f"{DIST_INFO}/top_level.txt"] = ("\n".join(FRAMEWORK_PACKAGES) + "\n").encode()
     files[f"{DIST_INFO}/licenses/LICENSE"] = (source_root / "LICENSE").read_bytes()

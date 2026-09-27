@@ -1,5 +1,5 @@
-"""Built-in evolutionary CLI option adapter."""
+"""Public configuration helpers for the built-in evolve plugin."""
 
-from vibesys.loops.evolve.orchestration import resolve_openevolve_options
+from vibesys.orchestration.evolve import resolve_openevolve_options
 
 __all__ = ["resolve_openevolve_options"]

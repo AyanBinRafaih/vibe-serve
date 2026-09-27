@@ -23,7 +23,7 @@ from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.events import CoreEventType, EventStatus
 from vibesys.run.event_journal import EventJournal as CoreEventJournal
 from vibesys.run.integration import LocalRunIntegration
-from vibesys.run.run_control import RunControlChannel
+from vs_runtime.api.infrastructure import RunControlChannel
 
 if TYPE_CHECKING:
     from vibesys.api import RunSession
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 class _SessionControlStub:
     """Adapt a `RunControlChannel` to the `vibesys.api.RunControl` shape.
 
-    Mirrors what `vibesys.api.session._LocalRunSession`'s `steer`/`pause`/
+    Mirrors what `vibesys.api._session._LocalRunSession`'s `steer`/`pause`/
     `resume`/`stop` methods do in production, so a bare `runtime.run(...)`
     callback (which never goes through `ServerRuntime.drive`) can still stand
     in as the live session `runtime.api`'s `session_provider` reads.

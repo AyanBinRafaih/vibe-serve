@@ -1,12 +1,10 @@
 """In-memory, configurable :class:`AgentClientProtocol` test double.
 
-Where :class:`~vs_agent.stub_runner.StubAgentClient` returns the same scripted
-rounds with no configuration, ``FakeAgentClient`` lets a test assert what a
-caller actually sent (prompts, MCP servers, session keys), inject specific or
-failing responses, and observe streamed output and session-reuse behavior.
-Zero-config it behaves like the stub (scripted structured responses, a fixed
-default text); every call is recorded as a :class:`FakeInvocation` for direct
-assertions.
+``FakeAgentClient`` lets a test assert what a caller actually sent (prompts,
+tool servers, session keys), inject specific or failing responses, and observe
+streamed output and session-reuse behavior. With no configured structured
+response it uses the caller's fallback; every call is recorded as a
+:class:`FakeInvocation` for direct assertions.
 
 This module stays schema-agnostic (no ``vibesys`` core imports) and driver-
 agnostic (no ``agentshim``/``omnigent`` imports): callers enqueue already-
@@ -21,10 +19,8 @@ from typing import TYPE_CHECKING, Literal, Self, TypeVar
 
 from pydantic import BaseModel
 
-from vs_agent.contracts import AgentCapabilities, MCPServerSpec
-from vs_agent.scripted_rounds import round_number_from_label, scripted_round_payload
+from vs_agent.contracts import AgentCapabilities
 from vs_agent.sink import NULL_AGENT_EVENT_SINK, AgentEventSink
-from vs_agent.tools import StdioServerDescriptor
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -75,16 +71,6 @@ class FakeInvocation:
     reuse_session: bool | None
     session_key: AgentSessionKey | None
 
-    @property
-    def mcp_servers(self) -> list[MCPServerSpec] | None:
-        """Compatibility view of the generic tool declarations."""
-        if self.tool_servers is None:
-            return None
-        return [
-            MCPServerSpec(name=item.name, command=item.command, args=item.args, env=item.env)
-            for item in self.tool_servers
-        ]
-
 
 @dataclass(slots=True)
 class _FailureState:
@@ -124,10 +110,9 @@ def _pop(queues: dict[str, list[_PopT]], kind: str) -> _PopT | None:
 class FakeAgentClient:
     """Configurable in-memory double for :class:`~vs_agent.contracts.AgentClientProtocol`.
 
-    Zero-config it behaves like :class:`~vs_agent.stub_runner.StubAgentClient`:
-    ``invoke`` returns a scripted round payload (or ``fallback_factory()`` when
-    the response model is unscripted) and ``invoke_text`` returns a fixed
-    default sentence. Configured through the chained ``enqueue``/``set_*``/
+    With no configured response, ``invoke`` calls ``fallback_factory()`` and
+    ``invoke_text`` returns a fixed default sentence. Configured through the
+    chained ``enqueue``/``set_*``/
     ``fail``/``on_invoke`` methods, it can return specific responses per agent
     ``kind``, fail on demand, stream output through the injected event sink,
     and track provider-session reuse.
@@ -300,7 +285,7 @@ class FakeAgentClient:
         return self
 
     def set_capabilities(self, capabilities: AgentCapabilities) -> Self:
-        """Replace the reported capability set (e.g. to enable ``mcp_servers``)."""
+        """Replace the reported capability set (e.g. to enable ``tool_servers``)."""
         self._capabilities = capabilities
         self._session_reuse = capabilities.session_reuse
         return self
@@ -361,7 +346,6 @@ class FakeAgentClient:
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
         tool_servers: list[ToolServerDescriptor] | None = None,
-        mcp_servers: list[MCPServerSpec] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,
     ) -> T:
@@ -378,7 +362,6 @@ class FakeAgentClient:
             invocation_id=invocation_id,
             progress=progress,
             tool_servers=tool_servers,
-            mcp_servers=mcp_servers,
             reuse_session=reuse_session,
             session_key=session_key,
         )
@@ -399,7 +382,6 @@ class FakeAgentClient:
         invocation_id: str | None = None,
         progress: AgentProgress | None = None,
         tool_servers: list[ToolServerDescriptor] | None = None,
-        mcp_servers: list[MCPServerSpec] | None = None,
         reuse_session: bool | None = None,
         session_key: AgentSessionKey | None = None,
     ) -> str:
@@ -416,7 +398,6 @@ class FakeAgentClient:
             invocation_id=invocation_id,
             progress=progress,
             tool_servers=tool_servers,
-            mcp_servers=mcp_servers,
             reuse_session=reuse_session,
             session_key=session_key,
         )
@@ -441,7 +422,6 @@ class FakeAgentClient:
         invocation_id: str | None,
         progress: AgentProgress | None,
         tool_servers: list[ToolServerDescriptor] | None,
-        mcp_servers: list[MCPServerSpec] | None,
         reuse_session: bool | None,
         session_key: AgentSessionKey | None,
     ) -> FakeInvocation:
@@ -456,20 +436,7 @@ class FakeAgentClient:
             env=env,
             invocation_id=invocation_id,
             progress=progress,
-            tool_servers=[
-                *(tool_servers or ()),
-                *(
-                    StdioServerDescriptor(
-                        name=item.name,
-                        command=item.command,
-                        args=item.args,
-                        env=item.env,
-                    )
-                    for item in mcp_servers or ()
-                ),
-            ]
-            if tool_servers is not None or mcp_servers is not None
-            else None,
+            tool_servers=list(tool_servers) if tool_servers is not None else None,
             reuse_session=reuse_session,
             session_key=session_key,
         )
@@ -526,12 +493,7 @@ class FakeAgentClient:
         if source is None:
             source = self._constants.get(kind)
         if source is None:
-            scripted = scripted_round_payload(
-                response_cls.__name__, round_number_from_label(invocation.round_label)
-            )
-            if scripted is None:
-                return fallback_factory()
-            return response_cls.model_validate(scripted)
+            return fallback_factory()
         value = _materialize_response(source, invocation)
         if isinstance(value, BaseModel):
             # A model instance is returned as-is; the caller enqueued it (rather

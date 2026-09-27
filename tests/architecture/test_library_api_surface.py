@@ -11,13 +11,12 @@ import pytest
     "module_name",
     [
         "vs_evaluator_protocol.api",
-        "vs_feature_flags.api",
         "vs_github.api",
         "vs_issue_tracker.api",
-        "vs_issue_tracker.api.mcp",
         "vs_loop_state.api",
         "vs_project.api",
         "vs_prompts.api",
+        "vs_runtime.api",
         "vs_sandbox.api",
     ],
 )

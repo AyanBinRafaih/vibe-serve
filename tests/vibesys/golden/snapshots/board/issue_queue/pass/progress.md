@@ -1,27 +1,18 @@
 # Experiment Progress
 
-## Iter 1 — Implementer on issue #1
+## Iteration 1: implement issue #1
 
-**Issue**: [feature] Initial task: Maximize tok/s throughput.
+- **Summary**: Built the inference server.
+- **Self Check**: Ran the accuracy checker locally.
+- **Files touched**: `server.py`
 
-**Summary**: Built the inference server.
+## Iteration 1: review issue #1
 
-**Files touched**:
-- `server.py`
+- **Verdict**: pass
+- **Analysis**: Reviewed the diff and the accuracy checks.
 
-**Self-check**: ran the accuracy checker locally
+## Iteration 1: performance
 
-### Iter 1 — Judge on issue #1
-
-**Verdict**: PASS
-
-**Analysis**: reviewed the diff and the accuracy checks
-
-## Iter 1 — Performance Evaluator
-
-**Throughput trend**: IMPROVED
-
-**Latency trend**: IMPROVED
-
-**Analysis**: First benchmark run, no prior iteration to compare against.
-
+- **Analysis**: First benchmark run, with no prior iteration to compare.
+- **Throughput Trend**: improved
+- **Latency Trend**: improved

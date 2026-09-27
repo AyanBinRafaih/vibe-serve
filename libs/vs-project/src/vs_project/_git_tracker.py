@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, ClassVar
 from vs_project.project import Project
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from vs_project._git_events import GitTrackerEvents
     from vs_project._state import GitSnapshotPlan, ProjectGitIntegration, StateSnapshot
@@ -348,6 +348,46 @@ class GitTracker:
             return None
         return result.stdout.decode("utf-8", errors="replace")
 
+    def diff_patch(self, base: str, head: str, paths: Sequence[str]) -> str | None:
+        """Return a timeout-bounded unified diff for validated revisions and paths.
+
+        This is the patch counterpart to :meth:`diff_name_status`: revisions
+        must be plain object names, paths are normalized repository-relative
+        values passed as literal pathspecs, and operational failures are
+        reported through the tracker events before returning ``None``.
+        """
+        for value in (base, head):
+            if self._OBJECT_NAME.fullmatch(value) is None:
+                message = f"not a commit object name: {value!r}"
+                raise ValueError(message)
+        normalized = _normalize_project_paths(paths)
+        command = [
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--find-renames",
+            base,
+            head,
+            "--",
+            *(f":(literal){path.as_posix()}" for path in normalized),
+        ]
+        try:
+            result = self.run(command, check=False, timeout=self._READ_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self._events.warning(
+                f"read-only patch failed: {' '.join(command)}",
+                detail=str(error),
+            )
+            return None
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace").strip()
+            self._events.warning(
+                f"read-only patch exit {result.returncode}",
+                detail=stderr,
+            )
+            return None
+        return result.stdout.decode("utf-8", errors="replace")
+
     def _commit_staged(self, label: str) -> None:
         """Commit the current index, reporting the snapshot outcome."""
         # git diff --cached --quiet exits 1 when there are staged changes
@@ -593,10 +633,12 @@ class GitTracker:
     ) -> bool:
         """Materialize *sha*'s tree into the working directory.
 
-        Restores both the index and worktree from *sha* so paths introduced
-        after that snapshot are deleted as well as modified paths being reset.
-        HEAD stays where it is, so the next commit produces a new child commit
-        rather than rewriting history. With ``clean=True``, untracked files
+        Restores the worktree from *sha* so paths introduced after that
+        snapshot are deleted as well as modified paths being reset. The index
+        is reset to ``HEAD`` and stays clean, while HEAD itself stays where it
+        is. A later candidate checkpoint can therefore commit the restored
+        tree as a new child instead of encountering staged changes or
+        rewriting run history. With ``clean=True``, untracked files
         left over from a prior failed attempt are removed via ``git clean
         -fd``. Files below workspace-relative ``preserve_paths`` are captured
         before the restore and reapplied afterwards. This is intended for
@@ -605,11 +647,11 @@ class GitTracker:
         preserved: dict[Path, bytes] = {}
         try:
             preserved = self._capture_preserved_paths(preserve_paths)
+            self.run(["git", "reset", "--mixed", "HEAD"])
             restore_cmd = [
                 "git",
                 "restore",
                 f"--source={sha}",
-                "--staged",
                 "--worktree",
                 "--",
                 ".",

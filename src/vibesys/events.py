@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
@@ -13,8 +13,8 @@ import vs_agent.api as _agent_api
 
 # AgentOutputChannel, AgentStatusData, TodoItemData, and ToolResultPayload are
 # used directly below. CommandResultPayload and JsonResultPayload are only the
-# ToolResultPayload union members; re-exported here (like vs_loop_state's
-# enums in vibesys.schemas) so existing importers of vibesys.events keep working.
+# ToolResultPayload union members; re-exported here so existing importers of
+# vibesys.events keep working.
 from vs_agent.api import (
     AgentOutputChannel,
     AgentStatusData,
@@ -55,7 +55,7 @@ class CoreEventType(StrEnum):
     RUN_CONFIGURED = "run_configured"
     FRAMEWORK_WARNING = "framework_warning"
 
-    # Run-control transitions (see `vibesys.run.run_control.RunControlChannel`):
+    # Run-control transitions (see `vs_runtime.api.infrastructure.RunControlChannel`):
     # request-time events (`*_REQUESTED`, `STEER_QUEUED`, `RESUMED`) come from
     # `RunControl` callers; boundary-consume-time events (`PAUSED`, `STOPPED`,
     # `STEER_CONSUMED`) come from the run boundary or an agent turn. A server
@@ -278,9 +278,8 @@ class RoundFinishedData(EventPayload):
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
     # True when no fresh profile ran this round; such a round records no perf
-    # reading (perf_metric stays None). Defaults False so legacy persisted
-    # events stay valid.
-    profile_skipped: bool = False
+    # reading (perf_metric stays None).
+    profile_skipped: bool
 
 
 class GateStartedData(EventPayload):
@@ -390,6 +389,25 @@ CoreEventData = Annotated[
     | FrameworkWarningData,
     Field(discriminator="kind"),
 ]
+
+
+class CoreEventWriter(Protocol):
+    """Product event surface independent of storage and subscription mechanics."""
+
+    def emit(
+        self,
+        event_type: CoreEventType,
+        text: str = "",
+        *,
+        data: CoreEventData | None = None,
+        **fields: object,
+    ) -> CoreEvent:
+        """Create and publish one semantic event."""
+        ...
+
+    def record(self, event: CoreEvent) -> CoreEvent:
+        """Publish one already-created semantic event."""
+        ...
 
 
 class CoreEvent(BaseModel):
