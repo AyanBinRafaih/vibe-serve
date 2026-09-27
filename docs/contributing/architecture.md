@@ -55,6 +55,7 @@ graph TD
     headless --> vibesys
     server --> vibesys
     vibesys --> vs_agent
+    vibesys --> vs_evaluation
     vibesys --> vs_github
     vibesys --> vs_issue_tracker
     vibesys --> vs_loop_state
@@ -62,14 +63,21 @@ graph TD
     vibesys --> vs_prompts
     vibesys --> vs_runtime
     vibesys --> vs_sandbox
+    vibesys --> vs_slurm
     vs_agent --> vs_project
     vs_agent --> vs_sandbox
+    vs_evaluation --> vs_agent
+    vs_evaluation --> vs_async_ops
+    vs_evaluation --> vs_project
     vs_issue_tracker --> vs_github
     vs_runtime --> vs_agent
     vs_runtime --> vs_evaluator_protocol
     vs_runtime --> vs_project
     vs_runtime --> vs_sandbox
+    vs_runtime --> vs_slurm
+    vs_sandbox --> vs_evaluation
     vs_sandbox --> vs_project
+    vs_sandbox --> vs_slurm
 ```
 
 ## Core layers
@@ -79,6 +87,7 @@ Edges among the `vibesys` core modules. The graph is acyclic; `tach.toml` forbid
 ```mermaid
 graph TD
     vibesys --> vibesys.errors
+    vibesys --> vibesys.run.evaluation_backend
     vibesys.api --> vibesys
     vibesys.api --> vibesys.api.auxiliary
     vibesys.api --> vibesys.api.contracts
@@ -134,6 +143,13 @@ graph TD
     vibesys.orchestration.agent_options --> vibesys.orchestration.metrics
     vibesys.orchestration.domains --> vibesys
     vibesys.orchestration.domains --> vibesys.orchestration.prompts
+    vibesys.orchestration.dynamic --> vibesys.orchestration.agent_options
+    vibesys.orchestration.dynamic --> vibesys.orchestration.hypothesis
+    vibesys.orchestration.dynamic --> vibesys.orchestration.hypothesis.readmodel
+    vibesys.orchestration.dynamic --> vibesys.orchestration.metrics
+    vibesys.orchestration.dynamic --> vibesys.orchestration.resume
+    vibesys.orchestration.dynamic --> vibesys.plugin_registration
+    vibesys.orchestration.dynamic --> vibesys.run.contracts
     vibesys.orchestration.evolve --> vibesys
     vibesys.orchestration.evolve --> vibesys.errors
     vibesys.orchestration.evolve --> vibesys.orchestration.domains
@@ -188,6 +204,7 @@ graph TD
     vibesys.orchestration.single --> vibesys.plugin_registration
     vibesys.orchestration.single --> vibesys.run.contracts
     vibesys.orchestration.skill_selection --> vibesys
+    vibesys.plugin_builtins --> vibesys.orchestration.dynamic
     vibesys.plugin_builtins --> vibesys.orchestration.evolve
     vibesys.plugin_builtins --> vibesys.orchestration.issue_queue
     vibesys.plugin_builtins --> vibesys.orchestration.multi
@@ -205,12 +222,15 @@ graph TD
     vibesys.run.evaluation --> vibesys.inputs
     vibesys.run.evaluation --> vibesys.run.contracts
     vibesys.run.host --> vibesys
+    vibesys.run.host --> vibesys.orchestration.profiler_agent
     vibesys.run.host --> vibesys.orchestration.skill_selection
     vibesys.run.host --> vibesys.orchestration.steering
     vibesys.run.host --> vibesys.run
     vibesys.run.host --> vibesys.run.contracts
     vibesys.run.host --> vibesys.run.evaluation
+    vibesys.run.host --> vibesys.run.evaluation_backend
     vibesys.run.host --> vibesys.run.resources
+    vibesys.run.host --> vibesys.run.slurm_evaluation
     vibesys.run.profilers --> vibesys
     vibesys.run.profilers --> vibesys.errors
     vibesys.run.profilers --> vibesys.orchestration.profilers
@@ -226,6 +246,7 @@ graph TD
     vibesys.run.resources --> vibesys.run.profilers
     vibesys.run.skill_sources --> vibesys
     vibesys.run.skill_sources --> vibesys.orchestration.skill_selection
+    vibesys.run.slurm_evaluation --> vibesys.run.evaluation_backend
 ```
 
 ## Full module graph
@@ -309,7 +330,10 @@ graph TD
     server.tool_payloads --> vibesys.api
     server.transport --> server.api
     vibesys --> vibesys.errors
+    vibesys --> vibesys.run.evaluation_backend
     vibesys --> vs_agent
+    vibesys --> vs_evaluation.api
+    vibesys --> vs_evaluation.api.tools
     vibesys --> vs_runtime
     vibesys --> vs_sandbox
     vibesys.api --> vibesys
@@ -384,6 +408,16 @@ graph TD
     vibesys.orchestration.agent_options --> vibesys.orchestration.metrics
     vibesys.orchestration.domains --> vibesys
     vibesys.orchestration.domains --> vibesys.orchestration.prompts
+    vibesys.orchestration.dynamic --> vibesys.orchestration.agent_options
+    vibesys.orchestration.dynamic --> vibesys.orchestration.hypothesis
+    vibesys.orchestration.dynamic --> vibesys.orchestration.hypothesis.readmodel
+    vibesys.orchestration.dynamic --> vibesys.orchestration.metrics
+    vibesys.orchestration.dynamic --> vibesys.orchestration.resume
+    vibesys.orchestration.dynamic --> vibesys.plugin_registration
+    vibesys.orchestration.dynamic --> vibesys.run.contracts
+    vibesys.orchestration.dynamic --> vs_loop_state
+    vibesys.orchestration.dynamic --> vs_prompts
+    vibesys.orchestration.dynamic --> vs_runtime
     vibesys.orchestration.evolve --> vibesys
     vibesys.orchestration.evolve --> vibesys.errors
     vibesys.orchestration.evolve --> vibesys.orchestration.domains
@@ -429,6 +463,8 @@ graph TD
     vibesys.orchestration.multi --> vs_loop_state
     vibesys.orchestration.multi --> vs_prompts
     vibesys.orchestration.multi --> vs_runtime
+    vibesys.orchestration.profiler_agent --> vs_evaluation.api
+    vibesys.orchestration.profiler_agent --> vs_runtime
     vibesys.orchestration.profilers --> vibesys
     vibesys.orchestration.profilers --> vibesys.run.contracts
     vibesys.orchestration.prompts --> vibesys
@@ -456,6 +492,7 @@ graph TD
     vibesys.orchestration.single --> vs_runtime
     vibesys.orchestration.skill_selection --> vibesys
     vibesys.orchestration.skill_selection --> vs_agent
+    vibesys.plugin_builtins --> vibesys.orchestration.dynamic
     vibesys.plugin_builtins --> vibesys.orchestration.evolve
     vibesys.plugin_builtins --> vibesys.orchestration.issue_queue
     vibesys.plugin_builtins --> vibesys.orchestration.multi
@@ -485,16 +522,25 @@ graph TD
     vibesys.run.evaluation --> vibesys.inputs
     vibesys.run.evaluation --> vibesys.run.contracts
     vibesys.run.evaluation --> vs_runtime
+    vibesys.run.evaluation_backend --> vs_evaluation.api
+    vibesys.run.evaluation_backend --> vs_project
+    vibesys.run.evaluation_backend --> vs_runtime
     vibesys.run.host --> vibesys
+    vibesys.run.host --> vibesys.orchestration.profiler_agent
     vibesys.run.host --> vibesys.orchestration.skill_selection
     vibesys.run.host --> vibesys.orchestration.steering
     vibesys.run.host --> vibesys.run
     vibesys.run.host --> vibesys.run.contracts
     vibesys.run.host --> vibesys.run.evaluation
+    vibesys.run.host --> vibesys.run.evaluation_backend
     vibesys.run.host --> vibesys.run.resources
+    vibesys.run.host --> vibesys.run.slurm_evaluation
     vibesys.run.host --> vs_agent
+    vibesys.run.host --> vs_evaluation.api
+    vibesys.run.host --> vs_project
     vibesys.run.host --> vs_runtime
     vibesys.run.host --> vs_sandbox
+    vibesys.run.host --> vs_slurm
     vibesys.run.profilers --> vibesys
     vibesys.run.profilers --> vibesys.errors
     vibesys.run.profilers --> vibesys.orchestration.profilers
@@ -517,13 +563,69 @@ graph TD
     vibesys.run.skill_sources --> vibesys
     vibesys.run.skill_sources --> vibesys.orchestration.skill_selection
     vibesys.run.skill_sources --> vs_runtime
+    vibesys.run.slurm_evaluation --> vibesys.run.evaluation_backend
+    vibesys.run.slurm_evaluation --> vs_evaluation.api
+    vibesys.run.slurm_evaluation --> vs_project
+    vibesys.run.slurm_evaluation --> vs_runtime
+    vibesys.run.slurm_evaluation --> vs_sandbox
+    vibesys.run.slurm_evaluation --> vs_slurm
     vs_agent --> vs_project
     vs_agent --> vs_sandbox
+    vs_async_ops.api --> vs_async_ops.coordinator
+    vs_async_ops.api --> vs_async_ops.models
+    vs_async_ops.api --> vs_async_ops.ports
+    vs_async_ops.api.testing --> vs_async_ops.testing
+    vs_async_ops.coordinator --> vs_async_ops.models
+    vs_async_ops.coordinator --> vs_async_ops.ports
+    vs_async_ops.ports --> vs_async_ops.models
+    vs_async_ops.testing --> vs_async_ops.models
+    vs_evaluation.agent_mcp --> vs_agent
+    vs_evaluation.agent_mcp --> vs_evaluation.agent_evidence
+    vs_evaluation.agent_mcp --> vs_evaluation.agent_models
+    vs_evaluation.agent_mcp --> vs_evaluation.profiler_models
+    vs_evaluation.agent_models --> vs_evaluation.agent_evidence
+    vs_evaluation.agent_models --> vs_evaluation.models
+    vs_evaluation.agent_models --> vs_evaluation.profiler_models
+    vs_evaluation.agent_service --> vs_evaluation.agent_evidence
+    vs_evaluation.agent_service --> vs_evaluation.agent_models
+    vs_evaluation.agent_service --> vs_evaluation.models
+    vs_evaluation.agent_service --> vs_evaluation.profiler_service
+    vs_evaluation.agent_service --> vs_project
+    vs_evaluation.api --> vs_evaluation.agent_evidence
+    vs_evaluation.api --> vs_evaluation.agent_models
+    vs_evaluation.api --> vs_evaluation.agent_service
+    vs_evaluation.api --> vs_evaluation.coordinator
+    vs_evaluation.api --> vs_evaluation.filesystem_store
+    vs_evaluation.api --> vs_evaluation.models
+    vs_evaluation.api --> vs_evaluation.ports
+    vs_evaluation.api --> vs_evaluation.profiler_models
+    vs_evaluation.api --> vs_evaluation.profiler_service
+    vs_evaluation.api.testing --> vs_evaluation.profiler_testing
+    vs_evaluation.api.testing --> vs_evaluation.testing
+    vs_evaluation.api.tools --> vs_evaluation.agent_mcp
+    vs_evaluation.coordinator --> vs_evaluation.models
+    vs_evaluation.coordinator --> vs_evaluation.ports
+    vs_evaluation.filesystem_store --> vs_evaluation.coordinator
+    vs_evaluation.filesystem_store --> vs_evaluation.models
+    vs_evaluation.ports --> vs_evaluation.models
+    vs_evaluation.profiler_models --> vs_evaluation.agent_evidence
+    vs_evaluation.profiler_service --> vs_async_ops.api
+    vs_evaluation.profiler_service --> vs_evaluation.agent_evidence
+    vs_evaluation.profiler_service --> vs_evaluation.profiler_models
+    vs_evaluation.profiler_service --> vs_project
+    vs_evaluation.profiler_testing --> vs_evaluation.profiler_models
+    vs_evaluation.testing --> vs_evaluation.coordinator
+    vs_evaluation.testing --> vs_evaluation.models
+    vs_evaluation.testing --> vs_evaluation.ports
     vs_issue_tracker --> vs_github
     vs_runtime --> vs_agent
     vs_runtime --> vs_evaluator_protocol
     vs_runtime --> vs_project
     vs_runtime --> vs_sandbox
+    vs_runtime --> vs_slurm
+    vs_sandbox --> vs_evaluation
+    vs_sandbox --> vs_evaluation.api
     vs_sandbox --> vs_project
+    vs_sandbox --> vs_slurm
 ```
 [//]: # (tach-graph:end)
