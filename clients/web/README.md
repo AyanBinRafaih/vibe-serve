@@ -23,4 +23,6 @@ uv run python -m entrypoints.web stop --instance clients/web/.vibesys-demo/web-g
 ```
 
 See [Web UI development](../../docs/contributing/web-development.md) for replay,
-real-project, and remote-host workflows.
+real-project, and remote-host workflows. In an SSH session the script does not
+try to open a browser on the remote host; forward port 8765 and open the printed
+capability URL on the local machine.
