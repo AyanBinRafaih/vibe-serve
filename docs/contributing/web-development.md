@@ -59,6 +59,43 @@ uv run python -m entrypoints.web status --instance clients/web/.vibesys-demo/web
 uv run python -m entrypoints.web stop --instance clients/web/.vibesys-demo/web-gateway.json
 ```
 
+`stop`'s exit status is the only signal that says whether the instance
+directory's files are free, so anything that removes or reuses that directory
+must be conditional on it:
+
+- Exit 0: no process this host can observe is using the directory. Its
+  remaining files (`web-gateway.json.lock` and, for a detached gateway,
+  `web-gateway.json.log`) are retained by design, but nothing holds them open,
+  so removing them is safe.
+- Exit 1: something is still using it, or that could not be established.
+  Removing the directory now is the bug this contract exists to prevent: on
+  NFS, unlinking a file another process holds open leaves a `.nfsXXXX` entry
+  behind and the `rmdir` then fails with `ENOTEMPTY`. Leave the directory
+  alone. The message names the pids it measured and gives the `kill -9` that
+  ends them.
+
+Two observations decide that: the pids with a file open under the directory
+(read from `/proc`), and whether anything holds the startup log's `flock`. The
+instance record decides nothing, because the gateway unlinks it as the first
+step of teardown and a gateway started without `--detach` never writes a
+startup log at all. Neither does `status`, which reads only the record and so
+reports "no gateway is running" for exactly the directories `stop` refuses to
+declare free. Where a host exposes neither witness (no `/proc`, or `flock`
+unavailable or failing), `stop` reports exit 1 rather than treating missing
+evidence as an idle directory.
+
+`stop` waits up to 10 seconds, fixed. That is a teardown budget, not a run
+budget: the gateway closes its transport and its session on SIGTERM, and a
+run's own work is already finished or abandoned by the time anything signals
+it, so nothing about the run mode makes teardown longer. It sends only SIGTERM,
+because that is what runs the ordered teardown; SIGKILL leaves the record
+behind for the next launch to trip over, which is why escalation stays with the
+operator.
+
+Do not remove `<project>/.vibesys` itself. Only the demo's ignored
+`clients/web/.vibesys-demo` is disposable; a real project's `.vibesys` holds
+run state that `Project` owns.
+
 Pass a real project and task for an operator-owned run. Additional VibeSys run
 arguments follow `--`:
 
