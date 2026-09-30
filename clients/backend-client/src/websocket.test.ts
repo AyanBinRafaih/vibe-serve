@@ -1,8 +1,11 @@
 import {describe, expect, it} from 'bun:test';
-import type {ControlChannelState} from './control-channel.js';
-import type {BackendClientError} from './errors.js';
-import type {ProtocolResponse, RequestInput} from './protocol.js';
-import {REQUEST_POLICIES} from './request-policy.js';
+import type {
+  BackendClientError,
+  ControlChannelState,
+  ProtocolResponse,
+  RequestInput,
+} from './index.js';
+import {REQUEST_POLICIES} from './index.js';
 import {type WebSocketLike, WebSocketTransport} from './websocket.js';
 
 const URL = 'ws://127.0.0.1:43123';
@@ -156,6 +159,17 @@ class FakeScheduler {
       if (!entry.cancelled) entry.callback();
     }
   }
+}
+
+/**
+ * One reported state as a short string, so a sequence of them reads as a
+ * sequence. Names every field a frontend renders, which is also what makes the
+ * report dedup checkable: an assertion on the whole trace fails if a transition
+ * is emitted twice or swallowed.
+ */
+function trace(state: ControlChannelState): string {
+  if (state.status === 'connected') return 'connected';
+  return `down:${state.everConnected ? 'lost' : 'cold'}${state.retrying ? ':retrying' : ''}`;
 }
 
 const okResponse = (requestId: string, body: Record<string, unknown> = {}) => ({
@@ -384,7 +398,14 @@ describe('WebSocketTransport', () => {
     await tick();
     expect(gateway.sockets).toHaveLength(2);
     expect(transport.connected).toBe(true);
-    expect(states.map(state => state.status)).toEqual(['connected', 'disconnected', 'connected']);
+    // The redial's own start is reported too, so an affordance bound to
+    // `retrying` knows a click would be a no-op while it is in flight.
+    expect(states.map(trace)).toEqual([
+      'connected',
+      'down:lost',
+      'down:lost:retrying',
+      'connected',
+    ]);
 
     const second = transport.request({type: 'command.pause'});
     await tick();
@@ -471,7 +492,8 @@ describe('WebSocketTransport', () => {
     // fails typed rather than hanging, and the dead channel is reportable.
     await expect(pending).rejects.toMatchObject({kind: 'disconnected', retryable: true});
     expect(transport.connected).toBe(false);
-    expect(states.map(state => state.status)).toEqual(['connected', 'disconnected']);
+    // A spent schedule arms no dial, so the outage is reported as idle.
+    expect(states.map(trace)).toEqual(['connected', 'down:lost']);
 
     const revived = transport.request({type: 'query.snapshot'});
     await tick();
@@ -479,7 +501,12 @@ describe('WebSocketTransport', () => {
     gateway.socket(1).answerAll();
     await expect(revived).resolves.toMatchObject({ok: true});
     expect(transport.connected).toBe(true);
-    expect(states.map(state => state.status)).toEqual(['connected', 'disconnected', 'connected']);
+    expect(states.map(trace)).toEqual([
+      'connected',
+      'down:lost',
+      'down:lost:retrying',
+      'connected',
+    ]);
     await transport.close();
   });
 
@@ -562,6 +589,12 @@ describe('WebSocketTransport', () => {
     const pending = transport.request({type: 'query.snapshot'}, {timeoutMs: 20});
     await tick();
     scheduler.runDue(20);
+    await tick();
+    // The override fires first, then everything else. A build that ignored the
+    // override used to leave nothing due at 20ms and this test waited on a
+    // promise that could not settle until the runner killed it; firing the 30s
+    // default too makes that failure an assertion on the message instead.
+    scheduler.runPending();
 
     await expect(pending).rejects.toMatchObject({
       kind: 'timeout',
@@ -682,6 +715,212 @@ describe('WebSocketTransport', () => {
     await tick();
     expect(gateway.sockets).toHaveLength(2);
     await transport.close();
+  });
+
+  it('reports a dial in flight, and a second reconnect during it opens nothing', async () => {
+    const gateway = new FakeGateway();
+    const scheduler = new FakeScheduler();
+    const states: ControlChannelState[] = [];
+    const transport = controlTransport(gateway, scheduler, {
+      reconnectDelaysMs: [60_000],
+      onConnectionState: state => states.push(state),
+    });
+
+    const first = transport.request({type: 'query.snapshot'});
+    await tick();
+    gateway.socket(0).answerAll();
+    await expect(first).resolves.toMatchObject({ok: true});
+
+    // The peer goes away and the next dial hangs in its handshake. That window
+    // is exactly where `reconnect()` is inert, so the reported state has to say
+    // a dial is already running or the affordance cannot know.
+    gateway.outcome = 'stall';
+    gateway.socket(0).drop();
+    transport.reconnect();
+    await tick();
+    expect(gateway.sockets).toHaveLength(2);
+    expect(states.map(trace)).toEqual(['connected', 'down:lost', 'down:lost:retrying']);
+
+    // A second press while the handshake is outstanding must not stack another
+    // socket onto it, and must not re-report the state it did not change.
+    transport.reconnect();
+    await tick();
+    expect(gateway.sockets).toHaveLength(2);
+    expect(states.map(trace)).toEqual(['connected', 'down:lost', 'down:lost:retrying']);
+
+    // When the stalled handshake expires, the outage is reported again with no
+    // dial in flight, so the affordance comes back to life.
+    scheduler.runDue(5_000);
+    await tick();
+    expect(states.map(trace)).toEqual([
+      'connected',
+      'down:lost',
+      'down:lost:retrying',
+      'down:lost',
+    ]);
+    await transport.close();
+  });
+
+  it('reconnect() is inert on a live channel and after close, which cancels the redial', async () => {
+    const gateway = new FakeGateway();
+    const scheduler = new FakeScheduler();
+    const transport = controlTransport(gateway, scheduler, {reconnectDelaysMs: [60_000]});
+
+    const first = transport.request({type: 'query.snapshot'});
+    await tick();
+    gateway.socket(0).answerAll();
+    await expect(first).resolves.toMatchObject({ok: true});
+
+    // Nothing to reconnect: a press on a live channel must not replace the
+    // connection the requests riding it are correlated against.
+    transport.reconnect();
+    await tick();
+    expect(gateway.sockets).toHaveLength(1);
+
+    gateway.socket(0).drop();
+    await transport.close();
+    // The redial the drop armed is cancelled, so a client that is gone does not
+    // dial the gateway a minute after its owner stopped caring.
+    scheduler.runPending();
+    await tick();
+    expect(gateway.sockets).toHaveLength(1);
+    // And the affordance cannot resurrect a closed client either.
+    transport.reconnect();
+    await tick();
+    expect(gateway.sockets).toHaveLength(1);
+  });
+
+  it('ignores a retired connection still reporting after its replacement is live', async () => {
+    const gateway = new FakeGateway();
+    const scheduler = new FakeScheduler();
+    const states: ControlChannelState[] = [];
+    const transport = controlTransport(gateway, scheduler, {
+      reconnectDelaysMs: [0],
+      onConnectionState: state => states.push(state),
+    });
+
+    const first = transport.request({type: 'query.snapshot'});
+    await tick();
+    gateway.socket(0).answerAll();
+    await expect(first).resolves.toMatchObject({ok: true});
+
+    gateway.socket(0).drop();
+    scheduler.runDue(0);
+    await tick();
+    expect(gateway.sockets).toHaveLength(2);
+    expect(transport.connected).toBe(true);
+
+    // The old socket is still wired to the handlers its own dial bound, and a
+    // real one can fire again while closing. Attributed to the generation that
+    // opened it, so it cannot take the live connection down or be answered on.
+    gateway.socket(0).drop();
+    gateway.socket(0).receive(JSON.stringify(okResponse('never-issued')));
+    await tick();
+    expect(transport.connected).toBe(true);
+    expect(states.map(trace)).toEqual([
+      'connected',
+      'down:lost',
+      'down:lost:retrying',
+      'connected',
+    ]);
+
+    const second = transport.request({type: 'query.snapshot'});
+    await tick();
+    gateway.socket(1).answerAll();
+    await expect(second).resolves.toMatchObject({ok: true});
+    await transport.close();
+  });
+
+  it('never resends a held request the caller abandoned during the outage', async () => {
+    const gateway = new FakeGateway();
+    const scheduler = new FakeScheduler();
+    const transport = controlTransport(gateway, scheduler, {reconnectDelaysMs: [60_000]});
+
+    const first = transport.request({type: 'query.snapshot'});
+    await tick();
+    gateway.socket(0).answerAll();
+    await expect(first).resolves.toMatchObject({ok: true});
+
+    // Two idempotent requests are held for the recovery; the caller gives up on
+    // one of them while it is still held rather than in flight.
+    const controller = new AbortController();
+    const abandoned = rejection(
+      transport.request({type: 'query.snapshot'}, {signal: controller.signal}),
+    );
+    const kept = transport.request({type: 'query.tui_defaults'});
+    gateway.socket(0).drop();
+    await tick();
+    controller.abort();
+    expect((await abandoned).name).toBe('AbortError');
+
+    transport.reconnect();
+    await tick();
+    // Only the kept request rides the recovery. A held entry removed from the
+    // queue must not be written to the fresh connection, or the caller gets a
+    // command they explicitly abandoned.
+    const resent = gateway.socket(1).frames();
+    expect(resent.map(frame => frame['type'])).toEqual(['query.tui_defaults']);
+    gateway.socket(1).answerAll();
+    await expect(kept).resolves.toMatchObject({ok: true});
+    await transport.close();
+  });
+
+  it('fails the dial when the socket it was handed is already gone', async () => {
+    const scheduler = new FakeScheduler();
+    const sockets: FakeSocket[] = [];
+    const transport = new WebSocketTransport(URL, {
+      closeGraceMs: 0,
+      scheduleTimeout: scheduler.schedule,
+      reconnectDelaysMs: [],
+      // An embedded runtime may hand back a socket that is already open, which
+      // skips the handshake and so installs none of its handlers. If it dies in
+      // the microtask before the caller adopts it, no listener hears the close
+      // and `readyState` is the only evidence left.
+      webSocket: () => {
+        const socket = new FakeSocket();
+        socket.readyState = 1;
+        sockets.push(socket);
+        queueMicrotask(() => socket.drop());
+        return socket;
+      },
+    });
+
+    const rejected = rejection(transport.request({type: 'query.snapshot'}));
+    await tick();
+    // Fire whatever is armed, so a build that hands the dead socket to the
+    // channel fails on the request deadline instead of hanging this test.
+    scheduler.runPending();
+
+    expect(sockets).toHaveLength(1);
+    // A dead socket is a failed dial, not a request that sits on a connection
+    // nothing will ever answer.
+    expect(await rejected).toMatchObject({kind: 'disconnected'});
+    expect(sockets[0]?.sent).toEqual([]);
+    await transport.close();
+  });
+
+  it('closes a control socket that close() raced before the dial was claimed', async () => {
+    const scheduler = new FakeScheduler();
+    const socket = new FakeSocket();
+    const transport = new WebSocketTransport(URL, {
+      closeGraceMs: 0,
+      scheduleTimeout: scheduler.schedule,
+      webSocket: () => socket,
+    });
+
+    const rejected = rejection(transport.request({type: 'query.snapshot'}));
+    // Open the socket and close the client in one turn, so `close()` runs in
+    // the window between the dial resolving and the channel adopting it.
+    socket.open();
+    const closing = transport.close();
+
+    // Asserted before yielding: the socket has to be torn down by `close()`
+    // itself, not by the dial's own continuation running afterwards, or
+    // `close()` can return with a live socket behind it.
+    expect(socket.closeCalls).toBe(1);
+    await closing;
+    expect(socket.readyState).toBe(3);
+    expect(await rejected).toMatchObject({kind: 'disconnected'});
   });
 
   it('disposes the rest of a resend batch when one send fails mid-flush', async () => {
