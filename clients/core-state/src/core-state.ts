@@ -756,8 +756,13 @@ function foldEvent(state: CoreState, event: RunEvent, folder: TranscriptFolder |
   next.sequence = Math.max(state.sequence, sequence);
   next = applyDiagnosticEvent(next, event);
   next = applyAgentExecutionEvent(next, event);
-  next = applyAgentStatusEvent(next, event);
+  // The chat return sits above the status fold, not below it. The chat agent
+  // runs its own session with its own context window, and the backend attaches
+  // that session's status block to every chat chunk it publishes, so folding
+  // one would report the chat's token count as the run's. The same exclusion
+  // covers chat `usage_update` events, which `applyRunFacts` never sees.
   if (event.agent_kind === 'chat') return applyChatEvent(next, event, folder);
+  next = applyAgentStatusEvent(next, event);
   if (event.agent_kind) next.agentKind = event.agent_kind;
   if (event.round_label) next.roundLabel = event.round_label;
   next = applyRunMapProjection(next, state, event, sequence);
@@ -810,6 +815,18 @@ function applyRunFacts(state: CoreState, event: RunEvent, sequence: number): Cor
   return state;
 }
 
+/**
+ * Whether `event` contributes a measurement to the benchmark series.
+ *
+ * Exported because a consumer that caches a projection of `state.benchmarks`
+ * needs to know which events can change it, and re-deriving that from event
+ * types misses the gate-shaped form (#692). One predicate, so the fold and
+ * its consumers cannot disagree about what a measurement is.
+ */
+export function recordsBenchmark(event: RunEvent): boolean {
+  return benchmarkFromEvent(event, event.sequence ?? 0) !== null;
+}
+
 function benchmarkFromEvent(event: RunEvent, sequence: number): BenchmarkRecord | null {
   const data = event.data;
   if (data?.kind === 'benchmark_result') {
@@ -824,10 +841,16 @@ function benchmarkFromEvent(event: RunEvent, sequence: number): BenchmarkRecord 
   // A completed benchmark gate carries the measurement `benchmark_result`
   // used to, so it feeds the same fold; old journals have only the legacy
   // kind and new journals only this one (#692).
+  //
+  // A reused gate is a cache hit: it re-reports the number an earlier round
+  // measured, so folding it would append a phantom round to the series and
+  // flatten it. `gateFinishedEntry` in `transcript.ts` draws the same line,
+  // rendering a reused gate as a PASS rather than a Benchmark card.
   if (
     data?.kind !== 'gate_finished' ||
     data.gate !== 'benchmark' ||
     event.status === 'failed' ||
+    data.reused === true ||
     data.metric == null ||
     data.value == null
   ) {
@@ -894,6 +917,34 @@ export function latestDiagnosticChange(
     current.diagnostics.find((diagnostic, index) => diagnostic !== previous.diagnostics[index]) ??
     null
   );
+}
+
+/**
+ * Whether `event` is the run reaching a status it never leaves.
+ *
+ * The same fact `applyRunLifecycle` and `applyRunStatus` route to `terminate`,
+ * asked one stage earlier so the per-execution status map closes out with the
+ * rest of the run. Statuses are the reason this is not just a list of event
+ * types: an operator `/stop` ends the run through `run_status_changed` alone,
+ * with no run-scoped terminal event after it.
+ *
+ * `run-map.ts`'s `runClosingStatus` is deliberately narrower: it answers what
+ * to write onto work that was still open, and `completed` and `failed` already
+ * have a terminal event that owns that. Clearing a status map the run has
+ * finished with has no such owner and no ordering hazard.
+ */
+function endsRun(event: RunEvent): boolean {
+  switch (event.type) {
+    case 'run_finished':
+    case 'run_failed':
+    case 'run_interrupted':
+    case 'configuration_failed':
+      return true;
+    default: {
+      const data = event.data;
+      return data?.kind === 'run_status_changed' && endedRunStatus(data.status) !== null;
+    }
+  }
 }
 
 /** Folds one backend-published status, ending the run when that status has. */
@@ -1007,11 +1058,7 @@ function applyAgentStatusEvent(state: CoreState, event: RunEvent): CoreState {
     executionStatuses = reconcileExecutionStatuses(executionStatuses, state.activeExecutions);
   } else if (data?.kind === 'agent_execution_finished' && executionId != null) {
     executionStatuses = removeExecutionStatus(executionStatuses, executionId);
-  } else if (
-    event.type === 'run_finished' ||
-    event.type === 'run_failed' ||
-    event.type === 'run_interrupted'
-  ) {
+  } else if (endsRun(event)) {
     executionStatuses = {};
   } else {
     executionStatuses = applyExecutionStatus(executionStatuses, event);
