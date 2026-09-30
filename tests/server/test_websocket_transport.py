@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
+import secrets
 import socket
+import struct
+import threading
 from http.client import HTTPConnection, HTTPMessage, HTTPResponse
 from pathlib import Path
 from string import ascii_lowercase, digits
@@ -22,23 +27,116 @@ from websockets.protocol import State
 
 from server.api.protocol import SnapshotQuery, SubscribeRequest
 from server.transport.discovery import WebInstanceRecord
+from server.transport.subscriptions import SubscriptionTracker
+from server.transport.unix_jsonl import UnixJsonlServer
 from server.transport.websocket import (
     WebSocketGateway,
+    WebSocketLimits,
     _connection_closed,
     _content_type,
     _request_id,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from websockets.asyncio.server import ServerConnection
     from websockets.http11 import Request
     from websockets.typing import Origin
 
+# The burst has to be larger than the send path can absorb, or the producing
+# coroutine never stalls and the write deadline under test never fires. The
+# absorber is the server's socket send queue, which is not settable from this
+# side and which Linux autotunes up to ``net.ipv4.tcp_wmem``'s ceiling. That
+# queue charges skb overhead against ``sk_wmem_queued`` alongside the bytes, so
+# the payload that fits is a fraction of the ceiling, not the ceiling. Measured
+# on a host whose ceiling is 4 MiB, with the peer's receive buffer capped as
+# below, the boundary is sharp: 17 events (1.0625 MiB) are absorbed 3/3 and 18
+# (1.125 MiB) stall 3/3. The burst is derived from the ceiling rather than
+# hardcoded so a host tuned to 16 or 32 MiB cannot turn this test red.
+#
+# Nothing bounds that absorber from below, so the derivation must not be
+# clamped: ``send_buffer_bytes`` is a ``drain()`` high-water mark rather than a
+# send cap and ``SO_RCVBUF`` is advisory, and measured on the same host the
+# burst is absorbed at 1, 2, 4, 8, 12 and 16 events. A fixed clamp would
+# therefore stop stalling on exactly the high-ceiling hosts the derivation
+# exists to serve, if the absorber scales with the ceiling (plausible, since
+# Linux autotunes ``sk_wmem_queued`` toward ``tcp_wmem``'s ceiling; settling it
+# needs a host with a different ceiling and root to write the sysctl). So the
+# burst is never clamped. What is bounded instead is memory: the payload costs
+# about 4 resident bytes per byte (measured peak RSS 97.7 MiB + 4.05 x payload,
+# within 0.4 MiB from 0.5 MiB to 256 MiB of payload), so 4, 16 and 32 MiB
+# ceilings cost 130, 228 and 357 MiB and run, while a 128 MiB ceiling would
+# cost 1.11 GiB and skips with its numbers in the reason.
+_SEND_CEILING_PATH = Path("/proc/sys/net/ipv4/tcp_wmem")
+_SEND_CEILING_FALLBACK_BYTES = 4 * 1024 * 1024
+_BURST_CEILING_MULTIPLE = 2
+_BURST_PAYLOAD_BUDGET_BYTES = 64 * 1024 * 1024
+_STALL_EVENT_BYTES = 64 * 1024
+# Capping the peer's receive buffer takes the second, receive-side absorber out
+# of that derivation, since the send-side ceiling says nothing about its size.
+# It is not the main absorber and the burst is not sized against it: measured
+# here the stall boundary is 38 events absorbed / 39 stalling (2.4375 MiB)
+# uncapped and 17 / 18 (1.125 MiB) capped, so the cap moves it down 1.3125 MiB.
+# The kernel doubles the request and enforces its own floor, so 2048 is granted
+# as 4096.
+_PEER_RECEIVE_BUFFER_BYTES = 2048
+# RFC 6455's two payload-length escape values.
+_EXTENDED_LENGTH = 126
+_EXTENDED_LENGTH_64 = 127
+
+
+def _stall_event_count() -> int:
+    """How many ``_STALL_EVENT_BYTES`` events exceed this host's send-side absorber.
+
+    Skips rather than clamping when the honest burst would exceed the memory
+    budget: a clamped burst could fall under the absorber, which would fail the
+    test on the hosts the derivation is for. The skip is a host-capability
+    gate, not a masked failure; below the threshold this test fails red.
+    """
+    try:
+        ceiling = int(_SEND_CEILING_PATH.read_text().split()[2])
+    except (OSError, IndexError, ValueError):
+        ceiling = _SEND_CEILING_FALLBACK_BYTES
+    burst = _BURST_CEILING_MULTIPLE * ceiling
+    if burst > _BURST_PAYLOAD_BUDGET_BYTES:
+        pytest.skip(
+            f"net.ipv4.tcp_wmem's {ceiling}B ceiling needs a {burst}B burst to"
+            f" outrun the send-side absorber, over this test's"
+            f" {_BURST_PAYLOAD_BUDGET_BYTES}B budget at ~4 resident bytes per"
+            f" payload byte"
+        )
+    return (burst + _STALL_EVENT_BYTES - 1) // _STALL_EVENT_BYTES
+
 
 def _http_request(path: str) -> Request:
     return cast("Request", SimpleNamespace(path=path, headers={}))
+
+
+def test_the_stated_transport_bounds_are_the_values_they_replaced() -> None:
+    """The six pinned bounds must stay the numbers the wire contract publishes.
+
+    Three of them compose into the liveness ceiling in ``WP-DISCONNECT`` and
+    one is the flow-control threshold burst batching depends on, so editing a
+    default here, or ``_KEEPALIVE_SECONDS``, changes a documented contract.
+
+    What the positional tuple establishes, measured mutation by mutation:
+    dropping a field fails (``TypeError``, seven positional arguments for six
+    parameters), and reordering two fields whose defaults differ fails. What it
+    does not establish: adding a seventh field with a default passes, and
+    swapping ``ping_interval_seconds`` with ``ping_timeout_seconds`` passes,
+    because both hold ``_KEEPALIVE_SECONDS``.
+
+    It also says nothing about which ``serve()`` keyword each field reaches.
+    Measured, that mapping is pinned by
+    ``test_a_half_open_subscriber_is_reaped_by_the_keepalive_and_lets_the_run_finish``
+    instead: it sets ``write_deadline_seconds`` to 300.0, so passing that field
+    as ``close_timeout`` parks the connection in ``CLOSING`` past its ceiling,
+    and it is the only failure in the suite. The stalled-subscriber test cannot
+    catch the same swap, because there ``write_deadline_seconds`` is the
+    shorter of the two.
+    """
+    assert WebSocketLimits() == WebSocketLimits(20.0, 20.0, 10.0, 40.0, 32768, (32, 8))
 
 
 def test_gateway_serves_assets_and_round_trips_protocol_frames(tmp_path: Path) -> None:
@@ -769,6 +867,307 @@ def test_gateway_reports_subscription_bootstrap_failure(
     assert response["type"] == "protocol_error"
     assert response["client_id"] == "failing-browser-client"
     assert response["code"] == "stream_failed"
+
+
+class _HalfOpenPeer:
+    """A subscriber that completes the handshake and then never answers.
+
+    Hand-framed on a raw socket on purpose. Every WebSocket client library,
+    including ``websockets``' own, answers a protocol ping automatically below
+    its public API, so no library client can produce the peer this contract is
+    about: one that is still connected at the TCP level but will never pong
+    and, in ``stop_reading`` mode, never drain its socket either.
+    """
+
+    def __init__(self, gateway: WebSocketGateway, *, receive_buffer: int | None = None) -> None:
+        """Handshake against *gateway*, optionally capping the receive window."""
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if receive_buffer is not None:
+            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+        self._socket.settimeout(10)
+        self._socket.connect(("127.0.0.1", gateway.bound_port))
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        self._socket.sendall(
+            (
+                f"GET /ws?token={gateway.token} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{gateway.bound_port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                f"Origin: http://127.0.0.1:{gateway.bound_port}\r\n"
+                "\r\n"
+            ).encode()
+        )
+        self._buffer = b""
+        while b"\r\n\r\n" not in self._buffer:
+            self._buffer += self._recv()
+        head, self._buffer = self._buffer.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0]
+        assert status == b"HTTP/1.1 101 Switching Protocols", status
+
+    def subscribe(self) -> None:
+        """Send one masked subscribe frame."""
+        payload = SubscribeRequest(client_id="half-open-peer").model_dump_json().encode()
+        mask = secrets.token_bytes(4)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        length = (
+            bytes([0x80 | len(payload)])
+            if len(payload) < _EXTENDED_LENGTH
+            else bytes([0x80 | _EXTENDED_LENGTH]) + struct.pack("!H", len(payload))
+        )
+        self._socket.sendall(bytes([0x81]) + length + mask + masked)
+
+    def receive_text(self) -> dict[str, Any]:
+        """Read the next server text frame, ignoring control frames."""
+        while True:
+            opcode, payload = self._read_frame()
+            if opcode == 0x1:
+                return cast("dict[str, Any]", json.loads(payload))
+
+    def close(self) -> None:
+        """Drop the socket."""
+        self._socket.close()
+
+    def _recv(self) -> bytes:
+        chunk = self._socket.recv(65536)
+        assert chunk, "gateway closed the connection before the expected frame"
+        return chunk
+
+    def _take(self, count: int) -> bytes:
+        while len(self._buffer) < count:
+            self._buffer += self._recv()
+        taken, self._buffer = self._buffer[:count], self._buffer[count:]
+        return taken
+
+    def _read_frame(self) -> tuple[int, bytes]:
+        header = self._take(2)
+        opcode = header[0] & 0x0F
+        length = header[1] & 0x7F
+        if length == _EXTENDED_LENGTH:
+            length = struct.unpack("!H", self._take(2))[0]
+        elif length == _EXTENDED_LENGTH_64:
+            length = struct.unpack("!Q", self._take(8))[0]
+        return opcode, self._take(length)
+
+
+def _reaped(wait: Callable[[], None], *, ceiling: float = 30.0) -> bool:
+    """Whether *wait* observes the last subscription ending.
+
+    The assertion is on the boolean, never on how long it took, but the
+    boolean is still a wall-clock comparison: the two socket callers below race
+    real timers inside ``websockets`` against this ceiling, and measured, their
+    verdict flips 3/3 between a 1.2s and a 1.5s ceiling. This helper is
+    therefore not a wall-clock-free construction, only one with a large margin.
+    Their docstrings say what that costs and why there is no seam to remove it.
+    The Fake-connection test needs none of this and takes no ceiling.
+
+    The ceiling is deliberately far above the injected timeouts, because those
+    are not the largest term under it. ``wait_for_subscriber_disconnect``
+    reaches ``wait_for_none_active`` with its default settle window,
+    ``RECONNECT_SETTLE_SECONDS`` (1.0s), which no caller here injects and which
+    dominates both socket tests' elapsed time. 30s leaves room for that
+    constant to be retuned without silently eating the headroom, and lowering
+    it would widen the wall-clock exposure rather than narrow it.
+    """
+    observed = threading.Event()
+
+    def run() -> None:
+        wait()
+        observed.set()
+
+    threading.Thread(target=run, name="reap-waiter", daemon=True).start()
+    return observed.wait(timeout=ceiling)
+
+
+def test_a_half_open_subscriber_is_reaped_by_the_keepalive_and_lets_the_run_finish(
+    tmp_path: Path, socket_dir: Path
+) -> None:
+    """The keepalive alone must carry an idle half-open peer through to run exit.
+
+    The write deadline is left far above the ceiling so it cannot be what ends
+    this connection: the only mechanism under test is ping, ping timeout, and
+    the closing handshake giving up on a peer that never echoes the close.
+    Setting ``write_deadline_seconds`` that far out is also what makes this the
+    one test that pins the field-to-``serve()``-keyword mapping, since passing
+    it as ``close_timeout`` would park the connection in ``CLOSING`` for 300s.
+
+    Load sensitive by construction, with no seam to fix it here. The three
+    timers under test are ``websockets``' own, taken from ``loop.time()``
+    inside a dependency this repository does not own, so there is no clock to
+    inject without adding a production parameter for the test's benefit. The
+    chain completes in 1.40s to 1.51s against the 30s ceiling, measured stable
+    over 11 runs including 6 at a load average of 28 to 34 on a 64-core host,
+    so the margin is about 20x. If it is ever exceeded the signature to look
+    for is a connection parked in ``State.CLOSING``: only ``send_context``'s
+    ``raise_close_exc`` abort moves it to ``CLOSED``, and ``_stream`` polls for
+    exactly that.
+    """
+    limits = WebSocketLimits(
+        ping_interval_seconds=0.1,
+        ping_timeout_seconds=0.1,
+        close_timeout_seconds=0.1,
+        write_deadline_seconds=300.0,
+    )
+    parts = build_server_parts(tmp_path / "logs")
+    tracker = SubscriptionTracker()
+    try:
+        with (
+            UnixJsonlServer(socket_dir / "half-open.sock", parts.api, tracker) as unix,
+            WebSocketGateway(parts.api, subscriptions=tracker, limits=limits) as gateway,
+        ):
+            peer = _HalfOpenPeer(gateway)
+            try:
+                peer.subscribe()
+                assert peer.receive_text()["type"] == "subscribed"
+                # ``wait_for_subscriber_disconnect`` is the exact call
+                # ``ServerRuntime`` makes to decide a non-detached run may
+                # finish, over the tracker both transports share.
+                assert _reaped(unix.wait_for_subscriber_disconnect)
+            finally:
+                peer.close()
+    finally:
+        parts.close()
+
+
+def test_a_subscriber_that_stops_draining_is_abandoned_at_the_write_deadline(
+    tmp_path: Path, socket_dir: Path
+) -> None:
+    """Regression: a stalled send must not also block the reaping keepalive.
+
+    ``websockets`` ends every write in ``drain()``, which suspends while the
+    transport is over its high-water mark. A peer that neither drains its
+    socket nor answers pings therefore stalled the gateway's stream loop *and*
+    the library's own keepalive ping and close frames, so before the write
+    deadline this subscription was never released and a non-detached run never
+    exited. Measured against the unfixed gateway the tracker still reported
+    the peer as active after 90 seconds.
+
+    The keepalive is pushed out past the ceiling here, so the write deadline is
+    the only thing that can end the connection. That also makes the pass an
+    assertion about the producer stall itself: had the burst been buffered
+    instead of stalling, the send would have completed and no deadline could
+    have fired. A burst too small to stall therefore fails this test red rather
+    than passing it vacuously, in either direction, which is what lets
+    ``_stall_event_count`` derive the burst from the host instead of pinning
+    it. Measured on a 4 MiB-ceiling host the boundary is 17 events absorbed and
+    18 stalling, against a derived burst of 128.
+
+    Load sensitive in the same way as the keepalive test above, and for the
+    same reason: ``asyncio.timeout`` reads the running loop's clock, so this
+    verdict is a wall-clock comparison with a large margin (1.4s against 30s)
+    rather than a wall-clock-free one. The Fake-connection test below covers
+    the same policy with no clock at all.
+    """
+    limits = WebSocketLimits(
+        ping_interval_seconds=600.0,
+        ping_timeout_seconds=600.0,
+        close_timeout_seconds=600.0,
+        write_deadline_seconds=0.3,
+        send_buffer_bytes=1024,
+    )
+    parts = build_server_parts(tmp_path / "logs")
+    tracker = SubscriptionTracker()
+    try:
+        with (
+            UnixJsonlServer(socket_dir / "stalled.sock", parts.api, tracker) as unix,
+            WebSocketGateway(parts.api, subscriptions=tracker, limits=limits) as gateway,
+        ):
+            peer = _HalfOpenPeer(gateway, receive_buffer=_PEER_RECEIVE_BUFFER_BYTES)
+            try:
+                for index in range(_stall_event_count()):
+                    parts.journal.publish_output(
+                        "stdout", f"{index:04d}" + "x" * _STALL_EVENT_BYTES
+                    )
+                peer.subscribe()
+                # The acknowledgement precedes the replay, so it arrives before
+                # the buffers fill; the replay behind it is what stalls.
+                assert peer.receive_text()["type"] == "subscribed"
+                assert _reaped(unix.wait_for_subscriber_disconnect)
+            finally:
+                peer.close()
+    finally:
+        parts.close()
+
+
+def test_a_write_that_never_drains_abandons_the_peer_and_frees_its_subscription(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The send-side overflow policy, without depending on any socket's buffers.
+
+    The Fake raises the expired deadline rather than waiting for one, so this
+    test is wall-clock free: what is under test is how ``_send`` and its
+    callers handle the error, not that ``asyncio.timeout`` fires, which the
+    socket tests above already exercise against a real stalled transport.
+
+    Exactly one abort is the assertion that matters. A deadline is not a
+    request failure, so it must not be funnelled into the control-path
+    ``Response`` handler and written a second time to the socket that was just
+    aborted.
+
+    The warning is the other half. Abandoning a subscriber is an operator-
+    visible decision, and it must not arrive as silence: it is reported by
+    ``_send``, which makes it, rather than by ``_handle_connection``'s handler,
+    which also absorbs a browser closing its tab. Asserted as a count and the
+    bound that was exceeded, not as wording.
+    """
+    parts = build_server_parts(tmp_path / "logs")
+    tracker = SubscriptionTracker()
+    gateway = WebSocketGateway(parts.api, subscriptions=tracker)
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.aborts = 0
+
+        def abort(self) -> None:
+            self.aborts += 1
+
+    class StalledConnection:
+        """A connection whose every write has already outlasted its deadline."""
+
+        def __init__(self, frames: list[str]) -> None:
+            self.frames = iter(frames)
+            self.transport = FakeTransport()
+
+        def __aiter__(self) -> StalledConnection:
+            return self
+
+        async def __anext__(self) -> str:
+            try:
+                return next(self.frames)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def send(self, message: str) -> None:
+            del message
+            raise TimeoutError
+
+        async def close(self) -> None:
+            """Absorb the library-owned close in ``_handle_connection``'s teardown.
+
+            A real ``Connection.close()`` on an aborted transport does abort a
+            second time: ``send_context`` sees a state other than ``OPEN``,
+            takes its ``raise_close_exc`` path, and reaches
+            ``transport.abort()`` again. That extra abort is idempotent and
+            invisible to the caller, so the Fake omits it, which is why
+            ``aborts == 1`` below counts only ``_send``'s own abort.
+            """
+
+    connection = StalledConnection([SubscribeRequest(client_id="stalled").model_dump_json()])
+
+    with caplog.at_level(logging.DEBUG, logger="server.transport.websocket"):
+        asyncio.run(
+            gateway._handle_connection(  # noqa: SLF001  # lint-waiver: LW-101109 [SLF001]; drive the write deadline without a socket whose buffers the test cannot bound
+                cast("ServerConnection", connection)
+            )
+        )
+
+    assert connection.transport.aborts == 1
+    assert _reaped(lambda: tracker.wait_for_none_active(settle_seconds=0.0))
+    reported = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(reported) == 1
+    assert str(gateway.limits.write_deadline_seconds) in reported[0].getMessage()
+    parts.close()
 
 
 def test_gateway_publishes_and_cleans_project_instance_record(tmp_path: Path) -> None:

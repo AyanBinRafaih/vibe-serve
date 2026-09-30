@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 
 _SCENARIOS = Path(__file__).parent / "scenarios"
 _HISTORY_EVENTS = 100
+# A burst large enough that one batch per event would be unmistakable, split
+# into chunks so the coalescing bound is a ratio rather than a timing guess.
+_BURST_CHUNKS = 10
+_BURST_CHUNK_EVENTS = 10
+_BURST_EVENTS = _BURST_CHUNKS * _BURST_CHUNK_EVENTS
 
 
 class _Connection(Protocol):
@@ -158,6 +163,69 @@ def test_shared_bootstrap_scenarios_run_against_each_transport(
             assert batch["history_after_sequence"] == parts.api.latest_sequence - 50
         else:
             assert batch["history_after_sequence"] == 0
+    finally:
+        parts.close()
+
+
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+def test_a_backlog_published_between_checkpoints_arrives_as_coalesced_batches(
+    tmp_path: Path,
+    socket_dir: Path,
+    transport: str,
+) -> None:
+    """Checkpoint coalescing is a property of both transports, not a WebSocket accident.
+
+    ``subscription_checkpoint`` returns everything past the cursor, so however
+    many events land between two checkpoints arrive as one batch. That is what
+    keeps a consumer that reads less often than the journal is written cheap,
+    instead of repainting once per event.
+
+    Each chunk is published under the shared condition the stream loop waits
+    on, so a chunk can never be observed half-written. The consumer's cursor
+    therefore always sits on a chunk boundary and every batch carries at least
+    one whole chunk, which makes the batch count bounded by construction
+    rather than by how fast the host happens to be.
+
+    Frame size, on the other hand, is bounded only by ``_BURST_EVENTS``: a
+    batch is 364 bytes per event plus a 144 to 155 byte envelope, so the whole
+    burst in one frame is about 36.6 kB. Measured over 210 runs, 45 cold
+    processes and 60 warm iterations per transport, batch counts ranged over
+    {1, 2, 3, 4} and the largest frame was 36548B, one cold WebSocket run that
+    coalesced all 100 events. That is above ``send_buffer_bytes`` (32 KiB) and
+    harmless: ``write_limit`` reaches only ``transport.set_write_buffer_limits``,
+    and ``transport.write`` appends a whole frame to an unbounded buffer before
+    consulting the mark, so overrunning it suspends the following ``drain()``
+    rather than failing or truncating the send. Confirmed directly: a forced
+    single batch of 1000 events delivers intact as one 366052B frame.
+
+    What this pins is therefore the coalescing, on both transports, and not any
+    stall. The consumer here reads continuously. That the WebSocket send path
+    really does stall rather than buffer without bound is a separate claim,
+    asserted in ``tests/server/test_websocket_transport.py`` by the write
+    deadline firing, which can only happen if a write made no progress.
+    """
+    parts = build_server_parts(tmp_path / "logs")
+    try:
+        with _running_connection(transport, parts, socket_dir / "burst.sock") as connection:
+            connection.send({"type": "subscribe", "after_sequence": 0})
+            assert connection.receive()["type"] == "subscribed"
+            assert connection.receive()["type"] == "event_batch"
+
+            for chunk in range(_BURST_CHUNKS):
+                with parts.condition:
+                    for index in range(_BURST_CHUNK_EVENTS):
+                        parts.journal.publish_output("stdout", f"burst-{chunk}-{index}")
+
+            latest = parts.api.latest_sequence
+            batches: list[dict[str, Any]] = []
+            while not batches or batches[-1]["through_sequence"] < latest:
+                batch = connection.receive()
+                assert batch["type"] == "event_batch"
+                batches.append(batch)
+
+            delivered = [event for batch in batches for event in batch["events"]]
+            assert len(delivered) == _BURST_EVENTS
+            assert len(batches) <= _BURST_CHUNKS
     finally:
         parts.close()
 

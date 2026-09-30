@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import mimetypes
 import os
 import posixpath
 import secrets
 import threading
 from contextlib import suppress
+from dataclasses import dataclass
 from http import HTTPStatus
 from ipaddress import ip_address
 from pathlib import Path
@@ -39,6 +41,8 @@ if TYPE_CHECKING:
     from websockets.http11 import Response as HttpResponse
 
     from server.api.service import RunApi, SubscriptionBootstrap
+
+_LOG = logging.getLogger(__name__)
 
 _REQUEST_ADAPTER = TypeAdapter(ProtocolRequest)
 _DISCONNECT_POLL_SECONDS = 0.1
@@ -117,6 +121,59 @@ _STATIC_HEADERS = MappingProxyType(
         "X-Content-Type-Options": "nosniff",
     }
 )
+# One keepalive period, the single number the liveness defaults are built from.
+_KEEPALIVE_SECONDS = 20.0
+
+
+@dataclass(frozen=True)
+class WebSocketLimits:
+    """The gateway's liveness and flow-control bounds, stated rather than inherited.
+
+    Every field here was previously either a literal in the ``serve()`` call or
+    an unstated ``websockets`` default. They are declared together because they
+    compose into the two contracts a subscriber depends on, both written down
+    under ``WP-DISCONNECT`` in ``docs/contributing/wire-protocol.md``:
+
+    Liveness. A peer that stops answering is closed after
+    ``ping_interval_seconds + ping_timeout_seconds``, and its socket is aborted
+    a further ``close_timeout_seconds`` later when the peer never echoes the
+    close frame. Only that abort moves the connection to ``CLOSED``, which is
+    what ``_stream`` polls for, so the subscription is released one
+    ``_DISCONNECT_POLL_SECONDS`` after the sum of all three.
+
+    Flow control. ``send_buffer_bytes`` is the transport high-water mark that
+    makes an unread frame stall the producing coroutine instead of queueing
+    without bound; it is the WebSocket equivalent of the blocking
+    ``wfile.write`` plus ``flush`` in ``unix_jsonl.py``'s ``_write_message``.
+    It is unrelated to ``receive_queue``, which bounds frames arriving *from*
+    the peer. ``write_deadline_seconds`` bounds how long that stall may last
+    before the peer is treated as gone; without it a peer that neither reads
+    nor answers pings also blocks the library's own keepalive writes, and no
+    liveness bound holds at all.
+
+    Defaults reproduce the values in force before they were named, so the
+    library's own defaults can no longer move them. The field defaults below
+    are the only statement of those numbers in this module; the published
+    liveness table in ``wire-protocol.md`` quotes them, and
+    ``test_the_stated_transport_bounds_are_the_values_they_replaced`` asserts
+    the whole tuple so an edit here cannot silently falsify the table. The
+    default write deadline is one full keepalive reaping window, because a
+    write that cannot make progress for as long as an unresponsive peer would
+    take to fail its keepalive is the same failure and deserves the same bound.
+
+    The fields are independent rather than derived from each other so a test
+    can exercise one mechanism at a time: raising the ping interval takes the
+    keepalive out of the picture while leaving the write deadline in it, and
+    vice versa. Deriving the deadline instead made the two race in any test
+    small enough to run in CI.
+    """
+
+    ping_interval_seconds: float = _KEEPALIVE_SECONDS
+    ping_timeout_seconds: float = _KEEPALIVE_SECONDS
+    close_timeout_seconds: float = 10.0
+    write_deadline_seconds: float = 2 * _KEEPALIVE_SECONDS
+    send_buffer_bytes: int = 32768
+    receive_queue: tuple[int, int] = (32, 8)
 
 
 class WebSocketGateway:
@@ -130,7 +187,7 @@ class WebSocketGateway:
     Unix adapter.
     """
 
-    def __init__(  # noqa: PLR0913  # lint-waiver: LW-101057 [PLR0913]; the gateway exposes independent protocol, asset, port, capability, and discovery options
+    def __init__(  # noqa: PLR0913  # lint-waiver: LW-101057 [PLR0913]; the gateway exposes independent protocol, asset, port, capability, discovery, and transport-bound options
         self,
         api: RunApi,
         *,
@@ -141,6 +198,7 @@ class WebSocketGateway:
         instance_path: Path | None = None,
         project_root: Path | None = None,
         allowed_origins: Sequence[str] = (),
+        limits: WebSocketLimits | None = None,
     ) -> None:
         """Create a loopback gateway around a shared run API.
 
@@ -158,6 +216,7 @@ class WebSocketGateway:
         # and an origin no browser can send is a construction-time error rather
         # than an allowlist entry that silently never matches.
         self.allowed_origins = frozenset(browser_origin(origin) for origin in allowed_origins)
+        self.limits = limits or WebSocketLimits()
         self.subscriptions = subscriptions or SubscriptionTracker()
         self._claim: WebInstanceClaim | None = None
         self._instance_record: WebInstanceRecord | None = None
@@ -266,9 +325,16 @@ class WebSocketGateway:
             self.port,
             process_request=self._process_request,
             compression=None,
-            ping_interval=20,
-            ping_timeout=20,
-            max_queue=(32, 8),
+            # Every bound below is stated, never inherited: see
+            # ``WebSocketLimits``. ``write_limit`` is the send-side high-water
+            # mark that makes an unread frame stall the producer, the analogue
+            # of ``unix_jsonl.py``'s blocking ``wfile.write``; ``max_queue``
+            # bounds the opposite direction, frames arriving from the peer.
+            ping_interval=self.limits.ping_interval_seconds,
+            ping_timeout=self.limits.ping_timeout_seconds,
+            close_timeout=self.limits.close_timeout_seconds,
+            write_limit=self.limits.send_buffer_bytes,
+            max_queue=self.limits.receive_queue,
             server_header="VibeSys-WebSocket",
         ) as server:
             self._server = server
@@ -465,26 +531,81 @@ class WebSocketGateway:
             )
         return self._response(HTTPStatus.OK, body, _content_type(candidate))
 
+    async def _send(self, websocket: ServerConnection, payload: str) -> None:
+        """Write one protocol frame, stalling at most one write deadline.
+
+        Every *protocol* frame the gateway emits goes through here, so the
+        send-side policy lives in one place: stall the producing coroutine
+        while the peer is behind (which is what lets the next
+        ``subscription_checkpoint`` coalesce a backlog into one batch), and
+        abandon the peer once the stall outlasts ``write_deadline_seconds``.
+        The one write that does not is the library-owned close frame in
+        ``_handle_connection``'s teardown, whose ``drain()`` is unbounded;
+        that path runs only after the stream is already ending.
+
+        The deadline is what makes the liveness bound true rather than
+        conditional. ``websockets`` ends every write, including its own
+        keepalive ping and close frames, in ``drain()``, which suspends while
+        the transport sits above ``send_buffer_bytes``. A peer that neither
+        drains its socket nor answers pings therefore blocks the keepalive that
+        was supposed to reap it, and without this deadline the subscription is
+        never released and a non-detached run never exits. The keepalive's own
+        ping write is still not covered by any deadline, so the keepalive bound
+        holds only while the transport dips below its low-water mark, which it
+        does whenever a ``send`` here returns.
+
+        The transport is aborted rather than closed because a close frame is
+        itself a write: it would re-enter the same stalled ``drain()``. This is
+        the library's own escape hatch for the same problem. ``Connection``'s
+        ``send_context`` ends in one ``transport.abort()``
+        (``websockets.asyncio.connection``, 14.2 line 931) shared by four
+        ``raise_close_exc`` assignments, of which the close-deadline one at
+        line 925 is the analogue here: a peer that will not complete the
+        closing handshake is abandoned rather than waited on. The four aborts
+        in ``Server.conn_handler`` are not this case; they are cancellation
+        during the opening handshake, handshake failure, a rejected handshake,
+        and an unexpected error.
+        """
+        try:
+            async with asyncio.timeout(self.limits.write_deadline_seconds):
+                await websocket.send(payload)
+        except TimeoutError:
+            # Reported here, where the decision is made, rather than in
+            # ``_handle_connection``'s handler: that handler also absorbs a
+            # browser closing its tab, so it cannot say anything above debug
+            # without either crying wolf or type-sniffing its own exception.
+            _LOG.warning(
+                "abandoning a websocket peer that did not drain within %ss",
+                self.limits.write_deadline_seconds,
+            )
+            websocket.transport.abort()
+            raise
+
     async def _handle_connection(self, connection: ServerConnection) -> None:
         websocket = connection
         try:
             async for raw in websocket:
                 if not isinstance(raw, str):
-                    await websocket.send(
+                    await self._send(
+                        websocket,
                         ProtocolErrorMessage(
                             code="invalid_frame",
                             message="WebSocket frames must contain text",
-                        ).model_dump_json()
+                        ).model_dump_json(),
                     )
                     continue
                 if await self._handle_request(websocket, raw):
                     return
         except Exception as error:  # noqa: BLE001  # lint-waiver: LW-101016 [BLE001]; a disconnected browser is normal at the transport boundary
-            # The websocket library owns close frames. A peer disappearing
-            # while the API is writing is therefore a normal stream teardown.
+            # The websocket library owns close frames, so a peer disappearing
+            # while the API is writing is a normal stream teardown. Debug
+            # rather than silence, because this clause is also where the
+            # re-raised write deadline lands, and `del error` made the two
+            # indistinguishable; the deadline itself is reported at warning by
+            # ``_send``, which is what decided to abandon the peer.
+            _LOG.debug("websocket stream ended: %r", error)
             with suppress(Exception):
                 await websocket.close()
-            del error
 
     async def _handle_request(self, websocket: ServerConnection, raw: str) -> bool:
         request_id, client_id = _request_metadata(raw)
@@ -495,13 +616,20 @@ class WebSocketGateway:
                     await self._stream(websocket, request)
                 return True
             response = self.api.execute(request)
+        except TimeoutError:
+            # A write deadline is not a request failure, and ``TimeoutError``
+            # is an ``OSError`` subclass, so without this the broad handler
+            # below would convert it into a control-path ``Response`` and hand
+            # it to ``_send`` for the transport that was just aborted: a second
+            # doomed write, on the wrong envelope, costing a second deadline.
+            raise
         except Exception as error:  # noqa: BLE001  # lint-waiver: LW-101017 [BLE001]; convert malformed browser frames into protocol responses
             response = Response.from_exception(
                 request_id,
                 error,
                 operation="Request",
             ).model_copy(update={"client_id": client_id})
-        await websocket.send(response.model_dump_json())
+        await self._send(websocket, response.model_dump_json())
         return False
 
     async def _stream(self, websocket: ServerConnection, request: SubscribeRequest) -> None:
@@ -510,7 +638,8 @@ class WebSocketGateway:
                 request.after_sequence, request.tail, store_id=request.store_id
             )
         except Exception as error:  # noqa: BLE001  # lint-waiver: LW-101018 [BLE001]; convert API failures into protocol responses at the transport boundary
-            await websocket.send(
+            await self._send(
+                websocket,
                 ProtocolErrorMessage.from_exception(
                     error,
                     operation="Event stream",
@@ -518,16 +647,17 @@ class WebSocketGateway:
                     request_id=request.request_id,
                 )
                 .model_copy(update={"client_id": request.client_id})
-                .model_dump_json()
+                .model_dump_json(),
             )
             return
-        await websocket.send(
+        await self._send(
+            websocket,
             SubscribedMessage(
                 request_id=request.request_id,
                 client_id=request.client_id,
                 run_id=bootstrap.run_id,
                 latest_sequence=bootstrap.through_sequence,
-            ).model_dump_json()
+            ).model_dump_json(),
         )
         cursor, reported_floor, store_id = await self._write_bootstrap(
             websocket, request, bootstrap
@@ -565,14 +695,15 @@ class WebSocketGateway:
                     websocket, request, bootstrap
                 )
                 continue
-            await websocket.send(
+            await self._send(
+                websocket,
                 EventBatchMessage(
                     events=checkpoint.events,
                     through_sequence=checkpoint.through_sequence,
                     active_executions=checkpoint.active_executions,
                     history_after_sequence=reported_floor,
                     store_id=store_id,
-                ).model_dump_json()
+                ).model_dump_json(),
             )
             cursor = checkpoint.through_sequence
 
@@ -583,14 +714,15 @@ class WebSocketGateway:
         bootstrap: SubscriptionBootstrap,
     ) -> tuple[int, int, str]:
         reported_floor = 0 if request.tail is None else bootstrap.floor
-        await websocket.send(
+        await self._send(
+            websocket,
             EventBatchMessage(
                 events=bootstrap.events,
                 through_sequence=bootstrap.through_sequence,
                 active_executions=bootstrap.active_executions,
                 history_after_sequence=reported_floor,
                 store_id=bootstrap.store_id,
-            ).model_dump_json()
+            ).model_dump_json(),
         )
         return bootstrap.through_sequence, reported_floor, bootstrap.store_id
 
