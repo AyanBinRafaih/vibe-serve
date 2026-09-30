@@ -34,7 +34,7 @@ from server.transport.discovery import WebInstanceClaim, WebInstanceRecord
 from server.transport.subscriptions import SubscriptionTracker
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
     from websockets.asyncio.server import ServerConnection
     from websockets.http11 import Request
@@ -123,6 +123,13 @@ _STATIC_HEADERS = MappingProxyType(
 )
 # One keepalive period, the single number the liveness defaults are built from.
 _KEEPALIVE_SECONDS = 20.0
+# One frame cap, the single number both frame-size defaults are built from: it
+# is the `max_size` default `websockets` applies to received messages, which
+# this gateway adopts as its own inbound cap and assumes of a peer. Stated here
+# so a dependency bump cannot move either direction;
+# `test_the_frame_caps_default_to_the_websockets_value_they_state` fails if the
+# installed library's default no longer agrees with it.
+_FRAME_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -151,6 +158,21 @@ class WebSocketLimits:
     nor answers pings also blocks the library's own keepalive writes, and no
     liveness bound holds at all.
 
+    Frame size. ``receive_frame_bytes`` and ``send_frame_bytes`` are the hard
+    caps, and unlike the flow-control pair they are caps rather than
+    thresholds: exceeding one ends the connection with close code 1009 instead
+    of stalling a writer. They are separate fields holding the same number
+    because they are bounds on different things, only one of which this process
+    enforces. ``receive_frame_bytes`` is passed to ``serve()`` as ``max_size``
+    and is what this gateway refuses to receive. ``send_frame_bytes`` is a
+    statement about *peers*: ``max_size`` applies to received messages on each
+    side, so naming it here cannot change what a peer accepts, and the send
+    side is bounded by chunking instead (``_event_batch_chunks``). Its value is
+    therefore chosen against the smallest cap a supported client imposes, not
+    against this gateway's own: browsers impose no receive limit, so the
+    binding client is the Python ``websockets`` client, whose default is the
+    same 1 MiB.
+
     Defaults reproduce the values in force before they were named, so the
     library's own defaults can no longer move them. The field defaults below
     are the only statement of those numbers in this module; the published
@@ -165,7 +187,8 @@ class WebSocketLimits:
     can exercise one mechanism at a time: raising the ping interval takes the
     keepalive out of the picture while leaving the write deadline in it, and
     vice versa. Deriving the deadline instead made the two race in any test
-    small enough to run in CI.
+    small enough to run in CI. Lowering ``send_frame_bytes`` alone is what lets
+    a test exercise chunking without building a megabyte of events.
     """
 
     ping_interval_seconds: float = _KEEPALIVE_SECONDS
@@ -174,6 +197,8 @@ class WebSocketLimits:
     write_deadline_seconds: float = 2 * _KEEPALIVE_SECONDS
     send_buffer_bytes: int = 32768
     receive_queue: tuple[int, int] = (32, 8)
+    receive_frame_bytes: int = _FRAME_BYTES
+    send_frame_bytes: int = _FRAME_BYTES
 
 
 class WebSocketGateway:
@@ -329,12 +354,16 @@ class WebSocketGateway:
             # ``WebSocketLimits``. ``write_limit`` is the send-side high-water
             # mark that makes an unread frame stall the producer, the analogue
             # of ``unix_jsonl.py``'s blocking ``wfile.write``; ``max_queue``
-            # bounds the opposite direction, frames arriving from the peer.
+            # bounds the opposite direction, frames arriving from the peer, as
+            # does ``max_size``: it is the cap on what this gateway will
+            # *receive*, and says nothing about what a peer will accept from
+            # it. The send side is bounded by ``_event_batch_chunks`` instead.
             ping_interval=self.limits.ping_interval_seconds,
             ping_timeout=self.limits.ping_timeout_seconds,
             close_timeout=self.limits.close_timeout_seconds,
             write_limit=self.limits.send_buffer_bytes,
             max_queue=self.limits.receive_queue,
+            max_size=self.limits.receive_frame_bytes,
             server_header="VibeSys-WebSocket",
         ) as server:
             self._server = server
@@ -695,7 +724,7 @@ class WebSocketGateway:
                     websocket, request, bootstrap
                 )
                 continue
-            await self._send(
+            await self._send_event_batch(
                 websocket,
                 EventBatchMessage(
                     events=checkpoint.events,
@@ -703,7 +732,7 @@ class WebSocketGateway:
                     active_executions=checkpoint.active_executions,
                     history_after_sequence=reported_floor,
                     store_id=store_id,
-                ).model_dump_json(),
+                ),
             )
             cursor = checkpoint.through_sequence
 
@@ -714,7 +743,7 @@ class WebSocketGateway:
         bootstrap: SubscriptionBootstrap,
     ) -> tuple[int, int, str]:
         reported_floor = 0 if request.tail is None else bootstrap.floor
-        await self._send(
+        await self._send_event_batch(
             websocket,
             EventBatchMessage(
                 events=bootstrap.events,
@@ -722,9 +751,91 @@ class WebSocketGateway:
                 active_executions=bootstrap.active_executions,
                 history_after_sequence=reported_floor,
                 store_id=bootstrap.store_id,
-            ).model_dump_json(),
+            ),
         )
         return bootstrap.through_sequence, reported_floor, bootstrap.store_id
+
+    async def _send_event_batch(
+        self, websocket: ServerConnection, batch: EventBatchMessage
+    ) -> None:
+        """Write *batch* as the fewest frames that each fit ``send_frame_bytes``.
+
+        Every ``event_batch`` the gateway emits goes through here, so the one
+        batch whose size is not bounded by anything the client asked for,
+        ``_write_bootstrap``'s whole-backlog replay, cannot reach the wire as a
+        frame no peer will accept. A client resuming after a long detached run
+        supplies ``tail`` only if it has one, so the batch is otherwise sized by
+        the run's entire history.
+        """
+        for chunk in _event_batch_chunks(batch, self.limits.send_frame_bytes):
+            await self._send(websocket, chunk.model_dump_json())
+
+
+def _event_batch_chunks(batch: EventBatchMessage, budget: int) -> Iterator[EventBatchMessage]:
+    """Split *batch* into whole batches that each serialize within *budget* bytes.
+
+    Chunking is on serialized size, not on event count. An event count does not
+    bound bytes: measured on a run of output events the per-event JSON ranges
+    from 282 to 647 bytes, so any count that is safe for the large ones wastes
+    most of the frame on the small ones and any count tuned to the average
+    overflows on a burst of large ones.
+
+    Each chunk is a complete ``event_batch`` message rather than a fragment of
+    one, so no receiver needs a reassembly step and ``WP-GRANULARITY`` still
+    holds: one frame is still exactly one protocol message. What makes that
+    safe is the ``through_sequence`` on each chunk. It is the sequence of the
+    last event that chunk carries, not the batch's, so a consumer that folds
+    batches in order advances its cursor exactly as far as the events it has
+    actually seen. A connection lost mid-replay therefore resumes from a cursor
+    that is true, which is what keeps the client's bootstrap detection correct
+    (``persistent-event-stream.ts`` marks itself bootstrapped on the *first*
+    ``event_batch`` of a fresh dial and resumes from its cursor afterwards). The
+    final chunk keeps the batch's own ``through_sequence``, which may run past
+    its last event when the journal's watermark advanced over events the
+    checkpoint did not return; carrying it on an earlier chunk would claim
+    delivery of events still to come.
+
+    The split is computed from measured byte lengths rather than by serializing
+    candidate chunks, which would be quadratic. The arithmetic is exact because
+    compact JSON renders a list as its items joined by commas: a chunk costs
+    its envelope (measured once, at the batch's own ``through_sequence``, the
+    longest number any chunk carries) plus each event's own serialization plus
+    one separator between neighbors. That identity is a property of the
+    serializer rather than of this function, so it is pinned from the outside:
+    ``test_a_chunked_batch_reaches_the_peer_whole_and_within_the_stated_send_cap``
+    asserts the real frame bytes over generated batches and fails if it ever
+    stops holding.
+
+    The one case *budget* cannot bound is a single event whose own
+    serialization exceeds it: a chunk always carries at least one event, so it
+    is emitted oversized rather than dropped or truncated. Nothing bounds an
+    individual event's size today, so that is a payload-level gap this
+    transport cannot close.
+    """
+    if not batch.events:
+        # One frame, so an empty checkpoint still reports its watermark.
+        yield batch
+        return
+    room = budget - len(batch.model_copy(update={"events": []}).model_dump_json().encode())
+    # Boundaries are indices into `batch.events` rather than an accumulated
+    # list, so the chunks are slices of the batch's own field and this function
+    # never needs to name the event type. `server.transport` may not depend on
+    # `server.events`, and the alternative was a `tach.toml` edge for a local
+    # annotation.
+    start = 0
+    used = 0
+    for index, event in enumerate(batch.events):
+        size = len(event.model_dump_json().encode())
+        if index > start and used + 1 + size > room:
+            yield batch.model_copy(
+                update={
+                    "events": batch.events[start:index],
+                    "through_sequence": batch.events[index - 1].sequence,
+                }
+            )
+            start, used = index, 0
+        used += size + (1 if index > start else 0)
+    yield batch.model_copy(update={"events": batch.events[start:]})
 
 
 def browser_origin(value: str) -> str:
