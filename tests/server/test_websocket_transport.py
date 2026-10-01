@@ -10,7 +10,9 @@ import secrets
 import socket
 import struct
 import threading
+from dataclasses import asdict
 from http.client import HTTPConnection, HTTPMessage, HTTPResponse
+from inspect import signature
 from pathlib import Path
 from string import ascii_lowercase, digits
 from types import SimpleNamespace
@@ -22,10 +24,16 @@ from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 from tests.server.support import build_server_parts
 from websockets.asyncio.client import connect
-from websockets.exceptions import InvalidStatus
+from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
 from websockets.protocol import State
 
-from server.api.protocol import SnapshotQuery, SubscribeRequest
+from server.api.protocol import (
+    EventBatchMessage,
+    SnapshotQuery,
+    SteerCommand,
+    SubscribeRequest,
+)
 from server.transport.discovery import WebInstanceRecord
 from server.transport.subscriptions import SubscriptionTracker
 from server.transport.unix_jsonl import UnixJsonlServer
@@ -40,9 +48,12 @@ from server.transport.websocket import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from websockets.asyncio.client import ClientConnection
     from websockets.asyncio.server import ServerConnection
     from websockets.http11 import Request
     from websockets.typing import Origin
+
+    from server.api.service import RunApi
 
 # The burst has to be larger than the send path can absorb, or the producing
 # coroutine never stalls and the write deadline under test never fires. The
@@ -114,18 +125,21 @@ def _http_request(path: str) -> Request:
 
 
 def test_the_stated_transport_bounds_are_the_values_they_replaced() -> None:
-    """The six pinned bounds must stay the numbers the wire contract publishes.
+    """The pinned bounds must stay the numbers the wire contract publishes.
 
     Three of them compose into the liveness ceiling in ``WP-DISCONNECT`` and
     one is the flow-control threshold burst batching depends on, so editing a
     default here, or ``_KEEPALIVE_SECONDS``, changes a documented contract.
 
     What the positional tuple establishes, measured mutation by mutation:
-    dropping a field fails (``TypeError``, seven positional arguments for six
-    parameters), and reordering two fields whose defaults differ fails. What it
-    does not establish: adding a seventh field with a default passes, and
-    swapping ``ping_interval_seconds`` with ``ping_timeout_seconds`` passes,
-    because both hold ``_KEEPALIVE_SECONDS``.
+    dropping a field fails (``TypeError``, too many positional arguments for
+    the remaining parameters), and reordering two fields whose defaults differ
+    fails. What it does not establish: *adding* a field with a default passes,
+    and swapping ``ping_interval_seconds`` with ``ping_timeout_seconds``
+    passes, because both hold ``_KEEPALIVE_SECONDS``. The first of those gaps
+    is why the field set itself is asserted by name in
+    ``test_every_stated_bound_is_named_and_not_merely_positional``; this test
+    is kept for the ordering the dict cannot see.
 
     It also says nothing about which ``serve()`` keyword each field reaches.
     Measured, that mapping is pinned by
@@ -134,9 +148,60 @@ def test_the_stated_transport_bounds_are_the_values_they_replaced() -> None:
     as ``close_timeout`` parks the connection in ``CLOSING`` past its ceiling,
     and it is the only failure in the suite. The stalled-subscriber test cannot
     catch the same swap, because there ``write_deadline_seconds`` is the
-    shorter of the two.
+    shorter of the two. ``receive_frame_bytes`` reaching ``max_size`` is pinned
+    by ``test_an_inbound_frame_past_the_stated_cap_is_refused_by_the_gateway``,
+    which lowers it and sends a frame the default would have accepted.
     """
-    assert WebSocketLimits() == WebSocketLimits(20.0, 20.0, 10.0, 40.0, 32768, (32, 8))
+    assert WebSocketLimits() == WebSocketLimits(
+        20.0, 20.0, 10.0, 40.0, 32768, (32, 8), 1048576, 1048576
+    )
+
+
+def test_every_stated_bound_is_named_and_not_merely_positional() -> None:
+    """The set of bounds, by name, is exactly what the wire contract states.
+
+    Keyed by field name rather than compared as a tuple, because the tuple
+    comparison above cannot see a field being added: measured, it passes
+    unchanged when a new field with a default is appended, which is how
+    ``max_size`` stayed an unstated inherited default while six bounds around
+    it were named. A dict comparison fails on an added, removed, or renamed
+    field as well as on a changed default, so a bound cannot enter or leave
+    this dataclass without this assertion being edited to say so.
+
+    What it deliberately does not check is field order, which only the
+    positional test above can see.
+    """
+    assert asdict(WebSocketLimits()) == {
+        "ping_interval_seconds": 20.0,
+        "ping_timeout_seconds": 20.0,
+        "close_timeout_seconds": 10.0,
+        "write_deadline_seconds": 40.0,
+        "send_buffer_bytes": 32768,
+        "receive_queue": (32, 8),
+        "receive_frame_bytes": 1048576,
+        "send_frame_bytes": 1048576,
+    }
+
+
+def test_the_frame_caps_default_to_the_websockets_value_they_state() -> None:
+    """Both frame caps must keep stating the installed library's own default.
+
+    The two defaults exist to reproduce what the gateway inherited before it
+    named them, and that only stays true while the library agrees. This reads
+    the installed signatures rather than restating a number, so a ``websockets``
+    bump that moves ``max_size`` fails here instead of silently changing the
+    inbound cap (``serve``) or invalidating the send-side chunk budget, which is
+    sized against the smallest cap a supported client imposes and so is a claim
+    about ``connect``.
+
+    Asserted on both entry points because they are separate defaults in the
+    library and the gateway depends on one of each: ``serve`` is what it
+    enforces, ``connect`` is what the Python clients that consume its stream
+    enforce back.
+    """
+    limits = WebSocketLimits()
+    assert signature(serve).parameters["max_size"].default == limits.receive_frame_bytes
+    assert signature(connect).parameters["max_size"].default == limits.send_frame_bytes
 
 
 def test_gateway_serves_assets_and_round_trips_protocol_frames(tmp_path: Path) -> None:
@@ -1168,6 +1233,233 @@ def test_a_write_that_never_drains_abandons_the_peer_and_frees_its_subscription(
     assert len(reported) == 1
     assert str(gateway.limits.write_deadline_seconds) in reported[0].getMessage()
     parts.close()
+
+
+# A backlog whose bootstrap batch is a multiple of the frame cap, so the replay
+# needs at least three frames and therefore exercises a chunk that is neither
+# first nor last. Sized by construction rather than by a count taken on faith:
+# the test measures the unchunked batch and fails if it is not over the cap, so
+# a change to the event envelope cannot quietly turn this into a one-frame case
+# that no longer covers anything. Measured here, each event serializes to about
+# 854B and the whole batch to about 2.5 caps. Only "about": every event carries
+# the run id, which the fixture takes from its temp directory's name, so the
+# total moves by 20B per event between runs.
+_BACKLOG_EVENT_TEXT = "x" * 512
+_BACKLOG_EVENTS = 3000
+# The cap the Python ``websockets`` client enforces on a message it receives,
+# read from the installed library rather than restated. This, not the gateway's
+# own field, is what the replay below is measured against: the bound that broke
+# the replay is the one a supported *peer* imposes, and the gateway's
+# ``send_frame_bytes`` is a claim about it that
+# ``test_the_frame_caps_default_to_the_websockets_value_they_state`` is what
+# ties down. Reading it here also keeps this test meaningful against a merge
+# base that has no such field, where it fails on the close rather than on a
+# missing attribute.
+_CLIENT_FRAME_CAP = cast("int", signature(connect).parameters["max_size"].default)
+
+
+async def _next_frame(websocket: ClientConnection) -> str:
+    """Read one frame, failing rather than hanging if the stream stops early.
+
+    The deadline is a deadlock guard and nothing else. The replay's own
+    stopping condition is the watermark the batch must reach, so expiry is
+    never a value this test consumes: it can only fail the test on the spot,
+    and it exists because a send path that stopped short would otherwise block
+    this reader forever instead of reporting.
+    """
+    return cast("str", await asyncio.wait_for(websocket.recv(), timeout=30))
+
+
+async def _replay_batches(gateway: WebSocketGateway, watermark: int) -> list[str]:
+    """Subscribe and read the bootstrap replay up to *watermark*."""
+    origin = f"http://127.0.0.1:{gateway.bound_port}"
+    frames: list[str] = []
+    async with connect(gateway.websocket_url, origin=cast("Origin", origin)) as websocket:
+        await websocket.send(SubscribeRequest(client_id="backlog-client").model_dump_json())
+        assert json.loads(await _next_frame(websocket))["type"] == "subscribed"
+        while True:
+            frame = await _next_frame(websocket)
+            frames.append(frame)
+            batch = json.loads(frame)
+            assert batch["type"] == "event_batch"
+            if batch["through_sequence"] >= watermark:
+                return frames
+
+
+def _bootstrap_batch(api: RunApi) -> EventBatchMessage:
+    """Build the one batch the gateway's bootstrap would send for a full replay."""
+    bootstrap = api.subscription_bootstrap(0, None)
+    return EventBatchMessage(
+        events=bootstrap.events,
+        through_sequence=bootstrap.through_sequence,
+        active_executions=bootstrap.active_executions,
+        history_after_sequence=0,
+        store_id=bootstrap.store_id,
+    )
+
+
+def test_a_backlog_past_the_frame_cap_is_delivered_instead_of_closing_the_connection(
+    tmp_path: Path,
+) -> None:
+    """A whole-history bootstrap must reach a peer that enforces the frame cap.
+
+    ``_write_bootstrap`` is the one batch no client-supplied bound limits: a
+    client that has never subscribed sends no ``tail``, so the batch is sized
+    by the run's entire backlog. Against the merge base this test does not fail
+    an assertion, it never gets the data: measured, the client refuses the
+    2623614B frame and the connection dies, raising ``ConnectionClosedError``
+    ("sent 1009 (message too big) ... exceeds limit of 1048576 bytes") on the
+    first read after ``subscribed``. Nothing on the server side notices, which
+    is why the failure had to be found from a client.
+
+    The client is deliberately left on its stock ``max_size``. The cap under
+    test is the one a supported client imposes, not one this test invents, so
+    configuring the client would test the wrong number.
+    """
+    parts = build_server_parts(tmp_path / "logs")
+    for index in range(_BACKLOG_EVENTS):
+        parts.journal.publish_output("stdout", f"{index}: {_BACKLOG_EVENT_TEXT}")
+    expected = _bootstrap_batch(parts.api)
+    unchunked = len(expected.model_dump_json().encode())
+    assert unchunked > 2 * _CLIENT_FRAME_CAP, unchunked
+
+    with WebSocketGateway(parts.api) as gateway:
+        frames = asyncio.run(_replay_batches(gateway, parts.api.latest_sequence))
+    parts.close()
+
+    assert max(len(frame.encode()) for frame in frames) <= _CLIENT_FRAME_CAP
+    # Fewest frames, not merely enough of them: one frame per cap's worth of
+    # payload, plus one for the envelope each frame repeats. A regression to
+    # one event per frame would deliver the same events and fail here.
+    assert 2 < len(frames) <= -(-unchunked // _CLIENT_FRAME_CAP) + 1
+    batches = [EventBatchMessage.model_validate_json(frame) for frame in frames]
+    assert [event for batch in batches for event in batch.events] == expected.events
+    # Every chunk reports only what it carried, so a peer that folds them in
+    # order holds a cursor it can resume from at any point in the replay.
+    assert [batch.through_sequence for batch in batches] == [
+        *(batch.events[-1].sequence for batch in batches[:-1]),
+        expected.through_sequence,
+    ]
+
+
+# Chunking is exercised against a lowered send cap rather than a megabyte of
+# generated events, because the cap is a declared bound and lowering it is
+# setting an input. 4096 leaves about 3900 bytes for events once the envelope
+# is paid, and the generated texts below top out well under that, so no single
+# event can overflow a frame on its own and every frame owes the budget.
+_CHUNKED_SEND_FRAME_BYTES = 4096
+# Multi-byte and astral characters are in the alphabet on purpose: the batch is
+# measured in UTF-8 bytes but ``model_dump_json`` returns a ``str`` and emits
+# these raw rather than escaped, so an accounting that counted characters would
+# overflow the frame by up to 4x here and pass on ASCII alone.
+_EVENT_TEXTS = st.lists(
+    st.text(alphabet="ab é水\U0001d11e", min_size=0, max_size=400),
+    min_size=0,
+    max_size=40,
+)
+
+
+@settings(max_examples=15, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(texts=_EVENT_TEXTS)
+@example(texts=[])
+@example(texts=["\U0001d11e" * 400] * 8)
+def test_a_chunked_batch_reaches_the_peer_whole_and_within_the_stated_send_cap(
+    tmp_path: Path, texts: list[str]
+) -> None:
+    """Whatever the batch, every frame fits the cap and the events arrive whole.
+
+    Four properties, over a real gateway and a real client rather than the
+    splitter in isolation, so what is measured is the bytes on the wire:
+
+    - A batch is chunked exactly when it has to be, so one that fits still
+      costs one frame.
+    - Every frame is within ``send_frame_bytes``. This is what pins the size
+      accounting, which is arithmetic over measured lengths rather than trial
+      serialization and so relies on compact JSON rendering a list as its items
+      joined by commas. If that ever stops holding, this fails.
+    - The events arrive exactly once each, in order, with nothing added. A
+      chunk boundary is not allowed to drop, duplicate, or reorder an event.
+    - No cursor runs ahead of its events. Each frame's ``through_sequence`` is
+      the last sequence it carried, except the final one, which carries the
+      batch's own watermark and so may run past its last event.
+
+    Two examples are pinned rather than left to generation. The empty batch is
+    the one case that must still produce exactly one frame: a checkpoint with
+    no events still reports a watermark, and yielding nothing would strand the
+    subscriber. The eight astral-character events are the opposite end, four
+    frames' worth, so the multi-frame path is covered without depending on what
+    the generator happened to draw.
+    """
+    parts = build_server_parts(tmp_path / "logs")
+    for text in texts:
+        parts.journal.publish_output("stdout", text)
+    expected = _bootstrap_batch(parts.api)
+    unchunked = len(expected.model_dump_json().encode())
+    limits = WebSocketLimits(send_frame_bytes=_CHUNKED_SEND_FRAME_BYTES)
+
+    with WebSocketGateway(parts.api, limits=limits) as gateway:
+        frames = asyncio.run(_replay_batches(gateway, parts.api.latest_sequence))
+    parts.close()
+
+    # Chunked exactly when it had to be, so a batch that fits still costs one
+    # frame. The biconditional holds because the generated texts cannot produce
+    # a single event above the budget; one that could would land here, which is
+    # the right place for it to be reported.
+    assert (len(frames) > 1) == (unchunked > _CHUNKED_SEND_FRAME_BYTES)
+    assert max(len(frame.encode()) for frame in frames) <= _CHUNKED_SEND_FRAME_BYTES
+    batches = [EventBatchMessage.model_validate_json(frame) for frame in frames]
+    assert [event for batch in batches for event in batch.events] == expected.events
+    assert [batch.through_sequence for batch in batches] == [
+        *(batch.events[-1].sequence for batch in batches[:-1]),
+        expected.through_sequence,
+    ]
+
+
+def test_an_inbound_frame_past_the_stated_cap_is_refused_by_the_gateway(
+    tmp_path: Path,
+) -> None:
+    """``receive_frame_bytes`` must be the cap the gateway actually enforces.
+
+    Lowered to 4096 and probed from both sides of it, which is what pins the
+    field onto ``serve()``'s ``max_size`` keyword: a request that the stock
+    1 MiB cap would accept is refused here, and one just under the lowered cap
+    still answers. The client is given ``max_size=None`` so the only cap in
+    play is the server's.
+
+    The rejection is a transport close with code 1009 and no in-band frame,
+    which is *not* the ``WP-PROTOCOL-ERROR`` shape the gateway uses for every
+    failure it decides itself. It cannot be: ``websockets`` raises inside its
+    own reader and closes before the handler is ever handed the frame, so the
+    only way to answer in band would be ``max_size=None`` plus a size check
+    after buffering the whole message, which removes the bound the cap exists
+    to enforce. Pinned here so the difference is a recorded outcome rather than
+    a surprise.
+    """
+    parts = build_server_parts(tmp_path / "logs")
+    limits = WebSocketLimits(receive_frame_bytes=4096)
+
+    async def probe(gateway: WebSocketGateway, text: str) -> object:
+        origin = f"http://127.0.0.1:{gateway.bound_port}"
+        async with connect(
+            gateway.websocket_url, origin=cast("Origin", origin), max_size=None
+        ) as websocket:
+            await websocket.send(SteerCommand(text=text).model_dump_json())
+            return json.loads(await _next_frame(websocket))
+
+    with WebSocketGateway(parts.api, limits=limits) as gateway:
+        accepted = asyncio.run(probe(gateway, "s" * 3000))
+        with pytest.raises(ConnectionClosedError) as refused:
+            asyncio.run(probe(gateway, "s" * 8000))
+    parts.close()
+
+    assert cast("dict[str, Any]", accepted)["ok"] is True
+    # ``rcvd_then_sent`` is what says the gateway refused it rather than the
+    # client declining to read it: the close arrived and was then echoed, so
+    # both halves carry 1009 and only the order distinguishes the two cases.
+    assert refused.value.rcvd_then_sent is True
+    assert refused.value.rcvd is not None
+    assert refused.value.rcvd.code == 1009
+    assert str(limits.receive_frame_bytes) in refused.value.rcvd.reason
 
 
 def test_gateway_publishes_and_cleans_project_instance_record(tmp_path: Path) -> None:
