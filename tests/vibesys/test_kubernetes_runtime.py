@@ -28,6 +28,7 @@ TRAIN_CONFIG = EXAMPLES_ROOT / "repositories/train-ticket/.vibesys/tasks/kuberne
 sys.path.insert(0, str(EVALUATOR_ROOT))
 
 from kubernetes_runtime import (  # noqa: E402  # lint-waiver: LW-006003; import the fixture module after adding its resource directory to sys.path.
+    ForwardLauncher,
     HTTPProbe,
     KubernetesConfig,
     KubernetesLifecycle,
@@ -42,6 +43,17 @@ from kubernetes_runtime.control import (  # noqa: E402  # lint-waiver: LW-006005
     LifecycleControlServer,
     request_action,
 )
+
+
+def _assume_free_port(_name: str, _port: int) -> None:
+    """Keep fake-forward tests independent of which loopback ports the host uses."""
+
+
+def _launcher(popen: Callable[..., _Process] | None = None) -> ForwardLauncher:
+    return ForwardLauncher(
+        popen=popen or (lambda *_args, **_kwargs: _Process()),
+        require_free_port=_assume_free_port,
+    )
 
 
 class _Process:
@@ -140,6 +152,7 @@ def _start_lifecycle(
     config: KubernetesConfig | None = None,
     runner: _Runner | None = None,
     popen: Callable[..., _Process] | None = None,
+    forwards: ForwardLauncher | None = None,
 ) -> tuple[KubernetesLifecycle, _Runner]:
     _service_manifest(tmp_path)
     active_runner = runner or _Runner()
@@ -149,7 +162,7 @@ def _start_lifecycle(
         tmp_path,
         config_dir=tmp_path,
         runner=active_runner,
-        popen=popen or (lambda *_args, **_kwargs: _Process()),
+        forwards=forwards or _launcher(popen),
     )
     lifecycle.start()
     return lifecycle, active_runner
@@ -175,7 +188,7 @@ def test_manifest_is_config_relative_and_namespace_scoped(tmp_path: Path) -> Non
         candidate,
         config_dir=config_dir,
         runner=runner,
-        popen=lambda *_args, **_kwargs: _Process(),
+        forwards=_launcher(),
     )
     lifecycle.start()
     apply_index = next(index for index, call in enumerate(runner.calls) if "apply" in call)
@@ -253,7 +266,7 @@ def test_http_probe_retries_incomplete_response(
         tmp_path,
         config_dir=tmp_path,
         runner=runner,
-        popen=lambda *_args, **_kwargs: _Process(),
+        forwards=_launcher(),
     )
     calls = 0
 
@@ -291,7 +304,7 @@ def test_http_probe_waits_for_expected_json(
         tmp_path,
         config_dir=tmp_path,
         runner=_Runner(),
-        popen=lambda *_args, **_kwargs: _Process(),
+        forwards=_launcher(),
     )
     responses = iter(
         [
@@ -330,7 +343,7 @@ def test_http_probe_json_timeout_reports_expected_subset(
         tmp_path,
         config_dir=tmp_path,
         runner=_Runner(),
-        popen=lambda *_args, **_kwargs: _Process(),
+        forwards=_launcher(),
     )
     times = iter([0.0, 0.0, 2.0])
     monkeypatch.setattr("time.monotonic", lambda: next(times))
@@ -370,7 +383,7 @@ def test_lifecycle_start_restart_reset_and_close(tmp_path: Path) -> None:
         return process
 
     lifecycle = KubernetesLifecycle(
-        config, tmp_path, config_dir=tmp_path, runner=runner, popen=popen
+        config, tmp_path, config_dir=tmp_path, runner=runner, forwards=_launcher(popen)
     )
     lifecycle.start()
     first_namespace = lifecycle.namespace
@@ -878,7 +891,7 @@ def test_social_network_assets_build_and_override_candidate_services() -> None:
         Path("examples/microservices/repositories"),
         config_dir=SOCIAL_CONFIG.parent,
         runner=runner,
-        popen=lambda *_args, **_kwargs: _Process(),
+        forwards=_launcher(),
     )
     lifecycle.start()
     apply_index = next(index for index, call in enumerate(runner.calls) if "apply" in call)
@@ -950,7 +963,7 @@ def test_train_ticket_assets_build_current_java_modules(tmp_path: Path) -> None:
         candidate,
         config_dir=TRAIN_CONFIG.parent,
         runner=runner,
-        popen=lambda *_args, **_kwargs: _Process(),
+        forwards=_launcher(),
     )
     lifecycle.start()
     apply_index = next(index for index, call in enumerate(runner.calls) if "apply" in call)
@@ -1041,7 +1054,7 @@ def test_candidate_image_is_built_once_and_reused_across_reset(tmp_path: Path) -
         tmp_path,
         config_dir=tmp_path,
         runner=runner,
-        popen=lambda *_args, **_kwargs: _Process(),
+        forwards=_launcher(),
     )
 
     lifecycle.start()
@@ -1067,3 +1080,52 @@ def test_candidate_image_is_built_once_and_reused_across_reset(tmp_path: Path) -
     assert set_images == [first_image, first_image]
     assert runner.timeouts
     assert set(runner.timeouts) == {180}
+
+
+def test_start_rejects_forward_port_owned_by_another_listener(tmp_path: Path) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as foreign:
+        foreign.bind(("0.0.0.0", 0))  # noqa: S104  # lint-waiver: LW-006013; a wildcard listener is the collision under test.
+        foreign.listen()
+        port = foreign.getsockname()[1]
+        config = _config(Path("manifest.yaml")).model_copy(
+            update={
+                "forwards": (
+                    ServiceForward(
+                        name="gateway",
+                        resource="service/gateway",
+                        remote_port=8080,
+                        local_port=port,
+                    ),
+                ),
+                "primary_endpoint": "gateway",
+                "http_probes": (),
+            }
+        )
+        started: list[tuple[object, ...]] = []
+
+        def popen(*args: object, **_kwargs: object) -> _Process:
+            started.append(args)
+            return _Process()
+
+        with pytest.raises(RuntimeError, match=f"local port {port} for forward 'gateway'"):
+            _start_lifecycle(
+                tmp_path,
+                config=KubernetesConfig.model_validate(config.model_dump()),
+                forwards=ForwardLauncher(popen=popen),
+            )
+        assert started == []
+
+
+def test_forwards_bind_only_ipv4_loopback(tmp_path: Path) -> None:
+    commands: list[list[str]] = []
+
+    def popen(command: list[str], *_args: object, **_kwargs: object) -> _Process:
+        commands.append(command)
+        return _Process()
+
+    lifecycle, _runner = _start_lifecycle(tmp_path, popen=popen)
+    lifecycle.close()
+    assert commands
+    for command in commands:
+        index = command.index("port-forward")
+        assert command[index + 1 : index + 3] == ["--address", "127.0.0.1"]

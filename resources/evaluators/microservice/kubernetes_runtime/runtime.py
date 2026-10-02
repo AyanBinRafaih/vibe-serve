@@ -5,12 +5,14 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import socket
 import subprocess
 import time
 import urllib.error
 import urllib.request
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -227,6 +229,14 @@ class KubernetesLifecycleError(RuntimeError):
         """Create an error when a port forward exits before readiness."""
         return cls("kubectl port-forward exited before readiness")
 
+    @classmethod
+    def forward_port_in_use(cls, name: str, port: int) -> KubernetesLifecycleError:
+        """Create an error when another process already owns a forward's local port."""
+        return cls(
+            f"local port {port} for forward {name!r} is already in use on 127.0.0.1; "
+            "choose a free local_port"
+        )
+
 
 class KubernetesReadinessTimeoutError(TimeoutError):
     """Report that HTTP readiness probes did not pass before the deadline."""
@@ -302,6 +312,34 @@ def _default_runner(
         raise KubernetesLifecycleError.command_timed_out(timeout_seconds, command) from error
 
 
+def _require_free_local_port(name: str, port: int) -> None:
+    """Fail when another process owns ``127.0.0.1:port``.
+
+    Without this check, kubectl may bind only the IPv6 loopback while a foreign
+    IPv4 listener answers readiness probes and evaluator traffic.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        # Match kubectl's listener options so TIME_WAIT sockets from an earlier
+        # forward do not count as a conflict; an active listener still does.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError as error:
+            raise KubernetesLifecycleError.forward_port_in_use(name, port) from error
+
+
+@dataclass(frozen=True)
+class ForwardLauncher:
+    """Start port-forward processes on this host.
+
+    ``require_free_port`` receives each forward's name and local port before
+    ``popen`` starts kubectl, and raises when the port cannot be used.
+    """
+
+    popen: Callable[..., ForwardProcess] = subprocess.Popen
+    require_free_port: Callable[[str, int], None] = _require_free_local_port
+
+
 def load_config(path: Path) -> KubernetesConfig:
     """Load a strict JSON or YAML lifecycle configuration."""
     return KubernetesConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
@@ -329,14 +367,14 @@ class KubernetesLifecycle:
         *,
         config_dir: Path | None = None,
         runner: CommandRunner = _default_runner,
-        popen: Callable[..., ForwardProcess] = subprocess.Popen,
+        forwards: ForwardLauncher | None = None,
     ) -> None:
         """Create the namespace-scoped deployment runtime."""
         self.config = config
         self.candidate_dir = candidate_dir.resolve()
         self.config_dir = (config_dir or candidate_dir).resolve()
         self._runner = runner
-        self._popen = popen
+        self._launcher = forwards or ForwardLauncher()
         self._namespace: str | None = None
         self._namespace_uid: str | None = None
         self._ownership_token: str | None = None
@@ -697,10 +735,13 @@ class KubernetesLifecycle:
 
     def _start_forwards(self) -> None:
         for forward in self.config.forwards:
+            self._launcher.require_free_port(forward.name, forward.local_port)
             self._forwards.append(
-                self._popen(
+                self._launcher.popen(
                     self._kubectl(
                         "port-forward",
+                        "--address",
+                        "127.0.0.1",
                         forward.resource,
                         f"{forward.local_port}:{forward.remote_port}",
                         namespaced=True,
