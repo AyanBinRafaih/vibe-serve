@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from vs_agent.base import ResponseFallback
 from vs_agent.catalog import DriverInfo, agent_catalog
 from vs_agent.cli_docker import (
     DOCKER_PROVIDER_ENV,
@@ -57,6 +56,7 @@ from vs_agent.provider_policy import (
     cli_mcp_config_files,
     cli_skill_dirs,
 )
+from vs_agent.runner import describe_validation_error
 from vs_agent.selection import AgentSelection
 from vs_agent.session_key import AgentSessionKey, SessionScope
 from vs_agent.session_store import (
@@ -117,7 +117,6 @@ __all__ = [
     "MCPServerSpec",
     "NullAgentEventSink",
     "NullSessionStore",
-    "ResponseFallback",
     "RoundProgress",
     "SessionScope",
     "SessionStore",
@@ -138,6 +137,7 @@ __all__ = [
     "cli_mcp_config_files",
     "cli_skill_dirs",
     "declare_provider_state_resources",
+    "describe_validation_error",
     "expose_as_tools",
     "register_tool",
     "serve_stdio",
