@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from collections import deque
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from pydantic import BaseModel, ValidationError
 
 from vibesys.orchestration.dynamic import (
@@ -31,8 +35,6 @@ from vs_runtime.api import (
 from vs_runtime.api.testing import FakeEvaluation, FakeRun
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from vs_runtime.api import AgentRole, Workspace
 
 
@@ -914,3 +916,151 @@ def test_noise_aware_multi_axis_frontier_drives_dispositions_and_winner(
     }
     winner = next(item for item in state.workstreams if item.hypothesis_id == "fast")
     assert state.winner_revision == winner.candidate_revision
+
+
+def test_failed_slot_sequence_is_not_reused_by_a_later_winner(tmp_path: Path) -> None:
+    """A slot that failed before recording a round keeps its sequence to itself.
+
+    Otherwise a later workstream reuses the number, and the winner lookup by
+    round number resolves to the failed slot's unreviewed revision.
+    """
+
+    def respond(
+        role: AgentRole,
+        _history: tuple[str, ...],
+        message: str,
+        _response: type[BaseModel] | None,
+    ) -> object:
+        if role.id == ORCHESTRATOR.id:
+            return _portfolio("winner") if "epoch 2" in message else _portfolio("base", "broken")
+        hypothesis_id = next(
+            name for name in ("base", "broken", "winner") if f"`{name}`" in message
+        )
+        if role.id == IMPLEMENTER.id:
+            return _implementation(hypothesis_id)
+        if hypothesis_id == "broken":
+            raise _JudgeTransportError
+        return {"passed": True, "analysis": "Candidate is correct."}
+
+    async def scenario() -> FakeRun:
+        run = FakeRun(
+            PLUGIN,
+            project_root=tmp_path,
+            facts=RunFacts(domain_id="generic", objective="Improve.", benchmark_configured=True),
+            responder=respond,
+            supported_extra_tools={"evaluation", "profiler"},
+            supports_parallel_candidates=True,
+            supported_agent_capabilities={
+                AgentCapability.MCP_SERVERS,
+                AgentCapability.SESSION_REUSE,
+                AgentCapability.PROVIDER_SESSION_RESUME,
+            },
+        )
+        run.evaluation.script_benchmark(
+            *(
+                BenchmarkEvaluation(
+                    executed=True,
+                    metric_name="throughput",
+                    metric_value=value,
+                    metric_direction=MetricDirection.MAXIMIZE,
+                    row={"throughput": value},
+                )
+                for value in (10.0, 20.0)
+            )
+        )
+        await PLUGIN.orchestrate(run, _options(max_rounds=2))
+        return run
+
+    run = asyncio.run(scenario())
+    state = asyncio.run(run.state.load(DynamicState))
+    assert state is not None
+    sequences = [item.sequence for item in state.workstreams]
+    assert len(sequences) == len(set(sequences))
+    winner = next(item for item in state.workstreams if item.hypothesis_id == "winner")
+    assert state.winner_revision == winner.candidate_revision
+
+
+_FATES = st.sampled_from(("raise", "reject", "pass"))
+
+
+@settings(max_examples=30, deadline=None)
+@given(epochs=st.lists(st.tuples(_FATES, _FATES), min_size=1, max_size=3))
+def test_winner_is_always_the_workstream_of_the_winning_round(
+    epochs: list[tuple[str, str]],
+) -> None:
+    """For any mix of failed, rejected, and evaluated slots, adoption is consistent.
+
+    Sequences stay unique, and the adopted revision is the candidate of the
+    workstream that recorded the best trusted round.
+    """
+    fates = {
+        f"e{epoch}-{slot}": fate
+        for epoch, pair in enumerate(epochs, start=1)
+        for slot, fate in zip("ab", pair, strict=True)
+    }
+    planned = 0
+
+    def respond(
+        role: AgentRole,
+        _history: tuple[str, ...],
+        message: str,
+        _response: type[BaseModel] | None,
+    ) -> object:
+        nonlocal planned
+        if role.id == ORCHESTRATOR.id:
+            planned += 1
+            return _portfolio(f"e{planned}-a", f"e{planned}-b")
+        hypothesis_id = next(name for name in fates if f"`{name}`" in message)
+        if role.id == IMPLEMENTER.id:
+            return _implementation(hypothesis_id)
+        if fates[hypothesis_id] == "raise":
+            raise _JudgeTransportError
+        passed = fates[hypothesis_id] == "pass"
+        return {"passed": passed, "analysis": "Reviewed.", "feedback": "" if passed else "No."}
+
+    async def scenario(root: Path) -> FakeRun:
+        run = FakeRun(
+            PLUGIN,
+            project_root=root,
+            facts=RunFacts(domain_id="generic", objective="Improve.", benchmark_configured=True),
+            responder=respond,
+            supported_extra_tools={"evaluation", "profiler"},
+            supports_parallel_candidates=True,
+            supported_agent_capabilities={
+                AgentCapability.MCP_SERVERS,
+                AgentCapability.SESSION_REUSE,
+                AgentCapability.PROVIDER_SESSION_RESUME,
+            },
+        )
+        run.evaluation.script_benchmark(
+            *(
+                BenchmarkEvaluation(
+                    executed=True,
+                    metric_name="throughput",
+                    metric_value=value,
+                    metric_direction=MetricDirection.MAXIMIZE,
+                    row={"throughput": value},
+                )
+                for value in (10.0 * (index + 1) for index in range(len(fates)))
+            )
+        )
+        await PLUGIN.orchestrate(run, _options(max_rounds=len(epochs)))
+        return run
+
+    with tempfile.TemporaryDirectory() as directory:
+        run = asyncio.run(scenario(Path(directory)))
+        state = asyncio.run(run.state.load(DynamicState))
+    assert state is not None
+    sequences = [item.sequence for item in state.workstreams]
+    assert len(sequences) == len(set(sequences))
+    trusted = [
+        record
+        for record in state.search.rounds
+        if record.official_evaluation and record.perf_metric is not None
+    ]
+    if not trusted:
+        assert state.winner_revision is None
+        return
+    best = max(trusted, key=lambda record: record.perf_metric or 0.0)
+    winner = next(item for item in state.workstreams if item.hypothesis_id == best.hypothesis_id)
+    assert state.winner_revision == winner.candidate_revision == best.commit
