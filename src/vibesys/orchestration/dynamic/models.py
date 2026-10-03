@@ -21,7 +21,13 @@ from vibesys.orchestration.agent_options import AgentOrchestrationOptions
 from vibesys.orchestration.hypothesis.plan import HypothesisStrategyUpdate
 from vibesys.orchestration.hypothesis.state import HypothesisState
 from vs_loop_state.api import HypothesisOutcome
-from vs_runtime.api import AgentId, CandidateProfile, MetricDirection, PartialMeasurement
+from vs_runtime.api import (
+    AgentId,
+    CandidateProfile,
+    CandidateProfileStatus,
+    MetricDirection,
+    PartialMeasurement,
+)
 
 if TYPE_CHECKING:
     from pydantic.config import ExtraValues
@@ -220,6 +226,43 @@ class PortfolioPlan(BaseModel):
         return self
 
 
+class ImplementPortfolioPlan(PortfolioPlan):
+    """The planner's reply in a run that cannot profile: its schema offers no profile kind.
+
+    Validation is the portfolio's own, so a profile entry still parses and is
+    then corrected with the reason named, while a provider that enforces the
+    schema never produces one.
+    """
+
+    @classmethod
+    @override
+    def model_json_schema(
+        cls,
+        by_alias: bool = True,
+        ref_template: str = "#/$defs/{model}",
+        schema_generator: type[GenerateJsonSchema] = _AnyOfTaggedUnions,
+        mode: JsonSchemaMode = "validation",
+        *,
+        union_format: Literal["any_of", "primitive_type_array"] = "any_of",
+    ) -> dict[str, Any]:
+        """Return the portfolio schema with implement workstreams as the only entry kind."""
+        schema = super().model_json_schema(
+            by_alias=by_alias,
+            ref_template=ref_template,
+            schema_generator=schema_generator,
+            mode=mode,
+            union_format=union_format,
+        )
+        # The agent reads the portfolio's description, not this class's.
+        schema["description"] = PortfolioPlan.model_json_schema()["description"]
+        definitions = schema["$defs"]
+        del definitions["PlannedWorkstream"], definitions["ProfilePlan"]
+        workstreams = schema["properties"]["workstreams"]
+        workstreams["items"] = {"$ref": ref_template.format(model="WorkstreamPlan")}
+        workstreams["description"] = "The new workstreams to start: one entry per hypothesis."
+        return schema
+
+
 class ImplementerResult(BaseModel):
     """An implementer's compact, evidence-linked result."""
 
@@ -411,7 +454,8 @@ class DynamicProfile(BaseModel):
     """Durable record of one profile workstream and its trusted outcome.
 
     It shares the workstream sequence, so it spends one unit of the workstream
-    budget, but records no round: a profile produces no candidate.
+    budget unless it ends unsupported, but records no round: a profile
+    produces no candidate.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -512,6 +556,17 @@ class DynamicState(BaseModel):
             raise ValueError(message)
         return self
 
+    def unsupported_profiles(self) -> int:
+        """Return how many profiles ended unsupported: no capture ran for them.
+
+        The first one proves the run cannot profile, so policy stops offering
+        profiles; the outcomes themselves are the durable record of that.
+        """
+        return sum(
+            item.outcome is not None and item.outcome.status is CandidateProfileStatus.UNSUPPORTED
+            for item in self.profiles
+        )
+
     def scheduled(self) -> int:
         """Return the largest sequence scheduled so far, implement or profile."""
         return max(
@@ -605,6 +660,7 @@ __all__ = [
     "DynamicWorkstream",
     "EvaluationResult",
     "EvidenceReference",
+    "ImplementPortfolioPlan",
     "ImplementerResult",
     "PlannedWorkstream",
     "PortfolioPlan",
