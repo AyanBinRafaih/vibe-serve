@@ -138,7 +138,9 @@ class _DynamicRun:
             await self.run.control.checkpoint()
             epoch = self.state.next_epoch
             plans = self._recoverable_plans(epoch)
-            if not plans:
+            # An epoch whose scheduled work all finished before a stop is
+            # closed, not planned a second time.
+            if not plans and not any(item.epoch == epoch for item in self.state.workstreams):
                 portfolio = await self._plan(epoch)
                 plans = portfolio.workstreams
                 await self._record_plans(epoch, portfolio)
@@ -161,6 +163,8 @@ class _DynamicRun:
         capacity = self._capacity()
         pending = list(plans)
         fatal_failures: list[BaseException] = []
+        failures = dict.fromkeys((plan.hypothesis_id for plan in plans), 0)
+        retries = self.options.max_retries_per_round
         while pending:
             batch = pending[:capacity]
             del pending[:capacity]
@@ -173,13 +177,40 @@ class _DynamicRun:
                     self.run.observations.note(
                         f"dynamic workstream {plan.hypothesis_id} failed: {result}"
                     )
-                    item = self.state.workstreams[self._index(plan.hypothesis_id)]
+                    index = self._index(plan.hypothesis_id)
+                    item = self.state.workstreams[index]
                     if not isinstance(result, DynamicAttemptError) or item.attempts == 0:
                         fatal_failures.append(result)
-                    elif item.attempts < self.options.max_retries_per_round:
+                        continue
+                    failures[plan.hypothesis_id] += 1
+                    # A failure after a retained implementation keeps its
+                    # checkpoint, so the retry resumes at the failed stage.
+                    retained = item.phase is not WorkstreamPhase.FAILED
+                    if failures[plan.hypothesis_id] < retries and (
+                        retained or item.attempts < retries
+                    ):
                         pending.append(plan)
+                    else:
+                        await self._give_up(index)
         if fatal_failures:
             raise fatal_failures[0]
+
+    async def _give_up(self, index: int) -> None:
+        """Mark a slot failed with its durable retry budget spent.
+
+        Leaving ``attempts`` below the budget would make resume treat the slot
+        as retryable and reimplement it from its parent.
+        """
+        async with self._state_lock:
+            current = self.state.workstreams[index]
+            self.state.workstreams[index] = current.model_copy(
+                update={
+                    "phase": WorkstreamPhase.FAILED,
+                    "attempts": max(current.attempts, self.options.max_retries_per_round),
+                },
+                deep=True,
+            )
+            await self._commit(label=f"dynamic: {current.hypothesis_id} retries exhausted")
 
     def _recoverable_plans(self, epoch: int) -> tuple[WorkstreamPlan, ...]:
         """Recover work durably scheduled but not completed before interruption."""
@@ -382,7 +413,8 @@ class _DynamicRun:
             await self._update(index, phase=WorkstreamPhase.FAILED)
             raise
         except Exception as error:
-            await self._update(index, phase=WorkstreamPhase.FAILED)
+            if self.state.workstreams[index].phase is WorkstreamPhase.IMPLEMENTING:
+                await self._update(index, phase=WorkstreamPhase.FAILED)
             raise DynamicAttemptError.from_cause(plan.hypothesis_id, error) from error
         finally:
             await workspace.discard()
