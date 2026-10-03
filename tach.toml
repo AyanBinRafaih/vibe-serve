@@ -207,7 +207,7 @@ depends_on = ["vibesys.api.contracts", "vibesys.plugin_builtins", "vibesys.plugi
 
 [[modules]]
 path = "vibesys.api.testing"
-depends_on = ["vibesys.api._session", "vibesys.api.contracts", "vibesys.api.session", "vibesys.api.store", "vibesys.plugin_catalog", "vibesys.run.contracts", "vs_agent", "vs_sandbox"]
+depends_on = ["vibesys.api._session", "vibesys.api.contracts", "vibesys.api.session", "vibesys.api.store", "vibesys.plugin_catalog", "vibesys.run.contracts", "vs_agent", "vs_runtime", "vs_sandbox"]
 
 [[modules]]
 path = "vibesys.orchestration"
@@ -478,7 +478,7 @@ depends_on = ["vs_evaluator_protocol"]
 [[modules]]
 path = "vs_evaluation.agent_mcp"
 layer = "prompts_and_lower_libs"
-depends_on = ["vs_agent", "vs_evaluation.agent_evidence", "vs_evaluation.agent_models", "vs_evaluation.profiler_models"]
+depends_on = ["vs_agent", "vs_evaluation.agent_models", "vs_evaluation.profiler_models"]
 
 [[modules]]
 path = "vs_evaluation.agent_models"

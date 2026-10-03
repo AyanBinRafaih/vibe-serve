@@ -429,6 +429,7 @@ graph TD
     vibesys.api.testing --> vibesys.plugin_catalog
     vibesys.api.testing --> vibesys.run.contracts
     vibesys.api.testing --> vs_agent
+    vibesys.api.testing --> vs_runtime
     vibesys.api.testing --> vs_sandbox
     vibesys.domains --> vibesys
     vibesys.domains --> vibesys.prompts
@@ -628,7 +629,6 @@ graph TD
     vs_async_ops.testing --> vs_async_ops.models
     vs_evaluation.agent_evidence --> vs_evaluator_protocol
     vs_evaluation.agent_mcp --> vs_agent
-    vs_evaluation.agent_mcp --> vs_evaluation.agent_evidence
     vs_evaluation.agent_mcp --> vs_evaluation.agent_models
     vs_evaluation.agent_mcp --> vs_evaluation.profiler_models
     vs_evaluation.agent_models --> vs_evaluation.agent_evidence
