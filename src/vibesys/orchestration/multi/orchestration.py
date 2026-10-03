@@ -31,6 +31,7 @@ from vibesys.orchestration.multi.models import (
     PaidAttempt,
     ProfileGuidedMultiOptions,
 )
+from vibesys.orchestration.multi.prompts import render_turn_failed_feedback
 from vibesys.orchestration.multi.turns import AttemptRequest, MultiAgentTurns, PlanRequest
 from vibesys.orchestration.profile_focus import (
     FocusView,
@@ -254,6 +255,8 @@ class _MultiRun:
             raise TypeError(message)
         if isinstance(decision, NewHypothesis):
             context = decision.context
+            # The pre-round and plan prompts point at this entry for the notice text.
+            self.files.note_carry(number, context.carry)
             guidance = await self._prepare_profile_guidance()
             profile_decision = await self.turns.pre_round(
                 number,
@@ -396,6 +399,10 @@ class _MultiRun:
             if isinstance(response, TurnFailed):
                 attempt.implementation = None
                 attempt.judge = JudgeSkipped(JudgeSkipReason.UNPARSEABLE_IMPLEMENTATION)
+                feedback = render_turn_failed_feedback(response.reason)
+                attempt.feedback = feedback
+                selected.request.active_hypothesis.feedback = feedback
+                await self._checkpoint_hypothesis(selected)
                 self.run.observations.warning(
                     f"[implementer] attempt {retry} returned no valid response "
                     f"({response.reason}); retrying"
