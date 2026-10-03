@@ -349,6 +349,8 @@ class _DynamicRun:
         ):
             await self._record_hypothesis_round(index)
             return
+        if item.phase is WorkstreamPhase.IMPLEMENTING:
+            await self._refund_interrupted_attempt(index)
         parent = item.parent_revision
         resume_implemented = item.phase in {
             WorkstreamPhase.IMPLEMENTED,
@@ -410,7 +412,8 @@ class _DynamicRun:
                 await self._update(index, phase=WorkstreamPhase.FAILED)
             await self._record_hypothesis_round(index)
         except asyncio.CancelledError:
-            await self._update(index, phase=WorkstreamPhase.FAILED)
+            # Keep the durable phase: resume continues from the last checkpoint
+            # and redoes an interrupted implementation.
             raise
         except Exception as error:
             if self.state.workstreams[index].phase is WorkstreamPhase.IMPLEMENTING:
@@ -418,6 +421,30 @@ class _DynamicRun:
             raise DynamicAttemptError.from_cause(plan.hypothesis_id, error) from error
         finally:
             await workspace.discard()
+
+    async def _refund_interrupted_attempt(self, index: int) -> None:
+        """Uncount an implementation attempt that a stop or crash interrupted.
+
+        A failed attempt is marked ``failed``; ``implementing`` at entry means
+        the attempt never finished, so it must not consume the retry budget.
+        At most ``max_retries_per_round`` interruptions are refunded per
+        workstream; beyond that the interrupted attempt counts as failed, so
+        an attempt that crashes the process every time cannot loop forever.
+        """
+        async with self._state_lock:
+            current = self.state.workstreams[index]
+            if current.refunded_attempts >= self.options.max_retries_per_round:
+                update: dict[str, object] = {"phase": WorkstreamPhase.FAILED}
+                label = f"dynamic: {current.hypothesis_id} interrupted attempt counted"
+            else:
+                update = {
+                    "phase": WorkstreamPhase.PENDING,
+                    "attempts": max(current.attempts - 1, 0),
+                    "refunded_attempts": current.refunded_attempts + 1,
+                }
+                label = f"dynamic: {current.hypothesis_id} resume interrupted"
+            self.state.workstreams[index] = current.model_copy(update=update, deep=True)
+            await self._commit(label=label)
 
     async def _assess_candidate(
         self,
