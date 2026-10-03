@@ -350,7 +350,7 @@ depends_on = ["vibesys", "vibesys.orchestration.prompts"]
 # Evaluator execution remains owned by the runtime and sandbox libraries.
 path = "vibesys.inputs"
 layer = "prompts_and_lower_libs"
-depends_on = ["vibesys", "vs_project", "vs_runtime"]
+depends_on = ["vibesys", "vs_project", "vs_runtime", "vs_prompts"]
 
 [[modules]]
 path = "vibesys.orchestration.evolve.population"
@@ -640,7 +640,7 @@ expose = ["IssueQueueOptions", "IssueQueueState", "PLUGIN", "REGISTRATION"]
 from = ["vibesys.orchestration.issue_queue"]
 
 [[interfaces]]
-expose = ["AgentInput", "BenchmarkCommand", "BenchmarkResult", "EnvironmentInput", "EVALUATOR_SRC_DIRNAME", "EvaluatorInput", "InputBundle", "InputCommand", "InputManifest", "InputSynthesisError", "MANIFEST_NAME", "ModalEnvironmentInput", "PROTOCOL_OUTPUT_FLAG", "ProfileGuidedInput", "SynthesizedInputSpec", "WorkspaceInput", "WorkspaceSource", "benchmark_output_argument", "load_input_bundle", "load_project_task", "render_input_manifest", "synthesize_input_bundle"]
+expose = ["AgentInput", "BenchmarkCommand", "BenchmarkResult", "EnvironmentInput", "EVALUATOR_SRC_DIRNAME", "EvaluatorInput", "InputBundle", "InputCommand", "InputManifest", "InputSynthesisError", "MANIFEST_NAME", "ModalEnvironmentInput", "PROTOCOL_OUTPUT_FLAG", "ProfileGuidedInput", "SynthesizedInputSpec", "WorkspaceInput", "WorkspaceSource", "benchmark_output_argument", "load_input_bundle", "load_project_task", "render_input_manifest", "synthesize_input_bundle", "with_operator_constraints"]
 from = ["vibesys.inputs"]
 
 [[interfaces]]
@@ -679,7 +679,7 @@ depends_on = ["vs_project", "vibesys.errors", "vs_runtime"]
 [[modules]]
 path = "vibesys.orchestration.steering"
 layer = "orchestration_host"
-depends_on = []
+depends_on = ["vs_prompts"]
 
 [[modules]]
 path = "vibesys.plugin_registration"

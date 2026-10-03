@@ -406,6 +406,7 @@ graph TD
     vibesys.api.testing --> vs_sandbox
     vibesys.inputs --> vibesys
     vibesys.inputs --> vs_project
+    vibesys.inputs --> vs_prompts
     vibesys.inputs --> vs_runtime
     vibesys.orchestration.agent_options --> vibesys.inputs
     vibesys.orchestration.agent_options --> vibesys.orchestration.metrics
@@ -497,6 +498,7 @@ graph TD
     vibesys.orchestration.single --> vs_runtime
     vibesys.orchestration.skill_selection --> vibesys
     vibesys.orchestration.skill_selection --> vs_agent
+    vibesys.orchestration.steering --> vs_prompts
     vibesys.plugin_builtins --> vibesys.orchestration.dynamic
     vibesys.plugin_builtins --> vibesys.orchestration.evolve
     vibesys.plugin_builtins --> vibesys.orchestration.issue_queue
