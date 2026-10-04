@@ -12,6 +12,7 @@ from vibesys.orchestration.profilers import (
 )
 from vibesys.run.contracts import RunRequest
 from vs_agent.api import agent_driver_supports_tool_servers
+from vs_project.api import Project, ProjectLayoutError
 from vs_runtime.api.infrastructure import (
     NativeCpuProfilerKind,
     RunEnvironment,
@@ -109,7 +110,18 @@ def resolve_run_profiler(
 
 
 def validate_run_request(request: RunRequest) -> None:
-    """Validate profiler policy and its workload before opening run resources."""
+    """Validate placement, profiler policy, and workload before opening run resources."""
+    if request.runs_dir is not None:
+        try:
+            Project.validate_collection_root(request.runs_dir)
+        except ProjectLayoutError as exc:
+            raise ConfigurationError(
+                ConfigurationDiagnostic(
+                    code="invalid_runs_dir",
+                    stage="request_validation",
+                    message=f"--runs-dir: {exc}",
+                )
+            ) from exc
     environment = build_run_environment(request.run_environment or make_run_environment_spec())
     resolve_run_profiler(request, environment, preflight=False)
 

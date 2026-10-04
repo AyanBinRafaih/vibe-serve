@@ -607,6 +607,7 @@ graph TD
     vibesys.run.profilers --> vibesys.orchestration.profilers
     vibesys.run.profilers --> vibesys.run.contracts
     vibesys.run.profilers --> vs_agent
+    vibesys.run.profilers --> vs_project
     vibesys.run.profilers --> vs_runtime
     vibesys.run.resources --> vibesys
     vibesys.run.resources --> vibesys.errors
@@ -672,6 +673,7 @@ graph TD
     vs_evaluation.coordinator --> vs_evaluation.ports
     vs_evaluation.filesystem_store --> vs_evaluation.coordinator
     vs_evaluation.filesystem_store --> vs_evaluation.models
+    vs_evaluation.filesystem_store --> vs_project
     vs_evaluation.ports --> vs_evaluation.models
     vs_evaluation.profiler_models --> vs_evaluation.agent_evidence
     vs_evaluation.profiler_service --> vs_async_ops.api

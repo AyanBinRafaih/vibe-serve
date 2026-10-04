@@ -351,7 +351,7 @@ depends_on = ["vibesys", "vibesys.inputs", "vibesys.run.contracts", "vs_runtime"
 [[modules]]
 path = "vibesys.run.profilers"
 layer = "orchestration_host"
-depends_on = ["vibesys", "vibesys.errors", "vibesys.orchestration.profilers", "vibesys.run.contracts", "vs_agent", "vs_runtime"]
+depends_on = ["vibesys", "vibesys.errors", "vibesys.orchestration.profilers", "vibesys.run.contracts", "vs_agent", "vs_project", "vs_runtime"]
 
 [[modules]]
 path = "vibesys.run.skill_sources"
@@ -498,7 +498,7 @@ depends_on = ["vs_evaluation.models", "vs_evaluation.ports"]
 [[modules]]
 path = "vs_evaluation.filesystem_store"
 layer = "prompts_and_lower_libs"
-depends_on = ["vs_evaluation.coordinator", "vs_evaluation.models"]
+depends_on = ["vs_evaluation.coordinator", "vs_evaluation.models", "vs_project"]
 
 [[modules]]
 path = "vs_evaluation.failure_signature"
