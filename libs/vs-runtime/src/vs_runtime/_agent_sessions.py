@@ -20,15 +20,14 @@ from vs_runtime._agent_declarations import (
     validate_extra_tools,
 )
 from vs_runtime._agent_execution import RuntimeAgentExecution
-from vs_runtime._workspace_access import unauthorized_paths
 from vs_runtime.contracts import (
     AgentBinding,
     AgentCapability,
     AgentRole,
     AgentToolBindingContext,
     AgentTurnTimeoutError,
-    RuntimeContractError,
     SessionClosedError,
+    SessionTransportUnavailableError,
     StructuredResponseError,
     UnknownAgentRoleError,
     Workspace,
@@ -44,9 +43,13 @@ if TYPE_CHECKING:
         AgentCapabilities,
         AgentClientProtocol,
         AgentEventSink,
+        AgentSessionCheckpoint,
+        AgentSessions,
+        InvocationOutcome,
         SessionStore,
         ToolServerDescriptor,
     )
+    from vs_prompts.api import RenderedPrompt
     from vs_runtime._agent_execution import (
         AgentExecutionLifecycleSink,
         AgentMessageRouter,
@@ -71,6 +74,25 @@ def _supports_required_capability(
     return bool(getattr(capabilities, capability.value))
 
 
+async def await_session_operation[Result](operation: asyncio.Task[Result]) -> Result:
+    """Retain the session's resources until dispatch or access enforcement settles."""
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError as cancelled:
+        settled = asyncio.gather(operation, return_exceptions=True)
+        while not settled.done():
+            try:
+                await asyncio.shield(settled)
+            except asyncio.CancelledError:
+                continue
+        outcome = settled.result()[0]
+        if isinstance(outcome, BaseException):
+            cancelled.add_note(
+                f"session operation also failed: {type(outcome).__name__}: {outcome}"
+            )
+        raise
+
+
 class RuntimeAgentSession:
     """One context-preserving conversation owned by a runtime."""
 
@@ -85,8 +107,10 @@ class RuntimeAgentSession:
         tool_servers: tuple[ToolServerDescriptor, ...],
         *,
         session_id: str,
+        session_transport: AgentSessions | None,
         log: Callable[[str], None],
     ) -> None:
+        self._session_transport = session_transport
         self._execution = execution
         self._role = role
         self._workspace = workspace
@@ -135,6 +159,49 @@ class RuntimeAgentSession:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def session_key(self) -> AgentSessionKey:
+        return self._session_key
+
+    def _transport(self) -> AgentSessions:
+        if self._session_transport is None:
+            message = "durable agent session transport is not configured"
+            raise SessionTransportUnavailableError(message)
+        return self._session_transport
+
+    def checkpoint(self) -> AgentSessionCheckpoint:
+        return self._transport().checkpoint(self._session_key)
+
+    def inspect(self, invocation_id: str) -> InvocationOutcome:
+        return self._transport().inspect(self._session_key, invocation_id)
+
+    async def resume(self, message: RenderedPrompt, invocation_id: str) -> InvocationOutcome:
+        if self._closed:
+            raise SessionClosedError
+        async with self._turn_lock:
+            if self._closed:
+                raise SessionClosedError
+            transport = self._transport()
+            revision = await self._workspace.snapshot("session-resume-input")
+            try:
+                outcome = await await_session_operation(
+                    asyncio.create_task(
+                        asyncio.to_thread(
+                            transport.resume, self._session_key, message, invocation_id
+                        )
+                    )
+                )
+            finally:
+                await await_session_operation(
+                    asyncio.create_task(self._enforce_workspace_access(revision))
+                )
+            if (
+                self._role.workspace_access is WorkspaceAccess.READ_WRITE
+                or await self._workspace.pending_changes()
+            ):
+                await self._workspace.snapshot("session-resume")
+            return outcome
 
     @overload
     async def turn(self, message: str, *, response: None = None) -> str: ...
@@ -197,45 +264,21 @@ class RuntimeAgentSession:
         return result
 
     async def _enforce_workspace_access(self, revision: str) -> None:
-        if self._role.workspace_access not in {
-            WorkspaceAccess.READ_ONLY,
-            WorkspaceAccess.LIMITED,
-        }:
-            return
-        allowed = (
-            self._writable_paths if self._role.workspace_access is WorkspaceAccess.LIMITED else ()
-        )
-        directories = (
-            self._writable_directory_paths
-            if self._role.workspace_access is WorkspaceAccess.LIMITED
-            else ()
-        )
-        unauthorized = unauthorized_paths(
-            await self._workspace.pending_changes(),
-            allowed,
-            directories=directories,
-        )
-        if not unauthorized:
-            return
-        await self._workspace.restore_for_agent(
-            revision,
-            preserve_paths=allowed,
-        )
-        remaining = unauthorized_paths(
-            await self._workspace.pending_changes(),
-            allowed,
-            directories=directories,
-        )
-        if remaining:
-            message = (
-                f"role {self._role.id!r} left unauthorized workspace changes: "
-                f"{', '.join(remaining)}"
+        if self._role.workspace_access is not WorkspaceAccess.READ_WRITE:
+            limited = self._role.workspace_access is WorkspaceAccess.LIMITED
+            self._workspace.access_recovery.begin(
+                revision,
+                self._role.id,
+                self._writable_paths if limited else (),
+                self._writable_directory_paths if limited else (),
             )
-            raise RuntimeContractError(message)
-        self._log(
-            f"[role-isolation] reverted {len(unauthorized)} workspace change(s) "
-            f"attempted by {self._role.id}: {', '.join(unauthorized[:8])}"
-        )
+        restored = await self._workspace.access_recovery.reconcile(self._workspace)
+        unauthorized = restored.restored_paths
+        if unauthorized:
+            self._log(
+                f"[role-isolation] reverted {len(unauthorized)} workspace change(s) "
+                f"attempted by {self._role.id}: {', '.join(unauthorized[:8])}"
+            )
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -256,7 +299,7 @@ class RuntimeAgentSession:
         self._execution.cancel()
 
 
-class RuntimeAgentSessions:
+class RuntimeWorkspaceAgentSessions:
     """Production factory and reverse-order owner for explicit sessions."""
 
     def __init__(  # noqa: PLR0913  # lint-waiver: LW-837211 [PLR0913]; run composition injects independent lower-layer effects once; session callers see only create_session.
@@ -273,7 +316,9 @@ class RuntimeAgentSessions:
         client_factory: Callable[..., AgentClientProtocol],
         tool_bindings: Mapping[str, AgentToolResolver] | None,
         log: Callable[[str], None],
+        session_transport: AgentSessions | None = None,
     ) -> None:
+        self._session_transport = session_transport
         self._roles = {role.id: role for role in roles}
         self._workspaces = workspaces
         self._resolve_configuration = resolve_configuration
@@ -389,6 +434,7 @@ class RuntimeAgentSessions:
             tuple(path for path in writable_paths if workspace.is_directory(path)),
             tool_servers,
             session_id=session_id,
+            session_transport=self._session_transport,
             log=self._log,
         )
 
