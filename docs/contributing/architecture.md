@@ -181,6 +181,7 @@ graph TD
     vibesys.orchestration.dynamic --> vibesys.metrics
     vibesys.orchestration.dynamic --> vibesys.orchestration.agent_options
     vibesys.orchestration.dynamic --> vibesys.orchestration.dynamic.control
+    vibesys.orchestration.dynamic --> vibesys.orchestration.dynamic.lifecycle
     vibesys.orchestration.dynamic --> vibesys.orchestration.resume
     vibesys.orchestration.dynamic --> vibesys.orchestration.structured_turn
     vibesys.orchestration.dynamic --> vibesys.plugin_registration
@@ -467,6 +468,7 @@ graph TD
     vibesys.orchestration.dynamic --> vibesys.metrics
     vibesys.orchestration.dynamic --> vibesys.orchestration.agent_options
     vibesys.orchestration.dynamic --> vibesys.orchestration.dynamic.control
+    vibesys.orchestration.dynamic --> vibesys.orchestration.dynamic.lifecycle
     vibesys.orchestration.dynamic --> vibesys.orchestration.resume
     vibesys.orchestration.dynamic --> vibesys.orchestration.structured_turn
     vibesys.orchestration.dynamic --> vibesys.plugin_registration
@@ -654,6 +656,8 @@ graph TD
     vs_evaluation.agent_service --> vs_evaluation.models
     vs_evaluation.agent_service --> vs_evaluation.profiler_service
     vs_evaluation.agent_service --> vs_evaluation.repeated_failure
+    vs_evaluation.agent_service --> vs_evaluation.scope_state
+    vs_evaluation.agent_service --> vs_evaluation.state_namespace
     vs_evaluation.agent_service --> vs_project
     vs_evaluation.api --> vs_evaluation.agent_evidence
     vs_evaluation.api --> vs_evaluation.agent_models
@@ -666,6 +670,8 @@ graph TD
     vs_evaluation.api --> vs_evaluation.profiler_models
     vs_evaluation.api --> vs_evaluation.profiler_service
     vs_evaluation.api --> vs_evaluation.repeated_failure
+    vs_evaluation.api --> vs_evaluation.scope_state
+    vs_evaluation.api --> vs_evaluation.state_namespace
     vs_evaluation.api.testing --> vs_evaluation.profiler_testing
     vs_evaluation.api.testing --> vs_evaluation.testing
     vs_evaluation.api.tools --> vs_evaluation.agent_mcp
@@ -679,15 +685,17 @@ graph TD
     vs_evaluation.profiler_service --> vs_async_ops.api
     vs_evaluation.profiler_service --> vs_evaluation.agent_evidence
     vs_evaluation.profiler_service --> vs_evaluation.profiler_models
-    vs_evaluation.profiler_service --> vs_project
+    vs_evaluation.profiler_service --> vs_evaluation.state_namespace
     vs_evaluation.profiler_testing --> vs_evaluation.profiler_models
     vs_evaluation.repeated_failure --> vs_evaluation.agent_evidence
     vs_evaluation.repeated_failure --> vs_evaluation.agent_models
     vs_evaluation.repeated_failure --> vs_evaluation.failure_signature
     vs_evaluation.repeated_failure --> vs_evaluation.models
+    vs_evaluation.scope_state --> vs_evaluation.state_namespace
     vs_evaluation.testing --> vs_evaluation.coordinator
     vs_evaluation.testing --> vs_evaluation.models
     vs_evaluation.testing --> vs_evaluation.ports
+    vs_evaluation.testing --> vs_project
     vs_faults --> vs_agent
     vs_issue_tracker --> vs_github
     vs_runtime --> vs_agent

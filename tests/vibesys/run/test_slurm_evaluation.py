@@ -30,6 +30,7 @@ from vs_evaluation.api import (
 )
 from vs_evaluation.api.testing import FakeClock, InMemoryEvaluationStore
 from vs_project.api import StateNamespace
+from vs_runtime.api import RunCleanupError
 from vs_runtime.api.infrastructure import ScalarBenchmarkContract, TrustedEvaluationPlan
 from vs_runtime.api.testing import FakeRun
 from vs_sandbox.api.slurm import PROFILE_OUTPUT_ROOT, SlurmEvaluationPlan, SlurmExecutionPolicy
@@ -152,6 +153,7 @@ class _Runner(SlurmJobRunner):
             }
         )
         self.cancellations = 0
+        self.job_status = SlurmJobStatus.PENDING
         self.wait_started = threading.Event()
         self.wait_finished = threading.Event()
         self._release_wait = threading.Event()
@@ -162,6 +164,7 @@ class _Runner(SlurmJobRunner):
     def submit_batch(self, request: SlurmBatchRequest) -> SlurmBatchHandle:
         self.submissions += 1
         self.request = request
+        self.job_status = SlurmJobStatus.RUNNING
         return self.handle
 
     def wait_batch(
@@ -175,7 +178,9 @@ class _Runner(SlurmJobRunner):
         self.wait_started.set()
         self._release_wait.wait()
         self.wait_finished.set()
-        return SlurmBatchWaitResult(handle=handle, status=SlurmJobStatus.COMPLETED, timed_out=False)
+        if self.job_status is SlurmJobStatus.RUNNING:
+            self.job_status = SlurmJobStatus.COMPLETED
+        return SlurmBatchWaitResult(handle=handle, status=self.job_status, timed_out=False)
 
     def collect_batch(self, handle: SlurmBatchHandle) -> SlurmBatchResult:
         del handle
@@ -217,9 +222,16 @@ class _Runner(SlurmJobRunner):
             else replace(result, collection_failure=self.collection_failure)
         )
 
+    def poll_batch(self, handle: SlurmBatchHandle) -> SlurmJobStatus:
+        """Inspect the same external job state used by wait and cancellation."""
+        assert handle == self.handle
+        return self.job_status
+
     def cancel_batch(self, handle: SlurmBatchHandle) -> None:
         del handle
         self.cancellations += 1
+        if not self._fail_cancel:
+            self.job_status = SlurmJobStatus.CANCELLED
         self._release_wait.set()
         if self._fail_cancel:
             raise RuntimeError
@@ -822,11 +834,11 @@ async def test_close_attempts_every_cleanup_and_aggregates_errors(tmp_path: Path
     await _terminal(executor, "cleanup-one")
     await _terminal(executor, "cleanup-two")
 
-    with pytest.raises(ExceptionGroup) as caught:
+    with pytest.raises(RunCleanupError) as caught:
         await executor.close()
 
     assert [candidate.discard_calls for candidate in workspaces.candidates] == [1, 1]
-    assert {str(error) for error in caught.value.exceptions} == {
+    assert {str(error) for error in caught.value.failures} == {
         "first discard",
         "second discard",
     }
@@ -855,7 +867,7 @@ async def test_close_discards_workspace_when_provider_cleanup_fails(tmp_path: Pa
     await executor.submit(_request(snapshot), handle_id="provider-cleanup-error")
     await asyncio.to_thread(runner.wait_started.wait)
 
-    with pytest.raises(ExceptionGroup, match="cleanup failed"):
+    with pytest.raises(RunCleanupError, match="cleanup failed"):
         await executor.close()
 
     assert run.workspaces.candidates[0].discarded

@@ -14,6 +14,9 @@ from vibesys.hypothesis import (
 )
 from vibesys.hypothesis import transitions as hypothesis_transitions
 from vibesys.metrics import Measurement
+from vibesys.orchestration.dynamic import models as dynamic_models
+from vibesys.orchestration.dynamic import steers
+from vibesys.orchestration.dynamic.lifecycle import CompleteIntent, step, withdrawing
 from vibesys.orchestration.dynamic.models import (
     BenchmarkGap,
     DynamicWorkstream,
@@ -23,6 +26,9 @@ from vibesys.orchestration.dynamic.models import (
     PortfolioView,
     WorkstreamPhase,
 )
+from vibesys.orchestration.dynamic.prompts import render_steer_dropped
+from vibesys.orchestration.dynamic.transitions import SettlementProposed
+from vibesys.orchestration.dynamic.transitions import step as envelope_step
 from vs_loop_state.api import CandidateDisposition, HypothesisOutcome, RoundRecord
 from vs_runtime.api import MetricDirection
 
@@ -81,30 +87,30 @@ class BuildableCandidate:
     partial_measurement: PartialMeasurement | None
 
 
+@dataclass(slots=True)
 class Rounds:
     """Records each finished workstream as a round and selects the winner.
 
     Every candidate decision is made against the input reading of ``gate``;
     the winner is re-filtered at selection because a round recorded before
     the input was measured was not gated. The planner's view of the history
-    (bounded rows and the input reading) is projected here too.
+    (bounded rows and the input reading) is projected here too. ``clock``
+    returns run-elapsed seconds; settlement that drops steers requires it.
+    Read-only portfolio projections can omit the clock.
     """
 
-    def __init__(
-        self,
-        options: DynamicOptions,
-        state: DynamicState,
-        gate: InputGate,
-        *,
-        lock: asyncio.Lock,
-        commit: Callable[[str], Awaitable[None]],
-    ) -> None:
-        """Bind the round book to one run's state, input gate and commit path."""
-        self.options = options
-        self.state = state
-        self._gate = gate
-        self._lock = lock
-        self._commit = commit
+    options: DynamicOptions
+    state: DynamicState
+    gate: InputGate
+    lock: asyncio.Lock
+    commit: Callable[[str], Awaitable[None]]
+    clock: Callable[[], float] | None = None
+
+    def _now(self) -> float:
+        if self.clock is None:
+            message = "dynamic settlement requires an injected clock"
+            raise ValueError(message)
+        return self.clock()
 
     def planner_context(
         self,
@@ -262,7 +268,10 @@ class Rounds:
         """
         candidates: list[BuildableCandidate] = []
         for item in self.state.workstreams:
-            if item.phase is WorkstreamPhase.IMPLEMENTING:
+            if item.phase in {
+                WorkstreamPhase.IMPLEMENTING,
+                WorkstreamPhase.CANCELLED,
+            } or withdrawing(self.state.lifecycle, item.hypothesis_id):
                 continue
             evaluation = item.evaluation
             if (
@@ -303,24 +312,50 @@ class Rounds:
                 )
         return tuple(sorted(candidates, key=_measured_rank))
 
-    async def record(self, index: int) -> None:
-        """Commit one workstream result through shared hypothesis transitions."""
-        if self.state.workstreams[index].evaluation is not None:
+    async def cancel(self, index: int, operation_id: str) -> None:
+        """Commit cancellation, discarded round, steer drops and intent completion together."""
+        await self.record(index, cancellation_id=operation_id)
+
+    async def record(self, index: int, *, cancellation_id: str | None = None) -> None:
+        """Commit one workstream result through shared hypothesis transitions.
+
+        Recording the round settles the workstream: every path that ends one
+        (finished, failed, or given up) passes here. Steers still pending for
+        it are dropped and journaled in the same commit, since no worker turn
+        of the workstream follows.
+        """
+        if cancellation_id is None and self.state.workstreams[index].evaluation is not None:
             # The candidate decision compares against the input measurement.
-            await self._gate.measured()
-        async with self._lock:
+            await self.gate.measured()
+        async with self.lock:
             item = self.state.workstreams[index]
+            if cancellation_id is None and withdrawing(self.state.lifecycle, item.hypothesis_id):
+                return
+            if cancellation_id is not None and any(
+                record.round_number == item.sequence for record in self.state.search.rounds
+            ):
+                self.state.lifecycle, _ = step(
+                    self.state.lifecycle, CompleteIntent(operation_id=cancellation_id)
+                )
+                await self.commit(f"dynamic: {item.hypothesis_id} already settled")
+                return
             implementation = item.implementation
             # A slot given up before any implementer turn returned still ends
             # its hypothesis: without a round the hypothesis stays incomplete,
             # and the planner, told the slot failed, could not abandon it.
-            given_up = implementation is None and item.phase is WorkstreamPhase.FAILED
+            # A cancelled one ends it the same way.
+            cancelled = cancellation_id is not None or item.phase is WorkstreamPhase.CANCELLED
+            given_up = implementation is None and (
+                item.phase is WorkstreamPhase.FAILED or cancelled
+            )
             if (implementation is None and not given_up) or any(
                 record.round_number == item.sequence for record in self.state.search.rounds
             ):
                 return
             outcome = (
-                implementation.outcome
+                HypothesisOutcome.INCONCLUSIVE
+                if cancelled
+                else implementation.outcome
                 if implementation is not None
                 else HypothesisOutcome.IMPLEMENTATION_FAILED
             )
@@ -389,12 +424,18 @@ class Rounds:
                     else None
                 ),
             )
+            if cancelled:
+                disposition, retained = CandidateDisposition.DISCARD, False
             record = RoundRecord(
                 round_number=item.sequence,
                 commit=item.candidate_revision,
                 perf_metric=evaluation.metric_value if framework_metric else None,
                 perf_unit=evaluation.metric_name if framework_metric else None,
-                passed=review.passed if review is not None else not given_up,
+                passed=False
+                if cancelled
+                else review.passed
+                if review is not None
+                else not given_up,
                 reviewed=review is not None,
                 hypothesis_id=item.hypothesis_id,
                 hypothesis_declared_outcome=outcome.value,
@@ -426,18 +467,51 @@ class Rounds:
                 perf_provenance="framework" if framework_metric else None,
                 attempts=item.budget.spent,
             )
-            active_search = self.state.search.model_copy(
-                update={"active_hypothesis_id": item.hypothesis_id},
-                deep=True,
-            )
-            self.state.search = hypothesis_transitions.append_round(
-                active_search,
-                record,
-                keep_active=outcome is HypothesisOutcome.CONTINUE,
-            )
-            if self.state.search.active_hypothesis_id is not None:
-                self.state.search = hypothesis_transitions.finish_hypothesis(self.state.search)
-            await self._commit(f"dynamic: record hypothesis {item.hypothesis_id}")
+            if cancellation_id is not None:
+                at_s = self._now()
+                reduced, _ = envelope_step(
+                    self.state,
+                    SettlementProposed(
+                        operation_id=cancellation_id,
+                        record=record,
+                        drop_journal=tuple(
+                            dynamic_models.JournalEntry(
+                                at_s=at_s,
+                                turn=self.state.agent.turns,
+                                kind="steer",
+                                subject=item.hypothesis_id,
+                                text=render_steer_dropped(
+                                    note_sha256=note.note_sha256,
+                                    sent_at_s=note.sent_at_s,
+                                ),
+                            )
+                            for note in steers.pending(self.state, item.hypothesis_id)
+                        )
+                        if self.state.agent is not None
+                        else (),
+                        at_s=at_s,
+                        retry_limit=self.options.max_retries_per_round,
+                    ),
+                )
+                self.state.workstreams = reduced.workstreams
+                self.state.search = reduced.search
+                self.state.agent = reduced.agent
+                self.state.lifecycle = reduced.lifecycle
+            else:
+                active_search = self.state.search.model_copy(
+                    update={"active_hypothesis_id": item.hypothesis_id},
+                    deep=True,
+                )
+                self.state.search = hypothesis_transitions.append_round(
+                    active_search,
+                    record,
+                    keep_active=outcome is HypothesisOutcome.CONTINUE,
+                )
+                if self.state.search.active_hypothesis_id is not None:
+                    self.state.search = hypothesis_transitions.finish_hypothesis(self.state.search)
+                if steers.pending(self.state, item.hypothesis_id):
+                    steers.drop_pending(self.state, item.hypothesis_id, at_s=self._now())
+            await self.commit(f"dynamic: record hypothesis {item.hypothesis_id}")
 
     def winner(self) -> DynamicWorkstream | None:
         """Return the workstream of the best recorded round that beats the input, if any."""
@@ -448,7 +522,15 @@ class Rounds:
             [
                 record
                 for record in self.state.search.rounds
-                if self._gate.admits(
+                if not any(
+                    item.sequence == record.round_number
+                    and (
+                        item.phase is WorkstreamPhase.CANCELLED
+                        or withdrawing(self.state.lifecycle, item.hypothesis_id)
+                    )
+                    for item in self.state.workstreams
+                )
+                and self.gate.admits(
                     dict(record.metrics),
                     hypothesis_transitions.headline_measurement(record),
                 )
@@ -478,7 +560,7 @@ class Rounds:
         comparable = space.complete(metrics) if space.objectives else headline is not None
         if not comparable:
             return CandidateDisposition.UNASSESSED, None
-        if not self._gate.admits(metrics, headline):
+        if not self.gate.admits(metrics, headline):
             return CandidateDisposition.DISCARD, False
         search = HypothesisSearch(hypothesis_config(self.options))
         conflict = search.pareto_conflict(

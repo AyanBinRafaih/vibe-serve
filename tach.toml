@@ -240,9 +240,14 @@ layer = "loops"
 depends_on = []
 
 [[modules]]
+path = "vibesys.orchestration.dynamic.lifecycle"
+layer = "loops"
+depends_on = []
+
+[[modules]]
 path = "vibesys.orchestration.dynamic"
 layer = "loops"
-depends_on = ["vibesys.orchestration.dynamic.control", "vibesys.orchestration.structured_turn", "vibesys.orchestration.agent_options", "vibesys.hypothesis", "vibesys.hypothesis.readmodel", "vibesys.metrics", "vibesys.orchestration.resume", "vibesys.plugin_registration", "vibesys.run.contracts", "vs_loop_state", "vs_prompts", "vs_runtime"]
+depends_on = ["vibesys.orchestration.dynamic.lifecycle", "vibesys.orchestration.dynamic.control", "vibesys.orchestration.structured_turn", "vibesys.orchestration.agent_options", "vibesys.hypothesis", "vibesys.hypothesis.readmodel", "vibesys.metrics", "vibesys.orchestration.resume", "vibesys.plugin_registration", "vibesys.run.contracts", "vs_loop_state", "vs_prompts", "vs_runtime"]
 
 [[modules]]
 path = "vibesys.orchestration.evolve"
@@ -458,7 +463,7 @@ depends_on = []
 [[modules]]
 path = "vs_evaluation.api"
 layer = "prompts_and_lower_libs"
-depends_on = ["vs_evaluation.agent_evidence", "vs_evaluation.agent_models", "vs_evaluation.agent_service", "vs_evaluation.coordinator", "vs_evaluation.failure_signature", "vs_evaluation.filesystem_store", "vs_evaluation.models", "vs_evaluation.ports", "vs_evaluation.profiler_models", "vs_evaluation.profiler_service", "vs_evaluation.repeated_failure"]
+depends_on = ["vs_evaluation.agent_evidence", "vs_evaluation.agent_models", "vs_evaluation.agent_service", "vs_evaluation.coordinator", "vs_evaluation.failure_signature", "vs_evaluation.filesystem_store", "vs_evaluation.models", "vs_evaluation.ports", "vs_evaluation.profiler_models", "vs_evaluation.profiler_service", "vs_evaluation.repeated_failure", "vs_evaluation.scope_state", "vs_evaluation.state_namespace"]
 
 [[modules]]
 path = "vs_evaluation.api.tools"
@@ -488,7 +493,7 @@ depends_on = ["vs_evaluation.agent_evidence", "vs_evaluation.models", "vs_evalua
 [[modules]]
 path = "vs_evaluation.agent_service"
 layer = "prompts_and_lower_libs"
-depends_on = ["vs_evaluation.agent_evidence", "vs_evaluation.agent_models", "vs_evaluation.models", "vs_evaluation.profiler_service", "vs_evaluation.repeated_failure", "vs_project"]
+depends_on = ["vs_evaluation.agent_evidence", "vs_evaluation.agent_models", "vs_evaluation.models", "vs_evaluation.profiler_service", "vs_evaluation.repeated_failure", "vs_evaluation.scope_state", "vs_evaluation.state_namespace", "vs_project"]
 
 [[modules]]
 path = "vs_evaluation.coordinator"
@@ -528,7 +533,7 @@ depends_on = ["vs_evaluation.agent_evidence"]
 [[modules]]
 path = "vs_evaluation.profiler_service"
 layer = "prompts_and_lower_libs"
-depends_on = ["vs_async_ops.api", "vs_evaluation.agent_evidence", "vs_evaluation.profiler_models", "vs_project"]
+depends_on = ["vs_async_ops.api", "vs_evaluation.agent_evidence", "vs_evaluation.profiler_models", "vs_evaluation.state_namespace"]
 
 [[modules]]
 path = "vs_evaluation.profiler_testing"
@@ -538,7 +543,7 @@ depends_on = ["vs_evaluation.profiler_models"]
 [[modules]]
 path = "vs_evaluation.testing"
 layer = "prompts_and_lower_libs"
-depends_on = ["vs_evaluation.coordinator", "vs_evaluation.models", "vs_evaluation.ports"]
+depends_on = ["vs_evaluation.coordinator", "vs_evaluation.models", "vs_evaluation.ports", "vs_project"]
 
 [[modules]]
 path = "vs_prompts"
@@ -761,3 +766,25 @@ from = ["vibesys.domains"]
 [[interfaces]]
 expose = ["AgentRunProjection", "HypothesisRoundView", "HypothesisView", "RoundView", "agent_projection", "project_hypothesis_state"]
 from = ["vibesys.hypothesis.readmodel"]
+
+[[modules]]
+path = "vs_evaluation.scope_state"
+layer = "prompts_and_lower_libs"
+depends_on = ["vs_evaluation.state_namespace"]
+
+[[interfaces]]
+expose = ["[A-Z][A-Za-z]*", "step", "withdrawing"]
+from = ["vibesys.orchestration.dynamic.lifecycle"]
+
+[[interfaces]]
+expose = ["EvaluationAdmissionStoppedError", "ScopeClosingError", "ScopeIntent", "ScopeLifecycleStore", "ScopePhase", "ScopeState", "ScopeSubmissionTracker"]
+from = ["vs_evaluation.scope_state"]
+
+[[modules]]
+path = "vs_evaluation.state_namespace"
+layer = "prompts_and_lower_libs"
+depends_on = []
+
+[[interfaces]]
+expose = ["EvaluationStateNamespace"]
+from = ["vs_evaluation.state_namespace"]
