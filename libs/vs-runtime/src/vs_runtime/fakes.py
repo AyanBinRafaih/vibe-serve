@@ -3,30 +3,34 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import threading
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal, TypeAlias, TypeVar, overload
+from typing import TYPE_CHECKING, Literal, TypeAlias, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from vs_agent.api import (
     NULL_SKILL_SELECTION,
-    AgentOutputSchemaError,
     AgentSessionKey,
-    SessionScope,
-    describe_validation_error,
+    inspect_invocation_journal,
 )
+from vs_agent.api.testing import FakeAgentInvocationStore
 from vs_evaluation.api import StoredEvaluation
 from vs_runtime._agent_declarations import (
+    agent_session_key,
     validate_agent_capabilities,
     validate_extra_tools,
 )
-from vs_runtime._agent_sessions import await_session_operation
+from vs_runtime._fake_agent_sessions import (
+    FakeAgentSession,
+    FakeSessionConfiguration,
+    TurnResponder,
+    echo_responder,
+)
 from vs_runtime._local_validation import LocalValidationRecipeError, check_recipe_artifact_path
+from vs_runtime._prepared_conversations import prepare_agent_conversation
 from vs_runtime._trusted_evaluation import TrustedAccuracyResult, TrustedBenchmarkResult
 from vs_runtime._workspace_access import WorkspaceAccessRecovery
 from vs_runtime.contracts import (
@@ -34,6 +38,7 @@ from vs_runtime.contracts import (
     AccuracyReceipt,
     AgentBinding,
     AgentCapability,
+    AgentConversationRequest,
     AgentEvaluation,
     AgentRole,
     AgentSession,
@@ -45,18 +50,17 @@ from vs_runtime.contracts import (
     CommandResult,
     LocalValidationEvaluation,
     OrchestrationPlugin,
+    PreparedConversation,
     ReleasedJobs,
     ResolvedSkillResources,
     Run,
     RunFacts,
     RuntimeContractError,
     SessionClosedError,
-    SessionTransportUnavailableError,
     SkillCatalogError,
     SkillResolution,
     SkillResourceRequest,
     StateModelError,
-    StructuredResponseError,
     UnknownAgentRoleError,
     Workspace,
     WorkspaceAccess,
@@ -70,9 +74,10 @@ from vs_runtime.contracts import (
 )
 
 if TYPE_CHECKING:
-    from vs_agent.api import AgentSessionCheckpoint, AgentSessions, InvocationOutcome
+    from collections.abc import Awaitable, Callable, Collection, Sequence
+
+    from vs_agent.api import AgentInvocationStore, AgentSessions, InvocationOutcome
     from vs_evaluation.api import EvaluationSettlements
-    from vs_prompts.api import RenderedPrompt
     from vs_runtime._agent_execution import AgentExecutionLifecycleEvent
     from vs_runtime._run_control import RunControlTransition
     from vs_sandbox.api import HostResource, ProjectPathPolicy, Sandbox
@@ -180,11 +185,6 @@ class FakeTrustedEvaluationExecutor:
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-# A responder may return an awaitable: the turn awaits it, so a test can hold a
-# turn open the way a long provider turn is, and end it early.
-TurnResponder: TypeAlias = Callable[
-    [AgentRole, tuple[str, ...], str, type[BaseModel] | None], object
-]
 
 
 class FakeRunControlEventSink:
@@ -314,18 +314,6 @@ class _WorkspaceRetentionLabelError(ValueError):
 
 
 @dataclass(frozen=True)
-class _FakeSessionConfig:
-    """Immutable creation options shared by a fake session."""
-
-    member_id: str | None
-    writable_paths: tuple[str, ...]
-    writable_directory_paths: tuple[str, ...]
-    #: The resumed conversation's history, shared with earlier sessions.
-    history: list[str] | None = None
-    session_transport: AgentSessions | None = None
-
-
-@dataclass(frozen=True)
 class _FakeCandidateConfig:
     """Creation state copied into one isolated fake workspace."""
 
@@ -337,234 +325,6 @@ class _FakeCandidateConfig:
     revision_prefix: str
 
 
-def _echo_responder(
-    _role: AgentRole,
-    _history: tuple[str, ...],
-    message: str,
-    _response: type[BaseModel] | None,
-) -> object:
-    return message
-
-
-class FakeAgentSession:
-    """In-memory conversation with the public lifetime and context contract."""
-
-    def __init__(
-        self,
-        role: AgentRole,
-        workspace: FakeWorkspace,
-        binding: AgentBinding,
-        responder: TurnResponder,
-        config: _FakeSessionConfig,
-    ) -> None:
-        """Bind a session to its configuration and, if resumed, its conversation."""
-        self._session_transport = config.session_transport
-        self._session_key = AgentSessionKey(
-            SessionScope.MEMBER if config.member_id is not None else SessionScope.ROLE,
-            f"{role.id}:{config.member_id}"
-            if config.member_id is not None
-            else f"session:{uuid.uuid4().hex}",
-        )
-        self._role = role
-        self._workspace = workspace
-        self._member_id = config.member_id
-        self._writable_paths = config.writable_paths
-        self._writable_directory_paths = config.writable_directory_paths
-        self._binding = binding
-        self._responder = responder
-        self._history: list[str] = [] if config.history is None else config.history
-        self._turn_number = 0
-        self._turn_lock = asyncio.Lock()
-        self._closed = False
-        self._close_task: asyncio.Task[None] | None = None
-
-    @property
-    def role(self) -> AgentRole:
-        """Return the role bound at creation."""
-        return self._role
-
-    @property
-    def workspace(self) -> Workspace:
-        """Return the workspace bound at creation."""
-        return self._workspace
-
-    @property
-    def member_id(self) -> str | None:
-        """Return the durable policy identity for this instance."""
-        return self._member_id
-
-    @property
-    def writable_paths(self) -> tuple[str, ...]:
-        """Return the immutable session-specific write grants."""
-        return self._writable_paths
-
-    @property
-    def binding(self) -> AgentBinding:
-        """Return the configured immutable runtime attribution."""
-        return self._binding
-
-    @property
-    def closed(self) -> bool:
-        """Return whether cleanup has ended this session."""
-        return self._closed
-
-    @property
-    def history(self) -> tuple[str, ...]:
-        """Return completed user messages in conversation order."""
-        return tuple(self._history)
-
-    @property
-    def retains_session_key(self) -> bool:
-        """Retain exclusive ownership through pending or failed cleanup."""
-        task = self._close_task
-        return task is None or not task.done() or task.cancelled() or task.exception() is not None
-
-    @property
-    def session_key(self) -> AgentSessionKey:
-        """Return the same identity production binds for member sessions."""
-        return self._session_key
-
-    def _transport(self) -> AgentSessions:
-        if self._session_transport is None:
-            message = "durable agent session transport is not configured"
-            raise SessionTransportUnavailableError(message)
-        return self._session_transport
-
-    def checkpoint(self) -> AgentSessionCheckpoint:
-        """Read checkpoint identity from the injected agent session interface."""
-        return self._transport().checkpoint(self._session_key)
-
-    def inspect(self, invocation_id: str) -> InvocationOutcome:
-        """Preserve the owning interface's explicit invocation outcome."""
-        return self._transport().inspect(self._session_key, invocation_id)
-
-    async def resume(
-        self,
-        message: RenderedPrompt,
-        invocation_id: str,
-        *,
-        response: type[BaseModel] | None = None,
-    ) -> InvocationOutcome:
-        """Resume with production-equivalent workspace isolation."""
-        del response
-        if self._closed:
-            raise SessionClosedError
-        async with self._turn_lock:
-            if self._closed:
-                raise SessionClosedError
-            transport = self._transport()
-            revision = await self._workspace.snapshot("session-resume-input")
-            try:
-                outcome = await await_session_operation(
-                    asyncio.create_task(
-                        asyncio.to_thread(
-                            transport.resume, self._session_key, message, invocation_id
-                        )
-                    )
-                )
-            finally:
-                await await_session_operation(
-                    asyncio.create_task(self._enforce_workspace_access(revision))
-                )
-            if (
-                self._role.workspace_access is WorkspaceAccess.READ_WRITE
-                or await self._workspace.pending_changes()
-            ):
-                await self._workspace.snapshot("session-resume")
-            return outcome
-
-    @overload
-    async def turn(self, message: str, *, response: None = None) -> str: ...
-
-    @overload
-    async def turn(self, message: str, *, response: type[ResponseT]) -> ResponseT: ...
-
-    async def turn(
-        self, message: str, *, response: type[ResponseT] | None = None
-    ) -> str | ResponseT:
-        """Serialize turns, respond from completed history, and enforce access."""
-        if self._closed:
-            raise SessionClosedError
-        async with self._turn_lock:
-            if self._closed:
-                raise SessionClosedError
-            return await self._turn_once(message, response=response)
-
-    async def _turn_once(
-        self,
-        message: str,
-        *,
-        response: type[ResponseT] | None,
-    ) -> str | ResponseT:
-        self._turn_number += 1
-        label = f"{self._role.id}-session-turn-{self._turn_number}"
-        revision = await self._workspace.snapshot(f"{label}-input")
-        try:
-            result = await self._respond(message, response)
-        except StructuredResponseError:
-            # Production keeps the conversation after an invalid structured
-            # reply, so the correction turn sees this message in its history.
-            self._history.append(message)
-            raise
-        finally:
-            remaining_changes = await self._enforce_workspace_access(revision)
-        self._history.append(message)
-        if self._role.workspace_access is WorkspaceAccess.READ_WRITE or remaining_changes:
-            await self._workspace.snapshot(label)
-        return result
-
-    async def _respond(self, message: str, response: type[ResponseT] | None) -> str | ResponseT:
-        """Answer one turn, reporting invalid structured output as production does."""
-        try:
-            value = self._responder(self._role, tuple(self._history), message, response)
-            if inspect.isawaitable(value):
-                value = await value
-        except AgentOutputSchemaError as error:
-            if response is None:
-                raise
-            raise StructuredResponseError(self._role.id, response, detail=error.detail) from error
-        if response is None:
-            if not isinstance(value, str):
-                error = "text turn responder must return str"
-                raise TypeError(error)
-            return value
-        try:
-            return response.model_validate(value)
-        except ValidationError as error:
-            raise StructuredResponseError(
-                self._role.id, response, detail=describe_validation_error(error)
-            ) from error
-
-    async def _enforce_workspace_access(self, revision: str) -> list[str]:
-        if self._role.workspace_access is not WorkspaceAccess.READ_WRITE:
-            limited = self._role.workspace_access is WorkspaceAccess.LIMITED
-            self._workspace.access_recovery.begin(
-                revision,
-                self._role.id,
-                self._writable_paths if limited else (),
-                self._writable_directory_paths if limited else (),
-            )
-        if self._role.workspace_access is WorkspaceAccess.READ_WRITE:
-            return await self._workspace.pending_changes()
-        result = await self._workspace.access_recovery.reconcile(self._workspace)
-        return result.pending_changes
-
-    async def close(self) -> None:
-        """Reject more work and wait for the active turn before closing."""
-        if self._close_task is None:
-            self._closed = True
-            self._close_task = asyncio.create_task(self._close_once())
-        await asyncio.shield(self._close_task)
-
-    async def _close_once(self) -> None:
-        async with self._turn_lock:
-            return
-
-    def mark_closed(self) -> None:
-        """Reject new and already-queued turns before owner cleanup starts."""
-        self._closed = True
-
-
 class FakeWorkspaceAgentSessions:
     """Run-owned in-memory factory with isolated creation semantics."""
 
@@ -572,13 +332,14 @@ class FakeWorkspaceAgentSessions:
         self,
         agents: tuple[AgentRole, ...],
         *,
-        responder: TurnResponder = _echo_responder,
+        responder: TurnResponder = echo_responder,
         bindings: dict[str, AgentBinding] | None = None,
         supported_extra_tools: Collection[str] | None = None,
         supported_agent_capabilities: Collection[AgentCapability] | None = None,
     ) -> None:
         """Build role lookup, optionally restricting simulated driver support."""
         self._session_transport: AgentSessions | None = None
+        self._invocation_store: AgentInvocationStore = FakeAgentInvocationStore()
         self._roles = {role.id: role for role in agents}
         self._responder = responder
         self._bindings = bindings or {
@@ -602,13 +363,17 @@ class FakeWorkspaceAgentSessions:
         # conversation ran in and its shared history. Providers key resumable
         # history by working directory, so a member session continues only
         # from the same path.
-        self._conversations: dict[tuple[str, str], tuple[Path, list[str]]] = {}
+        self._conversations: dict[AgentSessionKey, tuple[Path, list[str]]] = {}
         self._creation_results: list[BaseException | None] = []
         self._closing = False
         self._closed = False
 
+    def bind_invocation_store(self, store: AgentInvocationStore) -> None:
+        """Use initial-turn backing when no continuation transport owns the ledger."""
+        self._invocation_store = store
+
     def bind_session_transport(self, transport: AgentSessions) -> None:
-        """Bind the owning agent interface before creating workspace sessions."""
+        """Bind continuation transport, whose journal also owns initial-turn fences."""
         self._session_transport = transport
 
     @property
@@ -620,12 +385,25 @@ class FakeWorkspaceAgentSessions:
         """Queue deterministic session-creation successes or failures."""
         self._creation_results.extend(results)
 
+    def prepare_conversation(self, request: AgentConversationRequest) -> PreparedConversation:
+        """Bind policy inputs through the same lifetime owner as production."""
+        if self._closing:
+            raise SessionClosedError
+        return prepare_agent_conversation(self, request)
+
+    def inspect_invocation(self, key: AgentSessionKey, invocation_id: str) -> InvocationOutcome:
+        """Inspect the authoritative initial or continuation journal before setup."""
+        if self._session_transport is not None:
+            return self._session_transport.inspect(key, invocation_id)
+        return inspect_invocation_journal(key, invocation_id, self._invocation_store)
+
     async def create_session(
         self,
         role: AgentRole,
         *,
         workspace: Workspace,
         member_id: str | None = None,
+        generation: int | None = None,
         writable_paths: tuple[str, ...] = (),
     ) -> AgentSession:
         """Validate the declared role and create an independent conversation."""
@@ -633,19 +411,18 @@ class FakeWorkspaceAgentSessions:
             raise SessionClosedError
         if self._roles.get(role.id) != role:
             raise UnknownAgentRoleError(role.id)
+        validate_member_id(member_id)
+        key = agent_session_key(role.id, member_id, generation, uuid.uuid4().hex)
         if (
             member_id is not None
             and AgentCapability.DURABLE_TURN_CONTINUATION in role.required_capabilities
             and any(
-                session.retains_session_key
-                and session.role == role
-                and session.member_id == member_id
+                session.retains_session_key and session.role == role and session.session_key == key
                 for session in self._active_sessions
             )
         ):
             message = f"durable session {role.id}:{member_id} already has a live owner"
             raise RuntimeContractError(message)
-        validate_member_id(member_id)
         bound_tool_ids = validate_extra_tools(role, self._supported_extra_tools)
         validate_agent_capabilities(
             role,
@@ -669,25 +446,24 @@ class FakeWorkspaceAgentSessions:
             workspace,
             self._bindings[role.id],
             self._responder,
-            _FakeSessionConfig(
+            FakeSessionConfiguration(
                 member_id,
+                key,
                 validated_paths,
                 tuple(path for path in validated_paths if workspace.is_directory(path)),
-                self._member_history(role, member_id, workspace.path),
+                self._member_history(key, workspace.path),
                 self._session_transport,
+                self._invocation_store,
             ),
         )
         self._sessions.append(session)
         self._active_sessions.append(session)
         return session
 
-    def _member_history(
-        self, role: AgentRole, member_id: str | None, path: Path
-    ) -> list[str] | None:
+    def _member_history(self, key: AgentSessionKey, path: Path) -> list[str] | None:
         """Return the conversation a member session resumes, or start one."""
-        if member_id is None:
+        if not key.durable:
             return None
-        key = (role.id, member_id)
         previous = self._conversations.get(key)
         if previous is not None and previous[0] == path:
             return previous[1]
@@ -1825,7 +1601,7 @@ class FakeRun(Run):
         run_id: str = "test-run",
         project_root: Path = Path(),
         facts: RunFacts | None = None,
-        responder: TurnResponder = _echo_responder,
+        responder: TurnResponder = echo_responder,
         agent_bindings: dict[str, AgentBinding] | None = None,
         supported_extra_tools: Collection[str] | None = None,
         supported_agent_capabilities: Collection[AgentCapability] | None = None,
