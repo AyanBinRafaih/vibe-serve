@@ -45,6 +45,7 @@ source_roots = [
     "libs/vs-github/src",
     "libs/vs-issue-tracker/src",
     "libs/vs-loop-state/src",
+    "libs/vs-core/src",
     "libs/vs-project/src",
     "libs/vs-prompts/src",
     "libs/vs-runtime/src",
@@ -880,3 +881,12 @@ depends_on = ["vs_evaluation.agent_evidence", "vs_evaluation.agent_models", "vs_
 [[interfaces]]
 expose = ["EvaluationDependencyError", "EvaluationPending", "EvaluationSettlementBackend", "EvaluationSettlementObservation", "EvaluationSettlementOutcome", "EvaluationSettlements", "EvaluationUnknown", "OwnedEvaluationDependencies", "ServiceEvaluationSettlements", "SettlementErrorCode", "TerminalEvaluationResult"]
 from = ["vs_evaluation.settlements"]
+
+[[modules]]
+path = "vs_core"
+layer = "prompts_and_lower_libs"
+depends_on = []
+
+[[interfaces]]
+from = ["vs_core"]
+expose = ["api", "api\\..*"]
