@@ -240,10 +240,12 @@ describe('channel admission', () => {
     const subscriber = request(chat.state, 3, 'subscribe');
     const failed = dispatch(subscriber.state, {type: 'master-failed', masterId: 1});
     expect(failed.outputs).toEqual([
-      {type: 'master-failed', demandId: 3},
-      {type: 'master-failed', demandId: 2},
+      {type: 'capacity', demandId: 3},
+      {type: 'capacity', demandId: 2},
+      {type: 'stop-master', masterId: 1},
     ]);
     expect(failed.state.demands).toEqual([]);
+    expect(failed.state.masters.find(master => master.id === 1)?.phase).toBe('retiring');
 
     const retry = request(failed.state, 4, 'chat');
     const waiting = request(retry.state, 5, 'subscribe');

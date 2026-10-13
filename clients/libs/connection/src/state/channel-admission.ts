@@ -75,7 +75,6 @@ export type AdmissionOutput =
   | {readonly type: 'granted'; readonly demandId: number; readonly masterId: number}
   | {readonly type: 'capacity'; readonly demandId: number}
   | {readonly type: 'cancelled'; readonly demandId: number}
-  | {readonly type: 'master-failed'; readonly demandId: number}
   | {readonly type: 'closed'; readonly demandId: number}
   | {readonly type: 'start-master'; readonly masterId: number}
   | {readonly type: 'stop-master'; readonly masterId: number};
@@ -369,18 +368,22 @@ function readyMaster(state: AdmissionState, masterId: number): AdmissionTransiti
 }
 
 function failMaster(state: AdmissionState, masterId: number): AdmissionTransition {
-  const withoutMaster = replaceMaster(state, masterId, master => {
+  const retiring = replaceMaster(state, masterId, master => {
     if (master.phase !== 'opening') throw new Error(`SSH master ${masterId} is not opening`);
     if (master.leases.length !== 0) {
       throw new Error(`failed SSH master ${masterId} owns channel leases`);
     }
-    return null;
+    return {...master, phase: 'retiring'};
   });
-  const outputs: AdmissionOutput[] = orderedDemands(withoutMaster.demands).map(demand => ({
-    type: 'master-failed',
+  // The creation command can fail after ControlPersist daemonized the master. Keep ownership until
+  // the bounded retirement path proves absence, while reporting only auxiliary-capacity failure to
+  // callers so a spill cannot misclassify the established base master as unhealthy.
+  const outputs: AdmissionOutput[] = orderedDemands(retiring.demands).map(demand => ({
+    type: 'capacity',
     demandId: demand.id,
   }));
-  return {state: {...withoutMaster, demands: []}, outputs};
+  outputs.push({type: 'stop-master', masterId});
+  return {state: {...retiring, demands: []}, outputs};
 }
 
 function activateChannel(state: AdmissionState, leaseId: number): AdmissionTransition {

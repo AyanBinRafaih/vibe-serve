@@ -610,10 +610,10 @@ export class SshLink implements Link {
     this.#applyAdmission(stepAdmission(this.#admission, {type: 'release', leaseId}));
   }
 
-  #applyAdmission(
-    transition: {readonly state: AdmissionState; readonly outputs: readonly AdmissionOutput[]},
-    failure?: Error,
-  ): void {
+  #applyAdmission(transition: {
+    readonly state: AdmissionState;
+    readonly outputs: readonly AdmissionOutput[];
+  }): void {
     this.#admission = transition.state;
     for (const output of transition.outputs) {
       switch (output.type) {
@@ -630,13 +630,6 @@ export class SshLink implements Link {
         case 'cancelled':
           this.#settleDemand(output.demandId, waiter =>
             waiter.reject(cancellationReason(waiter.signal)),
-          );
-          break;
-        case 'master-failed':
-          this.#settleDemand(output.demandId, waiter =>
-            waiter.reject(
-              failure ?? new ConnectionError('link', 'the SSH spillover master failed to open'),
-            ),
           );
           break;
         case 'closed':
@@ -669,15 +662,8 @@ export class SshLink implements Link {
         () => {
           this.#applyAdmission(stepAdmission(this.#admission, {type: 'master-ready', masterId}));
         },
-        (error: unknown) => {
-          const failure =
-            error instanceof Error
-              ? error
-              : new ConnectionError('link', 'SSH master creation failed');
-          this.#applyAdmission(
-            stepAdmission(this.#admission, {type: 'master-failed', masterId}),
-            failure,
-          );
+        () => {
+          this.#applyAdmission(stepAdmission(this.#admission, {type: 'master-failed', masterId}));
         },
       )
       .finally(() => {

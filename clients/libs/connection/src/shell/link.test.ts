@@ -15,10 +15,16 @@ interface FakeSshPool {
   readonly masters: Set<string>;
   readonly helperMasters: string[];
   readonly masterStarts: string[];
-  readonly controlCalls: Array<{readonly path: string; readonly operation: string}>;
+  readonly controlCalls: ControlCall[];
   readonly queuedControls: Map<string, FakeProcess[]>;
+  controlCallListener: ((call: ControlCall) => void) | null;
   deferNextMaster: FakeProcess | null;
   refuseNextHelperOn: string | null;
+}
+
+interface ControlCall {
+  readonly path: string;
+  readonly operation: string;
 }
 
 function controlPath(args: readonly string[]): string {
@@ -28,7 +34,9 @@ function controlPath(args: readonly string[]): string {
 }
 
 function controlOperation(pool: FakeSshPool, path: string, operation: string): SpawnedProcess {
-  pool.controlCalls.push({path, operation});
+  const call = {path, operation};
+  pool.controlCalls.push(call);
+  pool.controlCallListener?.(call);
   const key = `${path}:${operation}`;
   const queued = pool.queuedControls.get(key)?.shift();
   if (queued !== undefined) {
@@ -41,6 +49,17 @@ function controlOperation(pool: FakeSshPool, path: string, operation: string): S
   if (operation === 'exit') pool.masters.delete(path);
   process.end(operation === 'check' && !pool.masters.has(path) ? 255 : 0);
   return process.process;
+}
+
+function nextControlCall(pool: FakeSshPool): Promise<ControlCall> {
+  if (pool.controlCallListener !== null)
+    throw new Error('a control-call observer is already active');
+  return new Promise(resolve => {
+    pool.controlCallListener = call => {
+      pool.controlCallListener = null;
+      resolve(call);
+    };
+  });
 }
 
 function queueControl(
@@ -91,6 +110,7 @@ function fakeSshPool(helper: FakeHelper): FakeSshPool {
     masterStarts: [],
     controlCalls: [],
     queuedControls: new Map(),
+    controlCallListener: null,
     deferNextMaster: null,
     refuseNextHelperOn: null,
     spawn: (_command, args) => {
@@ -244,6 +264,22 @@ linkContract('local', localHarness);
 linkContract('fake SSH', sshHarness);
 
 describe('role-aware SSH link pool', () => {
+  test('a base-master authentication failure remains a host authentication failure', async () => {
+    const helper = new FakeHelper();
+    const pool = fakeSshPool(helper);
+    const failedBase = fakeProcess();
+    pool.deferNextMaster = failedBase;
+    const ssh = link(pool, {capacityPerMaster: 2, reservedControlSlots: 1, maxMasters: 2});
+    const establishing = ssh.establish(false);
+    failedBase.end(255, '', 'Permission denied (publickey,password).\n');
+
+    const error = await rejection(establishing);
+    await ssh.release();
+
+    expect(error).toBeInstanceOf(ConnectionError);
+    expect((error as ConnectionError).reason).toBe('auth');
+  });
+
   test('admits a follower when the paused spill creator cancels and retains its master', async () => {
     const helper = new FakeHelper();
     const pool = fakeSshPool(helper);
@@ -302,14 +338,16 @@ describe('role-aware SSH link pool', () => {
     await ssh.release();
   });
 
-  test('fails every spill waiter once and permits a clean retry after creation failure', async () => {
+  test('fails every spill waiter once and retries after confirming the failed spill is absent', async () => {
     const helper = new FakeHelper();
     const pool = fakeSshPool(helper);
     const ssh = link(pool, {capacityPerMaster: 2, reservedControlSlots: 1, maxMasters: 2});
     await ssh.establish(false);
     const base = await openProcess(ssh, 'chat');
     const failedSpill = fakeProcess();
+    const confirmedAbsent = fakeProcess();
     pool.deferNextMaster = failedSpill;
+    queueControl(pool, '/tmp/cm-%C.1', 'exit', confirmedAbsent);
     const chat = openProcess(ssh, 'chat');
     const subscriber = openProcess(ssh, 'subscribe');
 
@@ -318,20 +356,94 @@ describe('role-aware SSH link pool', () => {
       rejection(chat),
       rejection(subscriber),
     ]);
-    expect(chatFailure).toBeInstanceOf(ConnectionError);
-    expect(subscriberFailure).toBeInstanceOf(ConnectionError);
-    expect(ssh.diagnostics().masterCount).toBe(1);
+    expect(chatFailure).toBeInstanceOf(ChannelCapacityError);
+    expect((chatFailure as ChannelCapacityError).role).toBe('chat');
+    expect(subscriberFailure).toBeInstanceOf(ChannelCapacityError);
+    expect((subscriberFailure as ChannelCapacityError).role).toBe('subscribe');
+    expect(ssh.diagnostics().masterCount).toBe(2);
+    expect(pool.controlCalls.at(-1)).toEqual({
+      path: '/tmp/cm-%C.1',
+      operation: 'exit',
+    });
 
     const retrySpill = fakeProcess();
     pool.deferNextMaster = retrySpill;
     const retry = openProcess(ssh, 'subscribe');
-    expect(pool.masterStarts).toEqual(['/tmp/cm-%C', '/tmp/cm-%C.1', '/tmp/cm-%C.2']);
+    expect(pool.helperMasters).toEqual(['/tmp/cm-%C']);
     retrySpill.end(0);
+    confirmedAbsent.end(0);
     const retried = await retry;
+    expect(pool.masterStarts).toEqual(['/tmp/cm-%C', '/tmp/cm-%C.1', '/tmp/cm-%C.2']);
     expect(pool.helperMasters).toEqual(['/tmp/cm-%C', '/tmp/cm-%C.2']);
 
     await Promise.all([stopProcess(base), stopProcess(retried)]);
     await ssh.release();
+  });
+
+  test('reconciles a reachable spill after its creation command fails before reusing it', async () => {
+    const helper = new FakeHelper();
+    const pool = fakeSshPool(helper);
+    const ssh = link(pool, {capacityPerMaster: 2, reservedControlSlots: 1, maxMasters: 2});
+    await ssh.establish(false);
+    const base = await openProcess(ssh, 'chat');
+    const spillPath = '/tmp/cm-%C.1';
+    const failedSpill = fakeProcess();
+    const refusedExit = fakeProcess();
+    const reachableCheck = fakeProcess();
+    pool.deferNextMaster = failedSpill;
+    pool.masters.add(spillPath);
+    queueControl(pool, spillPath, 'exit', refusedExit);
+    queueControl(pool, spillPath, 'check', reachableCheck);
+    const opening = openProcess(ssh, 'chat');
+
+    failedSpill.end(1, '', 'remote command failed\n');
+    const failure = await rejection(opening);
+
+    expect(failure).toBeInstanceOf(ChannelCapacityError);
+    expect((failure as ChannelCapacityError).role).toBe('chat');
+    expect(ssh.diagnostics().masterCount).toBe(2);
+    expect(pool.controlCalls.at(-1)).toEqual({path: spillPath, operation: 'exit'});
+
+    const retry = openProcess(ssh, 'chat');
+    expect(pool.masterStarts).toEqual(['/tmp/cm-%C', spillPath]);
+    expect(pool.helperMasters).toEqual(['/tmp/cm-%C']);
+
+    const checking = nextControlCall(pool);
+    refusedExit.end(255);
+    expect(await checking).toEqual({path: spillPath, operation: 'check'});
+    expect(pool.helperMasters).toEqual(['/tmp/cm-%C']);
+    reachableCheck.end(0);
+    const reused = await retry;
+
+    expect(pool.masterStarts).toEqual(['/tmp/cm-%C', spillPath]);
+    expect(pool.helperMasters.at(-1)).toBe(spillPath);
+    expect(pool.masters).toEqual(new Set(['/tmp/cm-%C', spillPath]));
+
+    await Promise.all([stopProcess(base), stopProcess(reused)]);
+    await ssh.release();
+  });
+
+  test('a spill authentication failure leaves the established host connection healthy', async () => {
+    const helper = new FakeHelper();
+    helper.publish(record('000000000008', 'run-8'));
+    helper.host.runs.set('000000000008', ECHO_SERVER);
+    const pool = fakeSshPool(helper);
+    const ssh = link(pool, {capacityPerMaster: 2, reservedControlSlots: 1, maxMasters: 2});
+    const host = connection(ssh);
+    await host.ready();
+    const failedSpill = fakeProcess();
+    pool.deferNextMaster = failedSpill;
+    const opening = host.openRun('000000000008', 'subscribe');
+    failedSpill.end(255, '', 'Permission denied (publickey,password).\n');
+
+    const error = await rejection(opening);
+    const phase = host.phase.kind;
+    await host[Symbol.asyncDispose]();
+    await ssh.release();
+
+    expect(error).toBeInstanceOf(ChannelCapacityError);
+    expect((error as ChannelCapacityError).role).toBe('subscribe');
+    expect(phase).toBe('ready');
   });
 
   test('reserves base-master control capacity and spills passive channels deterministically', async () => {
