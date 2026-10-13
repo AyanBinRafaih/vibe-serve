@@ -5,22 +5,22 @@ export type ChannelRole = 'host-control' | RunChannelRole;
 
 export const CHANNEL_ROLES = ['host-control', 'run-control', 'subscribe', 'chat'] as const;
 
-export type LeasePhase = 'opening' | 'active';
+type LeasePhase = 'opening' | 'active';
 
-export interface ChannelLeaseState {
+interface ChannelLeaseState {
   readonly id: number;
   readonly role: ChannelRole;
   readonly phase: LeasePhase;
 }
 
-export interface ChannelDemandState {
+interface ChannelDemandState {
   readonly id: number;
   readonly role: ChannelRole;
   readonly order: number;
   readonly excludedMasters: readonly number[];
 }
 
-export interface MasterAdmissionState {
+interface MasterAdmissionState {
   readonly id: number;
   /**
    * `retained` is a reachable spill whose last retirement failed: it may be reused, but is not
