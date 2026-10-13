@@ -393,10 +393,7 @@ export class WebSocketTransport implements ControlTransport {
    * the still-opening socket immediately rather than waiting for the browser's
    * connect timeout; the settled fence makes a queued late socket event inert.
    */
-  async #openSocket(
-    role: RunChannelRole,
-    signal?: AbortSignalLike,
-  ): Promise<WebSocketLike> {
+  async #openSocket(role: RunChannelRole, signal?: AbortSignalLike): Promise<WebSocketLike> {
     if (signal?.aborted) throw abortReason(signal);
     let socket: WebSocketLike;
     try {

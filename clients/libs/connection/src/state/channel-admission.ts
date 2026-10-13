@@ -22,9 +22,17 @@ export interface ChannelDemandState {
 
 export interface MasterAdmissionState {
   readonly id: number;
-  readonly phase: 'opening' | 'ready' | 'retiring';
+  /**
+   * `retained` is a reachable spill whose last retirement failed: it may be reused, but is not
+   * retried while idle. `unresolved` retains ownership when the shell cannot prove either presence
+   * or absence; it consumes the pool bound but cannot receive a channel.
+   */
+  readonly phase: 'opening' | 'ready' | 'retiring' | 'retained' | 'unresolved';
   readonly leases: readonly ChannelLeaseState[];
 }
+
+/** What a bounded exit-and-reconcile operation proved about one retiring master. */
+export type MasterRetirementOutcome = 'retired' | 'reachable' | 'unknown';
 
 export interface AdmissionConfig {
   /** Maximum simultaneous helper sessions on one master. */
@@ -56,7 +64,11 @@ export type AdmissionEvent =
   | {readonly type: 'master-failed'; readonly masterId: number}
   | {readonly type: 'activate'; readonly leaseId: number}
   | {readonly type: 'release'; readonly leaseId: number}
-  | {readonly type: 'master-retired'; readonly masterId: number}
+  | {
+      readonly type: 'master-retirement-observed';
+      readonly masterId: number;
+      readonly outcome: MasterRetirementOutcome;
+    }
   | {readonly type: 'close'};
 
 export type AdmissionOutput =
@@ -149,7 +161,7 @@ export function rolePriority(role: ChannelRole): number {
 }
 
 function admits(master: MasterAdmissionState, config: AdmissionConfig, role: ChannelRole): boolean {
-  if (master.phase !== 'ready') return false;
+  if (master.phase !== 'ready' && master.phase !== 'retained') return false;
   const limit = isOperator(role)
     ? config.capacityPerMaster
     : config.capacityPerMaster - config.reservedControlSlots;
@@ -204,6 +216,7 @@ function grant(
     master.id,
     current => ({
       ...current,
+      phase: 'ready',
       leases: [...current.leases, {id: demand.id, role: demand.role, phase: 'opening'}],
     }),
   );
@@ -218,6 +231,28 @@ function canWaitForOwnedMaster(state: AdmissionState, demand: ChannelDemandState
 }
 
 /**
+ * Closing never creates masters. It retires each reachable idle master once; an unresolved result
+ * stays owned so the shell can report incomplete teardown instead of spinning or dropping it.
+ */
+function scheduleClosing(initial: AdmissionState): AdmissionTransition {
+  const idle = initial.masters.filter(
+    master =>
+      (master.phase === 'ready' || master.phase === 'retained') && master.leases.length === 0,
+  );
+  if (idle.length === 0) return {state: initial, outputs: []};
+  const ids = new Set(idle.map(master => master.id));
+  return {
+    state: {
+      ...initial,
+      masters: initial.masters.map(master =>
+        ids.has(master.id) ? {...master, phase: 'retiring'} : master,
+      ),
+    },
+    outputs: idle.map(master => ({type: 'stop-master', masterId: master.id})),
+  };
+}
+
+/**
  * Drain queued demand in stable role-priority/FIFO order. A ready spill master is offered to all
  * queued callers before it can be retired, so cancellation of its original requester cannot strand
  * a follower. At most one opening master is needed: when it resolves this reducer runs again.
@@ -225,7 +260,7 @@ function canWaitForOwnedMaster(state: AdmissionState, demand: ChannelDemandState
 function schedule(initial: AdmissionState): AdmissionTransition {
   let state = initial;
   const outputs: AdmissionOutput[] = [];
-  if (state.phase === 'closed') return {state, outputs};
+  if (state.phase === 'closed') return scheduleClosing(state);
 
   while (state.demands.length > 0) {
     const demand = orderedDemands(state.demands)[0];
@@ -362,22 +397,44 @@ function releaseChannel(state: AdmissionState, leaseId: number): AdmissionTransi
   return schedule(updateLease(state, leaseId, () => null));
 }
 
-function retiredMaster(state: AdmissionState, masterId: number): AdmissionTransition {
-  return schedule(
-    replaceMaster(state, masterId, master => {
-      if (master.phase !== 'retiring') throw new Error(`SSH master ${masterId} is not retiring`);
-      if (master.leases.length !== 0) throw new Error(`SSH master ${masterId} still owns channels`);
-      return null;
-    }),
-  );
+function observeRetirement(
+  state: AdmissionState,
+  masterId: number,
+  outcome: MasterRetirementOutcome,
+): AdmissionTransition {
+  const observed = replaceMaster(state, masterId, master => {
+    if (master.phase !== 'retiring') throw new Error(`SSH master ${masterId} is not retiring`);
+    if (master.leases.length !== 0) throw new Error(`SSH master ${masterId} still owns channels`);
+    if (outcome === 'retired') return null;
+    if (state.phase === 'closed' || outcome === 'unknown') {
+      return {...master, phase: 'unresolved'};
+    }
+    return {...master, phase: 'retained'};
+  });
+  // A failed close attempt is terminal for this release. It remains accounted for so the shell can
+  // reject with truthful diagnostics rather than retrying forever or claiming it disappeared.
+  if (state.phase === 'closed' && outcome !== 'retired') return {state: observed, outputs: []};
+  return schedule(observed);
 }
 
 function closeAdmission(state: AdmissionState): AdmissionTransition {
   if (state.phase === 'closed') return {state, outputs: []};
-  return {
-    state: {...state, phase: 'closed', demands: []},
-    outputs: orderedDemands(state.demands).map(demand => ({type: 'closed', demandId: demand.id})),
+  const terminal: AdmissionOutput[] = orderedDemands(state.demands).map(demand => ({
+    type: 'closed',
+    demandId: demand.id,
+  }));
+  // `unresolved` masters get one explicit final reconciliation during close. A later failed result
+  // remains unresolved and is not automatically retried.
+  const closed: AdmissionState = {
+    ...state,
+    phase: 'closed',
+    demands: [],
+    masters: state.masters.map(master =>
+      master.phase === 'unresolved' ? {...master, phase: 'retained'} : master,
+    ),
   };
+  const retirement = scheduleClosing(closed);
+  return {state: retirement.state, outputs: [...terminal, ...retirement.outputs]};
 }
 
 /** Pure transition boundary for all queued demand, lease, and master lifecycle accounting. */
@@ -395,8 +452,8 @@ export function stepAdmission(state: AdmissionState, event: AdmissionEvent): Adm
       return activateChannel(state, event.leaseId);
     case 'release':
       return releaseChannel(state, event.leaseId);
-    case 'master-retired':
-      return retiredMaster(state, event.masterId);
+    case 'master-retirement-observed':
+      return observeRetirement(state, event.masterId, event.outcome);
     case 'close':
       return closeAdmission(state);
   }

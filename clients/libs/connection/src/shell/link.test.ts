@@ -2,7 +2,7 @@ import {describe, expect, test} from 'bun:test';
 import {FakeClock} from '@vibesys/transport/testing';
 import type {ChannelRole} from '../state/channel-admission.js';
 import {ECHO_SERVER, FakeHelper, record} from '../testing/fake-helper.js';
-import {type FakeProcess, fakeProcess} from '../testing/fake-process.js';
+import {deferredKillProcess, type FakeProcess, fakeProcess} from '../testing/fake-process.js';
 import {ConnectionError} from './helper-channel.js';
 import {HostConnection} from './host-connection.js';
 import {ChannelCapacityError, type Link, LocalLink, type Spawn, SshLink} from './link.js';
@@ -15,6 +15,8 @@ interface FakeSshPool {
   readonly masters: Set<string>;
   readonly helperMasters: string[];
   readonly masterStarts: string[];
+  readonly controlCalls: Array<{readonly path: string; readonly operation: string}>;
+  readonly queuedControls: Map<string, FakeProcess[]>;
   deferNextMaster: FakeProcess | null;
   refuseNextHelperOn: string | null;
 }
@@ -26,10 +28,31 @@ function controlPath(args: readonly string[]): string {
 }
 
 function controlOperation(pool: FakeSshPool, path: string, operation: string): SpawnedProcess {
+  pool.controlCalls.push({path, operation});
+  const key = `${path}:${operation}`;
+  const queued = pool.queuedControls.get(key)?.shift();
+  if (queued !== undefined) {
+    void queued.process.exit.then(code => {
+      if (operation === 'exit' && code === 0) pool.masters.delete(path);
+    });
+    return queued.process;
+  }
   const process = fakeProcess();
   if (operation === 'exit') pool.masters.delete(path);
   process.end(operation === 'check' && !pool.masters.has(path) ? 255 : 0);
   return process.process;
+}
+
+function queueControl(
+  pool: FakeSshPool,
+  path: string,
+  operation: 'exit' | 'check',
+  process: FakeProcess,
+): void {
+  const key = `${path}:${operation}`;
+  const queue = pool.queuedControls.get(key) ?? [];
+  queue.push(process);
+  pool.queuedControls.set(key, queue);
 }
 
 function startMaster(pool: FakeSshPool, path: string): SpawnedProcess {
@@ -66,6 +89,8 @@ function fakeSshPool(helper: FakeHelper): FakeSshPool {
     masters: new Set(),
     helperMasters: [],
     masterStarts: [],
+    controlCalls: [],
+    queuedControls: new Map(),
     deferNextMaster: null,
     refuseNextHelperOn: null,
     spawn: (_command, args) => {
@@ -94,12 +119,15 @@ function connection(link: SshLink, clock = new FakeClock()): HostConnection {
 function link(
   pool: FakeSshPool,
   options: {capacityPerMaster: number; reservedControlSlots: number; maxMasters: number},
+  clock = new FakeClock(),
 ): SshLink {
   return new SshLink({
     alias: 'gpu',
     controlPath: '/tmp/cm-%C',
     askpass: '/askpass',
     spawn: pool.spawn,
+    scheduleTimeout: clock.scheduleTimeout,
+    retirementCommandTimeoutMs: 100,
     ...options,
   });
 }
@@ -448,6 +476,133 @@ describe('role-aware SSH link pool', () => {
     subscribe.stream.destroy();
     firstOpened.stream.destroy();
     secondOpened.stream.destroy();
+  });
+
+  for (const outcome of [
+    {label: 'exit status 255', code: 255},
+    {label: 'a null signal exit', code: null},
+  ] as const) {
+    test(`reconciles ${outcome.label} and reuses the reachable spill for queued demand`, async () => {
+      const helper = new FakeHelper();
+      const pool = fakeSshPool(helper);
+      const ssh = link(pool, {capacityPerMaster: 2, reservedControlSlots: 1, maxMasters: 2});
+      await ssh.establish(false);
+      const base = await openProcess(ssh, 'chat');
+      const spill = await openProcess(ssh, 'chat');
+      const failedExit = fakeProcess();
+      failedExit.end(outcome.code);
+      queueControl(pool, '/tmp/cm-%C.1', 'exit', failedExit);
+
+      await stopProcess(spill);
+      const reused = await openProcess(ssh, 'chat');
+
+      expect(pool.controlCalls.slice(-2)).toEqual([
+        {path: '/tmp/cm-%C.1', operation: 'exit'},
+        {path: '/tmp/cm-%C.1', operation: 'check'},
+      ]);
+      expect(pool.masterStarts).toEqual(['/tmp/cm-%C', '/tmp/cm-%C.1']);
+      expect(pool.helperMasters.at(-1)).toBe('/tmp/cm-%C.1');
+      expect(pool.masters).toEqual(new Set(['/tmp/cm-%C', '/tmp/cm-%C.1']));
+      expect(ssh.diagnostics().masterCount).toBe(2);
+
+      await Promise.all([stopProcess(base), stopProcess(reused)]);
+      await ssh.release();
+    });
+  }
+
+  test('bounds an unconfirmed hung retirement and terminally settles demand queued behind it', async () => {
+    const helper = new FakeHelper();
+    const pool = fakeSshPool(helper);
+    const clock = new FakeClock();
+    const ssh = link(pool, {capacityPerMaster: 2, reservedControlSlots: 1, maxMasters: 2}, clock);
+    await ssh.establish(false);
+    const base = await openProcess(ssh, 'chat');
+    const spill = await openProcess(ssh, 'chat');
+    const kills: string[] = [];
+    const hungExit = deferredKillProcess(signal => kills.push(signal));
+    queueControl(pool, '/tmp/cm-%C.1', 'exit', hungExit);
+
+    await stopProcess(spill);
+    const waiting = openProcess(ssh, 'chat');
+    await clock.waitUntilScheduled(100);
+    clock.advanceBy(200);
+    const error = await rejection(waiting);
+
+    expect(kills).toEqual(['SIGKILL']);
+    expect(error).toBeInstanceOf(ChannelCapacityError);
+    expect(pool.controlCalls.at(-1)).toEqual({path: '/tmp/cm-%C.1', operation: 'exit'});
+    expect(pool.masterStarts).toEqual(['/tmp/cm-%C', '/tmp/cm-%C.1']);
+    expect(ssh.diagnostics().masterCount).toBe(2);
+
+    hungExit.end(null);
+    await hungExit.process.exit;
+    await Promise.resolve();
+    await stopProcess(base);
+    await ssh.release();
+  });
+
+  test('final release rejects partial base-and-spill teardown with truthful diagnostics', async () => {
+    const helper = new FakeHelper();
+    const pool = fakeSshPool(helper);
+    const ssh = link(pool, {capacityPerMaster: 1, reservedControlSlots: 0, maxMasters: 3});
+    await ssh.establish(false);
+    const base = await openProcess(ssh, 'chat');
+    const firstSpill = await openProcess(ssh, 'chat');
+    const secondSpill = await openProcess(ssh, 'chat');
+
+    const refusedExit = fakeProcess();
+    refusedExit.end(255);
+    queueControl(pool, '/tmp/cm-%C.1', 'exit', refusedExit);
+    const signalledExit = fakeProcess();
+    signalledExit.end(null);
+    queueControl(pool, '/tmp/cm-%C.2', 'exit', signalledExit);
+    const unknownCheck = fakeProcess();
+    unknownCheck.end(null);
+    queueControl(pool, '/tmp/cm-%C.2', 'check', unknownCheck);
+
+    const releasing = ssh.release();
+    await Promise.all([stopProcess(base), stopProcess(firstSpill), stopProcess(secondSpill)]);
+    const error = await rejection(releasing);
+
+    expect(error).toBeInstanceOf(ConnectionError);
+    expect(error.message).toContain('could not confirm teardown of 2 SSH masters');
+    expect(pool.masters).toEqual(new Set(['/tmp/cm-%C.1', '/tmp/cm-%C.2']));
+    expect(ssh.diagnostics()).toEqual({
+      masterCount: 2,
+      opening: {'host-control': 0, 'run-control': 0, subscribe: 0, chat: 0},
+      active: {'host-control': 0, 'run-control': 0, subscribe: 0, chat: 0},
+      masters: [
+        {
+          opening: {'host-control': 0, 'run-control': 0, subscribe: 0, chat: 0},
+          active: {'host-control': 0, 'run-control': 0, subscribe: 0, chat: 0},
+        },
+        {
+          opening: {'host-control': 0, 'run-control': 0, subscribe: 0, chat: 0},
+          active: {'host-control': 0, 'run-control': 0, subscribe: 0, chat: 0},
+        },
+      ],
+    });
+  });
+
+  test('successful final release removes every master from diagnostics', async () => {
+    const helper = new FakeHelper();
+    const pool = fakeSshPool(helper);
+    const ssh = link(pool, {capacityPerMaster: 1, reservedControlSlots: 0, maxMasters: 2});
+    await ssh.establish(false);
+    const base = await openProcess(ssh, 'chat');
+    const spill = await openProcess(ssh, 'chat');
+
+    const releasing = ssh.release();
+    await Promise.all([stopProcess(base), stopProcess(spill)]);
+    await releasing;
+
+    expect(pool.masters).toEqual(new Set());
+    expect(ssh.diagnostics()).toEqual({
+      masterCount: 0,
+      opening: {'host-control': 0, 'run-control': 0, subscribe: 0, chat: 0},
+      active: {'host-control': 0, 'run-control': 0, subscribe: 0, chat: 0},
+      masters: [],
+    });
   });
 
   test('release kills a paused spillover creation and starts no late helper', async () => {

@@ -19,6 +19,7 @@
  */
 import {spawn} from 'node:child_process';
 import {homedir} from 'node:os';
+import type {ScheduleTimeout} from '@vibesys/transport';
 import {
   type AdmissionConfig,
   type AdmissionOutput,
@@ -26,6 +27,7 @@ import {
   type ChannelRole,
   initialAdmissionState,
   type LinkPoolDiagnostics,
+  type MasterRetirementOutcome,
   poolDiagnostics,
   stepAdmission,
 } from '../state/channel-admission.js';
@@ -179,6 +181,10 @@ export interface SshLinkOptions {
   readonly capacityPerMaster?: number;
   readonly reservedControlSlots?: number;
   readonly maxMasters?: number;
+  /** Every retirement control command is killed after this bound. */
+  readonly retirementCommandTimeoutMs?: number;
+  /** Injected timer boundary; production supplies the desktop's real timer implementation. */
+  readonly scheduleTimeout: ScheduleTimeout;
 }
 
 export const DEFAULT_SSH_POOL_CONFIG: AdmissionConfig = {
@@ -186,6 +192,8 @@ export const DEFAULT_SSH_POOL_CONFIG: AdmissionConfig = {
   reservedControlSlots: 2,
   maxMasters: 4,
 };
+
+const DEFAULT_RETIREMENT_COMMAND_TIMEOUT_MS = 1_000;
 
 /** ssh's own exit status for a connection or authentication failure. */
 const SSH_FAILED = 255;
@@ -220,6 +228,19 @@ interface AdmissionWaiter {
   readonly reject: (error: Error) => void;
 }
 
+/** Shell ownership for one reducer-requested exit and its optional reachability check. */
+interface RetirementAttempt {
+  process: SpawnedProcess | null;
+  cancelDeadline: (() => void) | null;
+  promise: Promise<void>;
+}
+
+interface RetirementCommandResult {
+  /** Whether the shell observed this exact control process terminate. */
+  readonly confirmed: boolean;
+  readonly code: number | null;
+}
+
 export class SshLink implements Link {
   readonly host: string;
   readonly #options: SshLinkOptions;
@@ -238,14 +259,25 @@ export class SshLink implements Link {
   readonly #openingMasterProcesses = new Map<number, SpawnedProcess>();
   /** Every helper exit this link still owns; release joins all of them before masters. */
   readonly #helperExits = new Set<Promise<number | null>>();
-  /** Retirements already under way, also joined by release. */
-  readonly #retirements = new Map<number, Promise<void>>();
+  /** Retirements already under way, including the exact command and deadline the shell owns. */
+  readonly #retirements = new Map<number, RetirementAttempt>();
+  /** Killed control commands that did not confirm exit within their second, bounded grace period. */
+  readonly #unconfirmedRetirementCommands = new Set<Promise<number | null>>();
+  #releasing: Promise<void> | null = null;
   /** The `uv` a bootstrap on the host found, passed to the next one. */
   #uv: string | null = null;
 
   constructor(options: SshLinkOptions) {
     this.#options = options;
     this.#spawn = options.spawn ?? nodeSpawn;
+    this.#retirementCommandTimeoutMs =
+      options.retirementCommandTimeoutMs ?? DEFAULT_RETIREMENT_COMMAND_TIMEOUT_MS;
+    if (
+      !Number.isSafeInteger(this.#retirementCommandTimeoutMs) ||
+      this.#retirementCommandTimeoutMs < 1
+    ) {
+      throw new RangeError('retirementCommandTimeoutMs must be a positive integer');
+    }
     this.host = options.alias;
     this.#admission = initialAdmissionState({
       capacityPerMaster: options.capacityPerMaster ?? DEFAULT_SSH_POOL_CONFIG.capacityPerMaster,
@@ -330,7 +362,12 @@ export class SshLink implements Link {
     return poolDiagnostics(this.#admission);
   }
 
-  async release(): Promise<void> {
+  release(): Promise<void> {
+    this.#releasing ??= this.#release();
+    return this.#releasing;
+  }
+
+  async #release(): Promise<void> {
     // Every active or retired attempt owns the same master this release closes. Kill each attempt
     // so quitting is not held hostage by ConnectTimeout, then wait for confirmed exits before
     // `-O exit`; otherwise a retired process could still fork a master after exit completed.
@@ -340,14 +377,25 @@ export class SshLink implements Link {
     for (const process of this.#openingMasterProcesses.values()) process.kill('SIGTERM');
     await Promise.all([...this.#attempts].map(attempt => attempt.promise.catch(() => {})));
     await Promise.all([...this.#openingMasters.values()].map(opening => opening.catch(() => {})));
+    // The base establishment lifecycle deliberately remains `opening` across a failed attempt so
+    // it can be retried. At final close it instead becomes an owned candidate whose absence must be
+    // reconciled through the same bounded retirement path.
+    this.#markMasterReady(0);
     await Promise.all(this.#helperExits);
-    await Promise.all([...this.#retirements.values()]);
-    const masters = this.#admission.masters.map(master => master.id);
-    await Promise.all(
-      masters.map(masterId =>
-        this.#finish(this.#ssh(['-O', 'exit', '--', this.#options.alias], undefined, {}, masterId)),
-      ),
-    );
+    // Lease releases can request new retirements while helpers are draining. Join until the map is
+    // empty rather than taking a snapshot that could miss one of those reducer outputs.
+    while (this.#retirements.size > 0) {
+      await Promise.all([...this.#retirements.values()].map(retirement => retirement.promise));
+    }
+    if (this.#admission.masters.length > 0 || this.#unconfirmedRetirementCommands.size > 0) {
+      const count = this.#admission.masters.length;
+      const commands = this.#unconfirmedRetirementCommands.size;
+      const detail =
+        count > 0
+          ? `${count} SSH master${count === 1 ? '' : 's'}`
+          : `${commands} SSH control command${commands === 1 ? '' : 's'}`;
+      throw new ConnectionError('link', `could not confirm teardown of ${detail}`);
+    }
   }
 
   #begin(interactive: boolean): EstablishAttempt {
@@ -640,15 +688,110 @@ export class SshLink implements Link {
   }
 
   #startRetirement(masterId: number): void {
-    if (this.#released || this.#retirements.has(masterId)) return;
-    const retiring = this.#finish(
-      this.#ssh(['-O', 'exit', '--', this.#options.alias], undefined, {}, masterId),
-    )
-      .then(() => {
-        this.#applyAdmission(stepAdmission(this.#admission, {type: 'master-retired', masterId}));
+    if (this.#retirements.has(masterId)) return;
+    const retirement: RetirementAttempt = {
+      process: null,
+      cancelDeadline: null,
+      promise: Promise.resolve(),
+    };
+    this.#retirements.set(masterId, retirement);
+    retirement.promise = this.#retireMaster(masterId, retirement)
+      .then(outcome => {
+        this.#applyAdmission(
+          stepAdmission(this.#admission, {
+            type: 'master-retirement-observed',
+            masterId,
+            outcome,
+          }),
+        );
       })
-      .finally(() => this.#retirements.delete(masterId));
-    this.#retirements.set(masterId, retiring);
+      .finally(() => {
+        retirement.cancelDeadline?.();
+        retirement.cancelDeadline = null;
+        retirement.process = null;
+        this.#retirements.delete(masterId);
+      });
+  }
+
+  async #retireMaster(
+    masterId: number,
+    retirement: RetirementAttempt,
+  ): Promise<MasterRetirementOutcome> {
+    const exit = await this.#runRetirementCommand(
+      ['-O', 'exit', '--', this.#options.alias],
+      masterId,
+      retirement,
+    );
+    if (!exit.confirmed) return 'unknown';
+    if (exit.code === 0) return 'retired';
+    const check = await this.#runRetirementCommand(
+      ['-O', 'check', '--', this.#options.alias],
+      masterId,
+      retirement,
+    );
+    if (!check.confirmed || check.code === null) return 'unknown';
+    if (check.code === 0) return 'reachable';
+    return 'retired';
+  }
+
+  async #runRetirementCommand(
+    args: readonly string[],
+    masterId: number,
+    retirement: RetirementAttempt,
+  ): Promise<RetirementCommandResult> {
+    let process: SpawnedProcess;
+    try {
+      process = this.#ssh(args, undefined, {}, masterId);
+    } catch {
+      return {confirmed: false, code: null};
+    }
+    retirement.process = process;
+    const finished = this.#finish(process);
+    return new Promise(resolve => {
+      let settled = false;
+      let cancelKill = (): void => {};
+      let cancelGrace = (): void => {};
+      const settle = (result: RetirementCommandResult): void => {
+        if (settled) return;
+        settled = true;
+        cancelKill();
+        cancelGrace();
+        retirement.cancelDeadline = null;
+        if (retirement.process === process) retirement.process = null;
+        resolve(result);
+      };
+      const ownUnconfirmedExit = (): void => {
+        const exit = process.exit;
+        this.#unconfirmedRetirementCommands.add(exit);
+        void exit.then(
+          () => this.#unconfirmedRetirementCommands.delete(exit),
+          () => this.#unconfirmedRetirementCommands.delete(exit),
+        );
+        settle({confirmed: false, code: null});
+      };
+      cancelKill = this.#options.scheduleTimeout(() => {
+        process.kill('SIGKILL');
+        cancelGrace = this.#options.scheduleTimeout(
+          ownUnconfirmedExit,
+          this.#retirementCommandTimeoutMs,
+        );
+        retirement.cancelDeadline = () => {
+          cancelKill();
+          cancelGrace();
+        };
+      }, this.#retirementCommandTimeoutMs);
+      retirement.cancelDeadline = () => {
+        cancelKill();
+        cancelGrace();
+      };
+      void finished.then(
+        result => settle({confirmed: true, code: result.code}),
+        () => {
+          process.kill('SIGKILL');
+          ownUnconfirmedExit();
+        },
+      );
+    });
   }
 
   #markMasterReady(masterId: number): void {

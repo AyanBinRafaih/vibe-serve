@@ -125,9 +125,11 @@ function generatedStep(
     });
   }
   if (retiring.length > 0) {
+    const outcomes = ['retired', 'reachable', 'unknown'] as const;
     return applyGeneratedEvent(state, {
-      type: 'master-retired',
+      type: 'master-retirement-observed',
       masterId: retiring[draw(retiring.length)]?.id as number,
+      outcome: outcomes[draw(outcomes.length)] as (typeof outcomes)[number],
     });
   }
   return state;
@@ -251,6 +253,92 @@ describe('channel admission', () => {
       {type: 'closed', demandId: 4},
     ]);
     expect(closed.state.demands).toEqual([]);
+  });
+
+  test('retains a reachable failed retirement for reuse without exceeding the master bound', () => {
+    const config = {capacityPerMaster: 2, reservedControlSlots: 1, maxMasters: 2};
+    let state = ready(config);
+    const base = request(state, 1, 'chat');
+    state = activateGranted(base.state, base.outputs);
+    const spill = request(state, 2, 'chat');
+    const opened = dispatch(spill.state, {type: 'master-ready', masterId: 1});
+    state = activateGranted(opened.state, opened.outputs);
+
+    const idle = dispatch(state, {type: 'release', leaseId: 2});
+    expect(idle.outputs).toEqual([{type: 'stop-master', masterId: 1}]);
+    const retained = dispatch(idle.state, {
+      type: 'master-retirement-observed',
+      masterId: 1,
+      outcome: 'reachable',
+    });
+    expect(retained.outputs).toEqual([]);
+    expect(retained.state.masters.find(master => master.id === 1)?.phase).toBe('retained');
+
+    const reused = request(retained.state, 3, 'chat');
+    expect(reused.outputs).toEqual([{type: 'granted', demandId: 3, masterId: 1}]);
+    expect(reused.state.masters.find(master => master.id === 1)?.phase).toBe('ready');
+    const stoppedAgain = dispatch(reused.state, {type: 'release', leaseId: 3});
+    const unresolved = dispatch(stoppedAgain.state, {
+      type: 'master-retirement-observed',
+      masterId: 1,
+      outcome: 'unknown',
+    });
+    expect(unresolved.state.masters.find(master => master.id === 1)?.phase).toBe('unresolved');
+
+    const exhausted = request(unresolved.state, 4, 'chat');
+    expect(exhausted.outputs).toEqual([{type: 'capacity', demandId: 4}]);
+    expect(exhausted.state.masters).toHaveLength(2);
+  });
+
+  test('close retires base and spills once and preserves every unresolved outcome', () => {
+    const config = {capacityPerMaster: 1, reservedControlSlots: 0, maxMasters: 3};
+    let state = ready(config);
+    for (let id = 1; id <= 3; id += 1) {
+      const admitted = request(state, id, 'chat');
+      state = admitted.state;
+      const starting = admitted.outputs.find(output => output.type === 'start-master');
+      if (starting !== undefined) {
+        const opened = dispatch(state, {type: 'master-ready', masterId: starting.masterId});
+        state = opened.state;
+        state = activateGranted(state, opened.outputs);
+      } else {
+        state = activateGranted(state, admitted.outputs);
+      }
+    }
+
+    const closed = dispatch(state, {type: 'close'});
+    expect(closed.outputs).toEqual([]);
+    const baseIdle = dispatch(closed.state, {type: 'release', leaseId: 1});
+    const firstIdle = dispatch(baseIdle.state, {type: 'release', leaseId: 2});
+    const secondIdle = dispatch(firstIdle.state, {type: 'release', leaseId: 3});
+    expect([...baseIdle.outputs, ...firstIdle.outputs, ...secondIdle.outputs]).toEqual([
+      {type: 'stop-master', masterId: 0},
+      {type: 'stop-master', masterId: 1},
+      {type: 'stop-master', masterId: 2},
+    ]);
+
+    const baseGone = dispatch(secondIdle.state, {
+      type: 'master-retirement-observed',
+      masterId: 0,
+      outcome: 'retired',
+    });
+    const firstFailed = dispatch(baseGone.state, {
+      type: 'master-retirement-observed',
+      masterId: 1,
+      outcome: 'reachable',
+    });
+    const secondUnknown = dispatch(firstFailed.state, {
+      type: 'master-retirement-observed',
+      masterId: 2,
+      outcome: 'unknown',
+    });
+
+    expect(secondUnknown.outputs).toEqual([]);
+    expect(secondUnknown.state.masters.map(master => [master.id, master.phase])).toEqual([
+      [1, 'unresolved'],
+      [2, 'unresolved'],
+    ]);
+    expect(poolDiagnostics(secondUnknown.state).masterCount).toBe(2);
   });
 
   test('generated request, cancellation, lifecycle, and release sequences conserve state', () => {

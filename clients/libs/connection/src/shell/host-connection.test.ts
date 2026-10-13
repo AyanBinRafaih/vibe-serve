@@ -459,7 +459,7 @@ describe('HostConnection over the FakeHelper', () => {
       ];
       await using connection = fakeConnection(link);
 
-      const {runId, stream} = await connection.openRun('00000000000b');
+      const {runId, stream} = await connection.openRun('00000000000b', 'run-control');
       const expected = Buffer.from(`${greeting}\n`);
       const delivered = await new Promise<Buffer>(resolve => {
         const chunks: Buffer[] = [];
@@ -487,7 +487,7 @@ describe('HostConnection over the FakeHelper', () => {
     await using connection = fakeConnection(link);
     await connection.ready();
 
-    const error = await rejection(connection.openRun('00000000000b'));
+    const error = await rejection(connection.openRun('00000000000b', 'run-control'));
 
     expect(error).toBeInstanceOf(ConnectionError);
     if (!(error instanceof ConnectionError)) throw error;
@@ -1065,7 +1065,7 @@ describe('ConnectionManager', () => {
       const error = await rejection(sshLink(spawn).release());
 
       expect(error).toBeInstanceOf(ConnectionError);
-      expect(error.message).toContain('remained reachable');
+      expect(error.message).toContain('could not confirm teardown of 1 SSH master');
       expect(operations).toEqual(['exit', 'check']);
     });
   }
