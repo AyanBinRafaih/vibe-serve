@@ -3,7 +3,7 @@ import type {
   ArchitectureComponent,
   ArchitectureGraphDocument,
 } from '@vibesys/contracts';
-import type {CSSProperties, JSX} from 'react';
+import {type CSSProperties, type JSX, useId, useRef} from 'react';
 import {
   foldArchitectureCursor,
   initialArchitectureState,
@@ -28,6 +28,8 @@ export function ArchitectureDiagram({
   selectedComponentId,
   onSelectedComponentId,
 }: ArchitectureDiagramProps): JSX.Element {
+  const instanceId = useId();
+  const opener = useRef<HTMLElement | null>(null);
   const state = foldArchitectureCursor(initialArchitectureState(graph), {
     type: 'campaign-cursor',
     cursor: {measurementId: cursorMeasurementId, sequence: cursorSequence},
@@ -36,13 +38,14 @@ export function ArchitectureDiagram({
   const layout = layoutArchitecture(graph);
   const components = new Map(graph.components.map(component => [component.id, component]));
   const selectedComponent = components.get(selectedComponentId ?? '');
+  const titleId = architectureTitleId(instanceId);
   return (
     <>
-      <section className="panel architecture-panel" aria-labelledby="architecture-title">
+      <section className="panel architecture-panel" aria-labelledby={titleId}>
         <header className="architecture-header">
           <div>
             <p className="section-kicker">SYSTEM TOPOLOGY · {graph.generation.approach}</p>
-            <h2 id="architecture-title">{graph.title}</h2>
+            <h2 id={titleId}>{graph.title}</h2>
             <p>{graph.description}</p>
           </div>
           <div className="architecture-observation" aria-live="polite">
@@ -92,15 +95,19 @@ export function ArchitectureDiagram({
                   }
                 >
                   <button
+                    id={componentTriggerId(instanceId, node.id)}
                     type="button"
                     className="architecture-node-trigger"
-                    aria-controls={componentDetailsId(node.id)}
+                    aria-controls={componentDetailsId(instanceId, node.id)}
                     aria-expanded={selectedComponentId === node.id}
                     aria-haspopup="dialog"
                     aria-label={`${component.label}, ${component.kind}${
                       changed ? ', changed at selected measurement' : ''
                     }. Open component details.`}
-                    onClick={() => onSelectedComponentId(node.id)}
+                    onClick={event => {
+                      opener.current = event.currentTarget;
+                      onSelectedComponentId(node.id);
+                    }}
                   >
                     <span className="architecture-node-heading">
                       <span>{component.kind}</span>
@@ -145,6 +152,7 @@ export function ArchitectureDiagram({
       </section>
       <ArchitectureComponentSheet
         component={selectedComponent}
+        instanceId={instanceId}
         attribution={selectedComponent && view.attributions.get(selectedComponent.id)}
         changedFiles={
           selectedComponent !== undefined && view.changedComponentIds.has(selectedComponent.id)
@@ -153,7 +161,7 @@ export function ArchitectureDiagram({
               )?.changed_files ?? [])
             : []
         }
-        onClose={() => onSelectedComponentId(null)}
+        onClose={() => closeComponentDetails(opener.current, onSelectedComponentId)}
       />
     </>
   );
@@ -161,11 +169,13 @@ export function ArchitectureDiagram({
 
 function ArchitectureComponentSheet({
   component,
+  instanceId,
   attribution,
   changedFiles,
   onClose,
 }: {
   readonly component: ArchitectureComponent | undefined;
+  readonly instanceId: string;
   readonly attribution:
     | {
         readonly cost: ArchitectureAttributionValue | null;
@@ -178,7 +188,11 @@ function ArchitectureComponentSheet({
   return (
     <Sheet open={component !== undefined} onOpenChange={open => !open && onClose()}>
       {component !== undefined && (
-        <SheetContent id={componentDetailsId(component.id)} className="architecture-detail-sheet">
+        <SheetContent
+          id={componentDetailsId(instanceId, component.id)}
+          className="architecture-detail-sheet"
+          onCloseAutoFocus={event => event.preventDefault()}
+        >
           <header className="dialog-head">
             <div>
               <p className="section-kicker">{component.kind} COMPONENT</p>
@@ -207,8 +221,13 @@ function ArchitectureComponentSheet({
             <Metric label="Cost" value={attribution?.cost} />
             <Metric label="Latency" value={attribution?.latency} />
           </dl>
-          <section className="architecture-detail-changes" aria-labelledby="component-files-title">
-            <h3 id="component-files-title">Changed files at this capture</h3>
+          <section
+            className="architecture-detail-changes"
+            aria-labelledby={componentFilesTitleId(instanceId, component.id)}
+          >
+            <h3 id={componentFilesTitleId(instanceId, component.id)}>
+              Changed files at this capture
+            </h3>
             {changedFiles.length === 0 ? (
               <p>No changed files were recorded for this component.</p>
             ) : (
@@ -227,8 +246,30 @@ function ArchitectureComponentSheet({
   );
 }
 
-function componentDetailsId(componentId: string): string {
-  return `architecture-component-${encodeURIComponent(componentId)}`;
+function architectureTitleId(instanceId: string): string {
+  return `${instanceId}-architecture-title`;
+}
+
+function componentDetailsId(instanceId: string, componentId: string): string {
+  return `${instanceId}-architecture-component-${encodeURIComponent(componentId)}`;
+}
+
+function componentTriggerId(instanceId: string, componentId: string): string {
+  return `${instanceId}-architecture-component-trigger-${encodeURIComponent(componentId)}`;
+}
+
+function componentFilesTitleId(instanceId: string, componentId: string): string {
+  return `${instanceId}-architecture-component-files-${encodeURIComponent(componentId)}`;
+}
+
+function closeComponentDetails(
+  opener: HTMLElement | null,
+  onSelectedComponentId: (id: string | null) => void,
+): void {
+  onSelectedComponentId(null);
+  queueMicrotask(() => {
+    if (opener?.isConnected === true) opener.focus();
+  });
 }
 
 function Metric({

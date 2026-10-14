@@ -2,7 +2,6 @@ import {expect, test} from 'bun:test';
 import {readFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import {type ArchitectureGraphDocument, parseArchitectureGraph} from '@vibesys/contracts';
-import {isValidElement, type ReactElement, type ReactNode} from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 import {ArchitectureDiagram} from '../index.js';
 
@@ -16,29 +15,21 @@ test('renders cursor-aligned changes, recorded paths, and explicit missing attri
   expect(html).toContain('data-component-id="queue.mutex" data-changed="false"');
   expect(html).toContain('C ABI, api, changed at selected measurement');
   expect(html).toContain('aria-haspopup="dialog"');
-  expect(html).toContain('aria-controls="architecture-component-queue.ffi"');
+  expect(html).toMatch(/aria-controls="[^"]+-architecture-component-queue\.ffi"/);
   expect(html).toContain('src/ffi.rs');
   expect(html).toContain('<dt>Cost</dt><dd>Unavailable</dd>');
   expect(html).toContain('<dt>Latency</dt><dd>Unavailable</dd>');
 });
 
-test('component buttons publish their stable identity to the campaign controller', () => {
-  const selected: Array<string | null> = [];
-  const tree = ArchitectureDiagram({
-    graph: queue,
-    cursorMeasurementId: 'queue-copy-elision',
-    cursorSequence: 2,
-    selectedComponentId: null,
-    onSelectedComponentId: id => selected.push(id),
-  });
-  const producer = descendants(tree).find(
-    node => node.props['aria-controls'] === 'architecture-component-queue.producer',
+test('component buttons expose instance-scoped accessible relationships', () => {
+  const html = render(queue, 'queue-copy-elision', 2);
+  const producerTrigger = html.match(
+    /id="([^"]+-architecture-component-trigger-queue\.producer)"[^>]+aria-controls="([^"]+-architecture-component-queue\.producer)"/,
   );
 
-  expect(producer?.type).toBe('button');
-  expect(producer?.props['aria-expanded']).toBe(false);
-  (producer?.props['onClick'] as (() => void) | undefined)?.();
-  expect(selected).toEqual(['queue.producer']);
+  expect(producerTrigger).not.toBeNull();
+  expect(producerTrigger?.[1]).not.toBe(producerTrigger?.[2]);
+  expect(html).toContain('aria-expanded="false"');
 });
 
 test('the responsive graph is a named keyboard region with accessible relationships', () => {
@@ -76,13 +67,6 @@ function render(
       onSelectedComponentId={() => undefined}
     />,
   );
-}
-
-function descendants(node: ReactNode): ReactElement<Record<string, unknown>>[] {
-  if (node === null || node === undefined || typeof node === 'boolean') return [];
-  if (Array.isArray(node)) return node.flatMap(descendants);
-  if (!isValidElement<Record<string, unknown>>(node)) return [];
-  return [node, ...descendants(node.props['children'] as ReactNode)];
 }
 
 function fixture(name: string): ArchitectureGraphDocument {

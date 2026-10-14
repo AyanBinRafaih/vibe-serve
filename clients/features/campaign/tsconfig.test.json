@@ -15,6 +15,7 @@
     "jsx": "react-jsx"
   },
   "include": [
+    "dom-tests/**/*.test.tsx",
     "src/**/*.test.ts",
     "src/**/*.test.tsx"
   ],
