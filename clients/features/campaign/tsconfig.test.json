@@ -26,6 +26,9 @@
       "path": "./tsconfig.renderer.json"
     },
     {
+      "path": "../../libs/contracts/tsconfig.lib.json"
+    },
+    {
       "path": "../../libs/machine/tsconfig.lib.json"
     },
     {
