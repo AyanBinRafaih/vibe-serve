@@ -159,10 +159,11 @@ export class AppWindow {
   /**
    * Replace the run page with a new one for `runId`, and show it.
    *
-   * This app shows one run page at a time: opening a second run's page here always replaces the
-   * first, the same way it always has. `runId` lets this window tell IPC admission and the
-   * `closed`/`connect` callbacks which run its one page is for, so run-control's binding for a run
-   * that is not the one currently shown is never reached by this window's events.
+   * This app shows one run page at a time: opening a second run's page here always detaches the
+   * first run before replacing its page, the same way it always has. `runId` lets this window tell
+   * IPC admission and the `closed`/`connect` callbacks which run its one page is for, so
+   * run-control's binding for a run that is not the one currently shown is never reached by this
+   * window's events.
    */
   openRunPage(
     runId: string,
@@ -171,6 +172,7 @@ export class AppWindow {
     wake(): void;
     close(): void;
   } {
+    this.#detachCurrentRun();
     const view = sandboxedView('run.cjs');
     this.#runPages.replace(view);
     this.#currentRunId = runId;
