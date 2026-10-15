@@ -87,7 +87,7 @@ class FalseyFakeBackendFactory:
 
     def __call__(self, *_args: object, **_kwargs: object) -> FakeComputeBackend:
         self.calls += 1
-        backend = FakeComputeBackend()
+        backend = FakeComputeBackend(threads=self.threads)
         backend.script_sandbox_for_kind(
             SandboxKind.DOCKER, FakeLifecycleRunner(threads=self.threads)
         )
@@ -245,7 +245,7 @@ def test_launch_wires_durable_invocation_store(tmp_path: Path, sim: Sim, *, inje
     threads = sim.threads()
     repositories = _WorktreeMarkerRepositories()
     clients: list[FakeAgentClient] = []
-    backend = FakeComputeBackend()
+    backend = FakeComputeBackend(threads=threads)
     backend.script_sandbox_for_kind(SandboxKind.DOCKER, FakeLifecycleRunner(threads=threads))
 
     def implement(invocation: FakeInvocation) -> dict[str, object]:

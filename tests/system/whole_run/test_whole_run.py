@@ -27,8 +27,10 @@ Replay a seed with ``--sim-seed=N``; the nightly depth sweeps ``_NIGHTLY_SEEDS``
 from __future__ import annotations
 
 import json
+import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -65,7 +67,9 @@ from vs_sandbox.api import DockerSandbox, SandboxKind, SubprocessDockerCli
 from vs_sandbox.api.testing import FakeComputeBackend
 from vs_sim.api import Signals
 from vs_sim.api.testing import (
+    DEFAULT_BUFFER_BYTES,
     HANG_GUARD_S,
+    End,
     FakePipedProcessLauncher,
     FakeProcesses,
     FakeProcessSignaller,
@@ -85,7 +89,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from vs_sandbox.api import CommandRunner, DockerCli, HostResource
-    from vs_sim.api import Connection, Network, ProcessSpec
+    from vs_sim.api import Connection, Event, Network, ProcessSpec
 
 _PLUGIN_ID = "whole-run"
 _RUN_ID = "whole-run-1"
@@ -109,14 +113,6 @@ the sandbox remap them anyway, and removing the container removes a result file 
 cleanup was lost."""
 _GATES = frozenset({"accuracy", "benchmark"})
 """Measurement commands whose loss the run reports as a failed gate instead of retrying."""
-_MISBLAMED = frozenset({"accuracy"})
-"""Commands the drawn deaths spare, because a known bug blames their death on the candidate.
-
-The sandbox reports a ``docker exec`` client killed by signal N as exit ``128 + N``, the
-status of a command killed inside the container, so a dead accuracy client reads as the
-revision failing its correctness check. The strict xfail of
-``test_a_killed_measurement_command_is_a_failed_gate`` tracks it; empty this set with
-the fix (SYSTEM-IFACE-PROGRESS, lane A)."""
 _AGENT_IDENTITY_READ = "id -u agent && id -g agent"
 _BENCHMARK_OUTPUT = re.compile(r"run-benchmark --vs-output \S+;")
 """The task's benchmark, as the framed benchmark command runs it."""
@@ -175,8 +171,6 @@ class _Faults:
     """Up to ``_MAX_DEATHS`` client deaths, on distinct commands."""
     link: LinkFault
     """What the network does to the client's first connection."""
-    spared: frozenset[str] = frozenset()
-    """Kinds of command no death hits, whatever its index."""
 
     @classmethod
     def draw(cls, sim: Sim) -> _Faults:
@@ -192,12 +186,10 @@ class _Faults:
             for command in commands
         )
         link = LinkFault.draw(rng, sends=_LATEST_LINK_FAULT, seconds=_LINK_FAULT_S)
-        return cls(deaths=deaths, link=link, spared=_MISBLAMED)
+        return cls(deaths=deaths, link=link)
 
     def death_of(self, command: int, kind: str, earlier: Sequence[_Command]) -> _Death | None:
         """The death of the ``command``-th command, of kind ``kind``, after ``earlier``."""
-        if kind in self.spared:
-            return None
         first_of_kind = all(issued.effect[0] != kind for issued in earlier)
         return next(
             (
@@ -332,9 +324,8 @@ class _Backend(FakeComputeBackend):
     """A compute backend whose Docker sandboxes are real ``DockerSandbox`` objects."""
 
     def __init__(self, docker: SubprocessDockerCli, threads: SimThreads) -> None:
-        super().__init__()
+        super().__init__(threads=threads)
         self._docker = docker
-        self._threads = threads
 
     def make_sandbox(
         self,
@@ -469,6 +460,73 @@ class _Client:
         return any(event["type"] in _TERMINAL for event in self.events)
 
 
+_SMALL_BUFFER_BYTES = 4096
+"""A socket buffer the run's event stream overflows, so a client that does not read blocks
+the server's writes to it."""
+
+
+class _Stall(StrEnum):
+    """How a subscriber stops draining what the server writes to it."""
+
+    NEVER_READS = "never-reads"
+    """It subscribes and never reads again, holding its connection open."""
+    BLACKHOLED = "blackholed"
+    """Everything the server sends it vanishes, and the connection outlives the run."""
+
+    def faults(self, link: LinkFault) -> tuple[LinkFault, ...]:
+        """The network's faults: the stalled subscriber's connection is the first."""
+        shifted = replace(link, connection=link.connection + 1)
+        if self is _Stall.NEVER_READS:
+            return (shifted,)
+        blackhole = LinkFault(
+            LinkFaultKind.BLACKHOLE, end=End.DIALER, before_send=2, seconds=10 * _RUN_LIMIT_S
+        )
+        return (blackhole, shifted)
+
+
+@dataclass
+class _StalledSubscriber:
+    """A subscriber that stops draining, beside the client that follows the run.
+
+    It holds the network's first connection, so the following client's connections and its
+    drawn fault come after it.
+    """
+
+    stall: _Stall
+    network: Network
+    socket_path: Path
+    threads: SimThreads
+    done: Event = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.done = self.threads.event()
+
+    def then(self, client: _Client, runtime: ServerRuntime) -> None:
+        """Subscribe and stop reading, then let ``client`` follow the run; wait for the end."""
+        assert runtime.transport_listening.wait(HANG_GUARD_S)
+        connection = self.network.connect(str(self.socket_path), HANG_GUARD_S)
+        request = SubscribeRequest(timestamp=REQUEST_TIME, after_sequence=0)
+        connection.send(request.model_dump_json().encode() + b"\n")
+        client.follow(runtime)
+        assert self.done.wait(HANG_GUARD_S)
+        if self.stall is _Stall.NEVER_READS:
+            # The server hung up on this subscriber: what it sent ends in an end of stream.
+            while connection.recv(65536, HANG_GUARD_S):
+                pass
+        connection.close()
+
+    def release(self) -> None:
+        self.done.set()
+
+    def drop_own(self, fired: tuple[FiredFault, ...]) -> tuple[FiredFault, ...]:
+        """The faults that fired on the following client's connections, renumbered from 1."""
+        return tuple(
+            FiredFault(replace(each.fault, connection=each.fault.connection - 1), each.at)
+            for each in fired
+            if each.fault.connection > 1
+        )
+
+
 def _messages(connection: Connection) -> Iterator[dict[str, Any]]:
     buffer = b""
     while True:
@@ -492,7 +550,7 @@ class _Outcome:
     root: Path
 
 
-def _run(tmp_path: Path, sim: Sim, faults: _Faults) -> _Outcome:
+def _run(tmp_path: Path, sim: Sim, faults: _Faults, stall: _Stall | None = None) -> _Outcome:
     schedule = sim.seed if sim.schedule_seed is None else sim.schedule_seed
     threads = SimThreads(sim.clock, schedule_seed=schedule, trace=sim.trace)
     sim.clock.limit = sim.clock.now() + _RUN_LIMIT_S
@@ -523,7 +581,8 @@ def _run(tmp_path: Path, sim: Sim, faults: _Faults) -> _Outcome:
             threads,
             processes=FakeProcesses(_no_git_remote, pass_time=threads.sleep),
             signaller=FakeProcessSignaller(set()),
-            network_faults=(faults.link,),
+            network_faults=(faults.link,) if stall is None else stall.faults(faults.link),
+            network_buffer_bytes=_SMALL_BUFFER_BYTES if stall is not None else DEFAULT_BUFFER_BYTES,
         )
         network = platform.network
         assert isinstance(network, SimNetwork)
@@ -549,7 +608,14 @@ def _run(tmp_path: Path, sim: Sim, faults: _Faults) -> _Outcome:
             platform=platform,
         )
         client = _Client(network, socket_path)
-        follower = threads.spawn(lambda: client.follow(runtime), name="client", daemon=False)
+        stalled = (
+            None if stall is None else _StalledSubscriber(stall, network, socket_path, threads)
+        )
+        follower = threads.spawn(
+            lambda: client.follow(runtime) if stalled is None else stalled.then(client, runtime),
+            name="client",
+            daemon=False,
+        )
         result: RunResult | None = None
         error: BaseException | None = None
         try:
@@ -558,10 +624,13 @@ def _run(tmp_path: Path, sim: Sim, faults: _Faults) -> _Outcome:
             # > Naming the expected types here would duplicate the invariant that a failed run names
             # > the killed command, and an unexpected type would escape before the cleanup checks run.
             error = raised
+        if stalled is not None:
+            stalled.release()
         follower.join(HANG_GUARD_S)
         assert not follower.is_alive(), "the client never saw the connection end"
         client.read_log(runtime)
-        return _Outcome(result, error, client, network.fired, daemon, socket_path, root)
+        fired = network.fired if stalled is None else stalled.drop_own(network.fired)
+        return _Outcome(result, error, client, fired, daemon, socket_path, root)
 
     return threads.run(main)
 
@@ -613,9 +682,11 @@ def _assert_invariants(outcome: _Outcome, sim: Sim, faults: _Faults) -> None:
     assert not outcome.socket_path.exists(), context
 
 
-def _check(tmp_path: Path, sim: Sim, faults: _Faults | None = None) -> _Outcome:
+def _check(
+    tmp_path: Path, sim: Sim, faults: _Faults | None = None, stall: _Stall | None = None
+) -> _Outcome:
     faults = _Faults.draw(sim) if faults is None else faults
-    outcome = _run(tmp_path, sim, faults)
+    outcome = _run(tmp_path, sim, faults, stall)
     _assert_invariants(outcome, sim, faults)
     return outcome
 
@@ -660,23 +731,7 @@ def test_a_killed_container_removal_leaves_no_container(
     assert outcome.daemon.ledger[target].argv[1] == "rm"
 
 
-@pytest.mark.parametrize(
-    "gate",
-    [
-        pytest.param(
-            gate,
-            marks=[
-                pytest.mark.xfail(
-                    strict=True,
-                    reason="a dead docker exec client reads as the candidate's failure",
-                )
-            ]
-            if gate in _MISBLAMED
-            else [],
-        )
-        for gate in sorted(_GATES)
-    ],
-)
+@pytest.mark.parametrize("gate", sorted(_GATES))
 @pytest.mark.parametrize("timing", ["before-effect", "after-effect"])
 def test_a_killed_measurement_command_is_a_failed_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate: str, timing: str
@@ -698,3 +753,20 @@ def test_a_killed_measurement_command_is_a_failed_gate(
     # The baseline measurement's gate failed; the run's final measurement of its winner runs
     # the gate again, in a new container, and may pass.
     assert finished[0] == "failed", finished
+
+
+@pytest.mark.parametrize("stall", list(_Stall))
+def test_a_stalled_subscriber_stalls_neither_the_run_nor_the_other_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stall: _Stall
+) -> None:
+    """Regression: the server wrote to a subscriber with no bound, so one that stopped draining
+    held its subscription for ever, and an attached server never exited.
+
+    The stalled subscriber connects first and the client that follows the run second, over a
+    socket buffer the event stream overflows. The run still ends, the following client is
+    told the end once, the server hangs up on the stalled one and says so, and exits.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    with caplog.at_level(logging.WARNING, logger="server.transport.unix_jsonl"):
+        _check(tmp_path, Sim(seed=0), _Faults(deaths=(), link=_NO_LINK_FAULT), stall)
+    assert any("disconnecting it" in record.getMessage() for record in caplog.records)

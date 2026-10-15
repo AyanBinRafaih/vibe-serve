@@ -160,7 +160,7 @@ def _run_input_check(
     client_factory = _ForbiddenAgentClientFactory()
     agents = _ForbiddenSessionAgents()
     invocation_stores = _ForbiddenInvocationStoreFactory()
-    backend = FakeComputeBackend()
+    backend = FakeComputeBackend(threads=threads)
     selected_sandbox = sandbox or FakeLifecycleRunner(threads=threads)
     backend.script_sandbox_for_kind(SandboxKind.DOCKER, selected_sandbox)
     processes = FakeProcesses(lambda _spec: ProcessScript(), pass_time=lambda _seconds: None)

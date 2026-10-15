@@ -47,7 +47,6 @@ from vs_runtime.api.infrastructure import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping
-    from contextlib import ExitStack
     from pathlib import Path
 
     from pydantic import BaseModel
@@ -77,7 +76,7 @@ if TYPE_CHECKING:
         WorkspaceRuntime,
     )
     from vs_sandbox.api import ComputeBackendImpl, DockerSandbox
-    from vs_sim.api import BlockingRunner, Network, SleepingClock
+    from vs_sim.api import BlockingRunner, Network, ReleaseStack, SleepingClock
 
 
 type StatelessToolServer = Callable[[object], ToolServerDescriptor | None]
@@ -145,7 +144,7 @@ class _ProductHostFactory:
     local_evaluation: Evaluation | None = field(default=None, init=False)
     facts: RunFacts | None = field(default=None, init=False)
 
-    def prepare(self, ownership: ExitStack) -> RunHostComponents:
+    def prepare(self, ownership: ReleaseStack) -> RunHostComponents:
         """Open product resources and compose the core services over them."""
         plugin = self.plugin
         if self.request.orchestration.id != plugin.id:
@@ -173,7 +172,7 @@ class _ProductHostFactory:
         )
         return self._components(resources, ownership)
 
-    def _components(self, resources: _PreparedRun, ownership: ExitStack) -> RunHostComponents:
+    def _components(self, resources: _PreparedRun, ownership: ReleaseStack) -> RunHostComponents:
         blocking = BlockingOperations(self.blocking)
         project = resources.project_resources
         environment = resources.environment_resources
@@ -310,7 +309,7 @@ class _ProductHostFactory:
         workspace_resources: WorkspaceResourceFactory,
         agent_runtime: WorkspaceRuntime,
         evaluation: Evaluation,
-        ownership: ExitStack,
+        ownership: ReleaseStack,
     ) -> CoreServices:
         """Compose the core run's services from the resources opened above."""
         policy = self.plugin.core
@@ -367,7 +366,7 @@ class _ProductHostFactory:
         resources: _PreparedRun,
         workspace_resources: WorkspaceResourceFactory,
         agent_runtime: WorkspaceRuntime,
-        ownership: ExitStack,
+        ownership: ReleaseStack,
     ) -> tuple[tuple[AgentRole, ...], CoreAgentResources | None, dict[str, str]]:
         """Resolve offered roles and open their indivisible session bundle, if any."""
         roles = self._offered_roles(resources)
@@ -528,7 +527,7 @@ class _ProductHostFactory:
             namespace.external_directory() / "slurm-provider-handles",
             clock=clock,
             sleeper=clock,
-            processes=integration.slurm_processes,
+            processes=integration.system.slurm_processes,
         )
 
     async def stop_new_work(self) -> None:

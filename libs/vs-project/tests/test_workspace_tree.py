@@ -307,3 +307,66 @@ def test_a_limited_listing_is_the_full_listing_or_refused_past_the_limit(
                     tree.files_below("inputs", limit=limit)
             else:
                 assert tree.files_below("inputs", limit=limit) == full
+
+
+def test_an_overwrite_keeps_the_inode_and_never_writes_through_a_link(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "state").mkdir(parents=True)
+    kept = workspace / "state" / "a.json"
+    kept.write_bytes(b"old contents\n")
+    inode = kept.stat().st_ino
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"host\n")
+    (workspace / "state" / "link.json").symlink_to(outside)
+
+    with open_workspace_tree(workspace) as tree:
+        tree.overwrite("state/a.json", b"new\n")
+        tree.overwrite("fresh/b.json", b"b\n")
+        with pytest.raises(WorkspacePathError):
+            tree.overwrite("state/link.json", b"agent\n")
+
+    assert kept.read_bytes() == b"new\n"
+    assert kept.stat().st_ino == inode
+    assert (workspace / "fresh" / "b.json").read_bytes() == b"b\n"
+    assert outside.read_bytes() == b"host\n"
+
+
+def test_entries_named_finds_every_match_without_entering_a_link_or_a_match(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    (outside / "linked" / ".git").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    (workspace / ".git" / "modules" / "x" / ".git").mkdir(parents=True)
+    (workspace / "a" / "b" / ".git").mkdir(parents=True)
+    (workspace / "a" / "b" / ".git" / ".git").mkdir()
+    (workspace / "c").mkdir()
+    (workspace / "c" / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+    (workspace / "d").symlink_to(outside)
+    (workspace / "e").mkdir()
+    (workspace / "e" / ".git").symlink_to(outside / "linked")
+
+    with open_workspace_tree(workspace) as tree:
+        found = tree.entries_named(".git", limit=100)
+
+    assert found == (".git", "a/b/.git", "c/.git", "e/.git")
+
+
+@settings(max_examples=examples(pr=4, nightly=50), deadline=None)
+@given(depth=st.integers(min_value=0, max_value=6), limit=st.integers(min_value=0, max_value=8))
+def test_entries_named_is_refused_past_the_limit_or_complete(*, depth: int, limit: int) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        nested = workspace
+        for number in range(depth):
+            nested = nested / f"d{number}"
+            nested.mkdir()
+        (nested / ".git").mkdir()
+        expected = (PurePosixPath(*(f"d{n}" for n in range(depth)), ".git").as_posix(),)
+
+        with open_workspace_tree(workspace) as tree:
+            if depth + 1 > limit:
+                with pytest.raises(TreeLimitError):
+                    tree.entries_named(".git", limit=limit)
+            else:
+                assert tree.entries_named(".git", limit=limit) == expected
