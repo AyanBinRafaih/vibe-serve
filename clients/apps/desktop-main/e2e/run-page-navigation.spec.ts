@@ -2,10 +2,10 @@
  * Navigating one window's run page from one run to another, against the fixture composition in
  * `run-page-navigation-app.mjs`. This is the regression spec for the single-window navigation leak
  * fixed in `AppWindow.openRunPage` (`clients/apps/desktop-main/src/main/window.ts`): before that
- * fix, opening a second run's page replaced the view and rebound `#currentRunId` without ever
- * detaching the first run, so `AppWindowDeps.closed` was never told the first run's page was gone
- * and its binding (in production, an SSH `ConnectionLease` plus its subscriptions) leaked for the
- * life of the window.
+ * fix, opening a second run's page replaced the view and took over as the window's current run
+ * without ever detaching the first, so `AppWindowDeps.closed` was never told the first run's page
+ * was gone and its binding (in production, an SSH `ConnectionLease` plus its subscriptions) leaked
+ * for the life of the window.
  */
 import {fileURLToPath} from 'node:url';
 import {type ElectronApplication, _electron as electron, expect, test} from '@playwright/test';
