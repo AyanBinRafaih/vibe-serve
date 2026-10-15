@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+# Import the leaf directly: importing it through the parent would create a dependency on the
+# orchestration package that already depends on this core registration.
+import vibesys.orchestration.input_check.prompts as prompts  # noqa: PLR0402  # lint-waiver: LW-264201 [PLR0402]; importing through the parent would create a dependency cycle with this registration module.
 from vibesys.candidates.api import (
     Gates,
     Measuring,
@@ -14,7 +17,6 @@ from vibesys.candidates.api import (
     terms_of,
 )
 from vibesys.core_wiring import EvaluationInputs, ResolvedRun, evaluation_inputs, operation_catalog
-from vibesys.orchestration.input_check import prompts
 from vibesys.orchestration.input_check.launch import InputCheckLaunch
 from vibesys.orchestration.input_check.operations import OPERATIONS
 from vibesys.orchestration.input_check.search import (

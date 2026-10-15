@@ -1345,6 +1345,15 @@ depends_on = ["vs_core", "vibesys.metrics"]
 from = ["vibesys.orchestration.input_check.launch"]
 expose = ["InputCheckLaunch"]
 
+[[modules]]
+path = "vibesys.orchestration.input_check.prompts"
+layer = "loops"
+depends_on = []
+
+[[interfaces]]
+from = ["vibesys.orchestration.input_check.prompts"]
+expose = ["__file__"]
+
 [[interfaces]]
 from = ["vibesys.input_check_core"]
 expose = ["input_check_core_registration", "input_check_operation_catalog"]
@@ -1352,7 +1361,7 @@ expose = ["input_check_core_registration", "input_check_operation_catalog"]
 [[modules]]
 path = "vibesys.input_check_core"
 layer = "loops"
-depends_on = ["vs_core", "vs_runtime", "vibesys.candidates", "vibesys.core_wiring", "vibesys.orchestration.input_check.launch", "vibesys.orchestration.input_check.operations", "vibesys.orchestration.input_check.search", "vibesys.plugin_registration", "vibesys.prompts", "vibesys.run.contracts"]
+depends_on = ["vs_core", "vs_runtime", "vibesys.candidates", "vibesys.core_wiring", "vibesys.orchestration.input_check.launch", "vibesys.orchestration.input_check.operations", "vibesys.orchestration.input_check.prompts", "vibesys.orchestration.input_check.search", "vibesys.plugin_registration", "vibesys.prompts", "vibesys.run.contracts"]
 
 [[modules]]
 # The options a dynamic run is launched with: the search's config and the task's inputs.
